@@ -1,0 +1,184 @@
+// Host module — a plain Vyx executable that drives the CUDA Driver API
+// directly (no DCI, no C shim). `vyx build` embeds the PTX and kernel ABI
+// generated from device/kernel.vyx.
+//
+// Device kernel ABI: `*T` params are the Vyx pointer handle {address,
+// metadata}; the kernel only ever reads the address (all access is inside
+// unsafe blocks), so the host passes {device_ptr, null} pairs. All host-side
+// memory access goes through typed handles (*f64 / *rawptr / *u8) — rawptr
+// arithmetic is avoided on purpose.
+
+use std.convert;
+
+extern "C" {
+    fn cuInit(flags: u32) -> i32;
+    fn cuDeviceGet(device: rawptr, ordinal: i32) -> i32;
+    fn cuDevicePrimaryCtxRetain(ctx_out: rawptr, device: rawptr) -> i32;
+    fn cuCtxSetCurrent(ctx: rawptr) -> i32;
+    fn cuMemAllocManaged(ptr_out: rawptr, bytes: u64, flags: u32) -> i32;
+    fn cuModuleLoadData(module_out: rawptr, image: rawptr) -> i32;
+    fn cuModuleGetFunction(fn_out: rawptr, module: rawptr, name: rawptr) -> i32;
+    fn cuLaunchKernel(f: rawptr, gx: u32, gy: u32, gz: u32,
+                      bx: u32, by: u32, bz: u32,
+                      shared_bytes: u32, stream: rawptr,
+                      params: rawptr, extra: rawptr) -> i32;
+    fn cuCtxSynchronize() -> i32;
+
+    fn malloc(size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+}
+
+const CU_SUCCESS: i32 = 0;
+const CU_MEM_ATTACH_GLOBAL: u32 = 1;
+
+fn csv_field(text: string, index: i32) -> string {
+    var current: i32 = 0;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= text.len) {
+        if (i == text.len || text.charAt(i) == 44) {
+            if (current == index) {
+                return text.substring(start, i).trim();
+            }
+            current = current + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn csv_at(text: string, index: i32) -> i32 {
+    let field = csv_field(text, index);
+    if (field.len == 0) { return -1; }
+    match (i32_from_str(field)) {
+        case Ok(value) => { return value; }
+        case Err(_) => { return -1; }
+    }
+}
+
+fn embedded_c_string(text: string) -> rawptr {
+    var out: rawptr = null;
+    unsafe { memcpy(to_rawptr(&out), to_rawptr(&text), 8); }
+    return out;
+}
+
+fn check(label: string, rc: i32) -> bool {
+    if (rc != CU_SUCCESS) {
+        print(label + ": FAIL (cuda error " + rc.toString() + ")");
+        return false;
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    let n: i32 = 1024;
+    let bytes: u64 = (n as u64) * 8;
+
+    if (!check("cuInit", cuInit(0))) { return 1; }
+    var device: rawptr = null;
+    if (!check("cuDeviceGet", cuDeviceGet(to_rawptr(&device), 0))) { return 1; }
+    // Managed buffers so both host fill and device compute hit one allocation.
+    var dev_src: rawptr = null;
+    var dev_dst: rawptr = null;
+    // On this driver, a context from cuCtxCreate(v4) cannot back managed
+    // allocations (CUDA_ERROR_INVALID_CONTEXT 201); the device's primary
+    // context can.  Retain it and make it current before any allocation.
+    var pctx: rawptr = null;
+    if (!check("cuDevicePrimaryCtxRetain", cuDevicePrimaryCtxRetain(to_rawptr(&pctx), device))) { return 1; }
+    if (!check("cuCtxSetCurrent", cuCtxSetCurrent(pctx))) { return 1; }
+    if (!check("cuMemAllocManaged(src)", cuMemAllocManaged(to_rawptr(&dev_src), bytes, CU_MEM_ATTACH_GLOBAL))) { return 1; }
+    if (!check("cuMemAllocManaged(dst)", cuMemAllocManaged(to_rawptr(&dev_dst), bytes, CU_MEM_ATTACH_GLOBAL))) { return 1; }
+
+    // The build embeds the PTX and its stable kernel symbol. The string data
+    // is already NUL-terminated by the compiler's string literal encoding.
+    let ptx_image = embedded_c_string(vyx_cuda_ptx());
+    let kernel_name = embedded_c_string(vyx_cuda_kernel_scale_kernel_symbol());
+    var cuda_mod: rawptr = null;
+    if (!check("cuModuleLoadData", cuModuleLoadData(to_rawptr(&cuda_mod), ptx_image))) { return 1; }
+    if (ptx_image == null || kernel_name == null) {
+        print("embedded CUDA image: FAIL");
+        return 1;
+    }
+    var kernel: rawptr = null;
+    if (!check("cuModuleGetFunction", cuModuleGetFunction(to_rawptr(&kernel), cuda_mod, kernel_name))) { return 1; }
+
+
+    // Typed views over the managed buffers (all access below is unsafe
+    // element indexing: typed GEP, no bounds checks, no rawptr arithmetic).
+    var src_view: *f64 = dev_src as *f64;
+    var dst_view: *f64 = dev_dst as *f64;
+    var i: i32 = 0;
+    while (i < n) {
+        unsafe { src_view[i] = i as f64; }
+        i = i + 1;
+    }
+
+    let param_count = vyx_cuda_kernel_scale_kernel_count();
+    let param_bytes = vyx_cuda_kernel_scale_kernel_bytes();
+    let param_offsets = vyx_cuda_kernel_scale_kernel_offsets();
+    if (param_count != 4 || param_bytes <= 0) {
+        print("kernel ABI: FAIL");
+        return 1;
+    }
+    let param_block = malloc(param_bytes as i64);
+    let param_array = malloc((param_count as i64) * 8);
+    if (param_block == null || param_array == null) { print("alloc: FAIL"); return 1; }
+    let scale: f64 = 2.5;
+    let count: i32 = n;
+    var pb_u8: *u8 = param_block as *u8;
+    var pa_slots: *rawptr = param_array as *rawptr;
+    let dst_off = csv_at(param_offsets, 0);
+    let src_off = csv_at(param_offsets, 1);
+    let scale_off = csv_at(param_offsets, 2);
+    let count_off = csv_at(param_offsets, 3);
+    if (dst_off < 0 || src_off < 0 || scale_off < 0 || count_off < 0) {
+        print("kernel ABI: FAIL");
+        return 1;
+    }
+    unsafe {
+        var dst_slot: *rawptr = to_rawptr(&pb_u8[dst_off]) as *rawptr;
+        var src_slot: *rawptr = to_rawptr(&pb_u8[src_off]) as *rawptr;
+        var scale_slot: *f64 = to_rawptr(&pb_u8[scale_off]) as *f64;
+        var count_slot: *i32 = to_rawptr(&pb_u8[count_off]) as *i32;
+        dst_slot[0] = dev_dst; dst_slot[1] = null;
+        src_slot[0] = dev_src; src_slot[1] = null;
+        scale_slot[0] = scale;
+        count_slot[0] = count;
+        pa_slots[0] = to_rawptr(&pb_u8[dst_off]);
+        pa_slots[1] = to_rawptr(&pb_u8[src_off]);
+        pa_slots[2] = to_rawptr(&pb_u8[scale_off]);
+        pa_slots[3] = to_rawptr(&pb_u8[count_off]);
+    }
+
+    let threads: u32 = 256;
+    let grid: u32 = ((n as u32) + threads - 1) / threads;
+    if (!check("cuLaunchKernel",
+               cuLaunchKernel(kernel, grid, 1, 1, threads, 1, 1,
+                              0, null, param_array, null))) { return 1; }
+    if (!check("cuCtxSynchronize", cuCtxSynchronize())) { return 1; }
+
+    // Verify on the host: dst[i] must be i * 2.5.
+    var failures: i32 = 0;
+    var sum: f64 = 0.0;
+    i = 0;
+    while (i < n) {
+        var got: f64 = 0.0;
+        unsafe { got = dst_view[i]; }
+        let want: f64 = (i as f64) * 2.5;
+        if (got != want) {
+            failures = failures + 1;
+            if (failures <= 3) { print("mismatch"); }
+        }
+        sum = sum + got;
+        i = i + 1;
+    }
+    let want_sum: f64 = 2.5 * ((n as f64) * ((n as f64) - 1.0) / 2.0);
+    if (failures == 0 && sum == want_sum) {
+        print("cuda_kernel: OK (n=${n}, sum=${sum})");
+        return 0;
+    }
+    print("cuda_kernel: FAIL");
+    return 1;
+}

@@ -1,0 +1,1425 @@
+module Zyn.App;
+
+use std.collections;
+use std.encoding;
+use std.fs;
+use Publish = Zyn.Toolchain.Publish;
+
+// ---------------------------------------------------------------------------
+// ZC-21 performance and stability gate
+//
+// The roadmap asks for numbers recorded on a *fixed machine and corpus*, and
+// for every optimisation to be compared against the same baseline. Everything
+// below exists to make those two sentences mechanically true rather than
+// aspirational:
+//
+//   * identity comes first. `AppMachineProfile` and `AppCorpus` are part of
+//     every baseline, and a comparison between two whose identity differs is
+//     refused. A 40% win measured against a different machine (or against a
+//     100-row corpus when the baseline was 10k rows) is not a win.
+//   * single numbers are not evidence. A series refuses to produce a verdict
+//     below a minimum sample count, and every budget is graded on a
+//     percentile rather than on the best or the mean. One lucky frame does not
+//     make a feature industrial-grade, and one unlucky one does not make it
+//     slow.
+//   * memory has two different questions that are usually conflated. Peak says
+//     whether the device survives the page; growth says whether the app can be
+//     left open. They get separate metrics and separate budgets.
+//   * the four stability scenarios are the ones that actually break long
+//     running apps: idle for hours, sustained interaction, GPU device loss and
+//     returning from the background. Each records what it needs and states the
+//     assertion it makes.
+//
+// This module measures and grades. It does not drive a frame loop: the host
+// records into it, because the host is the only place a real frame time is
+// known.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Vocabulary
+// ---------------------------------------------------------------------------
+
+public fn appPerfStartup() -> i32 { return 1; }
+public fn appPerfFirstFrame() -> i32 { return 2; }
+public fn appPerfInputToDisplay() -> i32 { return 3; }
+public fn appPerfScrollFrame() -> i32 { return 4; }
+public fn appPerfMemoryPeak() -> i32 { return 5; }
+public fn appPerfLongRunGrowth() -> i32 { return 6; }
+
+public fn appPerfMetricName(metric: i32) -> string {
+    if (metric == appPerfStartup()) { return "startup"; }
+    if (metric == appPerfFirstFrame()) { return "first-frame"; }
+    if (metric == appPerfInputToDisplay()) { return "input-to-display"; }
+    if (metric == appPerfScrollFrame()) { return "scroll-frame"; }
+    if (metric == appPerfMemoryPeak()) { return "memory-peak"; }
+    if (metric == appPerfLongRunGrowth()) { return "long-run-growth"; }
+    return "unknown";
+}
+
+// Latency metrics are graded in microseconds; the two memory metrics are
+// graded in bytes. Every budget carries its own unit rather than allowing a
+// silent comparison of a byte count against a microsecond budget.
+public fn appPerfUnitMicros() -> i32 { return 1; }
+public fn appPerfUnitBytes() -> i32 { return 2; }
+
+public fn appPerfUnitName(unit: i32) -> string {
+    if (unit == appPerfUnitMicros()) { return "us"; }
+    if (unit == appPerfUnitBytes()) { return "B"; }
+    return "unknown";
+}
+
+public fn appPerfUnitForMetric(metric: i32) -> i32 {
+    if (metric == appPerfMemoryPeak() || metric == appPerfLongRunGrowth()) { return appPerfUnitBytes(); }
+    return appPerfUnitMicros();
+}
+
+public fn appPerfScenarioStartup() -> i32 { return 1; }
+public fn appPerfScenarioIdle() -> i32 { return 2; }
+public fn appPerfScenarioInteraction() -> i32 { return 3; }
+public fn appPerfScenarioScroll() -> i32 { return 4; }
+public fn appPerfScenarioGpuLoss() -> i32 { return 5; }
+public fn appPerfScenarioBackgroundRestore() -> i32 { return 6; }
+public fn appPerfScenarioLongRun() -> i32 { return 7; }
+
+public fn appPerfScenarioName(scenario: i32) -> string {
+    if (scenario == appPerfScenarioStartup()) { return "startup"; }
+    if (scenario == appPerfScenarioIdle()) { return "idle"; }
+    if (scenario == appPerfScenarioInteraction()) { return "interaction"; }
+    if (scenario == appPerfScenarioScroll()) { return "scroll"; }
+    if (scenario == appPerfScenarioGpuLoss()) { return "gpu-loss"; }
+    if (scenario == appPerfScenarioBackgroundRestore()) { return "background-restore"; }
+    if (scenario == appPerfScenarioLongRun()) { return "long-run"; }
+    return "unknown";
+}
+
+public fn appPerfScenarioOf(text: string) -> i32 {
+    if (text == "startup") { return appPerfScenarioStartup(); }
+    if (text == "idle") { return appPerfScenarioIdle(); }
+    if (text == "interaction") { return appPerfScenarioInteraction(); }
+    if (text == "scroll") { return appPerfScenarioScroll(); }
+    if (text == "gpu-loss") { return appPerfScenarioGpuLoss(); }
+    if (text == "background-restore") { return appPerfScenarioBackgroundRestore(); }
+    if (text == "long-run") { return appPerfScenarioLongRun(); }
+    return appPerfScenarioIdle();
+}
+
+public fn appPerfPass() -> i32 { return 0; }
+public fn appPerfWarn() -> i32 { return 1; }
+public fn appPerfFail() -> i32 { return 2; }
+
+public fn appPerfVerdictName(verdict: i32) -> string {
+    if (verdict == appPerfPass()) { return "pass"; }
+    if (verdict == appPerfWarn()) { return "warn"; }
+    if (verdict == appPerfFail()) { return "fail"; }
+    return "unknown";
+}
+
+// The standard corpora. Both are named in the roadmap, and naming them here
+// rather than in each test is what stops two runs from silently disagreeing
+// about what "large" means.
+public fn appCorpusRowCountLarge() -> i32 { return 10000; }
+public fn appCorpusControlCountDense() -> i32 { return 100; }
+
+// A percentile from fewer than this many samples is noise dressed as data. The
+// number is conservative on purpose: raising it is a decision a team should
+// have to make out loud.
+public fn appPerfMinSamples() -> i32 { return 30; }
+
+public fn appPerfGateCodeTooFewSamples() -> i32 { return 9200; }
+public fn appPerfGateCodeBudgetExceeded() -> i32 { return 9201; }
+public fn appPerfGateCodeMachineMismatch() -> i32 { return 9202; }
+public fn appPerfGateCodeCorpusMismatch() -> i32 { return 9203; }
+public fn appPerfGateCodeRegression() -> i32 { return 9204; }
+public fn appPerfGateCodeGpuLossUnhandled() -> i32 { return 9205; }
+public fn appPerfGateCodeRestoreDiverged() -> i32 { return 9206; }
+
+// ---------------------------------------------------------------------------
+// Identity: machine and corpus
+// ---------------------------------------------------------------------------
+
+// Everything that identifies the *machine* a number was measured on. The
+// renderer string matters as much as the CPU: the same application on an
+// integrated and a discrete adapter legitimately produces different numbers,
+// and a gate that ignores that will fail intermittently for years.
+public class AppMachineProfile {
+    public machine_id: string;
+    public os_name: string;
+    public cpu_name: string;
+    public renderer_name: string;
+    public clock_source: string;
+
+    public static fn empty() -> AppMachineProfile {
+        return AppMachineProfile {
+            machine_id: "",
+            os_name: "",
+            cpu_name: "",
+            renderer_name: "",
+            clock_source: ""
+        };
+    }
+
+    public static fn create(machine_id: string, os_name: string, cpu_name: string, renderer_name: string, clock_source: string) -> AppMachineProfile {
+        return AppMachineProfile {
+            machine_id: machine_id,
+            os_name: os_name,
+            cpu_name: cpu_name,
+            renderer_name: renderer_name,
+            clock_source: clock_source
+        };
+    }
+
+    public fn dup(&self) -> AppMachineProfile {
+        return AppMachineProfile.create(self.machine_id, self.os_name, self.cpu_name,
+            self.renderer_name, self.clock_source);
+    }
+
+    public fn isEmpty(&self) -> bool { return self.machine_id.len == 0; }
+
+    // Only the fields that can change a frame time. `machine_id` itself is
+    // deliberately excluded so a machine can be renamed without invalidating
+    // its history.
+    public fn matches(&self, other: AppMachineProfile) -> bool {
+        return self.os_name == other.os_name
+            && self.cpu_name == other.cpu_name
+            && self.renderer_name == other.renderer_name
+            && self.clock_source == other.clock_source;
+    }
+
+    public fn describe(&self) -> string {
+        return self.machine_id + " (" + self.os_name + ", " + self.cpu_name
+            + ", " + self.renderer_name + ", clock=" + self.clock_source + ")";
+    }
+
+    public fn digest(&self) -> string {
+        return AppChecksum.of(self.os_name + "|" + self.cpu_name + "|"
+            + self.renderer_name + "|" + self.clock_source);
+    }
+
+    // `M|machine_id|os|cpu|renderer|clock`
+    public fn serialize(&self) -> string {
+        return "M|" + self.machine_id
+            + "|" + hex_encode(self.os_name)
+            + "|" + hex_encode(self.cpu_name)
+            + "|" + hex_encode(self.renderer_name)
+            + "|" + hex_encode(self.clock_source);
+    }
+
+    public static fn parse(text: string) -> AppMachineProfile {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "M") { return AppMachineProfile.empty(); }
+        return AppMachineProfile.create(
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 1),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 2)),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3)),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 4)),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 5)));
+    }
+}
+
+// The fixed data set a number was measured against, plus the seed so a
+// pseudo-random corpus can be regenerated rather than archived.
+public class AppCorpus {
+    public name: string;
+    public row_count: i32;
+    public control_count: i32;
+    public seed: i64;
+
+    public static fn empty() -> AppCorpus {
+        return AppCorpus { name: "", row_count: 0, control_count: 0, seed: 0 };
+    }
+
+    public static fn create(name: string, row_count: i32, control_count: i32, seed: i64) -> AppCorpus {
+        return AppCorpus { name: name, row_count: row_count, control_count: control_count, seed: seed };
+    }
+
+    public fn dup(&self) -> AppCorpus {
+        return AppCorpus.create(self.name, self.row_count, self.control_count, self.seed);
+    }
+
+    public fn isEmpty(&self) -> bool { return self.name.len == 0; }
+
+    // The row count drives virtualisation cost and the control count drives
+    // layout cost, and they are independent: comparing a 10k-row run against a
+    // 1k-row baseline measures nothing.
+    public fn matches(&self, other: AppCorpus) -> bool {
+        return self.row_count == other.row_count && self.control_count == other.control_count;
+    }
+
+    // The standard large-table corpus.
+    public static fn rows10k() -> AppCorpus {
+        return AppCorpus.create("10k-rows", appCorpusRowCountLarge(), 0, 20240901);
+    }
+
+    // The standard dense-screen corpus.
+    public static fn controls100() -> AppCorpus {
+        return AppCorpus.create("100-controls", 0, appCorpusControlCountDense(), 20240902);
+    }
+
+    // Both at once - the realistic case for a page that is both wide and deep.
+    public static fn combined() -> AppCorpus {
+        return AppCorpus.create("10k-rows-100-controls",
+            appCorpusRowCountLarge(), appCorpusControlCountDense(), 20240903);
+    }
+
+    public fn describe(&self) -> string {
+        return self.name + " (" + format("%d", self.row_count as i64) + " rows, "
+            + format("%d", self.control_count as i64) + " controls, seed "
+            + format("%d", self.seed) + ")";
+    }
+
+    public fn digest(&self) -> string {
+        return AppChecksum.of(format("%d", self.row_count as i64) + "|"
+            + format("%d", self.control_count as i64) + "|" + format("%d", self.seed));
+    }
+
+    // `C|name|rows|controls|seed`
+    public fn serialize(&self) -> string {
+        return "C|" + self.name
+            + "|" + format("%d", self.row_count as i64)
+            + "|" + format("%d", self.control_count as i64)
+            + "|" + format("%d", self.seed);
+    }
+
+    public static fn parse(text: string) -> AppCorpus {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "C") { return AppCorpus.empty(); }
+        return AppCorpus.create(
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 1),
+            appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 2), 0 as u64),
+            appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3), 0 as u64),
+            appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 4), 0 as u64) as i64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Samples and series
+// ---------------------------------------------------------------------------
+
+// One observation. Every field is recorded rather than derived: the frame
+// index is what makes "the 4000th frame was slow" answerable, and the clock is
+// what lets two series from different components be interleaved.
+public class AppPerfSample {
+    public metric: i32;
+    public scenario: i32;
+    public value: i64;
+    public frame_index: i64;
+    public clock: u64;
+
+    // metric 0 is the sentinel: no real metric is numbered 0, so an unparsed
+    // or out-of-range sample is recognisable as empty rather than looking like
+    // a very fast first frame.
+    public static fn empty() -> AppPerfSample {
+        return AppPerfSample {
+            metric: 0,
+            scenario: 0,
+            value: 0,
+            frame_index: 0,
+            clock: 0 as u64
+        };
+    }
+
+    public static fn create(metric: i32, scenario: i32, value: i64) -> AppPerfSample {
+        var out = AppPerfSample.empty();
+        out.metric = metric;
+        out.scenario = scenario;
+        out.value = value;
+        return out;
+    }
+
+    public fn withFrame(mut self, frame_index: i64) -> AppPerfSample {
+        self.frame_index = frame_index;
+        return self;
+    }
+
+    public fn withClock(mut self, clock: u64) -> AppPerfSample {
+        self.clock = clock;
+        return self;
+    }
+
+    public fn dup(&self) -> AppPerfSample {
+        var out = AppPerfSample.empty();
+        out.metric = self.metric;
+        out.scenario = self.scenario;
+        out.value = self.value;
+        out.frame_index = self.frame_index;
+        out.clock = self.clock;
+        return out;
+    }
+
+    public fn isEmpty(&self) -> bool { return self.metric == 0; }
+
+    public fn describe(&self) -> string {
+        return appPerfMetricName(self.metric) + "/" + appPerfScenarioName(self.scenario)
+            + " " + format("%d", self.value)
+            + appPerfUnitName(appPerfUnitForMetric(self.metric))
+            + " frame=" + format("%d", self.frame_index)
+            + " clock=" + format("%d", self.clock as i64);
+    }
+
+    // `P|metric|scenario|value|frame|clock`
+    public fn serialize(&self) -> string {
+        return "P|" + format("%d", self.metric as i64)
+            + "|" + format("%d", self.scenario as i64)
+            + "|" + format("%d", self.value)
+            + "|" + format("%d", self.frame_index)
+            + "|" + format("%d", self.clock as i64);
+    }
+
+    public static fn parse(text: string) -> AppPerfSample {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "P") { return AppPerfSample.empty(); }
+        var out = AppPerfSample.empty();
+        out.metric = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 1), 2 as u64);
+        out.scenario = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 2), 1 as u64);
+        out.value = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3), 0 as u64) as i64;
+        out.frame_index = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 4), 0 as u64) as i64;
+        out.clock = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 5), 0 as u64);
+        return out;
+    }
+}
+
+// A resource-backed series for one metric under one scenario. Resource-backed
+// rather than a `Vec` field so it survives alongside the world it measures and
+// so a long run can keep appending without holding every sample in a host-side
+// object for the whole session.
+public class AppPerfSeries {
+    public metric: i32;
+    public scenario: i32;
+    public machine: AppMachineProfile;
+    public corpus: AppCorpus;
+
+    public static fn create(metric: i32, scenario: i32) -> AppPerfSeries {
+        return AppPerfSeries {
+            metric: metric,
+            scenario: scenario,
+            machine: AppMachineProfile.empty(),
+            corpus: AppCorpus.empty()
+        };
+    }
+
+    public fn withIdentity(mut self, machine: AppMachineProfile, corpus: AppCorpus) -> AppPerfSeries {
+        self.machine = machine;
+        self.corpus = corpus;
+        return self;
+    }
+
+    public static fn keyFor(metric: i32, scenario: i32) -> string {
+        return "perf:" + appPerfMetricName(metric) + ":" + appPerfScenarioName(scenario);
+    }
+
+    public fn key(&self) -> string {
+        return AppPerfSeries.keyFor(self.metric, self.scenario);
+    }
+
+    public fn count(&self, world: AppWorld) -> i32 {
+        return world.stringListResourceCount(self.key());
+    }
+
+    public fn at(&self, world: AppWorld, index: i32) -> AppPerfSample {
+        if (index < 0 || index >= self.count(world)) { return AppPerfSample.empty(); }
+        return AppPerfSample.parse(world.stringListResourceAt(self.key(), index));
+    }
+
+    // Recording returns the world: even though `AppWorld` shares its interior,
+    // the codebase's convention is to thread the returned handle back, and a
+    // caller who ignores it is silently opting out of any future move to value
+    // semantics.
+    public fn record(&self, world: AppWorld, value: i64) -> AppWorld {
+        return world.appendStringListResource(self.key(),
+            AppPerfSample.create(self.metric, self.scenario, value).serialize());
+    }
+
+    public fn recordAt(&self, world: AppWorld, value: i64, frame_index: i64, clock: u64) -> AppWorld {
+        let sample = AppPerfSample.create(self.metric, self.scenario, value)
+            .withFrame(frame_index).withClock(clock);
+        return world.appendStringListResource(self.key(), sample.serialize());
+    }
+
+    public fn clear(&self, world: AppWorld) -> AppWorld {
+        return AppRowStore.clearList(world, self.key());
+    }
+
+    // --- statistics -------------------------------------------------------
+    //
+    // All statistics sort a copy of the values. That is O(n log n) per query,
+    // which is fine because these run once per gate rather than once per
+    // frame, and it avoids keeping a sorted shadow structure in sync.
+
+    private fn values(&self, world: AppWorld) -> Vec<i64> {
+        var out = Vec::<i64>.new();
+        var i: i32 = 0;
+        while (i < self.count(world)) {
+            out.push(self.at(world, i).value);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    private fn sortedValues(&self, world: AppWorld) -> Vec<i64> {
+        var out = self.values(world);
+        out.sort();
+        return out;
+    }
+
+    public fn sum(&self, world: AppWorld) -> i64 {
+        var out: i64 = 0;
+        var i: i32 = 0;
+        while (i < self.count(world)) {
+            out = out + self.at(world, i).value;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // -1 rather than 0 for an empty series: zero is a real measurement (a
+    // first frame can legitimately take under a microsecond to record) and
+    // shouldn't be confused with "we have nothing".
+    public fn min(&self, world: AppWorld) -> i64 {
+        if (self.count(world) == 0) { return -1; }
+        var values = self.sortedValues(world);
+        let out = values.get(0);
+        values.destroy();
+        return out;
+    }
+
+    public fn max(&self, world: AppWorld) -> i64 {
+        if (self.count(world) == 0) { return -1; }
+        var values = self.sortedValues(world);
+        let out = values.get((values.len - 1));
+        values.destroy();
+        return out;
+    }
+
+    public fn mean(&self, world: AppWorld) -> i64 {
+        let n = self.count(world);
+        if (n == 0) { return -1; }
+        return self.sum(world) / (n as i64);
+    }
+
+    // Linear interpolation between neighbours. Nearest-rank would be one line
+    // shorter, but interpolating keeps p50 honest on the small sample counts a
+    // startup budget necessarily has.
+    public fn percentile(&self, world: AppWorld, percent: i32) -> i64 {
+        let n = self.count(world);
+        if (n == 0) { return -1; }
+        if (n == 1) { return self.at(world, 0).value; }
+        if (percent < 0) { return self.min(world); }
+        if (percent > 100) { return self.max(world); }
+        var values = self.sortedValues(world);
+        let rank = ((percent * (n - 1)) / 100);
+        let next = appPerfMinI32(rank + 1, n - 1);
+        let lower = values.get(rank as i64);
+        let upper = values.get(next as i64);
+        let fraction = (percent * (n - 1)) - (rank * 100);
+        let out = lower + (((upper - lower) * fraction) / 100);
+        values.destroy();
+        return out;
+    }
+
+    public fn median(&self, world: AppWorld) -> i64 { return self.percentile(world, 50); }
+    public fn p95(&self, world: AppWorld) -> i64 { return self.percentile(world, 95); }
+    public fn p99(&self, world: AppWorld) -> i64 { return self.percentile(world, 99); }
+
+    // Whether this series is allowed to support a claim at all. Checked before
+    // any budget gate: thirty frames of a 10k-row list says something, three
+    // does not.
+    public fn isRepresentative(&self, world: AppWorld) -> bool {
+        return self.count(world) >= appPerfMinSamples();
+    }
+
+    // The run-to-run identity of the series contents, for spotting "the same
+    // baseline" rather than trusting a file name.
+    public fn digest(&self, world: AppWorld) -> string {
+        var out = "";
+        var i: i32 = 0;
+        while (i < self.count(world)) {
+            out = out + self.at(world, i).serialize() + "\n";
+            i = i + 1;
+        }
+        return AppChecksum.of(out);
+    }
+
+    public fn summary(&self, world: AppWorld) -> string {
+        return appPerfMetricName(self.metric) + "/" + appPerfScenarioName(self.scenario)
+            + ": n=" + format("%d", self.count(world) as i64)
+            + " mean=" + format("%d", self.mean(world))
+            + " p50=" + format("%d", self.median(world))
+            + " p95=" + format("%d", self.p95(world))
+            + " max=" + format("%d", self.max(world))
+            + appPerfUnitName(appPerfUnitForMetric(self.metric));
+    }
+}
+
+// `min` for indices, spelled locally because the percentile code needs it once
+// and a generic helper would pull `<` constraint machinery into this module.
+public fn appPerfMinI32(a: i32, b: i32) -> i32 {
+    if (a > b) { return b; }
+    return a;
+}
+
+// ---------------------------------------------------------------------------
+// Budgets
+// ---------------------------------------------------------------------------
+
+// A budget is a promise about a *percentile*, not about a single frame. That
+// is the difference between "it was fast once" and "it is fast": a p95 budget
+// tolerates the inevitable scheduling hiccup while still failing genuinely
+// janky work.
+public class AppPerfBudget {
+    public metric: i32;
+    public scenario: i32;
+    public unit: i32;
+    public budget_value: i64;
+    public min_samples: i32;
+
+    public static fn create(metric: i32, scenario: i32, budget_value: i64) -> AppPerfBudget {
+        var out = AppPerfBudget {
+            metric: metric,
+            scenario: scenario,
+            unit: appPerfUnitForMetric(metric),
+            budget_value: budget_value,
+            min_samples: appPerfMinSamples()
+        };
+        return out;
+    }
+
+    public fn withMinSamples(mut self, value: i32) -> AppPerfBudget {
+        self.min_samples = value;
+        return self;
+    }
+
+    public fn dup(&self) -> AppPerfBudget {
+        var out = AppPerfBudget.create(self.metric, self.scenario, self.budget_value);
+        out.unit = self.unit;
+        out.min_samples = self.min_samples;
+        return out;
+    }
+
+    public fn unitName(&self) -> string { return appPerfUnitName(self.unit); }
+
+    public fn describe(&self) -> string {
+        return appPerfMetricName(self.metric) + "/" + appPerfScenarioName(self.scenario)
+            + " <= " + format("%d", self.budget_value) + self.unitName()
+            + " at p95 over " + format("%d", self.min_samples as i64) + " samples";
+    }
+
+    // The shipped budgets. These are starting points for the three acceptance
+    // applications, not universal laws - a desktop tool and a mobile field app
+    // legitimately differ, and the point is that the number is written down
+    // and revised deliberately rather than argued about per release.
+    public static fn startup() -> AppPerfBudget {
+        // Two seconds to a usable window, which is roughly where "slow" starts
+        // being noticed on a desktop tool.
+        return AppPerfBudget.create(appPerfStartup(), appPerfScenarioStartup(), 2000000);
+    }
+
+    public static fn firstFrame() -> AppPerfBudget {
+        return AppPerfBudget.create(appPerfFirstFrame(), appPerfScenarioStartup(), 50000);
+    }
+
+    public static fn inputToDisplay() -> AppPerfBudget {
+        // Input latency reads worse than frame time at the same value, because
+        // the user is comparing it against their own finger.
+        return AppPerfBudget.create(appPerfInputToDisplay(), appPerfScenarioInteraction(), 50000);
+    }
+
+    public static fn scrollFrame() -> AppPerfBudget {
+        // Two frames of headroom at 60Hz, so a dropped frame stays an event
+        // rather than becoming the steady state.
+        return AppPerfBudget.create(appPerfScrollFrame(), appPerfScenarioScroll(), 33000);
+    }
+
+    public static fn memoryPeak() -> AppPerfBudget {
+        return AppPerfBudget.create(appPerfMemoryPeak(), appPerfScenarioInteraction(), 536870912);
+    }
+
+    public static fn longRunGrowth() -> AppPerfBudget {
+        return AppPerfBudget.create(appPerfLongRunGrowth(), appPerfScenarioLongRun(), 67108864);
+    }
+
+    // All six, in the order the standard report prints them.
+    public static fn standard() -> AppPerfSuite {
+        var out = AppPerfSuite.empty();
+        out = out.withBudget(AppPerfBudget.startup());
+        out = out.withBudget(AppPerfBudget.firstFrame());
+        out = out.withBudget(AppPerfBudget.inputToDisplay());
+        out = out.withBudget(AppPerfBudget.scrollFrame());
+        out = out.withBudget(AppPerfBudget.memoryPeak());
+        out = out.withBudget(AppPerfBudget.longRunGrowth());
+        return out;
+    }
+}
+
+// The outcome of grading one series against one budget. It records the
+// observation and the sample count alongside the verdict, because a decision
+// is only reviewable if the reader can see what it was based on.
+public class AppPerfVerdict {
+    public metric: i32;
+    public scenario: i32;
+    public unit: i32;
+    public budget_value: i64;
+    public observed_value: i64;
+    public sample_count: i32;
+    public verdict: i32;
+    public message: string;
+
+    private static fn base() -> AppPerfVerdict {
+        return AppPerfVerdict {
+            metric: 0,
+            scenario: 0,
+            unit: appPerfUnitMicros(),
+            budget_value: 0,
+            observed_value: 0,
+            sample_count: 0,
+            verdict: appPerfPass(),
+            message: ""
+        };
+    }
+
+    public static fn create(metric: i32, scenario: i32, unit: i32, budget_value: i64, observed_value: i64, sample_count: i32) -> AppPerfVerdict {
+        var out = AppPerfVerdict.base();
+        out.metric = metric;
+        out.scenario = scenario;
+        out.unit = unit;
+        out.budget_value = budget_value;
+        out.observed_value = observed_value;
+        out.sample_count = sample_count;
+        return out;
+    }
+
+    public fn withVerdict(mut self, verdict: i32, message: string) -> AppPerfVerdict {
+        self.verdict = verdict;
+        self.message = message;
+        return self;
+    }
+
+    public fn isPass(&self) -> bool { return self.verdict == appPerfPass(); }
+    public fn isFail(&self) -> bool { return self.verdict == appPerfFail(); }
+
+    // How much of the budget was used, in tenths of a percent. This is the
+    // number a team watches between releases: it trends up long before it
+    // crosses the line.
+    public fn budgetUsageMilli(&self) -> i32 {
+        if (self.budget_value <= 0) { return 0; }
+        return ((self.observed_value * 1000) / self.budget_value) as i32;
+    }
+
+    public fn describe(&self) -> string {
+        return appPerfVerdictName(self.verdict) + " "
+            + appPerfMetricName(self.metric) + "/" + appPerfScenarioName(self.scenario)
+            + ": " + format("%d", self.observed_value) + appPerfUnitName(self.unit)
+            + " vs budget " + format("%d", self.budget_value) + appPerfUnitName(self.unit)
+            + " (" + format("%d", (self.budgetUsageMilli() / 10) as i64) + "% used, n="
+            + format("%d", self.sample_count as i64) + ") " + self.message;
+    }
+
+    // `V|verdict|metric|scenario|unit|budget|observed|samples|hex(message)`
+    public fn serialize(&self) -> string {
+        return "V|" + format("%d", self.verdict as i64)
+            + "|" + format("%d", self.metric as i64)
+            + "|" + format("%d", self.scenario as i64)
+            + "|" + format("%d", self.unit as i64)
+            + "|" + format("%d", self.budget_value)
+            + "|" + format("%d", self.observed_value)
+            + "|" + format("%d", self.sample_count as i64)
+            + "|" + hex_encode(self.message);
+    }
+
+    public static fn parse(text: string) -> AppPerfVerdict {
+        var out = AppPerfVerdict.base();
+        let id = AppDiagText.fieldAt(text, AppDiagText.pipe(), 0);
+        if (id != "V") { return out; }
+        out.verdict = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 1), 0 as u64);
+        out.metric = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 2), 0 as u64);
+        out.scenario = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3), 0 as u64);
+        out.unit = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 4), 1 as u64);
+        out.budget_value = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 5), 0 as u64) as i64;
+        out.observed_value = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 6), 0 as u64) as i64;
+        out.sample_count = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 7), 0 as u64);
+        out.message = hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 8));
+        return out;
+    }
+}
+
+// Grades a series against a budget. "Too few samples" is a *failure*, not a
+// warning: every other path through this code assumes the percentile means
+// something, and a green gate built on three frames is worse than a red one.
+public fn appPerfGrade(series: AppPerfSeries, budget: AppPerfBudget, world: AppWorld) -> AppPerfVerdict {
+    let n = series.count(world);
+    var verdict = AppPerfVerdict.create(series.metric, series.scenario, budget.unit,
+        budget.budget_value, -1, n);
+    if (n < budget.min_samples) {
+        return verdict.withVerdict(appPerfFail(),
+            "insufficient samples for a percentile: have " + format("%d", n as i64)
+            + ", need " + format("%d", budget.min_samples as i64));
+    }
+    let observed = series.p95(world);
+    verdict.observed_value = observed;
+    if (observed <= budget.budget_value) {
+        return verdict.withVerdict(appPerfPass(), "");
+    }
+    // Within 10% over is a warning rather than a failure so that normal machine
+    // noise does not turn the gate into a coin flip; beyond that it is real.
+    let slack = budget.budget_value + (budget.budget_value / 10);
+    if (observed <= slack) {
+        return verdict.withVerdict(appPerfWarn(), "within 10% of budget");
+    }
+    return verdict.withVerdict(appPerfFail(), "budget exceeded");
+}
+
+// ---------------------------------------------------------------------------
+// Baselines and regressions
+// ---------------------------------------------------------------------------
+
+// The stored result of one measurement campaign. Machine and corpus are part
+// of it, so "is this the same baseline" is answerable rather than assumed.
+public class AppPerfBaseline {
+    public name: string;
+    public version: string;
+    public machine: AppMachineProfile;
+    public corpus: AppCorpus;
+    public metric: i32;
+    public scenario: i32;
+    public unit: i32;
+    public median_value: i64;
+    public p95_value: i64;
+    public max_value: i64;
+    public sample_count: i32;
+
+    public static fn create(name: string, version: string, metric: i32, scenario: i32) -> AppPerfBaseline {
+        return AppPerfBaseline {
+            name: name,
+            version: version,
+            machine: AppMachineProfile.empty(),
+            corpus: AppCorpus.empty(),
+            metric: metric,
+            scenario: scenario,
+            unit: appPerfUnitForMetric(metric),
+            median_value: -1,
+            p95_value: -1,
+            max_value: -1,
+            sample_count: 0
+        };
+    }
+
+    public fn withIdentity(mut self, machine: AppMachineProfile, corpus: AppCorpus) -> AppPerfBaseline {
+        self.machine = machine;
+        self.corpus = corpus;
+        return self;
+    }
+
+    public fn dup(&self) -> AppPerfBaseline {
+        var out = AppPerfBaseline.create(self.name, self.version, self.metric, self.scenario);
+        out.machine = self.machine.dup();
+        out.corpus = self.corpus.dup();
+        out.unit = self.unit;
+        out.median_value = self.median_value;
+        out.p95_value = self.p95_value;
+        out.max_value = self.max_value;
+        out.sample_count = self.sample_count;
+        return out;
+    }
+
+    public fn isEmpty(&self) -> bool { return self.name.len == 0; }
+
+    // Snapshots a series into a baseline. The caller has already vetoed
+    // unrepresentative runs, so this stays a plain copy.
+    public static fn of(series: AppPerfSeries, world: AppWorld, name: string, version: string) -> AppPerfBaseline {
+        var out = AppPerfBaseline.create(name, version, series.metric, series.scenario);
+        out.machine = series.machine.dup();
+        out.corpus = series.corpus.dup();
+        out.median_value = series.median(world);
+        out.p95_value = series.p95(world);
+        out.max_value = series.max(world);
+        out.sample_count = series.count(world);
+        return out;
+    }
+
+    public fn describe(&self) -> string {
+        return self.name + "@" + self.version
+            + " " + appPerfMetricName(self.metric) + "/" + appPerfScenarioName(self.scenario)
+            + ": p50=" + format("%d", self.median_value)
+            + " p95=" + format("%d", self.p95_value)
+            + " max=" + format("%d", self.max_value)
+            + appPerfUnitName(self.unit)
+            + " n=" + format("%d", self.sample_count as i64)
+            + " on " + self.machine.describe()
+            + " with " + self.corpus.describe();
+    }
+
+    // `B|name|version|metric|scenario|unit|p50|p95|max|n`
+    // Identity travels as digests rather than inline fields: the readable form
+    // belongs in `describe()`, not in every stored record.
+    public fn serialize(&self) -> string {
+        return "B|" + self.name
+            + "|" + self.version
+            + "|" + format("%d", self.metric as i64)
+            + "|" + format("%d", self.scenario as i64)
+            + "|" + format("%d", self.unit as i64)
+            + "|" + format("%d", self.median_value)
+            + "|" + format("%d", self.p95_value)
+            + "|" + format("%d", self.max_value)
+            + "|" + format("%d", self.sample_count as i64)
+            + "|" + self.machine.serialize()
+            + "|" + self.corpus.serialize();
+    }
+
+    public static fn parse(text: string) -> AppPerfBaseline {
+        let head = AppDiagText.lineAt(text, 0);
+        if (AppDiagText.fieldAt(head, AppDiagText.pipe(), 0) != "B") {
+            return AppPerfBaseline.create("", "", 0, 0);
+        }
+        var out = AppPerfBaseline.create(
+            AppDiagText.fieldAt(head, AppDiagText.pipe(), 1),
+            AppDiagText.fieldAt(head, AppDiagText.pipe(), 2),
+            appDiagParseI32(AppDiagText.fieldAt(head, AppDiagText.pipe(), 3), 0 as u64),
+            appDiagParseI32(AppDiagText.fieldAt(head, AppDiagText.pipe(), 4), 0 as u64));
+        out.unit = appDiagParseI32(AppDiagText.fieldAt(head, AppDiagText.pipe(), 5), 1 as u64);
+        out.median_value = appDiagParseU64(AppDiagText.fieldAt(head, AppDiagText.pipe(), 6), 0 as u64) as i64;
+        out.p95_value = appDiagParseU64(AppDiagText.fieldAt(head, AppDiagText.pipe(), 7), 0 as u64) as i64;
+        out.max_value = appDiagParseU64(AppDiagText.fieldAt(head, AppDiagText.pipe(), 8), 0 as u64) as i64;
+        out.sample_count = appDiagParseI32(AppDiagText.fieldAt(head, AppDiagText.pipe(), 9), 0 as u64);
+        if (AppDiagText.lineCount(text) > 1) {
+            out.machine = AppMachineProfile.parse(AppDiagText.lineAt(text, 1));
+        }
+        if (AppDiagText.lineCount(text) > 2) {
+            out.corpus = AppCorpus.parse(AppDiagText.lineAt(text, 2));
+        }
+        return out;
+    }
+}
+
+// One metric compared between a stored baseline and a current series.
+//
+// Both sides must be from the same machine and corpus; that check is the point
+// of the whole exercise, because an "improvement" measured under different
+// conditions is indistinguishable from noise and everybody forgets.
+public class AppPerfComparison {
+    public metric: i32;
+    public scenario: i32;
+    public unit: i32;
+    public baseline_p95: i64;
+    public current_p95: i64;
+    public delta: i64;
+    public ratio_milli: i32;
+    public tolerance_milli: i32;
+    public comparable: bool;
+    public note: string;
+
+    public static fn incomparable(metric: i32, scenario: i32, note: string) -> AppPerfComparison {
+        var out = AppPerfComparison {
+            metric: metric,
+            scenario: scenario,
+            unit: appPerfUnitForMetric(metric),
+            baseline_p95: -1,
+            current_p95: -1,
+            delta: 0,
+            ratio_milli: 0,
+            tolerance_milli: 0,
+            comparable: false,
+            note: note
+        };
+        return out;
+    }
+
+    public static fn create(metric: i32, scenario: i32, baseline_p95: i64, current_p95: i64, tolerance_milli: i32) -> AppPerfComparison {
+        var out = AppPerfComparison.incomparable(metric, scenario, "");
+        out.comparable = true;
+        out.baseline_p95 = baseline_p95;
+        out.current_p95 = current_p95;
+        out.tolerance_milli = tolerance_milli;
+        out.delta = current_p95 - baseline_p95;
+        if (baseline_p95 > 0) {
+            out.ratio_milli = (((current_p95 - baseline_p95) * 1000) / baseline_p95) as i32;
+        }
+        return out;
+    }
+
+    // A regression is a *relative* movement beyond tolerance. An absolute-only
+    // rule would flag a 0.2ms change on a 12ms frame and ignore a 20ms change
+    // on a 400ms startup; neither behaviour is what anyone wants.
+    public fn isRegression(&self) -> bool {
+        if (!self.comparable) { return true; }
+        return self.ratio_milli > self.tolerance_milli;
+    }
+
+    public fn isImprovement(&self) -> bool {
+        if (!self.comparable) { return false; }
+        return self.ratio_milli < -(self.tolerance_milli);
+    }
+
+    public fn describe(&self) -> string {
+        if (!self.comparable) {
+            return "incomparable " + appPerfMetricName(self.metric) + ": " + self.note;
+        }
+        var word = "unchanged";
+        if (self.isRegression()) { word = "REGRESSION"; }
+        else if (self.isImprovement()) { word = "improvement"; }
+        return word + " " + appPerfMetricName(self.metric) + "/" + appPerfScenarioName(self.scenario)
+            + ": " + format("%d", self.baseline_p95) + " -> " + format("%d", self.current_p95)
+            + appPerfUnitName(self.unit)
+            + " (" + format("%d", (self.ratio_milli / 10) as i64) + "%)";
+    }
+}
+
+// The default tolerance for calling something a regression. 5% because it is
+// roughly the run-to-run spread of a warmed-up machine; below it nobody can
+// tell a change from the noise floor.
+public fn appPerfDefaultToleranceMilli() -> i32 { return 50; }
+
+public fn appPerfCompare(baseline: AppPerfBaseline, series: AppPerfSeries, world: AppWorld) -> Result<AppPerfComparison, AppError> {
+    return appPerfCompareWithTolerance(baseline, series, world, appPerfDefaultToleranceMilli());
+}
+
+public fn appPerfCompareWithTolerance(baseline: AppPerfBaseline, series: AppPerfSeries, world: AppWorld, tolerance_milli: i32) -> Result<AppPerfComparison, AppError> {
+    if (!baseline.machine.matches(series.machine)) {
+        return Err(AppError.create(appPerfGateCodeMachineMismatch(),
+            "baseline was measured on " + baseline.machine.describe()
+            + " but the current run used " + series.machine.describe()));
+    }
+    if (!baseline.corpus.matches(series.corpus)) {
+        return Err(AppError.create(appPerfGateCodeCorpusMismatch(),
+            "baseline used " + baseline.corpus.describe()
+            + " but the current run used " + series.corpus.describe()));
+    }
+    if (!series.isRepresentative(world)) {
+        return Err(AppError.create(appPerfGateCodeTooFewSamples(),
+            appPerfMetricName(series.metric) + " has only "
+            + format("%d", series.count(world) as i64) + " samples, need "
+            + format("%d", appPerfMinSamples() as i64)));
+    }
+    return Ok(AppPerfComparison.create(series.metric, series.scenario,
+        baseline.p95_value, series.p95(world), tolerance_milli));
+}
+
+// ---------------------------------------------------------------------------
+// Stability scenarios
+// ---------------------------------------------------------------------------
+
+// One long-running scenario and what it observed.
+//
+// Idle and interaction ask about *growth*: the absolute number at the end is
+// less interesting than whether it creeps, because creeping is what sends a
+// kiosk app back to a login screen at 3am. GPU loss and background restore ask
+// about *recovery*: they are passed by observing that the app came back, not
+// by observing that nothing happened.
+public class AppStabilityRun {
+    public scenario: i32;
+    public duration_us: i64;
+    public start_bytes: i64;
+    public end_bytes: i64;
+    public frames: i64;
+    public dropped_frames: i64;
+    public recovered: bool;
+    public state_revision_before: u64;
+    public state_revision_after: u64;
+    public note: string;
+
+    public static fn create(scenario: i32) -> AppStabilityRun {
+        return AppStabilityRun {
+            scenario: scenario,
+            duration_us: 0,
+            start_bytes: 0,
+            end_bytes: 0,
+            frames: 0,
+            dropped_frames: 0,
+            recovered: false,
+            state_revision_before: 0 as u64,
+            state_revision_after: 0 as u64,
+            note: ""
+        };
+    }
+
+    public fn dup(&self) -> AppStabilityRun {
+        var out = AppStabilityRun.create(self.scenario);
+        out.duration_us = self.duration_us;
+        out.start_bytes = self.start_bytes;
+        out.end_bytes = self.end_bytes;
+        out.frames = self.frames;
+        out.dropped_frames = self.dropped_frames;
+        out.recovered = self.recovered;
+        out.state_revision_before = self.state_revision_before;
+        out.state_revision_after = self.state_revision_after;
+        out.note = self.note;
+        return out;
+    }
+
+    public fn growthBytes(&self) -> i64 { return self.end_bytes - self.start_bytes; }
+
+    // Extrapolated rather than measured, and labelled as such: a 90-second test
+    // that grew 2MB in small steady steps tells you more than its raw number.
+    public fn growthBytesPerHour(&self) -> i64 {
+        let seconds = self.duration_us / 1000000;
+        if (seconds <= 0) { return 0; }
+        // Scaled through whole seconds rather than microseconds: multiplying a
+        // large growth by 3.6e9 first would overflow for any plausible leak.
+        return (self.growthBytes() * 3600) / seconds;
+    }
+
+    public fn droppedRatioMilli(&self) -> i32 {
+        if (self.frames <= 0) { return 0; }
+        return ((self.dropped_frames * 1000) / self.frames) as i32;
+    }
+
+    public fn hasMemoryObservation(&self) -> bool {
+        return self.start_bytes > 0 && self.end_bytes > 0;
+    }
+
+    public fn isLongEnoughToProject(&self) -> bool {
+        // Ten minutes. Below that the per-hour projection is an artefact of
+        // warm-up allocations more than a leak.
+        return self.duration_us >= 600000000;
+    }
+
+    public fn describe(&self) -> string {
+        var out = appPerfScenarioName(self.scenario)
+            + ": " + format("%d", (self.duration_us / 1000000)) + "s, "
+            + format("%d", self.frames) + " frames, "
+            + format("%d", (self.droppedRatioMilli() / 10) as i64) + "% dropped";
+        if (self.hasMemoryObservation()) {
+            out = out + ", " + format("%d", self.start_bytes) + "B -> "
+                + format("%d", self.end_bytes) + "B";
+            if (self.isLongEnoughToProject()) {
+                out = out + " (" + format("%d", self.growthBytesPerHour()) + "B/h projected)";
+            }
+        }
+        if (self.scenario == appPerfScenarioGpuLoss() || self.scenario == appPerfScenarioBackgroundRestore()) {
+            out = out + ", recovered=" + appDiagBoolText(self.recovered);
+        }
+        if (self.note.len > 0) { out = out + " - " + self.note; }
+        return out;
+    }
+
+    // `W|scenario|duration|start|end|frames|dropped|recovered|rev_before|rev_after|hex(note)`
+    public fn serialize(&self) -> string {
+        return "W|" + format("%d", self.scenario as i64)
+            + "|" + format("%d", self.duration_us)
+            + "|" + format("%d", self.start_bytes)
+            + "|" + format("%d", self.end_bytes)
+            + "|" + format("%d", self.frames)
+            + "|" + format("%d", self.dropped_frames)
+            + "|" + appDiagBoolText(self.recovered)
+            + "|" + format("%d", self.state_revision_before as i64)
+            + "|" + format("%d", self.state_revision_after as i64)
+            + "|" + hex_encode(self.note);
+    }
+
+    public static fn parse(text: string) -> AppStabilityRun {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "W") {
+            return AppStabilityRun.create(appPerfScenarioIdle());
+        }
+        var out = AppStabilityRun.create(
+            appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 1), 0 as u64));
+        out.duration_us = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 2), 0 as u64) as i64;
+        out.start_bytes = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3), 0 as u64) as i64;
+        out.end_bytes = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 4), 0 as u64) as i64;
+        out.frames = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 5), 0 as u64) as i64;
+        out.dropped_frames = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 6), 0 as u64) as i64;
+        out.recovered = AppDiagText.fieldAt(text, AppDiagText.pipe(), 7) == "1";
+        out.state_revision_before = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 8), 0 as u64);
+        out.state_revision_after = appDiagParseU64(AppDiagText.fieldAt(text, AppDiagText.pipe(), 9), 0 as u64);
+        out.note = hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 10));
+        return out;
+    }
+}
+
+// The expectations for the four scenarios the roadmap names. Each has exactly
+// one assertion, stated here rather than buried in a test, so a reviewer can
+// see what "stable" is being taken to mean.
+public class AppStabilityGate {
+    // Idle must not leak. This is the one that actually breaks long-lived apps:
+    // an idle path that allocates slowly enough to be invisible in a profile
+    // still adds up over a shift.
+    public static fn idleGrowthBudgetBytesPerHour() -> i64 { return 4194304; }
+    // Sustained interaction may allocate working set, but must not trend.
+    public static fn interactionGrowthBudgetBytesPerHour() -> i64 { return 12582912; }
+    // GPU loss must be noticed and recovered within this many frames.
+    public static fn gpuLossRecoveryFrames() -> i64 { return 300; }
+    // A restored session must be recognisably the same session.
+    public static fn restoreMaxRevisionDelta() -> i64 { return 64; }
+
+    public static fn check(run: AppStabilityRun) -> Result<i32, AppError> {
+        if (run.scenario == appPerfScenarioGpuLoss()) {
+            return AppStabilityGate.checkGpuLoss(run);
+        }
+        if (run.scenario == appPerfScenarioBackgroundRestore()) {
+            return AppStabilityGate.checkRestore(run);
+        }
+        if (run.scenario == appPerfScenarioIdle() || run.scenario == appPerfScenarioInteraction()) {
+            return AppStabilityGate.checkGrowth(run);
+        }
+        // Scroll has no long-run assertion of its own; it is graded by the
+        // scroll-frame budget in the suite.
+        return Ok(0);
+    }
+
+    public static fn checkGrowth(run: AppStabilityRun) -> Result<i32, AppError> {
+        if (!run.hasMemoryObservation()) {
+            return Err(AppError.create(appPerfGateCodeTooFewSamples(),
+                appPerfScenarioName(run.scenario) + " run has no memory observation"));
+        }
+        if (!run.isLongEnoughToProject()) {
+            return Err(AppError.create(appPerfGateCodeTooFewSamples(),
+                appPerfScenarioName(run.scenario) + " run is too short to judge growth: "
+                + format("%d", (run.duration_us / 1000000)) + "s of 600s"));
+        }
+        var budget = AppStabilityGate.idleGrowthBudgetBytesPerHour();
+        if (run.scenario == appPerfScenarioInteraction()) {
+            budget = AppStabilityGate.interactionGrowthBudgetBytesPerHour();
+        }
+        let per_hour = run.growthBytesPerHour();
+        if (per_hour > budget) {
+            return Err(AppError.create(appPerfGateCodeRegression(),
+                appPerfScenarioName(run.scenario) + " grows "
+                + format("%d", per_hour) + "B/h against a budget of "
+                + format("%d", budget) + "B/h"));
+        }
+        return Ok(per_hour as i32);
+    }
+
+    public static fn checkGpuLoss(run: AppStabilityRun) -> Result<i32, AppError> {
+        if (!run.recovered) {
+            return Err(AppError.create(appPerfGateCodeGpuLossUnhandled(),
+                "gpu device loss was not recovered"));
+        }
+        if (run.frames > AppStabilityGate.gpuLossRecoveryFrames()) {
+            return Err(AppError.create(appPerfGateCodeGpuLossUnhandled(),
+                "gpu recovery took " + format("%d", run.frames) + " frames, budget is "
+                + format("%d", AppStabilityGate.gpuLossRecoveryFrames())));
+        }
+        return Ok(run.frames as i32);
+    }
+
+    // Coming back from the background with a different state revision means the
+    // app did not simply resume - it restarted or discarded work, either of
+    // which is a user-visible failure even when nothing crashes.
+    public static fn checkRestore(run: AppStabilityRun) -> Result<i32, AppError> {
+        if (!run.recovered) {
+            return Err(AppError.create(appPerfGateCodeRestoreDiverged(),
+                "background restore did not complete"));
+        }
+        let before = run.state_revision_before as i64;
+        let after = run.state_revision_after as i64;
+        var delta = after - before;
+        if (delta < 0) { delta = -delta; }
+        if (delta > AppStabilityGate.restoreMaxRevisionDelta()) {
+            return Err(AppError.create(appPerfGateCodeRestoreDiverged(),
+                "state revision moved by " + format("%d", delta)
+                + " across background restore"));
+        }
+        return Ok(delta as i32);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite
+// ---------------------------------------------------------------------------
+
+// The whole gate: a set of budgets, the identity every series shares, and the
+// list of stability runs the release must clear.
+public class AppPerfSuite {
+    public name: string;
+    public machine: AppMachineProfile;
+    public corpus: AppCorpus;
+    private budgets: Vec<AppPerfBudget>;
+    private runs: Vec<AppStabilityRun>;
+
+    public static fn empty() -> AppPerfSuite {
+        return AppPerfSuite {
+            name: "",
+            machine: AppMachineProfile.empty(),
+            corpus: AppCorpus.empty(),
+            budgets: Vec::<AppPerfBudget>.new(),
+            runs: Vec::<AppStabilityRun>.new()
+        };
+    }
+
+    public static fn create(name: string) -> AppPerfSuite {
+        var out = AppPerfSuite.empty();
+        out.name = name;
+        return out;
+    }
+
+    public fn withIdentity(mut self, machine: AppMachineProfile, corpus: AppCorpus) -> AppPerfSuite {
+        self.machine = machine;
+        self.corpus = corpus;
+        return self;
+    }
+
+    public fn budgetCount(&self) -> i32 { return self.budgets.len as i32; }
+    public fn runCount(&self) -> i32 { return self.runs.len as i32; }
+
+    public fn withBudget(mut self, budget: AppPerfBudget) -> AppPerfSuite {
+        self.budgets.push(budget);
+        return self;
+    }
+
+    public fn withRun(mut self, run: AppStabilityRun) -> AppPerfSuite {
+        self.runs.push(run);
+        return self;
+    }
+
+    public fn budgetAt(&self, index: i32) -> AppPerfBudget {
+        if (index < 0 || index >= self.budgetCount()) {
+            return AppPerfBudget.create(appPerfStartup(), appPerfScenarioStartup(), 0);
+        }
+        return self.budgets.get(index as i64).dup();
+    }
+
+    public fn runAt(&self, index: i32) -> AppStabilityRun {
+        if (index < 0 || index >= self.runCount()) { return AppStabilityRun.create(appPerfScenarioIdle()); }
+        return self.runs.get(index as i64).dup();
+    }
+
+    // A series for one of the suite's budgets, carrying the suite identity so
+    // it can be compared against a stored baseline later.
+    public fn seriesFor(&self, index: i32) -> AppPerfSeries {
+        let budget = self.budgetAt(index);
+        var out = AppPerfSeries.create(budget.metric, budget.scenario);
+        out.machine = self.machine.dup();
+        out.corpus = self.corpus.dup();
+        return out;
+    }
+
+    public fn failingCount(&self, world: AppWorld) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.budgetCount()) {
+            let budget = self.budgetAt(i);
+            var series = self.seriesFor(i);
+            let verdict = appPerfGrade(series, budget, world);
+            if (!verdict.isPass()) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn reportText(&self, world: AppWorld) -> string {
+        var out = "perf suite '" + self.name + "' on " + self.machine.describe()
+            + " with " + self.corpus.describe();
+        var i: i32 = 0;
+        while (i < self.budgetCount()) {
+            let budget = self.budgetAt(i);
+            var series = self.seriesFor(i);
+            let verdict = appPerfGrade(series, budget, world);
+            out = out + "\n  " + verdict.describe();
+            i = i + 1;
+        }
+        var j: i32 = 0;
+        while (j < self.runCount()) {
+            out = out + "\n  stability " + self.runs.get(j as i64).describe();
+            j = j + 1;
+        }
+        return out;
+    }
+
+    // The release gate: every budget passes and every stability scenario
+    // clears its own assertion. A single failing metric fails the suite -
+    // partial credit is how regressions get shipped.
+    public fn gate(&self, world: AppWorld) -> Result<i32, AppError> {
+        var i: i32 = 0;
+        while (i < self.budgetCount()) {
+            let budget = self.budgetAt(i);
+            var series = self.seriesFor(i);
+            let verdict = appPerfGrade(series, budget, world);
+            if (!verdict.isPass()) {
+                return Err(AppError.create(appPerfGateCodeBudgetExceeded(), verdict.describe()));
+            }
+            i = i + 1;
+        }
+        var j: i32 = 0;
+        while (j < self.runCount()) {
+            let run = self.runs.get(j as i64);
+            match (AppStabilityGate.check(run)) {
+                case Ok(_n) => { }
+                case Err(e) => { return Err(e); }
+            }
+            j = j + 1;
+        }
+        return Ok(self.budgetCount() + self.runCount());
+    }
+
+    public fn serialize(&self) -> string {
+        var out = "U|" + self.name
+            + "\n" + self.machine.serialize()
+            + "\n" + self.corpus.serialize();
+        var i: i32 = 0;
+        while (i < self.budgetCount()) {
+            let b = self.budgets.get(i as i64);
+            out = out + "\nG|" + format("%d", b.metric as i64)
+                + "|" + format("%d", b.scenario as i64)
+                + "|" + format("%d", b.budget_value)
+                + "|" + format("%d", b.min_samples as i64);
+            i = i + 1;
+        }
+        var j: i32 = 0;
+        while (j < self.runCount()) {
+            out = out + "\n" + self.runs.get(j as i64).serialize();
+            j = j + 1;
+        }
+        return out;
+    }
+
+    public static fn parse(text: string) -> AppPerfSuite {
+        var out = AppPerfSuite.empty();
+        let lines = AppDiagText.lineCount(text);
+        if (lines == 0) { return out; }
+        let head = AppDiagText.lineAt(text, 0);
+        if (AppDiagText.fieldAt(head, AppDiagText.pipe(), 0) != "U") { return out; }
+        out.name = AppDiagText.fieldAt(head, AppDiagText.pipe(), 1);
+        var i: i32 = 1;
+        while (i < lines) {
+            let line = AppDiagText.lineAt(text, i);
+            let id = AppDiagText.fieldAt(line, AppDiagText.pipe(), 0);
+            if (id == "M") {
+                out.machine = AppMachineProfile.parse(line);
+            } else if (id == "C") {
+                out.corpus = AppCorpus.parse(line);
+            } else if (id == "G") {
+                let budget_value = appDiagParseU64(AppDiagText.fieldAt(line, AppDiagText.pipe(), 3), 0 as u64) as i64;
+                var budget = AppPerfBudget.create(
+                    appDiagParseI32(AppDiagText.fieldAt(line, AppDiagText.pipe(), 1), 0 as u64),
+                    appDiagParseI32(AppDiagText.fieldAt(line, AppDiagText.pipe(), 2), 0 as u64),
+                    budget_value);
+                let samples_field = AppDiagText.fieldAt(line, AppDiagText.pipe(), 4);
+                if (samples_field.len > 0) {
+                    budget = budget.withMinSamples(appDiagParseI32(samples_field, 0 as u64));
+                }
+                out.budgets.push(budget);
+            } else if (id == "W") {
+                out.runs.push(AppStabilityRun.parse(line));
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn dup(&self) -> AppPerfSuite {
+        var out = AppPerfSuite.create(self.name);
+        out.machine = self.machine.dup();
+        out.corpus = self.corpus.dup();
+        var i: i32 = 0;
+        while (i < self.budgetCount()) {
+            out.budgets.push(self.budgets.get(i as i64).dup());
+            i = i + 1;
+        }
+        var j: i32 = 0;
+        while (j < self.runCount()) {
+            out.runs.push(self.runs.get(j as i64).dup());
+            j = j + 1;
+        }
+        return out;
+    }
+
+    // Compact summary for a CI log line: what ran, on what, and which budgets
+    // did not pass. The full report is one call away when something is wrong.
+    public fn summaryText(&self, world: AppWorld) -> string {
+        return self.name + ": " + format("%d", (self.budgetCount() - self.failingCount(world)) as i64)
+            + "/" + format("%d", self.budgetCount() as i64) + " budgets pass, "
+            + format("%d", self.runCount() as i64) + " stability runs, on "
+            + self.machine.describe();
+    }
+
+    public fn destroy(mut self) {
+        self.budgets.destroy();
+        self.runs.destroy();
+    }
+}
+

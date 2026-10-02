@@ -1,0 +1,2708 @@
+module bootstrap.mir_pass;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_type_table;
+use bootstrap.mir_analysis;
+use bootstrap.mir_dump;
+use bootstrap.mir_copy_prop;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_sccp;
+use bootstrap.mir_verify;
+use bootstrap.policy;
+
+// Per-pass wall-time accumulators for the streaming pipeline (VYX_MIR_TIMING).
+// Disjoint: each pass runs once per round and rounds never nest.
+var g_mir_pass_fold_ms: i64 = 0;
+var g_mir_pass_branches_ms: i64 = 0;
+var g_mir_pass_sccp_ms: i64 = 0;
+var g_mir_pass_copy_ms: i64 = 0;
+var g_mir_pass_dce_ms: i64 = 0;
+var g_mir_pass_select_ms: i64 = 0;
+var g_mir_pass_cfg_ms: i64 = 0;
+var g_mir_pass_verify_ms: i64 = 0;
+
+public fn mir_pass_timing_sums() -> i64 {
+    return g_mir_pass_fold_ms + g_mir_pass_branches_ms + g_mir_pass_sccp_ms
+         + g_mir_pass_copy_ms + g_mir_pass_dce_ms + g_mir_pass_select_ms
+         + g_mir_pass_cfg_ms + g_mir_pass_verify_ms;
+}
+
+public fn mir_pass_timing_text() -> string {
+    return " fold=" + g_mir_pass_fold_ms.toString()
+         + " branches=" + g_mir_pass_branches_ms.toString()
+         + " sccp=" + g_mir_pass_sccp_ms.toString()
+         + " copy=" + g_mir_pass_copy_ms.toString()
+         + " dce=" + g_mir_pass_dce_ms.toString()
+         + " select=" + g_mir_pass_select_ms.toString()
+         + " cfg=" + g_mir_pass_cfg_ms.toString()
+         + " verify=" + g_mir_pass_verify_ms.toString();
+}
+
+public fn mir_pass_timing_reset() {
+    g_mir_pass_fold_ms = 0;
+    g_mir_pass_branches_ms = 0;
+    g_mir_pass_sccp_ms = 0;
+    g_mir_pass_copy_ms = 0;
+    g_mir_pass_dce_ms = 0;
+    g_mir_pass_select_ms = 0;
+    g_mir_pass_cfg_ms = 0;
+    g_mir_pass_verify_ms = 0;
+}
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn getenv(name: rawptr) -> rawptr;
+    fn vyx_bootstrap_now_ms() -> i64;
+}
+
+// Pass dumps are intentionally opt-in: self-hosting creates a large MIR unit
+// and emitting it at every fixed-point stage is only useful for diagnosis.
+fn mir_pass_env_enabled(name: string) -> bool {
+    let raw = getenv(name.c_str());
+    if (raw == null) { return false; }
+    let value = from_cstr(raw).trim();
+    return value.len > 0 && value != "0" && value != "false" && value != "FALSE"
+        && value != "False" && value != "off" && value != "OFF" && value != "Off";
+}
+
+fn mir_pass_dump_enabled() -> bool { return mir_pass_env_enabled("VYX_MIR_PASS_DUMP"); }
+fn mir_pass_diff_enabled() -> bool { return mir_pass_env_enabled("VYX_MIR_PASS_DIFF"); }
+
+public class MirPassContext {
+    public opt_level: i32
+    public function_id: i32
+    public analysis_generation: i32
+    public analysis_cache: MirAnalysisCache
+    public pass_name: string
+    public pass_required: i32
+    public pass_preserved: i32
+    public pass_changed: bool
+    public pass_start_changes: i32
+    public pass_start_functions: i32
+    public pass_start_blocks: i32
+    public pass_start_locals: i32
+    public pass_start_places: i32
+    public pass_start_values: i32
+    public pass_start_instrs: i32
+    public pass_start_cases: i32
+    public changes: i32
+    public errors: i32
+    public printed_errors: i32
+    public current_loc: rawptr
+    // Strict closure checks are opt-in because function-streaming lowering
+    // would otherwise rescan the materialized unit after every pass stage.
+    public strict_verify: bool
+    // Exact append marks for a streamed function body. They are retained in
+    // the pass context so every strict boundary can verify only the current
+    // body, even when recursive lowering has a caller body resident above it.
+    public strict_block_mark: i32
+    public strict_local_mark: i32
+    public strict_place_mark: i32
+    public strict_value_mark: i32
+    public strict_instr_mark: i32
+    public strict_case_mark: i32
+    // The current P3 pipeline only appends values in SCCP/select and
+    // instructions in select. Keep an explicit per-pipeline cap so a future
+    // non-convergent pass fails before it can grow MIR without bound.
+    public fixed_point_max_values: i64
+    public fixed_point_max_instrs: i64
+    public fixed_point_base_functions: i32
+    public fixed_point_base_blocks: i32
+    public fixed_point_base_locals: i32
+    public fixed_point_base_places: i32
+    public fixed_point_base_cases: i32
+
+    public static fn create(opt_level: i32,
+                            function_id: i32,
+                            strict_verify: bool,
+                            strict_block_mark: i32,
+                            strict_local_mark: i32,
+                            strict_place_mark: i32,
+                            strict_value_mark: i32,
+                            strict_instr_mark: i32,
+                            strict_case_mark: i32) -> MirPassContext {
+        var level = opt_level;
+        if (level < 0) { level = 0; }
+        if (level > 5) { level = 5; }
+        return MirPassContext {
+            opt_level: level,
+            function_id: function_id,
+            analysis_generation: 0,
+            analysis_cache: MirAnalysisCache.create(),
+            pass_name: "",
+            pass_required: 0,
+            pass_preserved: 0,
+            pass_changed: false,
+            pass_start_changes: 0,
+            pass_start_functions: 0,
+            pass_start_blocks: 0,
+            pass_start_locals: 0,
+            pass_start_places: 0,
+            pass_start_values: 0,
+            pass_start_instrs: 0,
+            pass_start_cases: 0,
+            changes: 0,
+            errors: 0,
+            printed_errors: 0,
+            current_loc: null,
+            strict_verify: strict_verify,
+            strict_block_mark: strict_block_mark,
+            strict_local_mark: strict_local_mark,
+            strict_place_mark: strict_place_mark,
+            strict_value_mark: strict_value_mark,
+            strict_instr_mark: strict_instr_mark,
+            strict_case_mark: strict_case_mark,
+            fixed_point_max_values: -1,
+            fixed_point_max_instrs: -1,
+            fixed_point_base_functions: 0,
+            fixed_point_base_blocks: 0,
+            fixed_point_base_locals: 0,
+            fixed_point_base_places: 0,
+            fixed_point_base_cases: 0
+        };
+    }
+
+    public fn report_error(self, message: string) {
+        self.errors = self.errors + 1;
+        if (self.printed_errors >= 32) { return; }
+        diag_emit_codegen_at(self.current_loc,
+                             "MIR pass verification failed: " + message);
+        self.printed_errors = self.printed_errors + 1;
+    }
+
+    public fn focus_function(self, m: MirUnit, function_id: i32) {
+        let loc = mir_unit_diag_loc_for_function(&m,  function_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_block(self, m: MirUnit, block_id: i32) {
+        let loc = mir_unit_diag_loc_for_block(&m,  block_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_instr(self, m: MirUnit, instr_id: i32) {
+        let loc = mir_unit_diag_loc_for_instr(&m,  instr_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_value(self, m: MirUnit, value_id: i32) {
+        let loc = mir_unit_diag_loc_for_value(&m,  value_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_case(self, m: MirUnit, case_id: i32) {
+        let loc = mir_unit_diag_loc_for_case(&m,  case_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn begin_pass(self,
+                         m: MirUnit,
+                         name: string,
+                         required_mask: i32,
+                         preserved_mask: i32) -> bool {
+        self.pass_name = name;
+        self.pass_required = required_mask;
+        self.pass_preserved = preserved_mask;
+        self.pass_changed = false;
+        self.pass_start_changes = self.changes;
+        self.pass_start_functions = m.function_count;
+        self.pass_start_blocks = m.block_count;
+        self.pass_start_locals = m.local_count;
+        self.pass_start_places = m.place_count;
+        self.pass_start_values = m.value_count;
+        self.pass_start_instrs = m.instr_count;
+        self.pass_start_cases = m.case_count;
+        self.focus_function(m, self.function_id);
+        if (mir_pass_dump_enabled()) {
+            print("[mir-pass-dump] stage=" + name + " phase=before");
+            mir_dump_unit(m);
+        }
+        mir_analysis_audit("begin pass=" + name
+                           + " required=" + mir_pass_id_text(required_mask)
+                           + " preserved=" + mir_pass_id_text(preserved_mask)
+                           + " generation=" + mir_pass_id_text(self.analysis_generation));
+        if (!self.analysis_cache.ensure(m, required_mask)) {
+            self.report_error("cannot prepare analyses for " + name + ": "
+                              + self.analysis_cache.error_message);
+            return false;
+        }
+        return true;
+    }
+
+    public fn record_change(self) {
+        self.changes = self.changes + 1;
+        if (!self.pass_changed) {
+            self.pass_changed = true;
+            self.analysis_generation = self.analysis_generation + 1;
+        }
+        // A pass may lazily rebuild an analysis after an earlier mutation.
+        // Re-apply the preservation contract on every later mutation so such
+        // a cache cannot survive stale until the pass boundary.
+        self.analysis_cache.apply_change(self.pass_preserved, self.analysis_generation);
+    }
+
+    public fn finish_pass(self, m: MirUnit) {
+        if (mir_pass_diff_enabled()) {
+            print("[mir-pass-diff] stage=" + self.pass_name
+                  + " changes=" + mir_pass_id_text(self.changes - self.pass_start_changes)
+                  + " functions=" + mir_pass_id_text(m.function_count - self.pass_start_functions)
+                  + " blocks=" + mir_pass_id_text(m.block_count - self.pass_start_blocks)
+                  + " locals=" + mir_pass_id_text(m.local_count - self.pass_start_locals)
+                  + " places=" + mir_pass_id_text(m.place_count - self.pass_start_places)
+                  + " values=" + mir_pass_id_text(m.value_count - self.pass_start_values)
+                  + " instrs=" + mir_pass_id_text(m.instr_count - self.pass_start_instrs)
+                  + " cases=" + mir_pass_id_text(m.case_count - self.pass_start_cases));
+        }
+        if (mir_pass_dump_enabled()) {
+            print("[mir-pass-dump] stage=" + self.pass_name + " phase=after");
+            mir_dump_unit(m);
+        }
+        mir_analysis_audit("end pass=" + self.pass_name
+                           + " changes=" + mir_pass_id_text(self.changes - self.pass_start_changes)
+                           + " generation=" + mir_pass_id_text(self.analysis_generation)
+                           + " valid=" + mir_pass_id_text(self.analysis_cache.valid_analyses));
+        self.pass_name = "";
+        self.pass_required = 0;
+        self.pass_preserved = 0;
+        self.pass_changed = false;
+    }
+
+    public fn begin_fixed_point_budget(self, m: MirUnit) {
+        let values = m.value_count as i64;
+        let instrs = m.instr_count as i64;
+        let blocks = m.block_count as i64;
+        // SCCP can append one constant for each original instruction and
+        // return terminator. Select formation can append one value per
+        // original block, and the next SCCP round may materialize a constant
+        // for that new select assignment. Instruction growth is select-only.
+        self.fixed_point_max_values = values + instrs + blocks + blocks + blocks;
+        self.fixed_point_max_instrs = instrs + blocks;
+        self.fixed_point_base_functions = m.function_count;
+        self.fixed_point_base_blocks = m.block_count;
+        self.fixed_point_base_locals = m.local_count;
+        self.fixed_point_base_places = m.place_count;
+        self.fixed_point_base_cases = m.case_count;
+    }
+
+    public fn fixed_point_reserve_growth(self,
+                                         m: MirUnit,
+                                         values: i32,
+                                         instrs: i32,
+                                         stage: string) -> bool {
+        if (self.fixed_point_max_values < 0 || self.fixed_point_max_instrs < 0) { return true; }
+        if ((m.value_count as i64) + (values as i64) > self.fixed_point_max_values) {
+            self.report_error("MIR fixed-point value growth budget exceeded before " + stage);
+            return false;
+        }
+        if ((m.instr_count as i64) + (instrs as i64) > self.fixed_point_max_instrs) {
+            self.report_error("MIR fixed-point instruction growth budget exceeded before " + stage);
+            return false;
+        }
+        return true;
+    }
+
+    public fn verify_fixed_point_budget(self, m: MirUnit, stage: string) -> bool {
+        if (self.fixed_point_max_values < 0 || self.fixed_point_max_instrs < 0) { return true; }
+        if ((m.value_count as i64) > self.fixed_point_max_values
+            || (m.instr_count as i64) > self.fixed_point_max_instrs) {
+            self.report_error("MIR fixed-point growth budget exceeded after " + stage);
+            return false;
+        }
+        if (m.function_count != self.fixed_point_base_functions
+            || m.block_count != self.fixed_point_base_blocks
+            || m.local_count != self.fixed_point_base_locals
+            || m.place_count != self.fixed_point_base_places
+            || m.case_count != self.fixed_point_base_cases) {
+            self.report_error("MIR fixed-point pass unexpectedly changed structural record counts after " + stage);
+            return false;
+        }
+        return true;
+    }
+
+    public fn end_fixed_point_budget(self) {
+        self.fixed_point_max_values = -1;
+        self.fixed_point_max_instrs = -1;
+        self.fixed_point_base_functions = 0;
+        self.fixed_point_base_blocks = 0;
+        self.fixed_point_base_locals = 0;
+        self.fixed_point_base_places = 0;
+        self.fixed_point_base_cases = 0;
+    }
+
+    public fn dispose(self) {
+        self.analysis_cache.dispose();
+    }
+}
+
+fn mir_pass_id_text(value: i32) -> string {
+    return policy_i64_to_string(value as i64);
+}
+
+fn mir_pass_valid_block_target(m: MirUnit,
+                               ctx: &mut MirPassContext,
+                               target_id: i32,
+                               allow_empty: bool,
+                               label: string) -> bool {
+    if (target_id == mir_id_invalid()) {
+        if (!allow_empty) { ctx.report_error(label + " is empty"); }
+        return allow_empty;
+    }
+    if (target_id < 1 || target_id > m.block_count || m.block_record(target_id) == null) {
+        ctx.report_error(label + " references invalid block #" + mir_pass_id_text(target_id));
+        return false;
+    }
+    if (m.block_is_removed( target_id)) {
+        ctx.report_error(label + " references removed block #" + mir_pass_id_text(target_id));
+        return false;
+    }
+    if (m.block_function(target_id) != ctx.function_id) {
+        ctx.report_error(label + " crosses from function #"
+                         + mir_pass_id_text(ctx.function_id)
+                         + " to block #" + mir_pass_id_text(target_id)
+                         + " owned by function #" + mir_pass_id_text(m.block_function(target_id)));
+        return false;
+    }
+    return true;
+}
+
+fn mir_pass_verify_instr_chain(m: MirUnit,
+                               ctx: &mut MirPassContext,
+                               block_id: i32) {
+    ctx.focus_block(m, block_id);
+    let expected_count = m.block_instr_count(block_id);
+    let expected_last = m.block_last_instr(block_id);
+    var instr_id = m.block_first_instr(block_id);
+    var count: i32 = 0;
+    var last = mir_id_invalid();
+    while (instr_id != mir_id_invalid()) {
+        if (instr_id < 1 || instr_id > m.instr_count || m.instr_record(instr_id) == null) {
+            ctx.report_error("block #" + mir_pass_id_text(block_id)
+                             + " references invalid instruction #" + mir_pass_id_text(instr_id));
+            return;
+        }
+        ctx.focus_instr(m, instr_id);
+        if (m.instr_function(instr_id) != ctx.function_id
+            || m.instr_block(instr_id) != block_id) {
+            ctx.report_error("instruction #" + mir_pass_id_text(instr_id)
+                             + " has inconsistent function/block ownership");
+        }
+        count = count + 1;
+        last = instr_id;
+        if (count > m.instr_count + 1) {
+            ctx.report_error("instruction chain for block #" + mir_pass_id_text(block_id)
+                             + " contains a cycle");
+            return;
+        }
+        instr_id = m.instr_next(instr_id);
+    }
+    if (count != expected_count) {
+        ctx.report_error("block #" + mir_pass_id_text(block_id)
+                         + " instruction count is " + mir_pass_id_text(expected_count)
+                         + " but chain contains " + mir_pass_id_text(count));
+    }
+    if (last != expected_last) {
+        ctx.report_error("block #" + mir_pass_id_text(block_id)
+                         + " last instruction is #" + mir_pass_id_text(expected_last)
+                         + " but chain ends at #" + mir_pass_id_text(last));
+    }
+}
+
+fn mir_pass_verify_case_chain(m: MirUnit,
+                              ctx: &mut MirPassContext,
+                              block_id: i32) {
+    ctx.focus_block(m, block_id);
+    var case_id = m.block_term_first_case(block_id);
+    var count: i32 = 0;
+    while (case_id != mir_id_invalid()) {
+        if (case_id < 1 || case_id > m.case_count || m.case_record(case_id) == null) {
+            ctx.report_error("block #" + mir_pass_id_text(block_id)
+                             + " references invalid case #" + mir_pass_id_text(case_id));
+            return;
+        }
+        ctx.focus_case(m, case_id);
+        if (m.case_owner_block(case_id) != block_id) {
+            ctx.report_error("case #" + mir_pass_id_text(case_id)
+                             + " is not owned by block #" + mir_pass_id_text(block_id));
+        }
+        mir_pass_valid_block_target(m,
+                                    ctx,
+                                    m.case_target_block(case_id),
+                                    false,
+                                    "case #" + mir_pass_id_text(case_id) + " target");
+        count = count + 1;
+        if (count > m.case_count + 1) {
+            ctx.report_error("case chain for block #" + mir_pass_id_text(block_id)
+                             + " contains a cycle");
+            return;
+        }
+        case_id = m.case_next(case_id);
+    }
+}
+
+fn mir_pass_verify_terminator(m: MirUnit,
+                              ctx: &mut MirPassContext,
+                              block_id: i32) {
+    ctx.focus_block(m, block_id);
+    let kind = m.block_term_kind(block_id);
+    if (kind < mir_term_return() || kind > mir_term_yield()) {
+        ctx.report_error("block #" + mir_pass_id_text(block_id)
+                         + " has invalid terminator kind " + mir_pass_id_text(kind));
+        return;
+    }
+    if (kind == mir_term_goto() || kind == mir_term_yield()) {
+        mir_pass_valid_block_target(m, ctx, m.block_term_target(block_id), false,
+                                    "goto block #" + mir_pass_id_text(block_id) + " target");
+    }
+    if (kind == mir_term_branch() || kind == mir_term_foreach_next()) {
+        mir_pass_valid_block_target(m, ctx, m.block_term_target(block_id), false,
+                                    "branch block #" + mir_pass_id_text(block_id) + " true target");
+        mir_pass_valid_block_target(m, ctx, m.block_term_false(block_id), false,
+                                    "branch block #" + mir_pass_id_text(block_id) + " false target");
+    }
+    if (kind == mir_term_match()) {
+        mir_pass_verify_case_chain(m, ctx, block_id);
+        mir_pass_valid_block_target(m, ctx, m.block_term_target(block_id), true,
+                                    "match block #" + mir_pass_id_text(block_id) + " legacy fallback");
+        mir_pass_valid_block_target(m, ctx, m.block_term_false(block_id), true,
+                                    "match block #" + mir_pass_id_text(block_id) + " fallback");
+    }
+}
+
+fn mir_pass_verify_function(m: MirUnit, ctx: &mut MirPassContext) {
+    let function_id = ctx.function_id;
+    ctx.focus_function(m, function_id);
+    if (function_id < 1 || function_id > m.function_count
+        || m.function_record(function_id) == null) {
+        ctx.report_error("invalid function #" + mir_pass_id_text(function_id));
+        return;
+    }
+    let expected_count = m.function_block_count(function_id);
+    var block_id = m.function_first_block(function_id);
+    if (block_id == mir_id_invalid()) {
+        if (expected_count != 0) {
+            ctx.report_error("function #" + mir_pass_id_text(function_id)
+                             + " has no first block but count is " + mir_pass_id_text(expected_count));
+        }
+        return;
+    }
+    var count: i32 = 0;
+    while (block_id != mir_id_invalid()) {
+        if (block_id < 1 || block_id > m.block_count || m.block_record(block_id) == null) {
+            ctx.report_error("function #" + mir_pass_id_text(function_id)
+                             + " references invalid block #" + mir_pass_id_text(block_id));
+            return;
+        }
+        ctx.focus_block(m, block_id);
+        if (m.block_function(block_id) != function_id) {
+            ctx.report_error("block #" + mir_pass_id_text(block_id)
+                             + " is linked from function #" + mir_pass_id_text(function_id)
+                             + " but owned by function #" + mir_pass_id_text(m.block_function(block_id)));
+        }
+        mir_pass_verify_instr_chain(m, ctx, block_id);
+        mir_pass_verify_terminator(m, ctx, block_id);
+        count = count + 1;
+        if (count > m.block_count + 1) {
+            ctx.report_error("block chain for function #" + mir_pass_id_text(function_id)
+                             + " contains a cycle");
+            return;
+        }
+        block_id = m.block_next(block_id);
+    }
+    if (count != expected_count) {
+        ctx.report_error("function #" + mir_pass_id_text(function_id)
+                         + " block count is " + mir_pass_id_text(expected_count)
+                         + " but chain contains " + mir_pass_id_text(count));
+    }
+}
+
+fn mir_pass_integer_bits(kind: i32) -> i32 {
+    // `char` is a 32-bit Unicode scalar in the language model, while the
+    // backends still disagree on its physical representation. Keep it out of
+    // shared folding until both lowerers use the same representation.
+    if (kind == ty_BOOL() || kind == ty_I8() || kind == ty_U8()) { return 8; }
+    if (kind == ty_I16() || kind == ty_U16()) { return 16; }
+    if (kind == ty_I32() || kind == ty_U32()) { return 32; }
+    if (kind == ty_I64() || kind == ty_U64() || kind == ty_ISIZE() || kind == ty_USIZE()) { return 64; }
+    return 0;
+}
+
+fn mir_pass_integer_signed(kind: i32) -> bool {
+    return kind == ty_I8() || kind == ty_I16() || kind == ty_I32()
+        || kind == ty_I64() || kind == ty_ISIZE();
+}
+
+fn mir_pass_normalize_integer(value: i64, kind: i32) -> i64 {
+    let bits = mir_pass_integer_bits(kind);
+    if (bits <= 0 || bits >= 64) { return value; }
+    let mask = ((1 as i64) << bits) - 1;
+    var out = value & mask;
+    if (mir_pass_integer_signed(kind)) {
+        let sign_bit = (1 as i64) << (bits - 1);
+        if ((out & sign_bit) != 0) { out = out | (~mask); }
+    }
+    return out;
+}
+
+fn mir_pass_is_integer_constant(m: MirUnit, value_id: i32) -> bool {
+    if (value_id == mir_id_invalid()
+        || value_id < 1
+        || value_id > m.value_count
+        || m.value_record(value_id) == null) { return false; }
+    let type_kind = hir_type_table_kind(m.types, m.value_type(value_id));
+    if (type_kind == ty_CHAR()) { return false; }
+    let kind = m.value_kind(value_id);
+    return kind == mir_value_const_int()
+        || kind == mir_value_const_bool()
+        || kind == mir_value_const_char();
+}
+
+fn mir_pass_constant_kind_for_type(type_kind: i32) -> i32 {
+    if (type_kind == ty_BOOL()) { return mir_value_const_bool(); }
+    if (type_kind == ty_CHAR()) { return mir_value_const_char(); }
+    return mir_value_const_int();
+}
+
+fn mir_pass_replace_integer(m: MirUnit,
+                            ctx: &mut MirPassContext,
+                            value_id: i32,
+                            constant_kind: i32,
+                            value: i64) {
+    ctx.record_change();
+    m.replace_value_with_integer_constant(value_id, constant_kind, value);
+}
+
+fn mir_pass_fold_unary_value(m: MirUnit,
+                             ctx: &mut MirPassContext,
+                             value_id: i32) -> bool {
+    if (m.value_kind(value_id) != mir_value_unary()) { return false; }
+    let inner_id = m.value_lhs(value_id);
+    if (!mir_pass_is_integer_constant(m, inner_id)) { return false; }
+    let op = m.value_op(value_id);
+    let out_kind = hir_type_table_kind(m.types, m.value_type(value_id));
+    let inner_kind = hir_type_table_kind(m.types, m.value_type(inner_id));
+    let inner = m.value_int(inner_id);
+    if (op == tk_NOT()) {
+        if (out_kind != ty_BOOL() || inner_kind != ty_BOOL()) { return false; }
+        var result: i64 = 0;
+        if (inner == 0) { result = 1; }
+        mir_pass_replace_integer(m, ctx, value_id, mir_value_const_bool(), result);
+        return true;
+    }
+    if (mir_pass_integer_bits(out_kind) <= 0 || inner_kind != out_kind) { return false; }
+    let constant_kind = mir_pass_constant_kind_for_type(out_kind);
+    if (op == tk_PLUS()) {
+        mir_pass_replace_integer(m, ctx, value_id, constant_kind,
+                                 mir_pass_normalize_integer(inner, out_kind));
+        return true;
+    }
+    if (op == tk_MINUS()) {
+        mir_pass_replace_integer(m, ctx, value_id, constant_kind,
+                                 mir_pass_normalize_integer(0 - inner, out_kind));
+        return true;
+    }
+    if (op == tk_TILDE()) {
+        mir_pass_replace_integer(m, ctx, value_id, constant_kind,
+                                 mir_pass_normalize_integer(~inner, out_kind));
+        return true;
+    }
+    return false;
+}
+
+fn mir_pass_fold_binary_value(m: MirUnit,
+                              ctx: &mut MirPassContext,
+                              value_id: i32) -> bool {
+    if (m.value_kind(value_id) != mir_value_binary()) { return false; }
+    let lhs_id = m.value_lhs(value_id);
+    let rhs_id = m.value_rhs(value_id);
+    if (!mir_pass_is_integer_constant(m, lhs_id)
+        || !mir_pass_is_integer_constant(m, rhs_id)) { return false; }
+    let op = m.value_op(value_id);
+    let lhs_kind = hir_type_table_kind(m.types, m.value_type(lhs_id));
+    let rhs_kind = hir_type_table_kind(m.types, m.value_type(rhs_id));
+    let out_kind = hir_type_table_kind(m.types, m.value_type(value_id));
+    // Mixed-width/signedness operations require the language's usual-conversion
+    // rules. Leave them intact until MIR carries that conversion explicitly.
+    if (lhs_kind != rhs_kind) { return false; }
+    let lhs = mir_pass_normalize_integer(m.value_int(lhs_id), lhs_kind);
+    let rhs = mir_pass_normalize_integer(m.value_int(rhs_id), rhs_kind);
+    if (op == tk_EQEQ() || op == tk_NEQ()) {
+        if (out_kind != ty_BOOL() || mir_pass_integer_bits(lhs_kind) <= 0) { return false; }
+        var equal: i64 = 0;
+        if (lhs == rhs) { equal = 1; }
+        if (op == tk_NEQ()) { equal = 1 - equal; }
+        mir_pass_replace_integer(m, ctx, value_id, mir_value_const_bool(), equal);
+        return true;
+    }
+    if (op == tk_AND() || op == tk_OR()) {
+        if (lhs_kind != ty_BOOL() || out_kind != ty_BOOL()) { return false; }
+        var result: i64 = 0;
+        if (op == tk_AND() && lhs != 0 && rhs != 0) { result = 1; }
+        if (op == tk_OR() && (lhs != 0 || rhs != 0)) { result = 1; }
+        mir_pass_replace_integer(m, ctx, value_id, mir_value_const_bool(), result);
+        return true;
+    }
+    if (mir_pass_integer_bits(out_kind) <= 0 || out_kind != lhs_kind) { return false; }
+    var result2: i64 = 0;
+    var supported = true;
+    if (op == tk_PLUS()) { result2 = lhs + rhs; }
+    else if (op == tk_MINUS()) { result2 = lhs - rhs; }
+    else if (op == tk_STAR()) { result2 = lhs * rhs; }
+    else if (op == tk_AMP()) { result2 = lhs & rhs; }
+    else if (op == tk_PIPE()) { result2 = lhs | rhs; }
+    else if (op == tk_CARET()) { result2 = lhs ^ rhs; }
+    else { supported = false; }
+    if (!supported) { return false; }
+    mir_pass_replace_integer(m, ctx, value_id, mir_pass_constant_kind_for_type(out_kind),
+                             mir_pass_normalize_integer(result2, out_kind));
+    return true;
+}
+
+fn mir_pass_fold_constants(m: MirUnit,
+                           ctx: &mut MirPassContext,
+                           function_filter: i32) {
+    var round: i32 = 0;
+    var keep_running = true;
+    while (round < 8 && keep_running) {
+        let before = ctx.changes;
+        var value_id: i32 = 1;
+        while (value_id <= m.value_count) {
+            if (function_filter == mir_id_invalid()
+                || m.value_function(value_id) == function_filter) {
+                if (!mir_pass_fold_unary_value(m, ctx, value_id)) {
+                    mir_pass_fold_binary_value(m, ctx, value_id);
+                }
+            }
+            value_id = value_id + 1;
+        }
+        keep_running = ctx.changes != before;
+        round = round + 1;
+    }
+}
+
+class MirPassIntegerEval {
+    public known: bool
+    public type_kind: i32
+    public constant_kind: i32
+    public value: i64
+
+    public static fn unknown() -> MirPassIntegerEval {
+        return MirPassIntegerEval {
+            known: false,
+            type_kind: 0,
+            constant_kind: 0,
+            value: 0
+        };
+    }
+
+    public static fn known_value(type_kind: i32,
+                                 constant_kind: i32,
+                                 value: i64) -> MirPassIntegerEval {
+        return MirPassIntegerEval {
+            known: true,
+            type_kind: type_kind,
+            constant_kind: constant_kind,
+            value: value
+        };
+    }
+}
+
+fn mir_pass_valid_local_id(m: MirUnit, local_id: i32) -> bool {
+    return local_id != mir_id_invalid()
+        && local_id >= 1
+        && local_id <= m.local_count
+        && m.local_record(local_id) != null;
+}
+
+fn mir_pass_valid_place_id(m: MirUnit, place_id: i32) -> bool {
+    return place_id != mir_id_invalid()
+        && place_id >= 1
+        && place_id <= m.place_count
+        && m.place_record(place_id) != null;
+}
+
+fn mir_pass_place_root_local(m: MirUnit, place_id: i32, depth: i32) -> i32 {
+    if (depth > 32 || !mir_pass_valid_place_id(m, place_id)) {
+        return mir_id_invalid();
+    }
+    let kind = m.place_kind(place_id);
+    if (kind == mir_place_local()) {
+        let local_id = m.place_local(place_id);
+        if (!mir_pass_valid_local_id(m, local_id)) { return mir_id_invalid(); }
+        return local_id;
+    }
+    if (kind == mir_place_field() || kind == mir_place_index()) {
+        return mir_pass_place_root_local(m, m.place_base(place_id), depth + 1);
+    }
+    return mir_id_invalid();
+}
+
+class MirPassLocalFacts {
+    public blocked: rawptr
+    public local_count: i32
+
+    public static fn create(m: MirUnit) -> MirPassLocalFacts {
+        var count = m.local_count;
+        if (count < 1) { count = 1; }
+        let bytes = ((count + 1) * 4) as u64;
+        let blocked = malloc(bytes);
+        if (blocked != null) { memset(blocked, 0, bytes); }
+        let facts = MirPassLocalFacts {
+            blocked: blocked,
+            local_count: m.local_count
+        };
+        if (blocked == null) { return facts; }
+
+        var local_id: i32 = 1;
+        while (local_id <= m.local_count) {
+            if (mir_pass_valid_local_id(m, local_id)) {
+                let flags = m.local_flags(local_id);
+                if ((flags & mir_local_flag_capture()) != 0
+                    || (flags & mir_local_flag_reference_capture()) != 0) {
+                    facts.block(local_id);
+                }
+                if ((flags & mir_local_flag_reference_capture()) != 0) {
+                    facts.block(m.local_capture_source(local_id));
+                }
+            }
+            local_id = local_id + 1;
+        }
+
+        var value_id: i32 = 1;
+        while (value_id <= m.value_count) {
+            if (m.value_record(value_id) != null
+                && m.value_kind(value_id) == mir_value_address_of()) {
+                facts.block(mir_pass_place_root_local(m, m.value_place(value_id), 0));
+            }
+            value_id = value_id + 1;
+        }
+        return facts;
+    }
+
+    /// Function-scoped variant for the streaming pipeline.  `local_count`
+    /// never rewinds after a streamed body is released (parameter records
+    /// stay live for later declarations), so the full-table scan above is
+    /// quadratic in the number of functions lowered into one unit.  The only
+    /// consumer of these facts (`mir_pass_local_place_is_non_escaping`)
+    /// consults them for locals owned by the filtered function, so scanning
+    /// (a) that function's own local chain, (b) every local created at or
+    /// after `local_mark` -- this body plus the closure bodies materialized
+    /// by its dependency walk, whose capture sources may name this
+    /// function's locals -- and (c) the live value table (address_of roots)
+    /// produces the same block set for every local the consumer can ask
+    /// about.  Locals created before `local_mark` cannot capture this
+    /// function's locals: a capture source is recorded when the capturing
+    /// local is created, before this function's records existed.
+    public static fn create_scoped(m: MirUnit,
+                                   local_mark: i32,
+                                   function_filter: i32) -> MirPassLocalFacts {
+        var count = m.local_count;
+        if (count < 1) { count = 1; }
+        let bytes = ((count + 1) * 4) as u64;
+        let blocked = malloc(bytes);
+        if (blocked != null) { memset(blocked, 0, bytes); }
+        let facts = MirPassLocalFacts {
+            blocked: blocked,
+            local_count: m.local_count
+        };
+        if (blocked == null) { return facts; }
+
+        var local_id: i32 = m.function_first_local(function_filter);
+        var guard: i32 = 0;
+        while (local_id != mir_id_invalid()
+               && local_id >= 1
+               && local_id <= m.local_count
+               && guard <= m.local_count) {
+            if (mir_pass_valid_local_id(m, local_id)) {
+                let flags = m.local_flags(local_id);
+                if ((flags & mir_local_flag_capture()) != 0
+                    || (flags & mir_local_flag_reference_capture()) != 0) {
+                    facts.block(local_id);
+                }
+                if ((flags & mir_local_flag_reference_capture()) != 0) {
+                    facts.block(m.local_capture_source(local_id));
+                }
+            }
+            local_id = m.local_next(local_id);
+            guard = guard + 1;
+        }
+
+        var scan_id: i32 = local_mark + 1;
+        while (scan_id <= m.local_count) {
+            if (mir_pass_valid_local_id(m, scan_id)) {
+                let flags = m.local_flags(scan_id);
+                if ((flags & mir_local_flag_capture()) != 0
+                    || (flags & mir_local_flag_reference_capture()) != 0) {
+                    facts.block(scan_id);
+                }
+                if ((flags & mir_local_flag_reference_capture()) != 0) {
+                    facts.block(m.local_capture_source(scan_id));
+                }
+            }
+            scan_id = scan_id + 1;
+        }
+
+        var value_id: i32 = 1;
+        while (value_id <= m.value_count) {
+            if (m.value_record(value_id) != null
+                && m.value_kind(value_id) == mir_value_address_of()) {
+                facts.block(mir_pass_place_root_local(m, m.value_place(value_id), 0));
+            }
+            value_id = value_id + 1;
+        }
+        return facts;
+    }
+
+    public fn block(self, local_id: i32) {
+        if (self.blocked == null || local_id < 1 || local_id > self.local_count) { return; }
+        ast_write_i32(ptr_offset(self.blocked, local_id * 4), 1);
+    }
+
+    public fn is_blocked(self, local_id: i32) -> bool {
+        if (self.blocked == null || local_id < 1 || local_id > self.local_count) {
+            return true;
+        }
+        return ast_read_i32(ptr_offset(self.blocked, local_id * 4)) != 0;
+    }
+
+    public fn dispose(self) {
+        if (self.blocked != null) {
+            free(self.blocked);
+            self.blocked = null;
+        }
+    }
+}
+
+/// Unit-scope pipelines keep the full-table facts build; the streaming
+/// function pipeline uses the scoped variant keyed on the body marks the
+/// caller already carries.
+fn mir_pass_local_facts_for_scope(m: MirUnit,
+                                  ctx: &mut MirPassContext,
+                                  function_filter: i32) -> MirPassLocalFacts {
+    if (function_filter != mir_id_invalid()
+        && ctx.strict_local_mark >= 0) {
+        return MirPassLocalFacts.create_scoped(m, ctx.strict_local_mark, function_filter);
+    }
+    return MirPassLocalFacts.create(m);
+}
+
+fn mir_pass_local_place_is_non_escaping(m: MirUnit,
+                                        function_id: i32,
+                                        place_id: i32,
+                                        facts: MirPassLocalFacts) -> bool {
+    if (!mir_pass_valid_place_id(m, place_id)
+        || m.place_function(place_id) != function_id) { return false; }
+    if (m.place_kind(place_id) != mir_place_local()) { return false; }
+    let local_id = m.place_local(place_id);
+    if (!mir_pass_valid_local_id(m, local_id)
+        || m.local_function(local_id) != function_id) { return false; }
+    return !facts.is_blocked(local_id);
+}
+
+fn mir_pass_last_block_assignment_before(m: MirUnit,
+                                         block_id: i32,
+                                         place_id: i32,
+                                         before_instr_id: i32) -> i32 {
+    if (block_id == mir_id_invalid()
+        || block_id < 1 || block_id > m.block_count
+        || m.block_record(block_id) == null
+        || !mir_pass_valid_place_id(m, place_id)
+        || m.place_function(place_id) != m.block_function(block_id)) {
+        return mir_id_invalid();
+    }
+    if (before_instr_id != mir_id_invalid()
+        && (before_instr_id < 1 || before_instr_id > m.instr_count
+            || m.instr_record(before_instr_id) == null
+            || m.instr_block(before_instr_id) != block_id)) {
+        return mir_id_invalid();
+    }
+    var assigned_instr = mir_id_invalid();
+    var reached_before = before_instr_id == mir_id_invalid();
+    var instr_id = m.block_first_instr(block_id);
+    var guard: i32 = 0;
+    while (instr_id != mir_id_invalid()) {
+        if (instr_id == before_instr_id) {
+            reached_before = true;
+            break;
+        }
+        if (instr_id < 1 || instr_id > m.instr_count
+            || m.instr_record(instr_id) == null
+            || m.instr_block(instr_id) != block_id) {
+            return mir_id_invalid();
+        }
+        if (m.instr_place(instr_id) == place_id) {
+            if (m.instr_kind(instr_id) == mir_instr_assign()) {
+                assigned_instr = instr_id;
+            } else if (m.instr_kind(instr_id) == mir_instr_storage_dead()) {
+                // A local lifetime end is an explicit barrier for any
+                // single-assignment fact collected before it.
+                assigned_instr = mir_id_invalid();
+            } else if (m.instr_kind(instr_id) != mir_instr_storage_live()) {
+                assigned_instr = mir_id_invalid();
+            }
+        }
+        guard = guard + 1;
+        if (guard > m.instr_count + 1) { return mir_id_invalid(); }
+        instr_id = m.instr_next(instr_id);
+    }
+    if (!reached_before) { return mir_id_invalid(); }
+    return assigned_instr;
+}
+
+fn mir_pass_eval_block_integer(m: MirUnit,
+                               facts: MirPassLocalFacts,
+                               block_id: i32,
+                               before_instr_id: i32,
+                               value_id: i32,
+                               depth: i32) -> MirPassIntegerEval {
+    if (depth > 32 || value_id == mir_id_invalid()
+        || value_id < 1 || value_id > m.value_count
+        || m.value_record(value_id) == null) {
+        return MirPassIntegerEval.unknown();
+    }
+    let kind = m.value_kind(value_id);
+    let type_kind = hir_type_table_kind(m.types, m.value_type(value_id));
+    if (mir_pass_is_integer_constant(m, value_id)) {
+        return MirPassIntegerEval.known_value(
+            type_kind,
+            kind,
+            mir_pass_normalize_integer(m.value_int(value_id), type_kind));
+    }
+    if (kind == mir_value_read_place()) {
+        let place_id = m.value_place(value_id);
+        if (place_id == mir_id_invalid()
+            || !mir_pass_local_place_is_non_escaping(m,
+                                                     m.value_function(value_id),
+                                                     place_id,
+                                                     facts)) {
+            return MirPassIntegerEval.unknown();
+        }
+        let assignment_instr = mir_pass_last_block_assignment_before(
+            m, block_id, place_id, before_instr_id);
+        if (assignment_instr == mir_id_invalid()) { return MirPassIntegerEval.unknown(); }
+        let assigned = m.instr_value(assignment_instr);
+        if (assigned == mir_id_invalid()) { return MirPassIntegerEval.unknown(); }
+        // Evaluate the RHS at its assignment point. Looking at the end of the
+        // block here would allow a later write to change an earlier read.
+        let resolved = mir_pass_eval_block_integer(
+            m, facts, block_id, assignment_instr, assigned, depth + 1);
+        if (!resolved.known || resolved.type_kind != type_kind) {
+            return MirPassIntegerEval.unknown();
+        }
+        return resolved;
+    }
+    if (kind == mir_value_unary()) {
+        let inner = mir_pass_eval_block_integer(
+            m, facts, block_id, before_instr_id, m.value_lhs(value_id), depth + 1);
+        if (!inner.known) { return MirPassIntegerEval.unknown(); }
+        let op = m.value_op(value_id);
+        if (op == tk_NOT() && type_kind == ty_BOOL() && inner.type_kind == ty_BOOL()) {
+            var not_value: i64 = 0;
+            if (inner.value == 0) { not_value = 1; }
+            return MirPassIntegerEval.known_value(type_kind, mir_value_const_bool(), not_value);
+        }
+        if (type_kind != inner.type_kind || mir_pass_integer_bits(type_kind) <= 0) {
+            return MirPassIntegerEval.unknown();
+        }
+        if (op == tk_PLUS()) {
+            return MirPassIntegerEval.known_value(
+                type_kind, mir_pass_constant_kind_for_type(type_kind), inner.value);
+        }
+        if (op == tk_MINUS()) {
+            return MirPassIntegerEval.known_value(
+                type_kind,
+                mir_pass_constant_kind_for_type(type_kind),
+                mir_pass_normalize_integer(0 - inner.value, type_kind));
+        }
+        if (op == tk_TILDE()) {
+            return MirPassIntegerEval.known_value(
+                type_kind,
+                mir_pass_constant_kind_for_type(type_kind),
+                mir_pass_normalize_integer(~inner.value, type_kind));
+        }
+        return MirPassIntegerEval.unknown();
+    }
+    if (kind != mir_value_binary()) { return MirPassIntegerEval.unknown(); }
+    let lhs = mir_pass_eval_block_integer(
+        m, facts, block_id, before_instr_id, m.value_lhs(value_id), depth + 1);
+    let rhs = mir_pass_eval_block_integer(
+        m, facts, block_id, before_instr_id, m.value_rhs(value_id), depth + 1);
+    if (!lhs.known || !rhs.known || lhs.type_kind != rhs.type_kind) {
+        return MirPassIntegerEval.unknown();
+    }
+    let op2 = m.value_op(value_id);
+    if (op2 == tk_EQEQ() || op2 == tk_NEQ()) {
+        if (type_kind != ty_BOOL() || mir_pass_integer_bits(lhs.type_kind) <= 0) {
+            return MirPassIntegerEval.unknown();
+        }
+        var equal: i64 = 0;
+        if (lhs.value == rhs.value) { equal = 1; }
+        if (op2 == tk_NEQ()) { equal = 1 - equal; }
+        return MirPassIntegerEval.known_value(type_kind, mir_value_const_bool(), equal);
+    }
+    if (op2 == tk_AND() || op2 == tk_OR()) {
+        if (type_kind != ty_BOOL() || lhs.type_kind != ty_BOOL()) {
+            return MirPassIntegerEval.unknown();
+        }
+        var logical: i64 = 0;
+        if (op2 == tk_AND() && lhs.value != 0 && rhs.value != 0) { logical = 1; }
+        if (op2 == tk_OR() && (lhs.value != 0 || rhs.value != 0)) { logical = 1; }
+        return MirPassIntegerEval.known_value(type_kind, mir_value_const_bool(), logical);
+    }
+    if (type_kind != lhs.type_kind || mir_pass_integer_bits(type_kind) <= 0) {
+        return MirPassIntegerEval.unknown();
+    }
+    var result: i64 = 0;
+    if (op2 == tk_PLUS()) { result = lhs.value + rhs.value; }
+    else if (op2 == tk_MINUS()) { result = lhs.value - rhs.value; }
+    else if (op2 == tk_STAR()) { result = lhs.value * rhs.value; }
+    else if (op2 == tk_AMP()) { result = lhs.value & rhs.value; }
+    else if (op2 == tk_PIPE()) { result = lhs.value | rhs.value; }
+    else if (op2 == tk_CARET()) { result = lhs.value ^ rhs.value; }
+    else { return MirPassIntegerEval.unknown(); }
+    return MirPassIntegerEval.known_value(
+        type_kind,
+        mir_pass_constant_kind_for_type(type_kind),
+        mir_pass_normalize_integer(result, type_kind));
+}
+
+fn mir_pass_fold_constant_branches(m: MirUnit,
+                                   ctx: &mut MirPassContext,
+                                   facts: MirPassLocalFacts) {
+    var block_id = m.function_first_block(ctx.function_id);
+    var guard: i32 = 0;
+    while (block_id != mir_id_invalid()) {
+        if (m.block_term_kind(block_id) == mir_term_branch()) {
+            let cond_id = m.block_term_value(block_id);
+            var cond_known = mir_pass_is_integer_constant(m, cond_id);
+            var cond_value: i64 = 0;
+            if (cond_known) { cond_value = m.value_int(cond_id); }
+            else {
+                let resolved = mir_pass_eval_block_integer(
+                    m, facts, block_id, mir_id_invalid(), cond_id, 0);
+                if (resolved.known && resolved.type_kind == ty_BOOL()) {
+                    cond_known = true;
+                    cond_value = resolved.value;
+                }
+            }
+            if (cond_known) {
+                var target = m.block_term_false(block_id);
+                if (cond_value != 0) { target = m.block_term_target(block_id); }
+                ctx.record_change();
+                m.set_block_terminator(block_id,
+                                       mir_term_goto(),
+                                       mir_id_invalid(),
+                                       target,
+                                       mir_id_invalid(),
+                                       mir_id_invalid(),
+                                       mir_id_invalid());
+            }
+        }
+        guard = guard + 1;
+        if (guard > m.block_count + 1) { return; }
+        block_id = m.block_next(block_id);
+    }
+}
+
+fn mir_pass_cfg_block_active(m: MirUnit, function_id: i32, block_id: i32) -> bool {
+    if (block_id < 1 || block_id > m.block_count) { return false; }
+    let rec = m.block_record(block_id);
+    return rec != null
+        && ast_read_i32(rec) == block_id
+        && m.block_function(block_id) == function_id
+        && !m.block_is_removed( block_id);
+}
+
+fn mir_pass_cfg_empty_goto(m: MirUnit,
+                           function_id: i32,
+                           entry_id: i32,
+                           block_id: i32) -> bool {
+    if (block_id == entry_id || !mir_pass_cfg_block_active(m, function_id, block_id)) {
+        return false;
+    }
+    return m.block_instr_count(block_id) == 0
+        && m.block_first_instr(block_id) == mir_id_invalid()
+        && m.block_last_instr(block_id) == mir_id_invalid()
+        && m.block_term_kind(block_id) == mir_term_goto()
+        && m.block_term_target(block_id) != mir_id_invalid()
+        && m.block_term_target(block_id) != block_id;
+}
+
+fn mir_pass_cfg_thread_target(m: MirUnit,
+                              function_id: i32,
+                              entry_id: i32,
+                              target_id: i32) -> i32 {
+    let original = target_id;
+    var current = target_id;
+    var guard: i32 = 0;
+    while (mir_pass_cfg_empty_goto(m, function_id, entry_id, current)) {
+        let next = m.block_term_target(current);
+        if (!mir_pass_cfg_block_active(m, function_id, next)) { return original; }
+        current = next;
+        guard = guard + 1;
+        if (current == original || guard > m.block_count + 1) { return original; }
+    }
+    return current;
+}
+
+fn mir_pass_cfg_value_is_pure(m: MirUnit, value_id: i32, depth: i32) -> bool {
+    if (value_id == mir_id_invalid() || depth > 32
+        || value_id < 1 || value_id > m.value_count
+        || m.value_record(value_id) == null) { return false; }
+    if ((m.value_flags(value_id) & mir_value_flag_move_arg()) != 0) { return false; }
+    let kind = m.value_kind(value_id);
+    if (kind == mir_value_const_int()
+        || kind == mir_value_const_bool()
+        || kind == mir_value_const_char()
+        || kind == mir_value_const_float()
+        || kind == mir_value_null()
+        || kind == mir_value_target_ref()) { return true; }
+    if (kind == mir_value_const_str()) {
+        return m.value_first_arg(value_id) == mir_id_invalid();
+    }
+    if (kind == mir_value_read_place()) {
+        let place_id = m.value_place(value_id);
+        if (place_id == mir_id_invalid()
+            || place_id < 1 || place_id > m.place_count
+            || m.place_kind(place_id) != mir_place_local()) { return false; }
+        let type_kind = hir_type_table_kind(m.types, m.value_type(value_id));
+        return mir_pass_integer_bits(type_kind) > 0
+            || type_kind == ty_CHAR()
+            || type_kind == ty_F32()
+            || type_kind == ty_F64()
+            || type_kind == ty_RAWPTR();
+    }
+    if (kind == mir_value_arg() || kind == mir_value_cast()) {
+        return mir_pass_cfg_value_is_pure(m, m.value_lhs(value_id), depth + 1);
+    }
+    if (kind == mir_value_unary()) {
+        return m.value_op(value_id) == tk_NOT()
+            && mir_pass_cfg_value_is_pure(m, m.value_lhs(value_id), depth + 1);
+    }
+    if (kind == mir_value_binary()) {
+        let op = m.value_op(value_id);
+        let safe_op = op == tk_EQEQ() || op == tk_NEQ()
+            || op == tk_LT() || op == tk_LE()
+            || op == tk_GT() || op == tk_GE()
+            || op == tk_AND() || op == tk_OR();
+        return safe_op
+            && mir_pass_cfg_value_is_pure(m, m.value_lhs(value_id), depth + 1)
+            && mir_pass_cfg_value_is_pure(m, m.value_rhs(value_id), depth + 1);
+    }
+    return false;
+}
+
+fn mir_pass_cfg_match_pattern_is_default(m: MirUnit, value_id: i32) -> bool {
+    if (value_id == mir_id_invalid()) { return false; }
+    return value_id >= 1 && value_id <= m.value_count
+        && m.value_kind(value_id) == mir_value_null()
+        && m.value_name(value_id) == "__match_default";
+}
+
+fn mir_pass_cfg_function_has_legacy_match_target(m: MirUnit,
+                                                  function_id: i32) -> bool {
+    var block_id = m.function_first_block(function_id);
+    var guard: i32 = 0;
+    while (block_id != mir_id_invalid()) {
+        if (m.block_term_kind(block_id) == mir_term_match()
+            && m.block_term_target(block_id) != mir_id_invalid()) { return true; }
+        block_id = m.block_next(block_id);
+        guard = guard + 1;
+        if (guard > m.block_count + 1) { return true; }
+    }
+    return false;
+}
+
+fn mir_pass_cfg_thread_successors(m: MirUnit,
+                                  ctx: &mut MirPassContext,
+                                  function_id: i32,
+                                  entry_id: i32) -> bool {
+    var block_id = m.function_first_block(function_id);
+    var guard: i32 = 0;
+    while (block_id != mir_id_invalid()) {
+        let kind = m.block_term_kind(block_id);
+        if (kind == mir_term_goto() || kind == mir_term_yield()) {
+            let old_target = m.block_term_target(block_id);
+            let new_target = mir_pass_cfg_thread_target(m, function_id, entry_id, old_target);
+            if (new_target != old_target) {
+                ctx.record_change();
+                m.set_block_terminator(block_id,
+                                       kind,
+                                       m.block_term_value(block_id),
+                                       new_target,
+                                       m.block_term_false(block_id),
+                                       m.block_term_first_case(block_id),
+                                       m.block_term_aux(block_id));
+            }
+        } else if (kind == mir_term_branch() || kind == mir_term_foreach_next()) {
+            let old_target2 = m.block_term_target(block_id);
+            let old_false = m.block_term_false(block_id);
+            let new_target2 = mir_pass_cfg_thread_target(m, function_id, entry_id, old_target2);
+            let new_false = mir_pass_cfg_thread_target(m, function_id, entry_id, old_false);
+            if (new_target2 != old_target2 || new_false != old_false) {
+                ctx.record_change();
+                m.set_block_terminator(block_id,
+                                       kind,
+                                       m.block_term_value(block_id),
+                                       new_target2,
+                                       new_false,
+                                       m.block_term_first_case(block_id),
+                                       m.block_term_aux(block_id));
+            }
+        } else if (kind == mir_term_match()
+                   && m.block_term_target(block_id) == mir_id_invalid()) {
+            var case_id = m.block_term_first_case(block_id);
+            var case_guard: i32 = 0;
+            while (case_id != mir_id_invalid()) {
+                let old_case_target = m.case_target_block(case_id);
+                let new_case_target = mir_pass_cfg_thread_target(m,
+                                                                 function_id,
+                                                                 entry_id,
+                                                                 old_case_target);
+                if (new_case_target != old_case_target) {
+                    ctx.record_change();
+                    if (!m.set_case_target_block( case_id, new_case_target)) {
+                        ctx.report_error("cannot thread match case #" + mir_pass_id_text(case_id));
+                        return false;
+                    }
+                }
+                case_id = m.case_next(case_id);
+                case_guard = case_guard + 1;
+                if (case_guard > m.case_count + 1) {
+                    ctx.report_error("cyclic match case chain in block #" + mir_pass_id_text(block_id));
+                    return false;
+                }
+            }
+            let old_fallback = m.block_term_false(block_id);
+            if (old_fallback != mir_id_invalid()) {
+                let new_fallback = mir_pass_cfg_thread_target(m,
+                                                              function_id,
+                                                              entry_id,
+                                                              old_fallback);
+                if (new_fallback != old_fallback) {
+                    ctx.record_change();
+                    m.set_block_terminator(block_id,
+                                           kind,
+                                           m.block_term_value(block_id),
+                                           m.block_term_target(block_id),
+                                           new_fallback,
+                                           m.block_term_first_case(block_id),
+                                           m.block_term_aux(block_id));
+                }
+            }
+        }
+        block_id = m.block_next(block_id);
+        guard = guard + 1;
+        if (guard > m.block_count + 1) {
+            ctx.report_error("cyclic block chain while threading function #"
+                             + mir_pass_id_text(function_id));
+            return false;
+        }
+    }
+    return true;
+}
+
+fn mir_pass_cfg_fold_trivial_terminators(m: MirUnit,
+                                         ctx: &mut MirPassContext,
+                                         function_id: i32) -> bool {
+    var block_id = m.function_first_block(function_id);
+    var guard: i32 = 0;
+    while (block_id != mir_id_invalid()) {
+        let kind = m.block_term_kind(block_id);
+        if (kind == mir_term_branch()
+            && m.block_term_target(block_id) == m.block_term_false(block_id)
+            && mir_pass_cfg_value_is_pure(m, m.block_term_value(block_id), 0)) {
+            let target = m.block_term_target(block_id);
+            ctx.record_change();
+            m.set_block_terminator(block_id,
+                                   mir_term_goto(),
+                                   mir_id_invalid(),
+                                   target,
+                                   mir_id_invalid(),
+                                   mir_id_invalid(),
+                                   mir_id_invalid());
+        } else if (kind == mir_term_match()
+                   && m.block_term_target(block_id) == mir_id_invalid()
+                   && mir_pass_cfg_value_is_pure(m, m.block_term_value(block_id), 0)) {
+            let first_case = m.block_term_first_case(block_id);
+            var folded_target = mir_id_invalid();
+            if (first_case == mir_id_invalid()) {
+                folded_target = m.block_term_false(block_id);
+            } else if (first_case >= 1 && first_case <= m.case_count
+                       && m.case_next(first_case) == mir_id_invalid()
+                       && m.case_guard_value(first_case) == mir_id_invalid()
+                       && mir_pass_cfg_match_pattern_is_default(
+                           m, m.case_pattern_value(first_case))) {
+                folded_target = m.case_target_block(first_case);
+            }
+            if (folded_target != mir_id_invalid()) {
+                ctx.record_change();
+                m.set_block_terminator(block_id,
+                                       mir_term_goto(),
+                                       mir_id_invalid(),
+                                       folded_target,
+                                       mir_id_invalid(),
+                                       mir_id_invalid(),
+                                       mir_id_invalid());
+            }
+        }
+        block_id = m.block_next(block_id);
+        guard = guard + 1;
+        if (guard > m.block_count + 1) {
+            ctx.report_error("cyclic block chain while folding function #"
+                             + mir_pass_id_text(function_id));
+            return false;
+        }
+    }
+    return true;
+}
+
+class MirPassCfgReachability {
+    public visited: rawptr
+    public queue: rawptr
+    public head: i32
+    public tail: i32
+    public capacity: i32
+    public failed: bool
+    public error_message: string
+
+    public static fn create(block_count: i32) -> MirPassCfgReachability {
+        var capacity = block_count + 1;
+        if (capacity < 2) { capacity = 2; }
+        let bytes = ((capacity as i64) * 4) as u64;
+        let visited = malloc(bytes);
+        let queue = malloc(bytes);
+        if (visited != null) { memset(visited, 0, bytes); }
+        if (queue != null) { memset(queue, 0, bytes); }
+        return MirPassCfgReachability {
+            visited: visited,
+            queue: queue,
+            head: 0,
+            tail: 0,
+            capacity: capacity,
+            failed: visited == null || queue == null,
+            error_message: "cannot allocate CFG reachability storage"
+        };
+    }
+
+    public fn add(self, m: MirUnit, function_id: i32, block_id: i32) {
+        if (self.failed) { return; }
+        if (!mir_pass_cfg_block_active(m, function_id, block_id)) {
+            self.failed = true;
+            self.error_message = "reachability references inactive block #"
+                + mir_pass_id_text(block_id);
+            return;
+        }
+        if (ast_read_i32(ptr_offset(self.visited, block_id * 4)) != 0) { return; }
+        if (self.tail >= self.capacity) {
+            self.failed = true;
+            self.error_message = "CFG reachability queue capacity exceeded";
+            return;
+        }
+        ast_write_i32(ptr_offset(self.visited, block_id * 4), 1);
+        ast_write_i32(ptr_offset(self.queue, self.tail * 4), block_id);
+        self.tail = self.tail + 1;
+    }
+
+    public fn pop(self) -> i32 {
+        if (self.head >= self.tail || self.queue == null) { return mir_id_invalid(); }
+        let out = ast_read_i32(ptr_offset(self.queue, self.head * 4));
+        self.head = self.head + 1;
+        return out;
+    }
+
+    public fn contains(self, block_id: i32) -> bool {
+        if (self.visited == null || block_id < 1 || block_id >= self.capacity) { return false; }
+        return ast_read_i32(ptr_offset(self.visited, block_id * 4)) != 0;
+    }
+
+    public fn dispose(self) {
+        if (self.visited != null) { free(self.visited); self.visited = null; }
+        if (self.queue != null) { free(self.queue); self.queue = null; }
+    }
+}
+
+fn mir_pass_cfg_mark_reachable(m: MirUnit,
+                               ctx: &mut MirPassContext,
+                               function_id: i32,
+                               reach: MirPassCfgReachability) -> bool {
+    reach.add(m, function_id, m.function_first_block(function_id));
+    while (!reach.failed && reach.head < reach.tail) {
+        let block_id = reach.pop();
+        let kind = m.block_term_kind(block_id);
+        if (kind == mir_term_goto() || kind == mir_term_yield()) {
+            reach.add(m, function_id, m.block_term_target(block_id));
+        } else if (kind == mir_term_branch() || kind == mir_term_foreach_next()) {
+            reach.add(m, function_id, m.block_term_target(block_id));
+            reach.add(m, function_id, m.block_term_false(block_id));
+        } else if (kind == mir_term_match()) {
+            var case_id = m.block_term_first_case(block_id);
+            var guard: i32 = 0;
+            while (case_id != mir_id_invalid()) {
+                reach.add(m, function_id, m.case_target_block(case_id));
+                case_id = m.case_next(case_id);
+                guard = guard + 1;
+                if (guard > m.case_count + 1) {
+                    reach.failed = true;
+                    reach.error_message = "cyclic match case chain in block #"
+                        + mir_pass_id_text(block_id);
+                    break;
+                }
+            }
+            let fallback = m.block_term_false(block_id);
+            if (fallback != mir_id_invalid()) { reach.add(m, function_id, fallback); }
+        }
+    }
+    if (reach.failed) {
+        ctx.report_error(reach.error_message);
+        return false;
+    }
+    return true;
+}
+
+fn mir_pass_cfg_rebuild_active_chain(m: MirUnit,
+                                     ctx: &mut MirPassContext,
+                                     function_id: i32,
+                                     reach: MirPassCfgReachability) -> bool {
+    let old_first = m.function_first_block(function_id);
+    var first = mir_id_invalid();
+    var last = mir_id_invalid();
+    var active_count: i32 = 0;
+    var block_id = old_first;
+    var guard: i32 = 0;
+    while (block_id != mir_id_invalid()) {
+        let next = m.block_next(block_id);
+        if (reach.contains(block_id)) {
+            if (first == mir_id_invalid()) { first = block_id; }
+            if (last != mir_id_invalid() && m.block_next(last) != block_id) {
+                ctx.record_change();
+                if (!m.set_block_next( last, block_id)) {
+                    ctx.report_error("cannot relink block #" + mir_pass_id_text(last));
+                    return false;
+                }
+            }
+            last = block_id;
+            active_count = active_count + 1;
+        } else {
+            ctx.record_change();
+            if (!m.tombstone_block( block_id)) {
+                ctx.report_error("cannot tombstone block #" + mir_pass_id_text(block_id));
+                return false;
+            }
+        }
+        block_id = next;
+        guard = guard + 1;
+        if (guard > m.block_count + 1) {
+            ctx.report_error("cyclic block chain while rebuilding function #"
+                             + mir_pass_id_text(function_id));
+            return false;
+        }
+    }
+    if (last != mir_id_invalid() && m.block_next(last) != mir_id_invalid()) {
+        ctx.record_change();
+        if (!m.set_block_next( last, mir_id_invalid())) {
+            ctx.report_error("cannot terminate active block chain for function #"
+                             + mir_pass_id_text(function_id));
+            return false;
+        }
+    }
+    if (first != old_first || active_count != m.function_block_count(function_id)) {
+        ctx.record_change();
+        if (!m.set_function_block_chain( function_id, first, active_count)) {
+            ctx.report_error("cannot rebuild active block chain for function #"
+                             + mir_pass_id_text(function_id));
+            return false;
+        }
+    }
+    return true;
+}
+
+fn mir_pass_cfg_simplify_function(m: MirUnit,
+                                  ctx: &mut MirPassContext,
+                                  function_id: i32) -> bool {
+    let entry = m.function_first_block(function_id);
+    if (entry == mir_id_invalid()) { return true; }
+    if (mir_pass_cfg_function_has_legacy_match_target(m, function_id)) {
+        mir_analysis_audit("cfg-simplify skip function=" + mir_pass_id_text(function_id)
+                           + " reason=legacy-match-target");
+        return true;
+    }
+    var round: i32 = 0;
+    var changed = true;
+    while (changed && round <= m.block_count + 1) {
+        let before = ctx.changes;
+        if (!mir_pass_cfg_thread_successors(m, ctx, function_id, entry)
+            || !mir_pass_cfg_fold_trivial_terminators(m, ctx, function_id)) {
+            return false;
+        }
+        changed = ctx.changes != before;
+        round = round + 1;
+    }
+    if (changed) {
+        ctx.report_error("CFG simplify fixed-point limit exceeded for function #"
+                         + mir_pass_id_text(function_id));
+        return false;
+    }
+    let reach = MirPassCfgReachability.create(m.block_count);
+    if (reach.failed) {
+        ctx.report_error(reach.error_message);
+        reach.dispose();
+        return false;
+    }
+    if (!mir_pass_cfg_mark_reachable(m, ctx, function_id, reach)
+        || !mir_pass_cfg_rebuild_active_chain(m, ctx, function_id, reach)) {
+        reach.dispose();
+        return false;
+    }
+    if (mir_analysis_audit_enabled()) {
+        let idempotence_mark = ctx.changes;
+        if (!mir_pass_cfg_thread_successors(m, ctx, function_id, entry)
+            || !mir_pass_cfg_fold_trivial_terminators(m, ctx, function_id)) {
+            reach.dispose();
+            return false;
+        }
+        if (ctx.changes != idempotence_mark) {
+            ctx.report_error("CFG simplify was not idempotent for function #"
+                             + mir_pass_id_text(function_id));
+            reach.dispose();
+            return false;
+        }
+    }
+    mir_analysis_audit("cfg-simplify function=" + mir_pass_id_text(function_id)
+                       + " rounds=" + mir_pass_id_text(round)
+                       + " active=" + mir_pass_id_text(m.function_block_count(function_id))
+                       + " idempotent=1");
+    reach.dispose();
+    return true;
+}
+
+fn mir_pass_verify_lightweight_scope(m: MirUnit,
+                                     ctx: &mut MirPassContext,
+                                     function_filter: i32) {
+    let saved_function = ctx.function_id;
+    if (function_filter != mir_id_invalid()) {
+        ctx.function_id = function_filter;
+        mir_pass_verify_function(m, ctx);
+    } else {
+        var function_id: i32 = 1;
+        while (function_id <= m.function_count) {
+            ctx.function_id = function_id;
+            mir_pass_verify_function(m, ctx);
+            function_id = function_id + 1;
+        }
+    }
+    ctx.function_id = saved_function;
+}
+
+// Per-function pass pipeline (LLVM and --emit=mir-verify streaming) verifies a
+// body here, then the lowerer may discard_recent_body_records. Whole-unit
+// verify walks every function record; streamed bodies set
+// function_streamed_body_discarded.
+fn mir_pass_verify_stage(m: MirUnit,
+                         ctx: &mut MirPassContext,
+                         function_filter: i32,
+                         stage: string) -> bool {
+    var verify_t0: i64 = vyx_bootstrap_now_ms();
+    let ok = mir_pass_verify_stage_inner(m, ctx, function_filter, stage);
+    g_mir_pass_verify_ms = g_mir_pass_verify_ms + (vyx_bootstrap_now_ms() - verify_t0);
+    return ok;
+}
+
+fn mir_pass_verify_stage_inner(m: MirUnit,
+                               ctx: &mut MirPassContext,
+                               function_filter: i32,
+                               stage: string) -> bool {
+    let errors_before = ctx.errors;
+    mir_pass_verify_lightweight_scope(m, ctx, function_filter);
+    if (mir_analysis_audit_enabled()) {
+        let required = mir_analysis_cfg() | mir_analysis_use_def();
+        if (!ctx.analysis_cache.ensure(m, required)) {
+            ctx.report_error("cannot build analysis cache at " + stage + ": "
+                             + ctx.analysis_cache.error_message);
+        } else if (!ctx.analysis_cache.verify(m, required)) {
+            ctx.report_error("analysis cache verification failed at " + stage + ": "
+                             + ctx.analysis_cache.error_message);
+        }
+    }
+    if (ctx.errors == errors_before && ctx.strict_verify) {
+        var strict_errors: i32 = 0;
+        var strict_scope = "unit";
+        if (function_filter != mir_id_invalid()) {
+            strict_scope = "function";
+            strict_errors = mir_verify_function_strict_silent(m,
+                                                               function_filter,
+                                                               ctx.strict_block_mark,
+                                                               ctx.strict_local_mark,
+                                                               ctx.strict_place_mark,
+                                                               ctx.strict_value_mark,
+                                                               ctx.strict_instr_mark,
+                                                               ctx.strict_case_mark);
+        } else {
+            strict_errors = mir_verify_unit_strict_silent(m);
+        }
+        mir_analysis_audit("strict verify scope=" + strict_scope + " stage=" + stage);
+        mir_analysis_audit("strict verify stage=" + stage
+                           + " errors=" + mir_pass_id_text(strict_errors));
+        if (strict_errors > 0) {
+            // The silent check keeps successful stage verification cheap and
+            // quiet. Re-run only a failing stage so its structural diagnostics
+            // remain visible together with the exact pass boundary.
+            if (function_filter != mir_id_invalid()) {
+                mir_verify_function_strict(m,
+                                           function_filter,
+                                           ctx.strict_block_mark,
+                                           ctx.strict_local_mark,
+                                           ctx.strict_place_mark,
+                                           ctx.strict_value_mark,
+                                           ctx.strict_instr_mark,
+                                           ctx.strict_case_mark);
+            } else {
+                mir_verify_unit_strict(m);
+            }
+            ctx.report_error("strict MIR closure verification failed at " + stage
+                             + " with " + mir_pass_id_text(strict_errors) + " error(s)");
+        }
+    }
+    mir_analysis_audit("verify stage=" + stage
+                       + " errors=" + mir_pass_id_text(ctx.errors - errors_before));
+    return ctx.errors == errors_before;
+}
+
+fn mir_pass_run_constant_fold(m: MirUnit,
+                              ctx: &mut MirPassContext,
+                              function_filter: i32) -> bool {
+    let preserved = mir_analysis_cfg() | mir_analysis_dominance();
+    if (!ctx.begin_pass(m, "fold-constants", 0, preserved)) { return false; }
+    mir_pass_fold_constants(m, ctx, function_filter);
+    ctx.finish_pass(m);
+    return mir_pass_verify_stage(m,
+                                 ctx,
+                                 function_filter,
+                                 "after fold-constants");
+}
+
+fn mir_pass_run_constant_branches(m: MirUnit,
+                                  ctx: &mut MirPassContext,
+                                  function_filter: i32) -> bool {
+    var required: i32 = 0;
+    if (mir_analysis_audit_enabled()) { required = mir_analysis_cfg(); }
+    if (!ctx.begin_pass(m,
+                        "fold-constant-branches",
+                        required,
+                        0)) { return false; }
+    let facts = mir_pass_local_facts_for_scope(m, ctx, function_filter);
+    if (function_filter != mir_id_invalid()) {
+        let saved_function = ctx.function_id;
+        ctx.function_id = function_filter;
+        mir_pass_fold_constant_branches(m, ctx, facts);
+        ctx.function_id = saved_function;
+    } else {
+        var function_id: i32 = 1;
+        while (function_id <= m.function_count) {
+            ctx.function_id = function_id;
+            mir_pass_fold_constant_branches(m, ctx, facts);
+            function_id = function_id + 1;
+        }
+        ctx.function_id = mir_id_invalid();
+    }
+    facts.dispose();
+    ctx.finish_pass(m);
+    return mir_pass_verify_stage(m,
+                                 ctx,
+                                 function_filter,
+                                 "after fold-constant-branches");
+}
+
+fn mir_pass_sccp_add_constant(m: &mut MirUnit,
+                              ctx: &mut MirPassContext,
+                              function_id: i32,
+                              source_value_id: i32,
+                              constant_kind: i32,
+                              int_value: i64) -> i32 {
+    if (source_value_id < 1 || source_value_id > m.value_count
+        || m.value_record(source_value_id) == null) { return mir_id_invalid(); }
+    let type_id = m.value_type(source_value_id);
+    var text_value = "";
+    if (constant_kind == mir_value_const_int()) {
+        text_value = policy_i64_to_string(int_value);
+    } else if (constant_kind == mir_value_const_bool()) {
+        if (int_value == 0) { text_value = "false"; }
+        else { text_value = "true"; }
+    } else if (constant_kind == mir_value_null()) {
+        text_value = "null";
+    } else {
+        return mir_id_invalid();
+    }
+    if (!ctx.fixed_point_reserve_growth(m.view(), 1, 0, "SCCP constant")) {
+        return mir_id_invalid();
+    }
+    let value_id = m.add_value(
+                                      function_id,
+                                      constant_kind,
+                                      type_id,
+                                      mir_id_invalid(),
+                                      mir_target_none(),
+                                      mir_id_invalid(),
+                                      m.value_source_expr(source_value_id),
+                                      0,
+                                      0,
+                                      int_value,
+                                      "",
+                                      text_value);
+    if (value_id != mir_id_invalid()) {
+        m.set_value_loc(
+                               value_id,
+                               m.value_loc_line(source_value_id),
+                               m.value_loc_col(source_value_id),
+                               m.value_loc_end_line(source_value_id),
+                               m.value_loc_end_col(source_value_id));
+    }
+    return value_id;
+}
+
+fn mir_pass_apply_sccp_plan(m: &mut MirUnit,
+                            ctx: &mut MirPassContext,
+                            plan: MirSccpPlan) -> bool {
+    var instr_id: i32 = 1;
+    while (instr_id <= plan.instr_count) {
+        let constant_kind = plan.instr_kind(instr_id);
+        if (constant_kind != 0) {
+            let old_value = m.instr_value(instr_id);
+            ctx.record_change();
+            let new_value = mir_pass_sccp_add_constant(m,
+                                                       ctx,
+                                                       m.instr_function(instr_id),
+                                                       old_value,
+                                                       constant_kind,
+                                                       plan.instr_value(instr_id));
+            if (new_value == mir_id_invalid()) {
+                ctx.report_error("cannot materialize SCCP instruction constant for #"
+                                 + mir_pass_id_text(instr_id));
+                return false;
+            }
+            if (!m.set_instr_value( instr_id, new_value)) {
+                ctx.report_error("SCCP instruction replacement rejected for #"
+                                 + mir_pass_id_text(instr_id));
+                return false;
+            }
+        }
+        instr_id = instr_id + 1;
+    }
+    var block_id: i32 = 1;
+    while (block_id <= plan.block_count) {
+        let constant_kind2 = plan.block_kind(block_id);
+        if (constant_kind2 != 0) {
+            let old_return = m.block_term_value(block_id);
+            ctx.record_change();
+            let new_return = mir_pass_sccp_add_constant(m,
+                                                        ctx,
+                                                        m.block_function(block_id),
+                                                        old_return,
+                                                        constant_kind2,
+                                                        plan.block_value(block_id));
+            if (new_return == mir_id_invalid()) {
+                ctx.report_error("cannot materialize SCCP return constant for block #"
+                                 + mir_pass_id_text(block_id));
+                return false;
+            }
+            m.set_block_terminator(block_id,
+                                   mir_term_return(),
+                                   new_return,
+                                   mir_id_invalid(),
+                                   mir_id_invalid(),
+                                   mir_id_invalid(),
+                                   m.block_term_aux(block_id));
+        }
+        let target = plan.block_target(block_id);
+        if (target != mir_id_invalid()) {
+            ctx.record_change();
+            m.set_block_terminator(block_id,
+                                   mir_term_goto(),
+                                   mir_id_invalid(),
+                                   target,
+                                   mir_id_invalid(),
+                                   mir_id_invalid(),
+                                   m.block_term_aux(block_id));
+        }
+        block_id = block_id + 1;
+    }
+    return true;
+}
+
+fn mir_pass_run_sccp(m: &mut MirUnit,
+                     ctx: &mut MirPassContext,
+                     function_filter: i32) -> bool {
+    if (!ctx.begin_pass(m.view(), "sccp", mir_analysis_cfg(), 0)) { return false; }
+    let plan = mir_sccp_build_plan(m.view(), ctx.analysis_cache, function_filter, ctx.strict_local_mark);
+    if (!plan.ok) {
+        ctx.report_error("SCCP failed: " + plan.error_message);
+        plan.dispose();
+        ctx.finish_pass(m.view());
+        return false;
+    }
+    let applied = mir_pass_apply_sccp_plan(m, ctx, plan);
+    plan.dispose();
+    ctx.finish_pass(m.view());
+    if (!applied) { return false; }
+    return mir_pass_verify_stage(m.view(), ctx, function_filter, "after sccp");
+}
+
+fn mir_pass_apply_copy_plan(m: MirUnit,
+                            ctx: &mut MirPassContext,
+                            plan: MirCopyPlan) -> bool {
+    if (plan.proposal_states == null || plan.proposal_places == null) { return true; }
+    var value_id: i32 = 1;
+    while (value_id <= plan.value_count) {
+        if (plan.state(value_id) == 1) {
+            let place_id = plan.place(value_id);
+            if (place_id != mir_id_invalid() && m.value_place(value_id) != place_id) {
+                if (!m.set_value_place( value_id, place_id)) {
+                    ctx.report_error("copy propagation replacement rejected for value #"
+                                     + mir_pass_id_text(value_id));
+                    return false;
+                }
+                ctx.record_change();
+            }
+        }
+        value_id = value_id + 1;
+    }
+    return true;
+}
+
+fn mir_pass_run_copy_propagation(m: MirUnit,
+                                  ctx: &mut MirPassContext,
+                                  function_filter: i32) -> bool {
+    // Place retargeting leaves graph edges intact, but only CFG is explicitly
+    // preserved until local/escape analyses have their own invalidation model.
+    if (!ctx.begin_pass(m,
+                        "copy-propagation",
+                        mir_analysis_cfg(),
+                        mir_analysis_cfg())) {
+        return false;
+    }
+    let plan = mir_copy_build_plan(m, ctx.analysis_cache, function_filter, ctx.strict_local_mark);
+    if (!plan.ok) {
+        ctx.report_error("copy propagation failed: " + plan.error_message);
+        plan.dispose();
+        ctx.finish_pass(m);
+        return false;
+    }
+    let applied = mir_pass_apply_copy_plan(m, ctx, plan);
+    let proposed = plan.rewrite_count;
+    let skipped = plan.skipped_functions;
+    plan.dispose();
+    if (!applied) {
+        ctx.finish_pass(m);
+        return false;
+    }
+    if (mir_analysis_audit_enabled()) {
+        let check = mir_copy_build_plan(m, ctx.analysis_cache, function_filter, ctx.strict_local_mark);
+        if (!check.ok) {
+            ctx.report_error("copy propagation idempotence check failed: " + check.error_message);
+        } else if (check.rewrite_count != 0) {
+            ctx.report_error("copy propagation was not idempotent: remaining rewrites="
+                             + mir_pass_id_text(check.rewrite_count));
+        }
+        mir_analysis_audit("copy-prop idempotent="
+                           + (if (check.rewrite_count == 0 && check.ok) { "1" } else { "0" })
+                           + " proposed=" + mir_pass_id_text(proposed)
+                           + " skipped_functions=" + mir_pass_id_text(skipped));
+        check.dispose();
+    }
+    ctx.finish_pass(m);
+    return mir_pass_verify_stage(m,
+                                 ctx,
+                                 function_filter,
+                                 "after copy-propagation");
+}
+
+// This first DCE slice is deliberately narrower than the CFG-purity helper:
+// it never treats target references, calls, aggregates, address formation, or
+// arbitrary local reads as discardable. In particular DCI and native calls
+// stay visible even when their result is unused.
+fn mir_pass_dce_direct_param_read(m: MirUnit, value_id: i32) -> bool {
+    if (value_id < 1 || value_id > m.value_count
+        || m.value_record(value_id) == null
+        || m.value_kind(value_id) != mir_value_read_place()
+        || (m.value_flags(value_id) & mir_value_flag_move_arg()) != 0) {
+        return false;
+    }
+    let place_id = m.value_place(value_id);
+    if (place_id < 1 || place_id > m.place_count
+        || m.place_record(place_id) == null
+        || m.place_kind(place_id) != mir_place_local()
+        || m.place_type(place_id) != m.value_type(value_id)) {
+        return false;
+    }
+    let local_id = m.place_local(place_id);
+    if (local_id < 1 || local_id > m.local_count
+        || m.local_record(local_id) == null
+        || m.local_function(local_id) != m.value_function(value_id)
+        || m.local_place(local_id) != place_id
+        || m.local_type(local_id) != m.value_type(value_id)
+        || (m.local_flags(local_id) & mir_local_flag_param()) == 0) {
+        return false;
+    }
+    let type_kind = hir_type_table_kind(m.types, m.value_type(value_id));
+    return mir_pass_integer_bits(type_kind) > 0
+        || type_kind == ty_RAWPTR();
+}
+
+fn mir_pass_dce_value_is_discardable(m: MirUnit, value_id: i32, depth: i32) -> bool {
+    if (value_id < 1 || value_id > m.value_count || depth > 32
+        || m.value_record(value_id) == null
+        || (m.value_flags(value_id) & mir_value_flag_move_arg()) != 0) {
+        return false;
+    }
+    let kind = m.value_kind(value_id);
+    if (kind == mir_value_const_int()
+        || kind == mir_value_const_bool()
+        || kind == mir_value_const_char()
+        || kind == mir_value_const_float()
+        || kind == mir_value_null()) {
+        return true;
+    }
+    if (kind == mir_value_const_str()) {
+        return m.value_first_arg(value_id) == mir_id_invalid();
+    }
+    if (kind == mir_value_read_place()) {
+        return mir_pass_dce_direct_param_read(m, value_id);
+    }
+    if (kind == mir_value_arg()) {
+        return mir_pass_dce_value_is_discardable(m, m.value_lhs(value_id), depth + 1);
+    }
+    if (kind == mir_value_binary()) {
+        let op = m.value_op(value_id);
+        let safe_op = op == tk_EQEQ() || op == tk_NEQ()
+            || op == tk_LT() || op == tk_LE()
+            || op == tk_GT() || op == tk_GE()
+            || op == tk_AND() || op == tk_OR();
+        return safe_op
+            && mir_pass_dce_value_is_discardable(m, m.value_lhs(value_id), depth + 1)
+            && mir_pass_dce_value_is_discardable(m, m.value_rhs(value_id), depth + 1);
+    }
+    return false;
+}
+
+fn mir_pass_dce_eval_removable(m: MirUnit,
+                                instr_id: i32,
+                                function_filter: i32) -> bool {
+    if (instr_id < 1 || instr_id > m.instr_count
+        || m.instr_record(instr_id) == null
+        || mir_unit_instr_owner_is_removed(&m,  instr_id)
+        || m.instr_kind(instr_id) != mir_instr_eval()) {
+        return false;
+    }
+    if (function_filter != mir_id_invalid()
+        && m.instr_function(instr_id) != function_filter) {
+        return false;
+    }
+    let value_id = m.instr_value(instr_id);
+    return value_id != mir_id_invalid()
+        && m.value_function(value_id) == m.instr_function(instr_id)
+        && mir_pass_dce_value_is_discardable(m, value_id, 0);
+}
+
+fn mir_pass_dce_remaining_evals(m: MirUnit, function_filter: i32) -> i32 {
+    var count: i32 = 0;
+    var instr_id: i32 = 1;
+    while (instr_id <= m.instr_count) {
+        if (mir_pass_dce_eval_removable(m, instr_id, function_filter)) {
+            count = count + 1;
+        }
+        instr_id = instr_id + 1;
+    }
+    return count;
+}
+
+fn mir_pass_run_drop_aware_dce(m: MirUnit,
+                                ctx: &mut MirPassContext,
+                                function_filter: i32) -> bool {
+    // Clearing an eval changes value uses but never changes control-flow.
+    if (!ctx.begin_pass(m,
+                        "drop-aware-dce",
+                        0,
+                        mir_analysis_cfg())) {
+        return false;
+    }
+    var removed: i32 = 0;
+    var dce_ok: bool = true;
+    if (function_filter != mir_id_invalid()) {
+        // Streamed lowering keeps ancestor bodies live in the shared unit, so
+        // a whole-table scan re-walks every frame above this one on every
+        // fixed-point round.  This function's own chains visit exactly the
+        // instructions the filtered scan accepts, in the same increasing-id
+        // order: removed blocks are rejected by the removable check itself.
+        var block_id = m.function_first_block(function_filter);
+        var block_guard: i32 = 0;
+        while (dce_ok && block_id != mir_id_invalid()
+               && block_id >= 1 && block_id <= m.block_count
+               && block_guard <= m.block_count) {
+            if ((m.block_flags(block_id) & mir_block_flag_removed()) == 0) {
+                var instr_id = m.block_first_instr(block_id);
+                var instr_guard: i32 = 0;
+                while (dce_ok && instr_id != mir_id_invalid()
+                       && instr_id >= 1 && instr_id <= m.instr_count
+                       && instr_guard <= m.instr_count) {
+                    if (mir_pass_dce_eval_removable(m, instr_id, function_filter)) {
+                        if (!m.clear_eval_instr_value( instr_id)) {
+                            ctx.report_error("cannot clear dead eval instruction #"
+                                             + mir_pass_id_text(instr_id));
+                            dce_ok = false;
+                        } else {
+                            ctx.record_change();
+                            removed = removed + 1;
+                        }
+                    }
+                    instr_id = m.instr_next(instr_id);
+                    instr_guard = instr_guard + 1;
+                }
+            }
+            block_id = m.block_next(block_id);
+            block_guard = block_guard + 1;
+        }
+    } else {
+        var instr_id: i32 = 1;
+        while (dce_ok && instr_id <= m.instr_count) {
+            if (mir_pass_dce_eval_removable(m, instr_id, function_filter)) {
+                if (!m.clear_eval_instr_value( instr_id)) {
+                    ctx.report_error("cannot clear dead eval instruction #"
+                                     + mir_pass_id_text(instr_id));
+                    dce_ok = false;
+                } else {
+                    ctx.record_change();
+                    removed = removed + 1;
+                }
+            }
+            instr_id = instr_id + 1;
+        }
+    }
+    if (!dce_ok) {
+        ctx.finish_pass(m);
+        return false;
+    }
+    if (mir_analysis_audit_enabled()) {
+        let remaining = mir_pass_dce_remaining_evals(m, function_filter);
+        if (remaining != 0) {
+            ctx.report_error("drop-aware DCE was not idempotent: remaining evals="
+                             + mir_pass_id_text(remaining));
+        }
+        mir_analysis_audit("drop-aware-dce removed=" + mir_pass_id_text(removed)
+                           + " idempotent=" + (if (remaining == 0) { "1" } else { "0" }));
+    }
+    ctx.finish_pass(m);
+    return mir_pass_verify_stage(m,
+                                 ctx,
+                                 function_filter,
+                                 "after drop-aware-dce");
+}
+
+fn mir_pass_select_max_candidates() -> i32 { return 250000; }
+
+fn mir_pass_select_alloc_i32(count: i32) -> rawptr {
+    if (count < 1 || count > mir_pass_select_max_candidates()) { return null; }
+    let bytes = ((count as i64) * 4) as u64;
+    let out = malloc(bytes);
+    if (out != null) { memset(out, 0, bytes); }
+    return out;
+}
+
+fn mir_pass_select_get_i32(values: rawptr, index: i32) -> i32 {
+    if (values == null || index < 0) { return mir_id_invalid(); }
+    return ast_read_i32(ptr_offset(values, index * 4));
+}
+
+fn mir_pass_select_set_i32(values: rawptr, index: i32, value: i32) {
+    if (values != null && index >= 0) {
+        ast_write_i32(ptr_offset(values, index * 4), value);
+    }
+}
+
+class MirSelectPlan {
+    public branch_blocks: rawptr
+    public result_places: rawptr
+    public cond_values: rawptr
+    public then_values: rawptr
+    public else_values: rawptr
+    public join_blocks: rawptr
+    public count: i32
+    public capacity: i32
+    public ok: bool
+    public skipped: bool
+
+    public static fn create(m: MirUnit) -> MirSelectPlan {
+        if (m.block_count < 1 || m.block_count > mir_pass_select_max_candidates()) {
+            return MirSelectPlan {
+                branch_blocks: null,
+                result_places: null,
+                cond_values: null,
+                then_values: null,
+                else_values: null,
+                join_blocks: null,
+                count: 0,
+                capacity: 0,
+                ok: true,
+                skipped: true
+            };
+        }
+        var plan = MirSelectPlan {
+            branch_blocks: mir_pass_select_alloc_i32(m.block_count),
+            result_places: mir_pass_select_alloc_i32(m.block_count),
+            cond_values: mir_pass_select_alloc_i32(m.block_count),
+            then_values: mir_pass_select_alloc_i32(m.block_count),
+            else_values: mir_pass_select_alloc_i32(m.block_count),
+            join_blocks: mir_pass_select_alloc_i32(m.block_count),
+            count: 0,
+            capacity: m.block_count,
+            ok: true,
+            skipped: false
+        };
+        if (plan.branch_blocks == null || plan.result_places == null
+            || plan.cond_values == null || plan.then_values == null
+            || plan.else_values == null || plan.join_blocks == null) {
+            plan.ok = false;
+        }
+        return plan;
+    }
+
+    public fn append(self,
+                     branch_block: i32,
+                     result_place: i32,
+                     cond_value: i32,
+                     then_value: i32,
+                     else_value: i32,
+                     join_block: i32) -> bool {
+        if (!self.ok || self.count < 0 || self.count >= self.capacity) {
+            self.ok = false;
+            return false;
+        }
+        mir_pass_select_set_i32(self.branch_blocks, self.count, branch_block);
+        mir_pass_select_set_i32(self.result_places, self.count, result_place);
+        mir_pass_select_set_i32(self.cond_values, self.count, cond_value);
+        mir_pass_select_set_i32(self.then_values, self.count, then_value);
+        mir_pass_select_set_i32(self.else_values, self.count, else_value);
+        mir_pass_select_set_i32(self.join_blocks, self.count, join_block);
+        self.count = self.count + 1;
+        return true;
+    }
+
+    public fn dispose(self) {
+        if (self.branch_blocks != null) { free(self.branch_blocks); self.branch_blocks = null; }
+        if (self.result_places != null) { free(self.result_places); self.result_places = null; }
+        if (self.cond_values != null) { free(self.cond_values); self.cond_values = null; }
+        if (self.then_values != null) { free(self.then_values); self.then_values = null; }
+        if (self.else_values != null) { free(self.else_values); self.else_values = null; }
+        if (self.join_blocks != null) { free(self.join_blocks); self.join_blocks = null; }
+        self.count = 0;
+        self.capacity = 0;
+    }
+}
+
+fn mir_pass_select_type_is_scalar(m: MirUnit, type_id: i32) -> bool {
+    if (type_id == mir_id_invalid()) { return false; }
+    let kind = hir_type_table_kind(m.types, type_id);
+    return mir_pass_integer_bits(kind) > 0 || kind == ty_RAWPTR();
+}
+
+fn mir_pass_select_direct_param_read(m: MirUnit,
+                                     function_id: i32,
+                                     value_id: i32,
+                                     expected_type: i32) -> bool {
+    if (value_id < 1 || value_id > m.value_count
+        || m.value_record(value_id) == null
+        || m.value_kind(value_id) != mir_value_read_place()
+        || m.value_function(value_id) != function_id
+        || m.value_type(value_id) != expected_type
+        || (m.value_flags(value_id) & mir_value_flag_move_arg()) != 0) {
+        return false;
+    }
+    let place_id = m.value_place(value_id);
+    if (place_id < 1 || place_id > m.place_count
+        || m.place_record(place_id) == null
+        || m.place_function(place_id) != function_id
+        || m.place_kind(place_id) != mir_place_local()
+        || m.place_type(place_id) != expected_type) {
+        return false;
+    }
+    let local_id = m.place_local(place_id);
+    if (local_id < 1 || local_id > m.local_count
+        || m.local_record(local_id) == null
+        || m.local_function(local_id) != function_id
+        || m.local_place(local_id) != place_id
+        || m.local_type(local_id) != expected_type) {
+        return false;
+    }
+    let flags = m.local_flags(local_id);
+    return (flags & mir_local_flag_param()) != 0
+        && (flags & mir_local_flag_capture()) == 0
+        && (flags & mir_local_flag_reference_capture()) == 0
+        && (flags & mir_local_flag_auto_drop()) == 0
+        && (flags & mir_local_flag_move_arg()) == 0
+        && (flags & mir_local_flag_self_receiver()) == 0;
+}
+
+fn mir_pass_select_arm_is_speculatable(m: MirUnit,
+                                       function_id: i32,
+                                       value_id: i32,
+                                       expected_type: i32) -> bool {
+    if (value_id < 1 || value_id > m.value_count
+        || m.value_record(value_id) == null
+        || m.value_function(value_id) != function_id
+        || m.value_type(value_id) != expected_type
+        || (m.value_flags(value_id) & mir_value_flag_move_arg()) != 0) {
+        return false;
+    }
+    let kind = m.value_kind(value_id);
+    let type_kind = hir_type_table_kind(m.types, expected_type);
+    if (kind == mir_value_const_int()) { return mir_pass_integer_bits(type_kind) > 0; }
+    if (kind == mir_value_const_bool()) { return type_kind == ty_BOOL(); }
+    if (kind == mir_value_null()) { return type_kind == ty_RAWPTR(); }
+    return mir_pass_select_direct_param_read(m, function_id, value_id, expected_type);
+}
+
+fn mir_pass_select_result_place(m: MirUnit,
+                                function_id: i32,
+                                place_id: i32) -> bool {
+    if (place_id < 1 || place_id > m.place_count
+        || m.place_record(place_id) == null
+        || m.place_function(place_id) != function_id
+        || m.place_kind(place_id) != mir_place_local()) {
+        return false;
+    }
+    let local_id = m.place_local(place_id);
+    if (local_id < 1 || local_id > m.local_count
+        || m.local_record(local_id) == null
+        || m.local_function(local_id) != function_id
+        || m.local_place(local_id) != place_id
+        || m.local_type(local_id) != m.place_type(place_id)
+        || !mir_pass_select_type_is_scalar(m, m.place_type(place_id))) {
+        return false;
+    }
+    let flags = m.local_flags(local_id);
+    return (flags & mir_local_flag_if_expr_result()) != 0
+        && (flags & mir_local_flag_capture()) == 0
+        && (flags & mir_local_flag_reference_capture()) == 0
+        && (flags & mir_local_flag_auto_drop()) == 0
+        && (flags & mir_local_flag_move_arg()) == 0
+        && (flags & mir_local_flag_self_receiver()) == 0;
+}
+
+fn mir_pass_select_single_arm(m: MirUnit,
+                              function_id: i32,
+                              block_id: i32,
+                              result_place: i32,
+                              join_block: i32) -> i32 {
+    if (!mir_pass_cfg_block_active(m, function_id, block_id)
+        || m.block_instr_count(block_id) != 1
+        || m.block_first_instr(block_id) != m.block_last_instr(block_id)
+        || m.block_term_kind(block_id) != mir_term_goto()
+        || m.block_term_target(block_id) != join_block) {
+        return mir_id_invalid();
+    }
+    let instr_id = m.block_first_instr(block_id);
+    if (instr_id < 1 || instr_id > m.instr_count
+        || m.instr_record(instr_id) == null
+        || m.instr_kind(instr_id) != mir_instr_assign()
+        || m.instr_place(instr_id) != result_place
+        || m.instr_function(instr_id) != function_id
+        || m.instr_type(instr_id) != m.place_type(result_place)) {
+        return mir_id_invalid();
+    }
+    return m.instr_value(instr_id);
+}
+
+fn mir_pass_select_candidate(m: MirUnit,
+                             cache: MirAnalysisCache,
+                             function_filter: i32,
+                             branch_block: i32,
+                             plan: &mut MirSelectPlan) {
+    if (branch_block < 1 || branch_block > m.block_count
+        || m.block_record(branch_block) == null
+        || m.block_is_removed( branch_block)
+        || m.block_term_kind(branch_block) != mir_term_branch()) {
+        return;
+    }
+    let function_id = m.block_function(branch_block);
+    if (function_filter != mir_id_invalid() && function_id != function_filter) { return; }
+    let then_block = m.block_term_target(branch_block);
+    let else_block = m.block_term_false(branch_block);
+    let cond_value = m.block_term_value(branch_block);
+    if (then_block == else_block || cond_value < 1 || cond_value > m.value_count
+        || m.value_record(cond_value) == null
+        || m.value_function(cond_value) != function_id
+        || !mir_pass_cfg_block_active(m, function_id, then_block)
+        || !mir_pass_cfg_block_active(m, function_id, else_block)
+        || cache.cfg_predecessor_count(then_block) != 1
+        || cache.cfg_predecessor_at(then_block, 0) != branch_block
+        || cache.cfg_predecessor_count(else_block) != 1
+        || cache.cfg_predecessor_at(else_block, 0) != branch_block) {
+        return;
+    }
+    let join_block = m.block_term_target(then_block);
+    if (join_block == mir_id_invalid() || join_block != m.block_term_target(else_block)
+        || !mir_pass_cfg_block_active(m, function_id, join_block)
+        || cache.cfg_predecessor_count(join_block) != 2) {
+        return;
+    }
+    let first_pred = cache.cfg_predecessor_at(join_block, 0);
+    let second_pred = cache.cfg_predecessor_at(join_block, 1);
+    if (!((first_pred == then_block && second_pred == else_block)
+          || (first_pred == else_block && second_pred == then_block))) {
+        return;
+    }
+    let then_instr = m.block_first_instr(then_block);
+    if (then_instr == mir_id_invalid()) { return; }
+    let result_place = m.instr_place(then_instr);
+    if (!mir_pass_select_result_place(m, function_id, result_place)) { return; }
+    let then_value = mir_pass_select_single_arm(m,
+                                                function_id,
+                                                then_block,
+                                                result_place,
+                                                join_block);
+    let else_value = mir_pass_select_single_arm(m,
+                                                function_id,
+                                                else_block,
+                                                result_place,
+                                                join_block);
+    let result_type = m.place_type(result_place);
+    if (then_value == mir_id_invalid() || else_value == mir_id_invalid()
+        || !mir_pass_select_arm_is_speculatable(m, function_id, then_value, result_type)
+        || !mir_pass_select_arm_is_speculatable(m, function_id, else_value, result_type)) {
+        return;
+    }
+    plan.append(branch_block,
+                result_place,
+                cond_value,
+                then_value,
+                else_value,
+                join_block);
+}
+
+fn mir_pass_select_build_plan(m: MirUnit,
+                              cache: MirAnalysisCache,
+                              function_filter: i32) -> MirSelectPlan {
+    var plan = MirSelectPlan.create(m);
+    if (!plan.ok || plan.skipped) { return plan; }
+    var block_id: i32 = 1;
+    while (block_id <= m.block_count && plan.ok) {
+        mir_pass_select_candidate(m, cache, function_filter, block_id, &mut plan);
+        block_id = block_id + 1;
+    }
+    return plan;
+}
+
+fn mir_pass_select_apply_plan(m: &mut MirUnit,
+                              ctx: &mut MirPassContext,
+                              plan: MirSelectPlan) -> bool {
+    var index: i32 = 0;
+    while (index < plan.count) {
+        let branch_block = mir_pass_select_get_i32(plan.branch_blocks, index);
+        let result_place = mir_pass_select_get_i32(plan.result_places, index);
+        let cond_value = mir_pass_select_get_i32(plan.cond_values, index);
+        let then_value = mir_pass_select_get_i32(plan.then_values, index);
+        let else_value = mir_pass_select_get_i32(plan.else_values, index);
+        let join_block = mir_pass_select_get_i32(plan.join_blocks, index);
+        let function_id = m.block_function(branch_block);
+        let result_type = m.place_type(result_place);
+        let source_expr = m.value_source_expr(cond_value);
+        if (!ctx.fixed_point_reserve_growth(m.view(), 1, 1, "select formation")) {
+            return false;
+        }
+        let select_value = m.add_value(
+                                              function_id,
+                                              mir_value_control_result(),
+                                              result_type,
+                                              mir_id_invalid(),
+                                              mir_target_none(),
+                                              mir_id_invalid(),
+                                              source_expr,
+                                              0,
+                                              0,
+                                              0,
+                                              "",
+                                              "");
+        if (select_value == mir_id_invalid()) {
+            ctx.report_error("cannot materialize select value for block #"
+                             + mir_pass_id_text(branch_block));
+            return false;
+        }
+        m.set_value_lhs( select_value, cond_value);
+        m.set_value_rhs( select_value, then_value);
+        m.set_value_aux( select_value, else_value);
+        m.set_value_loc(
+                               select_value,
+                               m.value_loc_line(cond_value),
+                               m.value_loc_col(cond_value),
+                               m.value_loc_end_line(cond_value),
+                               m.value_loc_end_col(cond_value));
+        let instr_id = m.add_instr(
+                                          function_id,
+                                          branch_block,
+                                          mir_instr_assign(),
+                                          result_type,
+                                          result_place,
+                                          select_value,
+                                          mir_id_invalid(),
+                                          mir_id_invalid(),
+                                          mir_target_none(),
+                                          mir_id_invalid(),
+                                          m.block_source_stmt(branch_block),
+                                          source_expr,
+                                          0,
+                                          0,
+                                          "ifexpr.select");
+        if (instr_id == mir_id_invalid()) {
+            ctx.report_error("cannot materialize select assignment for block #"
+                             + mir_pass_id_text(branch_block));
+            return false;
+        }
+        m.set_block_terminator(
+                                      branch_block,
+                                      mir_term_goto(),
+                                      mir_id_invalid(),
+                                      join_block,
+                                      mir_id_invalid(),
+                                      mir_id_invalid(),
+                                      mir_id_invalid());
+        ctx.record_change();
+        index = index + 1;
+    }
+    return true;
+}
+
+fn mir_pass_run_select_formation(m: &mut MirUnit,
+                                  ctx: &mut MirPassContext,
+                                  function_filter: i32) -> bool {
+    if (!ctx.begin_pass(m.view(), "select-formation", mir_analysis_cfg(), 0)) { return false; }
+    let plan = mir_pass_select_build_plan(m.view(), ctx.analysis_cache, function_filter);
+    if (!plan.ok) {
+        ctx.report_error("cannot allocate select formation plan");
+        plan.dispose();
+        ctx.finish_pass(m.view());
+        return false;
+    }
+    let candidate_count = plan.count;
+    let applied = mir_pass_select_apply_plan(m, ctx, plan);
+    let skipped = plan.skipped;
+    plan.dispose();
+    if (!applied) {
+        ctx.finish_pass(m.view());
+        return false;
+    }
+    if (mir_analysis_audit_enabled()) {
+        if (!ctx.analysis_cache.ensure(m.view(), mir_analysis_cfg())) {
+            ctx.report_error("cannot rebuild CFG for select formation audit: "
+                             + ctx.analysis_cache.error_message);
+        } else {
+            let check = mir_pass_select_build_plan(m.view(), ctx.analysis_cache, function_filter);
+            if (!check.ok) {
+                ctx.report_error("select formation idempotence plan allocation failed");
+            } else if (check.count != 0) {
+                ctx.report_error("select formation was not idempotent: remaining candidates="
+                                 + mir_pass_id_text(check.count));
+            }
+            mir_analysis_audit("select-formation candidates="
+                               + mir_pass_id_text(candidate_count)
+                               + " skipped=" + (if (skipped) { "1" } else { "0" })
+                               + " idempotent="
+                               + (if (check.ok && check.count == 0) { "1" } else { "0" }));
+            check.dispose();
+        }
+    }
+    ctx.finish_pass(m.view());
+    return mir_pass_verify_stage(m.view(),
+                                 ctx,
+                                 function_filter,
+                                 "after select-formation");
+}
+
+fn mir_pass_run_cfg_simplify(m: MirUnit,
+                             ctx: &mut MirPassContext,
+                             function_filter: i32) -> bool {
+    if (!ctx.begin_pass(m, "cfg-simplify", 0, 0)) { return false; }
+    if (function_filter != mir_id_invalid()) {
+        if (!mir_pass_cfg_simplify_function(m, ctx, function_filter)) {
+            ctx.finish_pass(m);
+            return false;
+        }
+    } else {
+        var function_id: i32 = 1;
+        while (function_id <= m.function_count) {
+            if (!mir_pass_cfg_simplify_function(m, ctx, function_id)) {
+                ctx.finish_pass(m);
+                return false;
+            }
+            function_id = function_id + 1;
+        }
+    }
+    ctx.finish_pass(m);
+    return mir_pass_verify_stage(m,
+                                 ctx,
+                                 function_filter,
+                                 "after cfg-simplify");
+}
+
+fn mir_pass_run_pipeline_round(m: &mut MirUnit,
+                               ctx: &mut MirPassContext,
+                               function_filter: i32) -> bool {
+    var t0: i64 = vyx_bootstrap_now_ms();
+    let fold_ok = mir_pass_run_constant_fold(m.view(), ctx, function_filter);
+    g_mir_pass_fold_ms = g_mir_pass_fold_ms + (vyx_bootstrap_now_ms() - t0);
+    if (!fold_ok) { return false; }
+    t0 = vyx_bootstrap_now_ms();
+    let branches_ok = mir_pass_run_constant_branches(m.view(), ctx, function_filter);
+    g_mir_pass_branches_ms = g_mir_pass_branches_ms + (vyx_bootstrap_now_ms() - t0);
+    if (!branches_ok) { return false; }
+    t0 = vyx_bootstrap_now_ms();
+    let sccp_ok = mir_pass_run_sccp(m, ctx, function_filter);
+    g_mir_pass_sccp_ms = g_mir_pass_sccp_ms + (vyx_bootstrap_now_ms() - t0);
+    if (!sccp_ok) { return false; }
+    t0 = vyx_bootstrap_now_ms();
+    let copy_ok = mir_pass_run_copy_propagation(m.view(), ctx, function_filter);
+    g_mir_pass_copy_ms = g_mir_pass_copy_ms + (vyx_bootstrap_now_ms() - t0);
+    if (!copy_ok) { return false; }
+    t0 = vyx_bootstrap_now_ms();
+    let dce_ok = mir_pass_run_drop_aware_dce(m.view(), ctx, function_filter);
+    g_mir_pass_dce_ms = g_mir_pass_dce_ms + (vyx_bootstrap_now_ms() - t0);
+    if (!dce_ok) { return false; }
+    t0 = vyx_bootstrap_now_ms();
+    let select_ok = mir_pass_run_select_formation(m, ctx, function_filter);
+    g_mir_pass_select_ms = g_mir_pass_select_ms + (vyx_bootstrap_now_ms() - t0);
+    if (!select_ok) { return false; }
+    t0 = vyx_bootstrap_now_ms();
+    let cfg_ok = mir_pass_run_cfg_simplify(m.view(), ctx, function_filter);
+    g_mir_pass_cfg_ms = g_mir_pass_cfg_ms + (vyx_bootstrap_now_ms() - t0);
+    return cfg_ok;
+}
+
+fn mir_pass_pipeline_scope_text(function_filter: i32) -> string {
+    if (function_filter == mir_id_invalid()) { return "unit"; }
+    return "function";
+}
+
+fn mir_pass_run_to_fixed_point(m: &mut MirUnit,
+                                ctx: &mut MirPassContext,
+                                function_filter: i32) -> bool {
+    let scope = mir_pass_pipeline_scope_text(function_filter);
+    let max_rounds: i32 = 4;
+    ctx.begin_fixed_point_budget(m.view());
+    var round: i32 = 1;
+    while (round <= max_rounds) {
+        let changes_before = ctx.changes;
+        ctx.function_id = function_filter;
+        if (!mir_pass_run_pipeline_round(m, ctx, function_filter)) {
+            ctx.end_fixed_point_budget();
+            return false;
+        }
+        if (!ctx.verify_fixed_point_budget(m.view(), "pipeline round " + mir_pass_id_text(round))) {
+            ctx.end_fixed_point_budget();
+            return false;
+        }
+        let round_changes = ctx.changes - changes_before;
+        mir_analysis_audit("pipeline scope=" + scope
+                           + " round=" + mir_pass_id_text(round)
+                           + " changes=" + mir_pass_id_text(round_changes)
+                           + " values=" + mir_pass_id_text(m.value_count)
+                           + " instrs=" + mir_pass_id_text(m.instr_count)
+                           + " blocks=" + mir_pass_id_text(m.block_count));
+        if (round_changes == 0) {
+            mir_analysis_audit("pipeline fixed-point scope=" + scope
+                               + " rounds=" + mir_pass_id_text(round));
+            ctx.end_fixed_point_budget();
+            return true;
+        }
+        round = round + 1;
+    }
+    ctx.report_error("MIR pass fixed-point limit exceeded for " + scope
+                     + " pipeline after " + mir_pass_id_text(max_rounds) + " rounds");
+    ctx.end_fixed_point_budget();
+    return false;
+}
+
+public fn mir_run_function_pass_pipeline(m: &mut MirUnit,
+                                         function_id: i32,
+                                         opt_level: i32,
+                                         strict_verify: bool,
+                                         block_mark: i32,
+                                         local_mark: i32,
+                                         place_mark: i32,
+                                         value_mark: i32,
+                                         instr_mark: i32,
+                                         case_mark: i32) -> i32 {
+    var ctx = MirPassContext.create(opt_level,
+                                    function_id,
+                                    strict_verify,
+                                    block_mark,
+                                    local_mark,
+                                    place_mark,
+                                    value_mark,
+                                    instr_mark,
+                                    case_mark);
+    if (!mir_pass_verify_stage(m.view(), &mut ctx, function_id, "pipeline input")) {
+        let errors = ctx.errors;
+        ctx.dispose();
+        return errors;
+    }
+    let dci_errors = mir_verify_dci_storage_contract_function(m.view(),
+                                                               function_id,
+                                                               value_mark,
+                                                               instr_mark);
+    if (dci_errors > 0) {
+        ctx.errors = ctx.errors + dci_errors;
+        let errors2 = ctx.errors;
+        ctx.dispose();
+        return errors2;
+    }
+    if (ctx.opt_level > 0) {
+        if (!mir_pass_run_to_fixed_point(m, &mut ctx, function_id)) {
+            let errors3 = ctx.errors;
+            ctx.dispose();
+            return errors3;
+        }
+    }
+    let errors4 = ctx.errors;
+    ctx.dispose();
+    return errors4;
+}
+
+public fn mir_run_unit_pass_pipeline(m: &mut MirUnit,
+                                     opt_level: i32,
+                                     strict_verify: bool) -> i32 {
+    var ctx = MirPassContext.create(opt_level,
+                                    mir_id_invalid(),
+                                    strict_verify,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0);
+    if (!mir_pass_verify_stage(m.view(), &mut ctx, mir_id_invalid(), "pipeline input")) {
+        let errors = ctx.errors;
+        ctx.dispose();
+        return errors;
+    }
+    let dci_errors = mir_verify_dci_storage_contract_unit(m.view());
+    if (dci_errors > 0) {
+        ctx.errors = ctx.errors + dci_errors;
+        let errors2 = ctx.errors;
+        ctx.dispose();
+        return errors2;
+    }
+    if (ctx.opt_level > 0) {
+        // Values from every function share one dense table in materialized
+        // MIR. Scan it once per fixed-point round instead of once per
+        // function, which avoids the previous F * V project cost.
+        if (!mir_pass_run_to_fixed_point(m, &mut ctx, mir_id_invalid())) {
+            let errors3 = ctx.errors;
+            ctx.dispose();
+            return errors3;
+        }
+    }
+    let errors4 = ctx.errors;
+    ctx.dispose();
+    return errors4;
+}

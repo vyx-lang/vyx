@@ -1,0 +1,1044 @@
+module Zyn.App;
+
+use std.collections;
+
+// ---------------------------------------------------------------------------
+// ZC-15 routing and window lifecycle
+//
+// `Navigator` already knows how to hold a stack; what it does not know is how a
+// path turns into a scene, where a route's parameters live, what happens when a
+// window is closed with unsaved work, or how to come back after the process was
+// suspended. This module is that missing half, and it keeps three boundaries:
+//
+//   * the *route table* maps a path pattern to a scene. Patterns carry `:name`
+//     parameters, matching prefers a literal segment over a parameter so that
+//     `/users/me` does not fall into `/users/:id`, and the extracted parameters
+//     land in resources keyed by route.
+//
+//   * a *window* is a descriptor (id, title, route, document, dirty). The
+//     per-window `Navigator` object stays with the application, because that is
+//     the object the application already owns; the framework's job is to tell it
+//     when to move, and to refuse to close a window whose document is dirty
+//     until the user has said so.
+//
+//   * a *session* is the flat, serialisable form of "what was open". Background
+//     restore is therefore a save and a load, not a special case.
+//
+// Every collection here is resource backed rather than a `Vec` field, for the
+// same reason as the rest of the App layer: a shallow copy of a class must not
+// share a buffer with the original.
+// ---------------------------------------------------------------------------
+
+public fn appWindowOpened() -> i32 { return 1; }
+public fn appWindowClosed() -> i32 { return 2; }
+public fn appWindowActivated() -> i32 { return 3; }
+public fn appWindowDeactivated() -> i32 { return 4; }
+public fn appWindowCloseRequested() -> i32 { return 5; }
+public fn appWindowCloseCancelled() -> i32 { return 6; }
+public fn appWindowBackgrounded() -> i32 { return 7; }
+public fn appWindowForegrounded() -> i32 { return 8; }
+
+public fn appSessionForeground() -> i32 { return 0; }
+public fn appSessionBackground() -> i32 { return 1; }
+
+// ---------------------------------------------------------------------------
+// Route patterns
+// ---------------------------------------------------------------------------
+
+// A pattern is a `/`-separated path where a segment starting with `:` is a
+// parameter. `AppRoutePattern` is pure: no world, no resources, which makes it
+// the one part of routing that is trivially testable.
+public class AppRoutePattern {
+    public static fn segmentCount(pattern: string) -> i32 {
+        if (pattern.len == 0) { return 0; }
+        var count: i32 = 0;
+        var i: i32 = 0;
+        var in_segment: bool = false;
+        while (i < (pattern.len as i32)) {
+            let code = pattern.charAt(i as i64);
+            if (code == 47) { in_segment = false; }
+            else if (!in_segment) { count = count + 1; in_segment = true; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public static fn segmentAt(pattern: string, index: i32) -> string {
+        var current: i32 = 0;
+        var start: i32 = -1;
+        var i: i32 = 0;
+        let len = pattern.len as i32;
+        while (i <= len) {
+            var at_end = i == len;
+            var code: i32 = 0;
+            if (!at_end) { code = pattern.charAt(i as i64); }
+            if (at_end || code == 47) {
+                if (start >= 0) {
+                    if (current == index) { return pattern.substring(start as i64, i as i64); }
+                    current = current + 1;
+                    start = -1;
+                }
+            } else if (start < 0) {
+                start = i;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public static fn isParam(pattern: string, index: i32) -> bool {
+        let segment = AppRoutePattern.segmentAt(pattern, index);
+        if (segment.len == 0) { return false; }
+        return segment.charAt(0) == 58;
+    }
+
+    public static fn paramName(pattern: string, index: i32) -> string {
+        let segment = AppRoutePattern.segmentAt(pattern, index);
+        if (segment.len < 2 || segment.charAt(0) != 58) { return ""; }
+        return segment.substring(1, segment.len as i64);
+    }
+
+    // Splits `path?query` so that matching only ever sees the path.
+    public static fn pathOnly(target: string) -> string {
+        let question = AppDocumentEnvelope.indexOf(target, 63, 0);
+        if (question < 0) { return target; }
+        return target.substring(0, question as i64);
+    }
+
+    public static fn queryOnly(target: string) -> string {
+        let question = AppDocumentEnvelope.indexOf(target, 63, 0);
+        if (question < 0) { return ""; }
+        return target.substring((question + 1) as i64, target.len as i64);
+    }
+
+    // Matches a pattern against a path and returns the parameters as a flat
+    // `name=value` list. An empty string means "no match"; a match with no
+    // parameters also returns an empty string, so callers must use `matches`
+    // when they need the distinction.
+    public static fn matches(pattern: string, path: string) -> bool {
+        let pattern_segments = AppRoutePattern.segmentCount(pattern);
+        let path_segments = AppRoutePattern.segmentCount(AppRoutePattern.pathOnly(path));
+        if (pattern_segments != path_segments) { return false; }
+        let clean = AppRoutePattern.pathOnly(path);
+        var i: i32 = 0;
+        while (i < pattern_segments) {
+            if (!AppRoutePattern.isParam(pattern, i)) {
+                if (AppRoutePattern.segmentAt(pattern, i) != AppRoutePattern.segmentAt(clean, i)) { return false; }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    public static fn extract(pattern: string, path: string) -> string {
+        let clean = AppRoutePattern.pathOnly(path);
+        let count = AppRoutePattern.segmentCount(pattern);
+        var out = "";
+        var written: i32 = 0;
+        var i: i32 = 0;
+        while (i < count) {
+            if (AppRoutePattern.isParam(pattern, i)) {
+                if (written > 0) { out = out + "\n"; }
+                out = out + AppRoutePattern.paramName(pattern, i) + "=" + AppRoutePattern.segmentAt(clean, i);
+                written = written + 1;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // A literal segment is worth more than a parameter, and an earlier literal
+    // beats a later one, which is what makes `/users/me` win over `/users/:id`
+    // regardless of registration order.
+    public static fn specificity(pattern: string) -> i32 {
+        let count = AppRoutePattern.segmentCount(pattern);
+        var score: i32 = 0;
+        var weight: i32 = 1000;
+        var i: i32 = 0;
+        while (i < count) {
+            if (!AppRoutePattern.isParam(pattern, i)) { score = score + weight; }
+            weight = weight / 4;
+            if (weight < 1) { weight = 1; }
+            i = i + 1;
+        }
+        return score;
+    }
+
+    // Fills a pattern's parameters from a `name=value` list, producing a
+    // concrete path. A parameter with no value becomes empty rather than being
+    // dropped, so the path keeps its shape.
+    public static fn build(pattern: string, params: string) -> string {
+        let count = AppRoutePattern.segmentCount(pattern);
+        var out = "";
+        var i: i32 = 0;
+        while (i < count) {
+            out = out + "/";
+            if (AppRoutePattern.isParam(pattern, i)) {
+                out = out + AppRoutePattern.paramValue(params, AppRoutePattern.paramName(pattern, i));
+            } else {
+                out = out + AppRoutePattern.segmentAt(pattern, i);
+            }
+            i = i + 1;
+        }
+        if (out.len == 0) { return "/"; }
+        return out;
+    }
+
+    public static fn paramValue(params: string, name: string) -> string {
+        let count = AppRouteParamList.count(params);
+        var i: i32 = 0;
+        while (i < count) {
+            if (AppRouteParamList.nameAt(params, i) == name) { return AppRouteParamList.valueAt(params, i); }
+            i = i + 1;
+        }
+        return "";
+    }
+}
+
+// A flat `name=value` list, newline separated. Used for both route parameters
+// and query strings so there is one parser instead of two.
+public class AppRouteParamList {
+    public static fn count(params: string) -> i32 {
+        if (params.len == 0) { return 0; }
+        var count: i32 = 1;
+        var i: i32 = 0;
+        while (i < (params.len as i32)) {
+            if (params.charAt(i as i64) == 10) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public static fn entryAt(params: string, index: i32) -> string {
+        var current: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        let len = params.len as i32;
+        while (i <= len) {
+            var at_end = i == len;
+            var code: i32 = 0;
+            if (!at_end) { code = params.charAt(i as i64); }
+            if (at_end || code == 10) {
+                if (current == index) { return params.substring(start as i64, i as i64); }
+                current = current + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public static fn nameAt(params: string, index: i32) -> string {
+        let entry = AppRouteParamList.entryAt(params, index);
+        let equals = AppDocumentEnvelope.indexOf(entry, 61, 0);
+        if (equals < 0) { return entry; }
+        return entry.substring(0, equals as i64);
+    }
+
+    public static fn valueAt(params: string, index: i32) -> string {
+        let entry = AppRouteParamList.entryAt(params, index);
+        let equals = AppDocumentEnvelope.indexOf(entry, 61, 0);
+        if (equals < 0) { return ""; }
+        return entry.substring((equals + 1) as i64, entry.len as i64);
+    }
+
+    public static fn value(params: string, name: string) -> string {
+        return AppRoutePattern.paramValue(params, name);
+    }
+
+    // `a=1&b=2` -> `a=1\nb=2`. Percent-decoding is applied so that a query
+    // value survives the round trip through a URL.
+    public static fn parseQuery(query: string) -> string {
+        if (query.len == 0) { return ""; }
+        var out = "";
+        var written: i32 = 0;
+        var current = "";
+        var i: i32 = 0;
+        while (i <= (query.len as i32)) {
+            var at_end = i == (query.len as i32);
+            var code: i32 = 0;
+            if (!at_end) { code = query.charAt(i as i64); }
+            if (at_end || code == 38) {
+                if (current.len > 0) {
+                    if (written > 0) { out = out + "\n"; }
+                    out = out + AppUrl.decodeComponent(current);
+                    written = written + 1;
+                }
+                current = "";
+            } else {
+                current = current + query.substring(i as i64, (i + 1) as i64);
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+// The route table. `match` writes the extracted parameters into resources so
+// that a `Component.view(world)` can read `AppRouter.param(world, owner, "id")`
+// without being handed a second argument.
+public class AppRouter {
+    public static fn patternListKey(owner: string) -> string { return "router:" + owner + ":patterns"; }
+    public static fn sceneListKey(owner: string) -> string { return "router:" + owner + ":scenes"; }
+    public static fn titleListKey(owner: string) -> string { return "router:" + owner + ":titles"; }
+    public static fn paramNamesKey(owner: string) -> string { return "router:" + owner + ":param_names"; }
+    public static fn paramValuesKey(owner: string) -> string { return "router:" + owner + ":param_values"; }
+    public static fn queryNamesKey(owner: string) -> string { return "router:" + owner + ":query_names"; }
+    public static fn queryValuesKey(owner: string) -> string { return "router:" + owner + ":query_values"; }
+    public static fn currentPathKey(owner: string) -> string { return "router:" + owner + ":current_path"; }
+    public static fn lastMatchKey(owner: string) -> string { return "router:" + owner + ":last_match"; }
+
+    public static fn declare(world: AppWorld, owner: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        var out = AppRowStore.clearList(world, AppRouter.patternListKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.sceneListKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.titleListKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.paramNamesKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.paramValuesKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.queryNamesKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.queryValuesKey(owner));
+        out = out.setIntResource(AppRouter.lastMatchKey(owner), -1);
+        return out.setStringResource(AppRouter.currentPathKey(owner), "");
+    }
+
+    public static fn addRoute(world: AppWorld, owner: string, pattern: string, scene_id: string, title: string) -> AppWorld {
+        if (owner.len == 0 || pattern.len == 0) { return world; }
+        var out = world.appendStringListResource(AppRouter.patternListKey(owner), pattern);
+        out = out.appendStringListResource(AppRouter.sceneListKey(owner), scene_id);
+        out = out.appendStringListResource(AppRouter.titleListKey(owner), title);
+        return out;
+    }
+
+    public static fn routeCount(world: AppWorld, owner: string) -> i32 {
+        return world.stringListResourceCount(AppRouter.patternListKey(owner));
+    }
+
+    public static fn patternAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppRouter.patternListKey(owner), index);
+    }
+
+    public static fn sceneAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppRouter.sceneListKey(owner), index);
+    }
+
+    public static fn titleAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppRouter.titleListKey(owner), index);
+    }
+
+    // The most specific matching route wins, so a literal path is never shadowed
+    // by a parameterised one that happened to be registered first.
+    public static fn matchIndex(world: AppWorld, owner: string, path: string) -> i32 {
+        let count = AppRouter.routeCount(world, owner);
+        var best: i32 = -1;
+        var best_score: i32 = -1;
+        var i: i32 = 0;
+        while (i < count) {
+            let pattern = AppRouter.patternAt(world, owner, i);
+            if (AppRoutePattern.matches(pattern, path)) {
+                let score = AppRoutePattern.specificity(pattern);
+                if (score > best_score) { best = i; best_score = score; }
+            }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    public static fn lastMatch(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppRouter.lastMatchKey(owner), -1);
+    }
+
+    public static fn currentPath(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppRouter.currentPathKey(owner), "");
+    }
+
+    // Resolves a path into a scene record and publishes the parameters. A path
+    // that matches nothing yields an empty record, which the caller can test
+    // with `isEmpty`.
+    public static fn resolve(world: AppWorld, owner: string, path: string) -> SceneRecord {
+        let index = AppRouter.matchIndex(world, owner, path);
+        var out = world.setIntResource(AppRouter.lastMatchKey(owner), index);
+        out = out.setStringResource(AppRouter.currentPathKey(owner), AppRoutePattern.pathOnly(path));
+        if (index < 0) {
+            out = AppRouter.clearParams(out, owner);
+            return SceneRecord.empty();
+        }
+        let pattern = AppRouter.patternAt(out, owner, index);
+        out = AppRouter.publishParams(out, owner, AppRoutePattern.extract(pattern, path));
+        out = AppRouter.publishQuery(out, owner, AppRoutePattern.queryOnly(path));
+        return SceneRecord.create(AppRouter.sceneAt(out, owner, index), AppRouter.titleAt(out, owner, index));
+    }
+
+    public static fn clearParams(world: AppWorld, owner: string) -> AppWorld {
+        var out = AppRowStore.clearList(world, AppRouter.paramNamesKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.paramValuesKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.queryNamesKey(owner));
+        return AppRowStore.clearList(out, AppRouter.queryValuesKey(owner));
+    }
+
+    public static fn publishParams(world: AppWorld, owner: string, params: string) -> AppWorld {
+        var out = AppRowStore.clearList(world, AppRouter.paramNamesKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.paramValuesKey(owner));
+        let count = AppRouteParamList.count(params);
+        var i: i32 = 0;
+        while (i < count) {
+            out = out.appendStringListResource(AppRouter.paramNamesKey(owner), AppRouteParamList.nameAt(params, i));
+            out = out.appendStringListResource(AppRouter.paramValuesKey(owner), AppRouteParamList.valueAt(params, i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn publishQuery(world: AppWorld, owner: string, query: string) -> AppWorld {
+        let params = AppRouteParamList.parseQuery(query);
+        var out = AppRowStore.clearList(world, AppRouter.queryNamesKey(owner));
+        out = AppRowStore.clearList(out, AppRouter.queryValuesKey(owner));
+        let count = AppRouteParamList.count(params);
+        var i: i32 = 0;
+        while (i < count) {
+            out = out.appendStringListResource(AppRouter.queryNamesKey(owner), AppRouteParamList.nameAt(params, i));
+            out = out.appendStringListResource(AppRouter.queryValuesKey(owner), AppRouteParamList.valueAt(params, i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn paramCount(world: AppWorld, owner: string) -> i32 {
+        return world.stringListResourceCount(AppRouter.paramNamesKey(owner));
+    }
+
+    public static fn paramNameAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppRouter.paramNamesKey(owner), index);
+    }
+
+    public static fn paramValueAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppRouter.paramValuesKey(owner), index);
+    }
+
+    public static fn param(world: AppWorld, owner: string, name: string) -> string {
+        return AppRouter.lookupIn(world, AppRouter.paramNamesKey(owner), AppRouter.paramValuesKey(owner), name);
+    }
+
+    public static fn query(world: AppWorld, owner: string, name: string) -> string {
+        return AppRouter.lookupIn(world, AppRouter.queryNamesKey(owner), AppRouter.queryValuesKey(owner), name);
+    }
+
+    public static fn lookupIn(world: AppWorld, names_key: string, values_key: string, name: string) -> string {
+        let count = world.stringListResourceCount(names_key);
+        var i: i32 = 0;
+        while (i < count) {
+            if (world.stringListResourceAt(names_key, i) == name) {
+                return world.stringListResourceAt(values_key, i);
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // Drives the Navigator: resolve, then push. The Navigator comes in and goes
+    // out by value, which is how the rest of the framework hands it around.
+    public static fn navigate(navigator: Navigator, world: AppWorld, owner: string, path: string) -> Navigator {
+        let scene = AppRouter.resolve(world, owner, path);
+        var nav = navigator;
+        if (scene.isEmpty()) { return nav; }
+        nav = nav.navigate(path, scene);
+        return nav;
+    }
+
+    public static fn replaceRoute(navigator: Navigator, world: AppWorld, owner: string, path: string) -> Navigator {
+        let scene = AppRouter.resolve(world, owner, path);
+        var nav = navigator;
+        if (scene.isEmpty()) { return nav; }
+        nav = nav.replaceRoute(path, scene);
+        return nav;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deep links
+// ---------------------------------------------------------------------------
+
+// A deep link is a URL whose path is a route and whose query is the parameters.
+// Parsing is separated from dispatching so that a test can assert on the parse
+// without a router.
+public class AppDeepLink {
+    public scheme: string;
+    public host: string;
+    public path: string;
+    public query: string;
+
+    public static fn parse(url: string) -> AppDeepLink {
+        let scheme = AppUrl.schemeOf(url);
+        var rest = url;
+        let colon = AppDocumentEnvelope.indexOf(url, 58, 0);
+        if (colon >= 0) { rest = url.substring((colon + 1) as i64, url.len as i64); }
+        // Strip the `//` of an authority form so that the host is easy to read.
+        if (rest.len >= 2 && rest.charAt(0) == 47 && rest.charAt(1) == 47) {
+            rest = rest.substring(2, rest.len as i64);
+        }
+        var host = rest;
+        var path = "";
+        var query = "";
+        let slash = AppDocumentEnvelope.indexOf(rest, 47, 0);
+        if (slash >= 0) {
+            host = rest.substring(0, slash as i64);
+            path = rest.substring(slash as i64, rest.len as i64);
+            let question = AppDocumentEnvelope.indexOf(path, 63, 0);
+            if (question >= 0) {
+                query = path.substring((question + 1) as i64, path.len as i64);
+                path = path.substring(0, question as i64);
+            }
+        }
+        return AppDeepLink { scheme: scheme, host: host, path: path, query: query };
+    }
+
+    public static fn isEmpty(link: AppDeepLink) -> bool {
+        return link.path.len == 0;
+    }
+
+    public static fn fullPath(link: AppDeepLink) -> string {
+        if (link.query.len == 0) { return link.path; }
+        return link.path + "?" + link.query;
+    }
+
+    // Rejects a link whose scheme is not the one the application registered,
+    // which is what stops a stray `http://` URL from being routed as if it were
+    // the application's own.
+    public static fn accepts(url: string, expected_scheme: string) -> bool {
+        if (expected_scheme.len == 0) { return true; }
+        return AppUrl.schemeOf(url) == expected_scheme;
+    }
+
+    public static fn dispatch(navigator: Navigator, world: AppWorld, owner: string, url: string) -> Navigator {
+        let link = AppDeepLink.parse(url);
+        var nav = navigator;
+        if (AppDeepLink.isEmpty(link)) { return nav; }
+        return AppRouter.navigate(nav, world, owner, AppDeepLink.fullPath(link));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Page state
+// ---------------------------------------------------------------------------
+
+// Page state is what a route keeps while it is off the stack: the scroll
+// position, the half-typed form, the expanded rows. It is keyed by route, not
+// by position, so pushing the same route twice does not confuse the two.
+public class AppPageState {
+    public static fn stateKey(owner: string, route_key: string) -> string {
+        return "pagestate:" + owner + ":" + route_key;
+    }
+
+    public static fn routeListKey(owner: string) -> string { return "pagestate:" + owner + ":routes"; }
+
+    public static fn save(world: AppWorld, owner: string, route_key: string, state: string) -> AppWorld {
+        if (owner.len == 0 || route_key.len == 0) { return world; }
+        var out = world.setStringResource(AppPageState.stateKey(owner, route_key), state);
+        if (AppPageState.indexOfRoute(out, owner, route_key) < 0) {
+            out = out.appendStringListResource(AppPageState.routeListKey(owner), route_key);
+        }
+        return out;
+    }
+
+    public static fn load(world: AppWorld, owner: string, route_key: string) -> string {
+        return world.stringResource(AppPageState.stateKey(owner, route_key), "");
+    }
+
+    public static fn has(world: AppWorld, owner: string, route_key: string) -> bool {
+        return world.stringResource(AppPageState.stateKey(owner, route_key), "").len > 0;
+    }
+
+    public static fn clear(world: AppWorld, owner: string, route_key: string) -> AppWorld {
+        let index = AppPageState.indexOfRoute(world, owner, route_key);
+        var out = world.setStringResource(AppPageState.stateKey(owner, route_key), "");
+        if (index >= 0) {
+            out = out.removeStringListResourceAt(AppPageState.routeListKey(owner), index);
+        }
+        return out;
+    }
+
+    public static fn clearAll(world: AppWorld, owner: string) -> AppWorld {
+        var out = world;
+        let count = AppPageState.routeCount(out, owner);
+        var i: i32 = 0;
+        while (i < count) {
+            let route_key = out.stringListResourceAt(AppPageState.routeListKey(owner), i);
+            out = out.setStringResource(AppPageState.stateKey(owner, route_key), "");
+            i = i + 1;
+        }
+        return AppRowStore.clearList(out, AppPageState.routeListKey(owner));
+    }
+
+    public static fn routeCount(world: AppWorld, owner: string) -> i32 {
+        return world.stringListResourceCount(AppPageState.routeListKey(owner));
+    }
+
+    public static fn routeAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppPageState.routeListKey(owner), index);
+    }
+
+    public static fn indexOfRoute(world: AppWorld, owner: string, route_key: string) -> i32 {
+        let count = AppPageState.routeCount(world, owner);
+        var i: i32 = 0;
+        while (i < count) {
+            if (world.stringListResourceAt(AppPageState.routeListKey(owner), i) == route_key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // Persisting page state is the difference between "restored" and "restored
+    // as the user left it", so it goes through the same atomic store as
+    // everything else.
+    public static fn saveToStore(world: AppWorld, store_owner: string, owner: string, relative: string) -> AppWorld {
+        var payload = "";
+        let count = AppPageState.routeCount(world, owner);
+        var i: i32 = 0;
+        while (i < count) {
+            let route_key = world.stringListResourceAt(AppPageState.routeListKey(owner), i);
+            let state = AppPageState.load(world, owner, route_key);
+            payload = payload + "P|" + AppUrl.encodeComponent(route_key) + "|" + AppUrl.encodeComponent(state) + "\n";
+            i = i + 1;
+        }
+        return AppStore.writeTextAtomic(world, store_owner, relative, payload);
+    }
+
+    public static fn loadFromStore(world: AppWorld, store_owner: string, owner: string, relative: string) -> AppWorld {
+        var out = AppStore.recoverIfInterrupted(world, store_owner, relative);
+        let text = AppStore.readText(out, store_owner, relative);
+        if (text.len == 0) { return out; }
+        out = AppPageState.clearAll(out, owner);
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i <= (text.len as i32)) {
+            var at_end = i == (text.len as i32);
+            var code: i32 = 0;
+            if (!at_end) { code = text.charAt(i as i64); }
+            if (at_end || code == 10) {
+                let line = text.substring(start as i64, i as i64);
+                if (line.len > 2 && line.charAt(0) == 80) {
+                    let rest = line.substring(2, line.len as i64);
+                    let bar = AppDocumentEnvelope.indexOf(rest, 124, 0);
+                    if (bar >= 0) {
+                        let route_key = AppUrl.decodeComponent(rest.substring(0, bar as i64));
+                        let state = AppUrl.decodeComponent(rest.substring((bar + 1) as i64, rest.len as i64));
+                        out = AppPageState.save(out, owner, route_key, state);
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window registry
+// ---------------------------------------------------------------------------
+
+// Descriptors only: the application keeps the `Navigator` object for each
+// window, and this registry keeps the facts the framework needs in order to
+// route events, decide about closing, and restore a session.
+public class AppWindowRegistry {
+    public static fn idListKey(owner: string) -> string { return "win:" + owner + ":ids"; }
+    public static fn titleListKey(owner: string) -> string { return "win:" + owner + ":titles"; }
+    public static fn routeListKey(owner: string) -> string { return "win:" + owner + ":routes"; }
+    public static fn docListKey(owner: string) -> string { return "win:" + owner + ":docs"; }
+    public static fn closePendingKey(owner: string) -> string { return "win:" + owner + ":close_pending"; }
+    public static fn activeKey(owner: string) -> string { return "win:" + owner + ":active"; }
+
+    public static fn register(world: AppWorld, owner: string, window_id: string, title: string, route: string, document_id: string) -> AppWorld {
+        if (owner.len == 0 || window_id.len == 0) { return world; }
+        var out = world;
+        let existing = AppWindowRegistry.indexOf(out, owner, window_id);
+        if (existing >= 0) {
+            out = AppWindowRegistry.setTitle(out, owner, window_id, title);
+            out = AppWindowRegistry.setRoute(out, owner, window_id, route);
+            out = AppWindowRegistry.setDocument(out, owner, window_id, document_id);
+            return AppWindowRegistry.setActive(out, owner, window_id);
+        }
+        out = out.appendStringListResource(AppWindowRegistry.idListKey(owner), window_id);
+        out = out.appendStringListResource(AppWindowRegistry.titleListKey(owner), title);
+        out = out.appendStringListResource(AppWindowRegistry.routeListKey(owner), route);
+        out = out.appendStringListResource(AppWindowRegistry.docListKey(owner), document_id);
+        out = out.appendBoolListResource(AppWindowRegistry.closePendingKey(owner), false);
+        out = AppWindowRegistry.setActive(out, owner, window_id);
+        return out;
+    }
+
+    public static fn unregister(world: AppWorld, owner: string, window_id: string) -> AppWorld {
+        let index = AppWindowRegistry.indexOf(world, owner, window_id);
+        if (index < 0) { return world; }
+        var out = world.removeStringListResourceAt(AppWindowRegistry.idListKey(owner), index);
+        out = out.removeStringListResourceAt(AppWindowRegistry.titleListKey(owner), index);
+        out = out.removeStringListResourceAt(AppWindowRegistry.routeListKey(owner), index);
+        out = out.removeStringListResourceAt(AppWindowRegistry.docListKey(owner), index);
+        out = out.removeBoolListResourceAt(AppWindowRegistry.closePendingKey(owner), index);
+        // Keep the active index in range rather than pointing at a window that
+        // no longer exists.
+        var active = out.intResource(AppWindowRegistry.activeKey(owner), 0);
+        if (active >= AppWindowRegistry.count(out, owner)) { active = AppWindowRegistry.count(out, owner) - 1; }
+        if (active < 0) { active = 0; }
+        return out.setIntResource(AppWindowRegistry.activeKey(owner), active);
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        return world.stringListResourceCount(AppWindowRegistry.idListKey(owner));
+    }
+
+    public static fn idAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppWindowRegistry.idListKey(owner), index);
+    }
+
+    public static fn titleAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppWindowRegistry.titleListKey(owner), index);
+    }
+
+    public static fn routeAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppWindowRegistry.routeListKey(owner), index);
+    }
+
+    public static fn documentAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppWindowRegistry.docListKey(owner), index);
+    }
+
+    public static fn isClosePendingAt(world: AppWorld, owner: string, index: i32) -> bool {
+        return world.boolListResourceAt(AppWindowRegistry.closePendingKey(owner), index);
+    }
+
+    public static fn indexOf(world: AppWorld, owner: string, window_id: string) -> i32 {
+        let count = AppWindowRegistry.count(world, owner);
+        var i: i32 = 0;
+        while (i < count) {
+            if (world.stringListResourceAt(AppWindowRegistry.idListKey(owner), i) == window_id) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public static fn titleOf(world: AppWorld, owner: string, window_id: string) -> string {
+        let index = AppWindowRegistry.indexOf(world, owner, window_id);
+        if (index < 0) { return ""; }
+        return AppWindowRegistry.titleAt(world, owner, index);
+    }
+
+    public static fn routeOf(world: AppWorld, owner: string, window_id: string) -> string {
+        let index = AppWindowRegistry.indexOf(world, owner, window_id);
+        if (index < 0) { return ""; }
+        return AppWindowRegistry.routeAt(world, owner, index);
+    }
+
+    public static fn documentOf(world: AppWorld, owner: string, window_id: string) -> string {
+        let index = AppWindowRegistry.indexOf(world, owner, window_id);
+        if (index < 0) { return ""; }
+        return AppWindowRegistry.documentAt(world, owner, index);
+    }
+
+    public static fn setTitle(world: AppWorld, owner: string, window_id: string, title: string) -> AppWorld {
+        return AppWindowRegistry.setStringAt(world, owner, window_id, AppWindowRegistry.titleListKey(owner), title);
+    }
+
+    public static fn setRoute(world: AppWorld, owner: string, window_id: string, route: string) -> AppWorld {
+        return AppWindowRegistry.setStringAt(world, owner, window_id, AppWindowRegistry.routeListKey(owner), route);
+    }
+
+    public static fn setDocument(world: AppWorld, owner: string, window_id: string, document_id: string) -> AppWorld {
+        return AppWindowRegistry.setStringAt(world, owner, window_id, AppWindowRegistry.docListKey(owner), document_id);
+    }
+
+    public static fn setStringAt(world: AppWorld, owner: string, window_id: string, list_key: string, value: string) -> AppWorld {
+        let index = AppWindowRegistry.indexOf(world, owner, window_id);
+        if (index < 0) { return world; }
+        // Rebuild the list with the new value in place. `setStringListResource`
+        // would need a `Vec`, and these lists hold a handful of windows, so a
+        // rebuild is cheaper than owning one.
+        var rebuilt = "";
+        let count = world.stringListResourceCount(list_key);
+        var i: i32 = 0;
+        while (i < count) {
+            if (i > 0) { rebuilt = rebuilt + "\n"; }
+            if (i == index) { rebuilt = rebuilt + value; }
+            else { rebuilt = rebuilt + world.stringListResourceAt(list_key, i); }
+            i = i + 1;
+        }
+        return AppWindowRegistry.writeList(world, list_key, rebuilt);
+    }
+
+    // Writes a newline-joined list back into a resource list.
+    public static fn writeList(world: AppWorld, list_key: string, joined: string) -> AppWorld {
+        var out = AppRowStore.clearList(world, list_key);
+        if (joined.len == 0) { return out; }
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i <= (joined.len as i32)) {
+            var at_end = i == (joined.len as i32);
+            var code: i32 = 0;
+            if (!at_end) { code = joined.charAt(i as i64); }
+            if (at_end || code == 10) {
+                out = out.appendStringListResource(list_key, joined.substring(start as i64, i as i64));
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn setActive(world: AppWorld, owner: string, window_id: string) -> AppWorld {
+        let index = AppWindowRegistry.indexOf(world, owner, window_id);
+        if (index < 0) { return world; }
+        return world.setIntResource(AppWindowRegistry.activeKey(owner), index);
+    }
+
+    public static fn activeIndex(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppWindowRegistry.activeKey(owner), 0);
+    }
+
+    public static fn activeId(world: AppWorld, owner: string) -> string {
+        return AppWindowRegistry.idAt(world, owner, AppWindowRegistry.activeIndex(world, owner));
+    }
+
+    public static fn setClosePending(world: AppWorld, owner: string, window_id: string, pending: bool) -> AppWorld {
+        let index = AppWindowRegistry.indexOf(world, owner, window_id);
+        if (index < 0) { return world; }
+        return world.setBoolListResourceAt(AppWindowRegistry.closePendingKey(owner), index, pending);
+    }
+
+    public static fn closePending(world: AppWorld, owner: string, window_id: string) -> bool {
+        let index = AppWindowRegistry.indexOf(world, owner, window_id);
+        if (index < 0) { return false; }
+        return AppWindowRegistry.isClosePendingAt(world, owner, index);
+    }
+
+    public static fn hasDocument(world: AppWorld, owner: string, window_id: string) -> bool {
+        return AppWindowRegistry.documentOf(world, owner, window_id).len > 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window lifecycle
+// ---------------------------------------------------------------------------
+
+// The close protocol, in one place. `requestClose` is what a title-bar button
+// calls; it either closes the window or parks the request until the user
+// answers. The lifecycle event log is a flat ring in resources so that a test
+// can assert on the order of events.
+public class AppWindowLifecycle {
+    public static fn eventKindListKey(owner: string) -> string { return "winevent:" + owner + ":kind"; }
+    public static fn eventWindowListKey(owner: string) -> string { return "winevent:" + owner + ":window"; }
+    public static fn eventFrameListKey(owner: string) -> string { return "winevent:" + owner + ":frame"; }
+    public static fn sessionStateKey(owner: string) -> string { return "win:" + owner + ":session_state"; }
+
+    public static fn record(world: AppWorld, owner: string, kind: i32, window_id: string) -> AppWorld {
+        var out = world.appendStringListResource(AppWindowLifecycle.eventKindListKey(owner), format("%d", kind as i64));
+        out = out.appendStringListResource(AppWindowLifecycle.eventWindowListKey(owner), window_id);
+        out = out.appendStringListResource(AppWindowLifecycle.eventFrameListKey(owner), format("%d", out.effectClock() as i64));
+        return out;
+    }
+
+    public static fn eventCount(world: AppWorld, owner: string) -> i32 {
+        return world.stringListResourceCount(AppWindowLifecycle.eventKindListKey(owner));
+    }
+
+    public static fn eventKindAt(world: AppWorld, owner: string, index: i32) -> i32 {
+        return app_parse_i32_or(world.stringListResourceAt(AppWindowLifecycle.eventKindListKey(owner), index), -1);
+    }
+
+    public static fn eventWindowAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppWindowLifecycle.eventWindowListKey(owner), index);
+    }
+
+    public static fn lastEventKind(world: AppWorld, owner: string) -> i32 {
+        let count = AppWindowLifecycle.eventCount(world, owner);
+        if (count == 0) { return -1; }
+        return AppWindowLifecycle.eventKindAt(world, owner, count - 1);
+    }
+
+    public static fn clearEvents(world: AppWorld, owner: string) -> AppWorld {
+        var out = AppRowStore.clearList(world, AppWindowLifecycle.eventKindListKey(owner));
+        out = AppRowStore.clearList(out, AppWindowLifecycle.eventWindowListKey(owner));
+        return AppRowStore.clearList(out, AppWindowLifecycle.eventFrameListKey(owner));
+    }
+
+    // Open: register the descriptor and log the event.
+    public static fn open(world: AppWorld, owner: string, window_id: string, title: string, route: string, document_id: string) -> AppWorld {
+        var out = AppWindowRegistry.register(world, owner, window_id, title, route, document_id);
+        return AppWindowLifecycle.record(out, owner, appWindowOpened(), window_id);
+    }
+
+    public static fn activate(world: AppWorld, owner: string, window_id: string) -> AppWorld {
+        var out = AppWindowRegistry.setActive(world, owner, window_id);
+        return AppWindowLifecycle.record(out, owner, appWindowActivated(), window_id);
+    }
+
+    // Does closing this window need an answer from the user? Only when it owns a
+    // document that the persistence layer has marked dirty - which is why the
+    // dirty flag lives on the document and not on the window.
+    public static fn needsConfirmation(world: AppWorld, owner: string, window_id: string) -> bool {
+        let document_id = AppWindowRegistry.documentOf(world, owner, window_id);
+        if (document_id.len == 0) { return false; }
+        return AppDocumentStore.isDirty(world, owner, document_id);
+    }
+
+    public static fn requestClose(world: AppWorld, owner: string, window_id: string) -> AppWorld {
+        if (AppWindowRegistry.indexOf(world, owner, window_id) < 0) { return world; }
+        if (AppWindowLifecycle.needsConfirmation(world, owner, window_id)) {
+            var parked = AppWindowRegistry.setClosePending(world, owner, window_id, true);
+            return AppWindowLifecycle.record(parked, owner, appWindowCloseRequested(), window_id);
+        }
+        return AppWindowLifecycle.closeNow(world, owner, window_id);
+    }
+
+    // The user answered "discard": close regardless of the dirty flag.
+    public static fn confirmClose(world: AppWorld, owner: string, window_id: string) -> AppWorld {
+        var out = AppWindowRegistry.setClosePending(world, owner, window_id, false);
+        return AppWindowLifecycle.closeNow(out, owner, window_id);
+    }
+
+    // The user answered "keep editing": the window stays and the pending flag is
+    // cleared so a second attempt asks again.
+    public static fn cancelClose(world: AppWorld, owner: string, window_id: string) -> AppWorld {
+        var out = AppWindowRegistry.setClosePending(world, owner, window_id, false);
+        return AppWindowLifecycle.record(out, owner, appWindowCloseCancelled(), window_id);
+    }
+
+    public static fn closeNow(world: AppWorld, owner: string, window_id: string) -> AppWorld {
+        var out = AppWindowLifecycle.record(world, owner, appWindowClosed(), window_id);
+        return AppWindowRegistry.unregister(out, owner, window_id);
+    }
+
+    public static fn background(world: AppWorld, owner: string) -> AppWorld {
+        var out = world.setIntResource(AppWindowLifecycle.sessionStateKey(owner), appSessionBackground());
+        return AppWindowLifecycle.record(out, owner, appWindowBackgrounded(), AppWindowRegistry.activeId(out, owner));
+    }
+
+    public static fn foreground(world: AppWorld, owner: string) -> AppWorld {
+        var out = world.setIntResource(AppWindowLifecycle.sessionStateKey(owner), appSessionForeground());
+        return AppWindowLifecycle.record(out, owner, appWindowForegrounded(), AppWindowRegistry.activeId(out, owner));
+    }
+
+    public static fn sessionState(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppWindowLifecycle.sessionStateKey(owner), appSessionForeground());
+    }
+
+    public static fn isBackgrounded(world: AppWorld, owner: string) -> bool {
+        return AppWindowLifecycle.sessionState(world, owner) == appSessionBackground();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session capture and restore
+// ---------------------------------------------------------------------------
+
+// The whole "come back where I left off" feature is one flat text blob: a
+// header line, one line per window, and one line per page state. Because it is
+// plain text it can be written atomically, diffed in a test, and versioned.
+public class AppWindowSession {
+    public static fn header() -> string { return "ZYNW|1"; }
+
+    public static fn capture(world: AppWorld, owner: string) -> string {
+        var out = AppWindowSession.header() + "\n";
+        out = out + "A|" + format("%d", AppWindowRegistry.activeIndex(world, owner) as i64) + "\n";
+        let count = AppWindowRegistry.count(world, owner);
+        var i: i32 = 0;
+        while (i < count) {
+            out = out + "W|" + AppUrl.encodeComponent(AppWindowRegistry.idAt(world, owner, i))
+                + "|" + AppUrl.encodeComponent(AppWindowRegistry.titleAt(world, owner, i))
+                + "|" + AppUrl.encodeComponent(AppWindowRegistry.routeAt(world, owner, i))
+                + "|" + AppUrl.encodeComponent(AppWindowRegistry.documentAt(world, owner, i))
+                + "\n";
+            i = i + 1;
+        }
+        let state_count = AppPageState.routeCount(world, owner);
+        var s: i32 = 0;
+        while (s < state_count) {
+            let route_key = AppPageState.routeAt(world, owner, s);
+            out = out + "P|" + AppUrl.encodeComponent(route_key)
+                + "|" + AppUrl.encodeComponent(AppPageState.load(world, owner, route_key)) + "\n";
+            s = s + 1;
+        }
+        return out;
+    }
+
+    // Restore rebuilds the descriptors and the page states. The per-window
+    // Navigators are rebuilt by the application, which is why the route is part
+    // of the record: the application replays `AppRouter.navigate` for each
+    // window after this returns.
+    public static fn restore(world: AppWorld, owner: string, blob: string) -> AppWorld {
+        let newline = AppDocumentEnvelope.indexOf(blob, 10, 0);
+        if (newline < 0) { return world; }
+        if (blob.substring(0, newline as i64) != AppWindowSession.header()) { return world; }
+        var out = AppRowStore.clearList(world, AppWindowRegistry.idListKey(owner));
+        out = AppRowStore.clearList(out, AppWindowRegistry.titleListKey(owner));
+        out = AppRowStore.clearList(out, AppWindowRegistry.routeListKey(owner));
+        out = AppRowStore.clearList(out, AppWindowRegistry.docListKey(owner));
+        out = AppRowStore.clearList(out, AppWindowRegistry.closePendingKey(owner));
+        out = AppPageState.clearAll(out, owner);
+        var active: i32 = 0;
+        var start = newline + 1;
+        var i = start;
+        while (i <= (blob.len as i32)) {
+            var at_end = i == (blob.len as i32);
+            var code: i32 = 0;
+            if (!at_end) { code = blob.charAt(i as i64); }
+            if (at_end || code == 10) {
+                let line = blob.substring(start as i64, i as i64);
+                if (line.len >= 1 && line.charAt(0) == 65) {
+                    active = app_parse_i32_or(AppWindowSession.field(line, 1), 0);
+                } else if (line.len >= 1 && line.charAt(0) == 87) {
+                    out = AppWindowRegistry.register(
+                        out, owner,
+                        AppUrl.decodeComponent(AppWindowSession.field(line, 1)),
+                        AppUrl.decodeComponent(AppWindowSession.field(line, 2)),
+                        AppUrl.decodeComponent(AppWindowSession.field(line, 3)),
+                        AppUrl.decodeComponent(AppWindowSession.field(line, 4)));
+                } else if (line.len >= 1 && line.charAt(0) == 80) {
+                    out = AppPageState.save(
+                        out, owner,
+                        AppUrl.decodeComponent(AppWindowSession.field(line, 1)),
+                        AppUrl.decodeComponent(AppWindowSession.field(line, 2)));
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (active < 0) { active = 0; }
+        if (active >= AppWindowRegistry.count(out, owner)) { active = AppWindowRegistry.count(out, owner) - 1; }
+        if (active < 0) { active = 0; }
+        return out.setIntResource(AppWindowRegistry.activeKey(owner), active);
+    }
+
+    // The nth pipe-separated field of a record line.
+    public static fn field(line: string, index: i32) -> string {
+        var current: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        let len = line.len as i32;
+        while (i <= len) {
+            var at_end = i == len;
+            var code: i32 = 0;
+            if (!at_end) { code = line.charAt(i as i64); }
+            if (at_end || code == 124) {
+                if (current == index) { return line.substring(start as i64, i as i64); }
+                current = current + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public static fn save(world: AppWorld, store_owner: string, owner: string, relative: string) -> AppWorld {
+        return AppStore.writeTextAtomic(world, store_owner, relative, AppWindowSession.capture(world, owner));
+    }
+
+    public static fn load(world: AppWorld, store_owner: string, owner: string, relative: string) -> AppWorld {
+        var out = AppStore.recoverIfInterrupted(world, store_owner, relative);
+        let blob = AppStore.readText(out, store_owner, relative);
+        if (blob.len == 0) { return out; }
+        return AppWindowSession.restore(out, owner, blob);
+    }
+}

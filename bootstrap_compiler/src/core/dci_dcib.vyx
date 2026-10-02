@@ -1,0 +1,659 @@
+module bootstrap.dci_dcib;
+
+use std.fs;
+use std.string;
+use bootstrap.dci_abi;
+use bootstrap.dci_ids;
+
+extern "C" {
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn cJSON_Parse(text: rawptr) -> rawptr;
+    fn cJSON_Delete(item: rawptr);
+    fn cJSON_GetObjectItemCaseSensitive(object: rawptr, string: rawptr) -> rawptr;
+    fn cJSON_GetStringValue(item: rawptr) -> rawptr;
+    fn cJSON_GetArraySize(array: rawptr) -> i32;
+    fn cJSON_GetArrayItem(array: rawptr, index: i32) -> rawptr;
+    fn cJSON_IsString(item: rawptr) -> i32;
+    fn cJSON_IsObject(item: rawptr) -> i32;
+    fn cJSON_IsArray(item: rawptr) -> i32;
+    fn cJSON_CreateNull() -> rawptr;
+    fn cJSON_CreateBool(boolean: i32) -> rawptr;
+    fn cJSON_CreateNumber(number: f64) -> rawptr;
+    fn cJSON_CreateString(text: rawptr) -> rawptr;
+    fn cJSON_CreateArray() -> rawptr;
+    fn cJSON_CreateObject() -> rawptr;
+    fn cJSON_AddItemToArray(array: rawptr, item: rawptr) -> i32;
+    fn cJSON_AddItemToObject(object: rawptr, key: rawptr, item: rawptr) -> i32;
+}
+
+// DCIB is the binary DCI contract container.  It is decoded here in Vyx from
+// std.fs bytes and materialized directly as the cJSON query tree used by the
+// lowerer.  No JSON text is reconstructed for a .dcib input.
+public class DciDcibParseResult {
+    public root: rawptr
+    public message: string
+}
+
+fn dci_dcib_byte_at(data: rawptr, index: i64) -> i64 {
+    var byte: i32 = 0;
+    memcpy(to_rawptr(&byte), data + index, 1);
+    return (byte & 0xFF) as i64;
+}
+
+fn dci_dcib_u32_at(data: rawptr, index: i64) -> i64 {
+    return dci_dcib_byte_at(data, index)
+        | (dci_dcib_byte_at(data, index + 1) << 8)
+        | (dci_dcib_byte_at(data, index + 2) << 16)
+        | (dci_dcib_byte_at(data, index + 3) << 24);
+}
+
+fn dci_dcib_crc32_step(crc_in: i64, byte: i64) -> i64 {
+    var crc = crc_in ^ (byte & 255);
+    var bit: i32 = 0;
+    while (bit < 8) {
+        if ((crc & 1) != 0) {
+            crc = (crc >> 1) ^ 3988292384;
+        } else {
+            crc = crc >> 1;
+        }
+        crc = crc & 4294967295;
+        bit = bit + 1;
+    }
+    return crc;
+}
+
+fn dci_dcib_crc32(data: rawptr, length: i64) -> i64 {
+    var crc: i64 = 4294967295;
+    var i: i64 = 0;
+    while (i + 4 <= length) {
+        var word: i64 = 0;
+        memcpy(to_rawptr(&word), data + i, 4);
+        var b: i32 = 0;
+        while (b < 4) {
+            crc = dci_dcib_crc32_step(crc, (word >> (b * 8)) & 255);
+            b = b + 1;
+        }
+        i = i + 4;
+    }
+    while (i < length) {
+        crc = dci_dcib_crc32_step(crc, dci_dcib_byte_at(data, i));
+        i = i + 1;
+    }
+    return (~crc) & 4294967295;
+}
+
+public fn dci_cjson_next(item: rawptr) -> rawptr {
+    if (item == null) { return null; }
+    var next: rawptr = null;
+    memcpy(to_rawptr(&next), item, 8);
+    return next;
+}
+
+public fn dci_cjson_child(item: rawptr) -> rawptr {
+    if (item == null) { return null; }
+    var child: rawptr = null;
+    memcpy(to_rawptr(&child), item + 16, 8);
+    return child;
+}
+
+public fn dci_cstr_eq(ptr: rawptr, wanted: string) -> bool {
+    if (ptr == null) { return wanted.len == 0; }
+    var i: i32 = 0;
+    let n: i32 = wanted.len as i32;
+    while (i < n) {
+        var byte: i32 = 0;
+        memcpy(to_rawptr(&byte), ptr + i, 1);
+        byte = byte & 255;
+        if (byte == 0 || byte != wanted.charAt(i)) { return false; }
+        i = i + 1;
+    }
+    var term: i32 = 0;
+    memcpy(to_rawptr(&term), ptr + n, 1);
+    return (term & 255) == 0;
+}
+
+fn dci_dcib_json_string(object: rawptr, key: string) -> string {
+    if (object == null || key.len == 0) { return ""; }
+    let item = cJSON_GetObjectItemCaseSensitive(object, key.c_str());
+    if (item == null || cJSON_IsString(item) == 0) { return ""; }
+    let raw = cJSON_GetStringValue(item);
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}
+
+/// Index Vyx/C++ type spellings from a parsed contract. Hot path later
+/// looks up by DciTypeId; `.replace()` lives only here.
+public fn dci_dcib_index_contract_root(root: rawptr) {
+    if (root == null || cJSON_IsObject(root) == 0) { return; }
+    let exports = cJSON_GetObjectItemCaseSensitive(root, "exports".c_str());
+    if (exports == null || cJSON_IsObject(exports) == 0) { return; }
+    let layouts = cJSON_GetObjectItemCaseSensitive(exports, "layouts".c_str());
+    if (layouts != null && cJSON_IsArray(layouts) != 0) {
+        var layout = dci_cjson_child(layouts);
+        while (layout != null) {
+            if (cJSON_IsObject(layout) != 0) {
+                let raw = dci_dcib_json_string(layout, "type_name");
+                if (raw.len > 0) {
+                    let canon = dci_abi_canonical_type_name_text(raw);
+                    let tid = dci_ids_intern_type(canon.clone());
+                    dci_ids_intern_layout(canon);
+                    if (tid == dci_type_id_invalid()) {
+                        print("dci.ids unmapped type " + canon);
+                    }
+                }
+            }
+            layout = dci_cjson_next(layout);
+        }
+    }
+    let symbols = cJSON_GetObjectItemCaseSensitive(exports, "symbols".c_str());
+    if (symbols != null && cJSON_IsArray(symbols) != 0) {
+        var symbol = dci_cjson_child(symbols);
+        while (symbol != null) {
+            if (cJSON_IsObject(symbol) != 0) {
+                var name = dci_dcib_json_string(symbol, "name");
+                if (name.len == 0) { name = dci_dcib_json_string(symbol, "link_name"); }
+                if (name.len > 0) { dci_ids_intern_symbol(name); }
+            }
+            symbol = dci_cjson_next(symbol);
+        }
+    }
+    dci_ids_report_last_segment_distinct();
+}
+
+public fn dci_lifecycle_binding_is_declaration(root: rawptr) -> bool {
+    if (root == null) { return true; }
+    let profile = cJSON_GetObjectItemCaseSensitive(root, "profile".c_str());
+    let binding = cJSON_GetObjectItemCaseSensitive(profile, "lifecycle_binding".c_str());
+    if (binding == null || cJSON_IsString(binding) == 0) { return true; }
+    let raw = cJSON_GetStringValue(binding);
+    if (raw == null) { return true; }
+    return dci_cstr_eq(raw, "") || dci_cstr_eq(raw, "declaration");
+}
+
+fn dci_dcib_valid_utf8(data: rawptr, length: i64) -> bool {
+    var i: i64 = 0;
+    while (i < length) {
+        let first = dci_dcib_byte_at(data, i);
+        if (first <= 127) {
+            if (first == 0) { return false; }
+            i = i + 1;
+        } else if (first >= 194 && first <= 223) {
+            if (i + 1 >= length) { return false; }
+            let second = dci_dcib_byte_at(data, i + 1);
+            if (second < 128 || second > 191) { return false; }
+            i = i + 2;
+        } else if (first == 224) {
+            if (i + 2 >= length) { return false; }
+            let second = dci_dcib_byte_at(data, i + 1);
+            let third = dci_dcib_byte_at(data, i + 2);
+            if (second < 160 || second > 191 || third < 128 || third > 191) { return false; }
+            i = i + 3;
+        } else if (first >= 225 && first <= 236) {
+            if (i + 2 >= length) { return false; }
+            let second = dci_dcib_byte_at(data, i + 1);
+            let third = dci_dcib_byte_at(data, i + 2);
+            if (second < 128 || second > 191 || third < 128 || third > 191) { return false; }
+            i = i + 3;
+        } else if (first == 237) {
+            if (i + 2 >= length) { return false; }
+            let second = dci_dcib_byte_at(data, i + 1);
+            let third = dci_dcib_byte_at(data, i + 2);
+            if (second < 128 || second > 159 || third < 128 || third > 191) { return false; }
+            i = i + 3;
+        } else if (first >= 238 && first <= 239) {
+            if (i + 2 >= length) { return false; }
+            let second = dci_dcib_byte_at(data, i + 1);
+            let third = dci_dcib_byte_at(data, i + 2);
+            if (second < 128 || second > 191 || third < 128 || third > 191) { return false; }
+            i = i + 3;
+        } else if (first == 240) {
+            if (i + 3 >= length) { return false; }
+            let second = dci_dcib_byte_at(data, i + 1);
+            let third = dci_dcib_byte_at(data, i + 2);
+            let fourth = dci_dcib_byte_at(data, i + 3);
+            if (second < 144 || second > 191 || third < 128 || third > 191 || fourth < 128 || fourth > 191) { return false; }
+            i = i + 4;
+        } else if (first >= 241 && first <= 243) {
+            if (i + 3 >= length) { return false; }
+            let second = dci_dcib_byte_at(data, i + 1);
+            let third = dci_dcib_byte_at(data, i + 2);
+            let fourth = dci_dcib_byte_at(data, i + 3);
+            if (second < 128 || second > 191 || third < 128 || third > 191 || fourth < 128 || fourth > 191) { return false; }
+            i = i + 4;
+        } else if (first == 244) {
+            if (i + 3 >= length) { return false; }
+            let second = dci_dcib_byte_at(data, i + 1);
+            let third = dci_dcib_byte_at(data, i + 2);
+            let fourth = dci_dcib_byte_at(data, i + 3);
+            if (second < 128 || second > 143 || third < 128 || third > 191 || fourth < 128 || fourth > 191) { return false; }
+            i = i + 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+class DciDcibReader {
+    public data: rawptr
+    public length: i64
+    public cursor: i64
+    public depth: i32
+    public node_count: i64
+    public failed: bool
+    public failure_message: string
+
+    public static fn create(data: rawptr, length: i64) -> DciDcibReader {
+        return DciDcibReader { data: data, length: length, cursor: 0, depth: 0, node_count: 0, failed: false, failure_message: "" };
+    }
+
+    public fn set_failure(self, message: string) {
+        if (!self.failed) {
+            self.failed = true;
+            self.failure_message = message;
+        }
+    }
+
+    public fn remaining(self) -> i64 {
+        if (self.cursor < 0 || self.cursor > self.length) { return 0; }
+        return self.length - self.cursor;
+    }
+
+    public fn take(self, count: i64) -> rawptr {
+        if (count < 0 || count > self.remaining()) {
+            self.set_failure("truncated DCIB payload");
+            return null;
+        }
+        let out = self.data + self.cursor;
+        self.cursor = self.cursor + count;
+        return out;
+    }
+
+    public fn take_u8(self) -> i64 {
+        let ptr = self.take(1);
+        if (ptr == null) { return 0; }
+        return dci_dcib_byte_at(ptr, 0);
+    }
+
+    public fn take_u32(self) -> i64 {
+        let ptr = self.take(4);
+        if (ptr == null) { return 0; }
+        return dci_dcib_u32_at(ptr, 0);
+    }
+
+    public fn take_i64(self) -> i64 {
+        let low = self.take_u32();
+        let high = self.take_u32();
+        if (self.failed) { return 0; }
+        if (high >= 2147483648) {
+            return (high - 4294967296) * 4294967296 + low;
+        }
+        return high * 4294967296 + low;
+    }
+
+    public fn take_u64_number(self) -> f64 {
+        let low = self.take_u32();
+        let high = self.take_u32();
+        if (self.failed) { return 0.0; }
+        if (high > 2097152 || (high == 2097152 && low != 0)) {
+            self.set_failure("DCIB integer exceeds cJSON exact range");
+            return 0.0;
+        }
+        return (high as f64) * 4294967296.0 + (low as f64);
+    }
+
+    public fn take_f64(self) -> f64 {
+        let ptr = self.take(8);
+        if (ptr == null) { return 0.0; }
+        var number: f64 = 0.0;
+        memcpy(to_rawptr(&number), ptr, 8);
+        if (number != number || (number != 0.0 && number / 2.0 == number)) {
+            self.set_failure("DCIB floating point value is not finite");
+            return 0.0;
+        }
+        return number;
+    }
+
+    public fn take_string(self) -> string {
+        let length = self.take_u32();
+        if (self.failed) { return ""; }
+        let ptr = self.take(length);
+        if (ptr == null) { return ""; }
+        if (!dci_dcib_valid_utf8(ptr, length)) {
+            self.set_failure("DCIB string is not valid UTF-8 or contains NUL");
+            return "";
+        }
+        return from_cstr_len(ptr, length);
+    }
+
+    public fn decode_array(self) -> rawptr {
+        let count = self.take_u32();
+        if (self.failed) { return null; }
+        if (count > self.remaining()) {
+            self.set_failure("DCIB array count exceeds remaining payload");
+            return null;
+        }
+        let array = cJSON_CreateArray();
+        if (array == null) {
+            self.set_failure("out of memory while creating DCIB array");
+            return null;
+        }
+        var i: i64 = 0;
+        while (i < count) {
+            let item = self.decode_value();
+            if (item == null) {
+                cJSON_Delete(array);
+                return null;
+            }
+            if (cJSON_AddItemToArray(array, item) == 0) {
+                cJSON_Delete(item);
+                cJSON_Delete(array);
+                self.set_failure("out of memory while appending DCIB array item");
+                return null;
+            }
+            i = i + 1;
+        }
+        return array;
+    }
+
+    public fn decode_map(self) -> rawptr {
+        let count = self.take_u32();
+        if (self.failed) { return null; }
+        if (count > self.remaining() / 6) {
+            self.set_failure("DCIB map count exceeds remaining payload");
+            return null;
+        }
+        let object = cJSON_CreateObject();
+        if (object == null) {
+            self.set_failure("out of memory while creating DCIB object");
+            return null;
+        }
+        var previous_key: string = "";
+        var has_previous_key: bool = false;
+        var i: i64 = 0;
+        while (i < count) {
+            let key_tag = self.take_u8();
+            if (self.failed || key_tag != 6) {
+                cJSON_Delete(object);
+                self.set_failure("DCIB map key is not a string");
+                return null;
+            }
+            let key = self.take_string();
+            if (self.failed) {
+                cJSON_Delete(object);
+                return null;
+            }
+            if (has_previous_key && str_compare(previous_key, key) >= 0) {
+                cJSON_Delete(object);
+                self.set_failure("DCIB map keys are not strictly canonical");
+                return null;
+            }
+            let value = self.decode_value();
+            if (value == null) {
+                cJSON_Delete(object);
+                return null;
+            }
+            if (cJSON_AddItemToObject(object, key.c_str(), value) == 0) {
+                cJSON_Delete(value);
+                cJSON_Delete(object);
+                self.set_failure("out of memory while appending DCIB object item");
+                return null;
+            }
+            previous_key = key;
+            has_previous_key = true;
+            i = i + 1;
+        }
+        return object;
+    }
+
+    public fn decode_value(self) -> rawptr {
+        if (self.failed) { return null; }
+        if (self.depth >= 256) {
+            self.set_failure("DCIB nesting depth exceeds limit");
+            return null;
+        }
+        if (self.node_count >= 1000000) {
+            self.set_failure("DCIB node count exceeds limit");
+            return null;
+        }
+        let tag = self.take_u8();
+        if (self.failed) { return null; }
+        self.node_count = self.node_count + 1;
+        self.depth = self.depth + 1;
+        var value: rawptr = null;
+        if (tag == 0) {
+            value = cJSON_CreateNull();
+        } else if (tag == 1) {
+            value = cJSON_CreateBool(0);
+        } else if (tag == 2) {
+            value = cJSON_CreateBool(1);
+        } else if (tag == 3) {
+            let integer = self.take_i64();
+            if (!self.failed) {
+                if (integer > 9007199254740992 || integer < -9007199254740992) {
+                    self.set_failure("DCIB integer exceeds cJSON exact range");
+                } else {
+                    value = cJSON_CreateNumber(integer as f64);
+                }
+            }
+        } else if (tag == 4) {
+            let number = self.take_u64_number();
+            if (!self.failed) { value = cJSON_CreateNumber(number); }
+        } else if (tag == 5) {
+            let number = self.take_f64();
+            if (!self.failed) { value = cJSON_CreateNumber(number); }
+        } else if (tag == 6) {
+            let text = self.take_string();
+            if (!self.failed) { value = cJSON_CreateString(text.c_str()); }
+        } else if (tag == 7) {
+            value = self.decode_array();
+        } else if (tag == 8) {
+            value = self.decode_map();
+        } else {
+            self.set_failure("unknown DCIB value tag " + tag.toString());
+        }
+        self.depth = self.depth - 1;
+        if (value == null && !self.failed) {
+            self.set_failure("out of memory while decoding DCIB value");
+        }
+        return value;
+    }
+}
+
+public fn dci_dcib_parse_file(path: string) -> DciDcibParseResult {
+    let file_size = fileSize(path);
+    if (file_size > 67108864) {
+        return DciDcibParseResult { root: null, message: "DCIB file exceeds 64 MiB limit" };
+    }
+    let file = File.open(path, FileOptions { read: true, write: false, create: false, truncate: false, binary: true });
+    if (!file.is_open()) {
+        return DciDcibParseResult { root: null, message: "failed to open DCIB file" };
+    }
+    let bytes = file.read_all_bytes();
+    if (file.close() != 0) {
+        bytes.destroy();
+        return DciDcibParseResult { root: null, message: "failed to close DCIB file" };
+    }
+    var root: rawptr = null;
+    var message: string = "";
+    if (bytes.len < 20) {
+        message = "truncated DCIB header";
+    } else if (dci_dcib_byte_at(bytes.data, 0) != 68
+               || dci_dcib_byte_at(bytes.data, 1) != 67
+               || dci_dcib_byte_at(bytes.data, 2) != 73
+               || dci_dcib_byte_at(bytes.data, 3) != 66) {
+        message = "DCIB magic mismatch";
+    } else if (dci_dcib_byte_at(bytes.data, 4) != 1
+               || dci_dcib_byte_at(bytes.data, 5) != 0
+               || dci_dcib_byte_at(bytes.data, 6) != 0
+               || dci_dcib_byte_at(bytes.data, 7) != 0) {
+        message = "unsupported DCIB version or flags";
+    } else {
+        let payload_length = bytes.len - 20;
+        let length_low = dci_dcib_u32_at(bytes.data, 8);
+        let length_high = dci_dcib_u32_at(bytes.data, 12);
+        let expected_low = payload_length - (payload_length >> 32) * 4294967296;
+        let expected_high = payload_length >> 32;
+        let expected_crc = dci_dcib_u32_at(bytes.data, 16);
+        if (length_low != expected_low || length_high != expected_high) {
+            message = "invalid DCIB payload length";
+        } else if (dci_dcib_crc32(bytes.data + 20, payload_length) != expected_crc) {
+            message = "DCIB payload CRC mismatch";
+        } else {
+            let reader = DciDcibReader.create(bytes.data + 20, payload_length);
+            root = reader.decode_value();
+            if (root != null && reader.cursor != reader.length) {
+                cJSON_Delete(root);
+                root = null;
+                reader.set_failure("DCIB payload has trailing values");
+            }
+            if (reader.failed && root != null) {
+                cJSON_Delete(root);
+                root = null;
+            }
+            if (reader.failed) { message = reader.failure_message; }
+        }
+    }
+    bytes.destroy();
+    if (root != null && message.len == 0) { dci_dcib_index_contract_root(root); }
+    return DciDcibParseResult { root: root, message: message };
+}
+
+public fn dci_path_list_count(paths: string) -> i32 {
+    if (paths.len == 0) { return 0; }
+    var n: i32 = 0;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= paths.len) {
+        if (i == paths.len || paths.charAt(i) == 10) {
+            if (i > start) { n = n + 1; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+public fn dci_path_list_at(paths: string, index: i32) -> string {
+    if (index < 0 || paths.len == 0) { return ""; }
+    var idx: i32 = 0;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= paths.len) {
+        if (i == paths.len || paths.charAt(i) == 10) {
+            if (i > start) {
+                if (idx == index) { return paths.substring(start, i); }
+                idx = idx + 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+public fn dci_path_list_contains(paths: string, path: string) -> bool {
+    if (path.len == 0) { return false; }
+    var i: i32 = 0;
+    let n = dci_path_list_count(paths.clone());
+    while (i < n) {
+        if (dci_path_list_at(paths.clone(), i) == path) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+public fn dci_path_list_append(paths: string, path: string) -> string {
+    let value = path.trim();
+    if (value.len == 0) { return paths; }
+    if (dci_path_list_contains(paths.clone(), value.clone())) { return paths; }
+    if (paths.len == 0) { return value; }
+    if (paths.charAt(paths.len - 1) == 10) { return paths + value; }
+    return paths + "\n" + value;
+}
+
+public fn dci_path_is_dcib(path: string) -> bool {
+    return path.toLower().endsWith(".dcib");
+}
+
+public class DciContractBundle {
+    public roots: rawptr
+    public message: string
+}
+
+public fn dci_parse_contract_path(path: string) -> DciDcibParseResult {
+    if (path.len == 0) {
+        return DciDcibParseResult { root: null, message: "empty DCI contract path" };
+    }
+    if (dci_path_is_dcib(path.clone())) {
+        return dci_dcib_parse_file(path);
+    }
+    if (!fileExists(path.clone())) {
+        return DciDcibParseResult { root: null, message: "failed to open DCI JSON file" };
+    }
+    let text = readFile(path.clone());
+    let root = cJSON_Parse(text.c_str());
+    if (root == null) {
+        return DciDcibParseResult { root: null, message: "invalid DCI JSON contract" };
+    }
+    dci_dcib_index_contract_root(root);
+    return DciDcibParseResult { root: root, message: "" };
+}
+
+public fn dci_load_contract_bundle(paths: string) -> DciContractBundle {
+    let n = dci_path_list_count(paths.clone());
+    if (n <= 0) {
+        return DciContractBundle { roots: null, message: "" };
+    }
+    let bundle = cJSON_CreateArray();
+    if (bundle == null) {
+        return DciContractBundle { roots: null, message: "out of memory while loading DCI contracts" };
+    }
+    var i: i32 = 0;
+    while (i < n) {
+        let path = dci_path_list_at(paths.clone(), i);
+        let parsed = dci_parse_contract_path(path.clone());
+        if (parsed.root == null || cJSON_IsObject(parsed.root) == 0) {
+            if (parsed.root != null) { cJSON_Delete(parsed.root); }
+            cJSON_Delete(bundle);
+            var detail = parsed.message;
+            if (detail.len == 0) { detail = "DCI contract root is not an object"; }
+            return DciContractBundle {
+                roots: null,
+                message: path.clone() + ": " + detail,
+            };
+        }
+        if (cJSON_AddItemToArray(bundle, parsed.root) == 0) {
+            cJSON_Delete(parsed.root);
+            cJSON_Delete(bundle);
+            return DciContractBundle {
+                roots: null,
+                message: "out of memory while loading DCI contracts",
+            };
+        }
+        i = i + 1;
+    }
+    return DciContractBundle { roots: bundle, message: "" };
+}
+
+public fn dci_bundle_count(bundle: rawptr) -> i32 {
+    if (bundle == null) { return 0; }
+    return cJSON_GetArraySize(bundle);
+}
+
+public fn dci_bundle_root_at(bundle: rawptr, index: i32) -> rawptr {
+    if (bundle == null || index < 0) { return null; }
+    return cJSON_GetArrayItem(bundle, index);
+}
+
+public fn dci_bundle_source_language(root: rawptr) -> string {
+    if (root == null) { return ""; }
+    let source = cJSON_GetObjectItemCaseSensitive(root, "source".c_str());
+    if (source == null || cJSON_IsObject(source) == 0) { return ""; }
+    let language = cJSON_GetObjectItemCaseSensitive(source, "language".c_str());
+    if (language == null || cJSON_IsString(language) == 0) { return ""; }
+    let raw = cJSON_GetStringValue(language);
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}

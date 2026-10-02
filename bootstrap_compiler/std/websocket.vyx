@@ -1,0 +1,629 @@
+module std.websocket;
+
+use std.encoding;
+use std.openssl;
+
+/// WebSocket client for `ws://` and `wss://`.
+///
+/// The client performs a real RFC 6455 opening handshake, validates
+/// `Sec-WebSocket-Accept`, masks client frames, and decodes text
+/// frames from the peer. `wss://` uses OpenSSL; link OpenSSL when an
+/// application imports this module.
+
+extern "C" {
+    fn malloc(size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dest: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dest: rawptr, c: i32, n: i64) -> rawptr;
+    fn gethostbyname(name: rawptr) -> rawptr;
+
+    fn OPENSSL_init_ssl(opts: u64, settings: rawptr) -> i32;
+    fn TLS_client_method() -> rawptr;
+    fn SSL_CTX_new(method: rawptr) -> rawptr;
+    fn SSL_CTX_free(ctx: rawptr);
+    fn SSL_new(ctx: rawptr) -> rawptr;
+    fn SSL_free(ssl: rawptr);
+    fn SSL_set_fd(ssl: rawptr, fd: i32) -> i32;
+    fn SSL_set_tlsext_host_name(ssl: rawptr, name: rawptr) -> i32;
+    fn SSL_connect(ssl: rawptr) -> i32;
+    fn SSL_read(ssl: rawptr, buf: rawptr, num: i32) -> i32;
+    fn SSL_write(ssl: rawptr, buf: rawptr, num: i32) -> i32;
+    fn SSL_shutdown(ssl: rawptr) -> i32;
+}
+
+@[platform("windows")] {
+    extern "C" {
+        fn WSAStartup(ver: i16, data: rawptr) -> i32;
+        fn WSACleanup() -> i32;
+        fn socket(af: i32, st: i32, proto: i32) -> i64;
+        fn closesocket(s: i64) -> i32;
+        fn send(s: i64, buf: rawptr, len: i32, flags: i32) -> i32;
+        fn recv(s: i64, buf: rawptr, len: i32, flags: i32) -> i32;
+        fn connect(s: i64, addr: rawptr, len: i32) -> i32;
+        fn htons(hostshort: i16) -> i16;
+    }
+}
+
+@[platform("linux")] {
+    extern "C" {
+        fn socket(af: i32, st: i32, proto: i32) -> i64;
+        fn close(fd: i32) -> i32;
+        fn send(s: i64, buf: rawptr, len: i64, flags: i32) -> i64;
+        fn recv(s: i64, buf: rawptr, len: i64, flags: i32) -> i64;
+        fn connect(s: i64, addr: rawptr, len: i32) -> i32;
+        fn htons(hostshort: i16) -> i16;
+    }
+}
+
+@[platform("macos")] {
+    extern "C" {
+        fn socket(af: i32, st: i32, proto: i32) -> i64;
+        fn close(fd: i32) -> i32;
+        fn send(s: i64, buf: rawptr, len: i64, flags: i32) -> i64;
+        fn recv(s: i64, buf: rawptr, len: i64, flags: i32) -> i64;
+        fn connect(s: i64, addr: rawptr, len: i32) -> i32;
+        fn htons(hostshort: i16) -> i16;
+    }
+}
+
+fn ws_opcode_continuation() -> i32 { return 0; }
+fn ws_opcode_text() -> i32 { return 1; }
+fn ws_opcode_close() -> i32 { return 8; }
+fn ws_opcode_ping() -> i32 { return 9; }
+fn ws_opcode_pong() -> i32 { return 10; }
+
+fn ws_state_connecting() -> i32 { return 0; }
+fn ws_state_open() -> i32 { return 1; }
+fn ws_state_closing() -> i32 { return 2; }
+fn ws_state_closed() -> i32 { return 3; }
+
+var g_ws_started: i32 = 0;
+
+@[platform("windows")]
+fn ws_net_start() -> bool {
+    if (g_ws_started != 0) { return true; }
+    let wsadata = malloc(512);
+    if (wsadata == null) { return false; }
+    memset(wsadata, 0, 512);
+    let rc = WSAStartup(514, wsadata);
+    free(wsadata);
+    if (rc == 0) {
+        g_ws_started = 1;
+        return true;
+    }
+    return false;
+}
+
+@[platform("linux")]
+fn ws_net_start() -> bool {
+    g_ws_started = 1;
+    return true;
+}
+
+@[platform("macos")]
+fn ws_net_start() -> bool {
+    g_ws_started = 1;
+    return true;
+}
+
+@[platform("windows")]
+fn ws_socket_close(fd: i64) {
+    if (fd >= 0) { closesocket(fd); }
+}
+
+@[platform("linux")]
+fn ws_socket_close(fd: i64) {
+    if (fd >= 0) { close(fd as i32); }
+}
+
+@[platform("macos")]
+fn ws_socket_close(fd: i64) {
+    if (fd >= 0) { close(fd as i32); }
+}
+
+@[platform("windows")]
+fn ws_socket_send(fd: i64, buf: rawptr, len: i32) -> i32 {
+    return send(fd, buf, len, 0);
+}
+
+@[platform("linux")]
+fn ws_socket_send(fd: i64, buf: rawptr, len: i32) -> i32 {
+    return send(fd, buf, len as i64, 0) as i32;
+}
+
+@[platform("macos")]
+fn ws_socket_send(fd: i64, buf: rawptr, len: i32) -> i32 {
+    return send(fd, buf, len as i64, 0) as i32;
+}
+
+@[platform("windows")]
+fn ws_socket_recv(fd: i64, buf: rawptr, len: i32) -> i32 {
+    return recv(fd, buf, len, 0);
+}
+
+@[platform("linux")]
+fn ws_socket_recv(fd: i64, buf: rawptr, len: i32) -> i32 {
+    return recv(fd, buf, len as i64, 0) as i32;
+}
+
+@[platform("macos")]
+fn ws_socket_recv(fd: i64, buf: rawptr, len: i32) -> i32 {
+    return recv(fd, buf, len as i64, 0) as i32;
+}
+
+fn ws_read_rawptr(addr: rawptr) -> rawptr {
+    var out: rawptr = null;
+    memcpy(to_rawptr(&out), addr, 8);
+    return out;
+}
+
+fn ws_read_u8(addr: rawptr) -> i32 {
+    var out: u8 = 0;
+    memcpy(to_rawptr(&out), addr, 1);
+    return out as i32;
+}
+
+fn ws_write_u8(addr: rawptr, value: i32) {
+    var b: u8 = (value & 255) as u8;
+    memcpy(addr, to_rawptr(&b), 1);
+}
+
+fn ws_write_u16_be(addr: rawptr, value: i32) {
+    ws_write_u8(addr, (value >> 8) & 255);
+    ws_write_u8(addr + 1, value & 255);
+}
+
+fn ws_write_u64_be(addr: rawptr, value: i64) {
+    var shift: i32 = 56;
+    var i: i32 = 0;
+    while (i < 8) {
+        ws_write_u8(addr + i, ((value >> shift) as i32) & 255);
+        shift = shift - 8;
+        i = i + 1;
+    }
+}
+
+fn ws_read_u16_be(buf: rawptr) -> i32 {
+    return ((ws_read_u8(buf) & 255) << 8) | (ws_read_u8(buf + 1) & 255);
+}
+
+fn ws_read_u64_be(buf: rawptr) -> i64 {
+    var out: i64 = 0;
+    var i: i32 = 0;
+    while (i < 8) {
+        out = (out << 8) | ((ws_read_u8(buf + i) & 255) as i64);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ws_host_first_addr(host: string) -> rawptr {
+    let he = gethostbyname(host.c_str());
+    if (he == null) { return null; }
+    let list = ws_read_rawptr(he + 24);
+    if (list == null) { return null; }
+    return ws_read_rawptr(list);
+}
+
+fn ws_tcp_connect(host: string, port: i32) -> i64 {
+    if (!ws_net_start()) { return -1; }
+    let ip = ws_host_first_addr(host);
+    if (ip == null) { return -1; }
+    let fd = socket(2, 1, 0);
+    if (fd < 0) { return -1; }
+
+    let addr = malloc(16);
+    if (addr == null) {
+        ws_socket_close(fd);
+        return -1;
+    }
+    memset(addr, 0, 16);
+    var family: i16 = 2;
+    var net_port: i16 = htons(port as i16);
+    memcpy(addr, to_rawptr(&family), 2);
+    memcpy(addr + 2, to_rawptr(&net_port), 2);
+    memcpy(addr + 4, ip, 4);
+
+    let rc = connect(fd, addr, 16);
+    free(addr);
+    if (rc != 0) {
+        ws_socket_close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+fn ws_default_port(secure: bool) -> i32 {
+    if (secure) { return 443; }
+    return 80;
+}
+
+fn ws_parse_int(text: string, fallback: i32) -> i32 {
+    var out: i32 = 0;
+    var i: i32 = 0;
+    if (text.len == 0) { return fallback; }
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c < 48 || c > 57) { return fallback; }
+        out = out * 10 + (c - 48);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ws_mask_byte(mask: i32, index: i32) -> i32 {
+    let shift = (index & 3) * 8;
+    let shifted = (mask as i64) >> (shift as i64);
+    return (shifted as i32) & 255;
+}
+
+fn ws_random_nonce16() -> string {
+    var out = "";
+    var i: i32 = 0;
+    var word: i32 = 0;
+    while (i < 16) {
+        if ((i % 4) == 0) { word = random_int(); }
+        var b = ws_mask_byte(word, i);
+        if (b == 0) { b = 1; }
+        out = out + format("%c", b);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ws_build_key() -> string {
+    return base64_encode(ws_random_nonce16());
+}
+
+fn ws_expected_accept(key: string) -> string {
+    let guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    return base64_encode(hex_decode(sha1(key + guid)));
+}
+
+public class WebSocket {
+    private sockfd: i64;
+    private state: i32;
+    private host: string;
+    private port: i32;
+    private path: string;
+    private secure: bool;
+    private ssl_ctx: rawptr;
+    private ssl: rawptr;
+    private last_error: string;
+
+    public static fn closed(message: string) -> WebSocket {
+        return WebSocket {
+            sockfd: -1,
+            state: ws_state_closed(),
+            host: "",
+            port: 0,
+            path: "/",
+            secure: false,
+            ssl_ctx: null,
+            ssl: null,
+            last_error: message
+        };
+    }
+
+    public static fn connect(url: string) -> WebSocket {
+        var secure = false;
+        var rest = url;
+        if (rest.startsWith("ws://")) {
+            rest = rest.substring(5, rest.len);
+        } elif (rest.startsWith("wss://")) {
+            rest = rest.substring(6, rest.len);
+            secure = true;
+        } else {
+            return WebSocket.closed("unsupported WebSocket URL scheme");
+        }
+
+        var path = "/";
+        let slash = rest.indexOf("/");
+        var authority = rest;
+        if (slash >= 0) {
+            authority = rest.substring(0, slash);
+            path = rest.substring(slash, rest.len);
+        }
+        if (authority.len == 0) {
+            return WebSocket.closed("missing WebSocket host");
+        }
+
+        var host = authority;
+        var port = ws_default_port(secure);
+        let colon = authority.indexOf(":");
+        if (colon > 0) {
+            host = authority.substring(0, colon);
+            port = ws_parse_int(authority.substring(colon + 1, authority.len), port);
+        }
+
+        let fd = ws_tcp_connect(host, port);
+        if (fd < 0) {
+            return WebSocket.closed("tcp connect failed");
+        }
+
+        var out = WebSocket {
+            sockfd: fd,
+            state: ws_state_connecting(),
+            host: host,
+            port: port,
+            path: path,
+            secure: secure,
+            ssl_ctx: null,
+            ssl: null,
+            last_error: ""
+        };
+
+        if (secure && !out.startTls()) {
+            let msg = out.last_error;
+            out.closeTransport();
+            return WebSocket.closed(msg);
+        }
+        if (!out.handshake()) {
+            let msg2 = out.last_error;
+            out.closeTransport();
+            return WebSocket.closed(msg2);
+        }
+        out.state = ws_state_open();
+        return out;
+    }
+
+    fn startTls() -> bool {
+        OPENSSL_init_ssl(0 as u64, null);
+        self.ssl_ctx = SSL_CTX_new(TLS_client_method());
+        if (self.ssl_ctx == null) {
+            self.last_error = "OpenSSL SSL_CTX_new failed";
+            return false;
+        }
+        self.ssl = SSL_new(self.ssl_ctx);
+        if (self.ssl == null) {
+            self.last_error = "OpenSSL SSL_new failed";
+            return false;
+        }
+        if (SSL_set_fd(self.ssl, self.sockfd as i32) != 1) {
+            self.last_error = "OpenSSL SSL_set_fd failed";
+            return false;
+        }
+        SSL_set_tlsext_host_name(self.ssl, self.host.c_str());
+        if (SSL_connect(self.ssl) != 1) {
+            self.last_error = "OpenSSL TLS handshake failed";
+            return false;
+        }
+        return true;
+    }
+
+    fn writeBytes(buf: rawptr, len: i32) -> i32 {
+        if (self.secure) {
+            return SSL_write(self.ssl, buf, len);
+        }
+        return ws_socket_send(self.sockfd, buf, len);
+    }
+
+    fn readBytes(buf: rawptr, len: i32) -> i32 {
+        if (self.secure) {
+            return SSL_read(self.ssl, buf, len);
+        }
+        return ws_socket_recv(self.sockfd, buf, len);
+    }
+
+    fn writeAll(buf: rawptr, len: i32) -> bool {
+        var sent: i32 = 0;
+        while (sent < len) {
+            let n = self.writeBytes(buf + sent, len - sent);
+            if (n <= 0) { return false; }
+            sent = sent + n;
+        }
+        return true;
+    }
+
+    fn readExact(buf: rawptr, len: i32) -> bool {
+        var got: i32 = 0;
+        while (got < len) {
+            let n = self.readBytes(buf + got, len - got);
+            if (n <= 0) { return false; }
+            got = got + n;
+        }
+        return true;
+    }
+
+    fn handshake() -> bool {
+        let key = ws_build_key();
+        let request = "GET " + self.path + " HTTP/1.1\r\n"
+            + "Host: " + self.host + ":" + self.port.toString() + "\r\n"
+            + "Upgrade: websocket\r\n"
+            + "Connection: Upgrade\r\n"
+            + "Sec-WebSocket-Key: " + key + "\r\n"
+            + "Sec-WebSocket-Version: 13\r\n"
+            + "\r\n";
+        if (!self.writeAll(request.c_str(), request.len as i32)) {
+            self.last_error = "WebSocket handshake write failed";
+            return false;
+        }
+        let response = self.readHeaders(16384);
+        if (response.len == 0) {
+            self.last_error = "WebSocket handshake response missing";
+            return false;
+        }
+        let lower = response.toLower();
+        if (!lower.startsWith("http/1.1 101") && !lower.startsWith("http/1.0 101")) {
+            self.last_error = "WebSocket server did not return HTTP 101";
+            return false;
+        }
+        if (!lower.contains("upgrade: websocket")) {
+            self.last_error = "WebSocket upgrade header missing";
+            return false;
+        }
+        if (!lower.contains("connection: upgrade")) {
+            self.last_error = "WebSocket connection upgrade header missing";
+            return false;
+        }
+        let accept = ws_expected_accept(key);
+        if (!lower.contains("sec-websocket-accept:") || !response.contains(accept)) {
+            self.last_error = "WebSocket accept key mismatch";
+            return false;
+        }
+        return true;
+    }
+
+    fn readHeaders(max_bytes: i32) -> string {
+        var out = "";
+        var buf: [u8; 1];
+        var count: i32 = 0;
+        while (count < max_bytes) {
+            if (!self.readExact(to_rawptr(&buf), 1)) { return ""; }
+            let b = buf[0] as i32;
+            out = out + format("%c", b);
+            if (out.endsWith("\r\n\r\n")) { return out; }
+            count = count + 1;
+        }
+        self.last_error = "WebSocket header block exceeded limit";
+        return "";
+    }
+
+    fn sendFrame(opcode: i32, payload: string) -> bool {
+        if (self.state != ws_state_open() && opcode != ws_opcode_close()) { return false; }
+        let payload_len = payload.len as i64;
+        var ext_len: i32 = 0;
+        if (payload_len > 125 && payload_len <= 65535) { ext_len = 2; }
+        if (payload_len > 65535) { ext_len = 8; }
+        let frame_len = 2 + ext_len + 4 + (payload_len as i32);
+        let frame = malloc(frame_len as i64);
+        if (frame == null) { return false; }
+
+        ws_write_u8(frame, 0x80 | (opcode & 15));
+        var offset: i32 = 2;
+        if (payload_len <= 125) {
+            ws_write_u8(frame + 1, 0x80 | (payload_len as i32));
+        } elif (payload_len <= 65535) {
+            ws_write_u8(frame + 1, 0x80 | 126);
+            ws_write_u16_be(frame + offset, payload_len as i32);
+            offset = offset + 2;
+        } else {
+            ws_write_u8(frame + 1, 0x80 | 127);
+            ws_write_u64_be(frame + offset, payload_len);
+            offset = offset + 8;
+        }
+
+        let mask_value = random_int();
+        var mi: i32 = 0;
+        while (mi < 4) {
+            ws_write_u8(frame + offset + mi, ws_mask_byte(mask_value, mi));
+            mi = mi + 1;
+        }
+        offset = offset + 4;
+
+        var i: i32 = 0;
+        while (i < payload_len as i32) {
+            let b = payload.charAt(i) & 255;
+            let m = ws_mask_byte(mask_value, i);
+            ws_write_u8(frame + offset + i, b ^ m);
+            i = i + 1;
+        }
+
+        let ok = self.writeAll(frame, frame_len);
+        free(frame);
+        return ok;
+    }
+
+    public fn send(message: string) -> bool {
+        return self.sendFrame(ws_opcode_text(), message);
+    }
+
+    public fn recv() -> string {
+        if (self.state != ws_state_open()) { return ""; }
+        var hdr: [u8; 2];
+        if (!self.readExact(to_rawptr(&hdr), 2)) {
+            self.state = ws_state_closed();
+            return "";
+        }
+        let b0 = hdr[0] as i32;
+        let b1 = hdr[1] as i32;
+        let opcode = b0 & 15;
+        var payload_len: i64 = (b1 & 127) as i64;
+        if (payload_len == 126) {
+            var ext2: [u8; 2];
+            if (!self.readExact(to_rawptr(&ext2), 2)) { return ""; }
+            payload_len = ws_read_u16_be(to_rawptr(&ext2)) as i64;
+        } elif (payload_len == 127) {
+            var ext8: [u8; 8];
+            if (!self.readExact(to_rawptr(&ext8), 8)) { return ""; }
+            payload_len = ws_read_u64_be(to_rawptr(&ext8));
+        }
+
+        var mask: [u8; 4];
+        let masked = (b1 & 128) != 0;
+        if (masked && !self.readExact(to_rawptr(&mask), 4)) { return ""; }
+
+        let payload = malloc(payload_len + 1);
+        if (payload == null) { return ""; }
+        if (payload_len > 0 && !self.readExact(payload, payload_len as i32)) {
+            free(payload);
+            return "";
+        }
+        if (masked) {
+            var i: i32 = 0;
+            while (i < payload_len as i32) {
+                let b = ws_read_u8(payload + i);
+                let m = mask[i % 4] as i32;
+                ws_write_u8(payload + i, b ^ m);
+                i = i + 1;
+            }
+        }
+        ws_write_u8(payload + (payload_len as i32), 0);
+
+        if (opcode == ws_opcode_close()) {
+            self.state = ws_state_closed();
+            free(payload);
+            return "";
+        }
+        if (opcode == ws_opcode_ping()) {
+            let data = from_cstr_len(payload, payload_len);
+            free(payload);
+            self.sendFrame(ws_opcode_pong(), data);
+            return self.recv();
+        }
+        if (opcode != ws_opcode_text() && opcode != ws_opcode_continuation()) {
+            free(payload);
+            return "";
+        }
+
+        let out = from_cstr_len(payload, payload_len);
+        free(payload);
+        return out;
+    }
+
+    public fn ping() -> bool {
+        return self.sendFrame(ws_opcode_ping(), "");
+    }
+
+    public fn isOpen() -> bool {
+        return self.state == ws_state_open();
+    }
+
+    public fn lastError() -> string {
+        return self.last_error;
+    }
+
+    fn closeTransport() {
+        if (self.ssl != null) {
+            SSL_shutdown(self.ssl);
+            SSL_free(self.ssl);
+            self.ssl = null;
+        }
+        if (self.ssl_ctx != null) {
+            SSL_CTX_free(self.ssl_ctx);
+            self.ssl_ctx = null;
+        }
+        if (self.sockfd >= 0) {
+            ws_socket_close(self.sockfd);
+            self.sockfd = -1;
+        }
+        self.state = ws_state_closed();
+    }
+
+    public fn close() {
+        if (self.state == ws_state_closed()) { return; }
+        self.state = ws_state_closing();
+        self.sendFrame(ws_opcode_close(), "");
+        self.closeTransport();
+    }
+}

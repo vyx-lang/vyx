@@ -1,0 +1,121 @@
+module bootstrap.llvm_unwind;
+
+use bootstrap.ast;
+use bootstrap.hir_ids;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+extern "C" {
+    fn vyx_rt_set_function_attr(h: rawptr, fn_value: rawptr, name: rawptr, len: u64,
+                                 value: rawptr, value_len: u64) -> i32;
+    fn vyx_rt_track_eh_owner(h: rawptr, object: rawptr, destructor: rawptr, release: rawptr) -> i32;
+    fn vyx_rt_build_call(h: rawptr, fty: rawptr, callee: rawptr,
+                         args: rawptr, n: u64, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_invoke(h: rawptr, fty: rawptr, callee: rawptr,
+                           args: rawptr, n: u64, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_owned_constructor(h: rawptr, fty: rawptr, callee: rawptr,
+                                       args: rawptr, n: u64, name: rawptr, len: u64,
+                                       destructor: rawptr, release: rawptr,
+                                       needs_invoke: i32) -> rawptr;
+}
+
+public fn llvm_unwind_prepare_adapter(mod: rawptr, adapter: rawptr, target: string) {
+    var actual = target;
+    if (actual.len == 0) { actual = policy_host_target_triple(); }
+    var personality = "__gxx_personality_v0";
+    if (actual.contains("windows") && actual.contains("msvc")) { personality = "__CxxFrameHandler3"; }
+    vyx_rt_set_function_attr(mod, adapter, "personality".c_str(), 11,
+                             personality.c_str(), personality.len as u64);
+    vyx_rt_set_function_attr(mod, adapter, "uwtable".c_str(), 7, "".c_str(), 0);
+}
+
+fn llvm_unwind_function_value(map: rawptr, id: i32) -> rawptr {
+    if (map == null || id <= 0 || (id as i64) >= ast_read_i64(map + 8)) { return null; }
+    let data = ast_read_rawptr(map);
+    let stride = ast_read_i64(map + 24);
+    return ast_read_rawptr(data + ((id as i64) * stride));
+}
+
+// The owning MIR Drop is authoritative, including native Vyx destructors.
+// Read only the caller's live body; no name-based destructor inference.
+public fn llvm_unwind_drop_for_type(m: &MirUnit, caller_id: i32, type_id: i32) -> i32 {
+    var block = m.function_first_block(caller_id);
+    while (block != mir_id_invalid()) {
+        var instr = m.block_first_instr(block);
+        while (instr != mir_id_invalid()) {
+            if (m.instr_kind(instr) == mir_instr_drop()) {
+                let place = m.instr_place(instr);
+                if (place != mir_id_invalid() && m.place_type(place) == type_id) {
+                    return m.instr_target_id(instr);
+                }
+            }
+            instr = m.instr_next(instr);
+        }
+        block = m.block_next(block);
+    }
+    return mir_id_invalid();
+}
+
+public fn llvm_unwind_drop_for_place(m: &MirUnit, caller_id: i32, place_id: i32) -> i32 {
+    if (m.place_kind(place_id) != mir_place_local()) { return mir_id_invalid(); }
+    var block = m.function_first_block(caller_id);
+    while (block != mir_id_invalid()) {
+        var instr = m.block_first_instr(block);
+        while (instr != mir_id_invalid()) {
+            if (m.instr_kind(instr) == mir_instr_drop() && m.instr_place(instr) == place_id) {
+                return m.instr_target_id(instr);
+            }
+            instr = m.instr_next(instr);
+        }
+        block = m.block_next(block);
+    }
+    return mir_id_invalid();
+}
+
+public fn llvm_unwind_track_owner(m: &MirUnit, place_id: i32, drop: i32, mod: rawptr,
+                                    object: rawptr, pointer_storage: bool,
+                                    function_values: rawptr, free_fn: rawptr) -> i32 {
+    var release: rawptr = null;
+    if (pointer_storage && mir_unit_function_is_foreign_dci_dtor(m, drop)
+        && !mir_unit_local_is_source_param(m, m.place_local(place_id))) { release = free_fn; }
+    return vyx_rt_track_eh_owner(mod, object, llvm_unwind_function_value(function_values, drop), release);
+}
+
+// SPLIT2: call/invoke emission is isolated from the shared lowerer body.
+public fn llvm_unwind_build_call(m: &MirUnit, caller_id: i32, callee_id: i32,
+                                  mod: rawptr, fty: rawptr, callee: rawptr,
+                                  args: rawptr, argc: u64, name: string,
+                                  needs_invoke: bool, shared: bool,
+                                  function_values: rawptr, function_types: rawptr,
+                                  free_fty: rawptr, free_fn: rawptr) -> rawptr {
+    if (shared && callee_id != mir_id_invalid()
+        && mir_unit_function_is_foreign_dci_ctor(m, callee_id)) {
+        let drop = llvm_unwind_drop_for_type(m, caller_id, m.function_return_type(callee_id));
+        if (drop != mir_id_invalid()) {
+            let destructor = llvm_unwind_function_value(function_values, drop);
+            var invoke: i32 = 0;
+            if (needs_invoke) { invoke = 1; }
+            return vyx_rt_build_owned_constructor(mod, fty, callee, args, argc,
+                                                   name.c_str(), name.len as u64,
+                                                   destructor, free_fn, invoke);
+        }
+    }
+    if (needs_invoke) {
+        return vyx_rt_build_invoke(mod, fty, callee, args, argc,
+                                    name.c_str(), name.len as u64);
+    }
+    return vyx_rt_build_call(mod, fty, callee, args, argc,
+                              name.c_str(), name.len as u64);
+}
+
+public fn llvm_unwind_shared_abi_supported(abi: string, target: string) -> bool {
+    var actual = target;
+    if (actual.len == 0) { actual = policy_host_target_triple(); }
+    if (!actual.startsWith("x86_64")) { return false; }
+    if (actual.contains("windows") && actual.contains("msvc")) {
+        return abi == "dci.eh.msvc-cxx.v1";
+    }
+    if (actual.contains("linux")) { return abi == "dci.eh.itanium-cxx.v1"; }
+    return false;
+}

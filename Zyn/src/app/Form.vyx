@@ -1,0 +1,1006 @@
+module Zyn.App;
+
+use std.collections;
+use Color = Zyn.Nut.Types.Color;
+
+// ---------------------------------------------------------------------------
+// ZC-08 forms and selection
+//
+// A form is a list of typed field specs plus their current values. Validation
+// is a pure function of (spec, value) for the built-in rules, and an injected
+// `AppValidator` for anything the application owns. Every issue carries the
+// field id it belongs to, which is what lets the UI move focus to the first
+// invalid field instead of just painting a red border somewhere.
+//
+// Asynchronous validation goes through the ZC-06 effect boundary: the field is
+// marked pending, the host requests an effect, and the result is committed on
+// the UI scheduler like any other external completion. The form never blocks.
+//
+// Every popup (combo box, date/time picker, file picker) is opened as an M0
+// overlay layer, so it inherits focus trapping, Esc dismissal and focus restore
+// without a second interaction model.
+//
+// Option lists live in AppWorld string-list resources rather than inside the
+// spec. `Vec.destroy()` does not run element destructors and a `get()` result
+// is a shallow copy, so a nested `Vec` field would make every copy a
+// double-free waiting to happen. A resource key has none of that hazard and
+// matches how `ListView` already carries its rows.
+// ---------------------------------------------------------------------------
+
+public fn appFieldText() -> i32 { return 1; }
+public fn appFieldMultiline() -> i32 { return 2; }
+public fn appFieldPassword() -> i32 { return 3; }
+public fn appFieldNumber() -> i32 { return 4; }
+public fn appFieldCheckbox() -> i32 { return 5; }
+public fn appFieldChoice() -> i32 { return 6; }
+public fn appFieldRadio() -> i32 { return 7; }
+public fn appFieldDate() -> i32 { return 8; }
+public fn appFieldTime() -> i32 { return 9; }
+public fn appFieldFile() -> i32 { return 10; }
+
+public fn appValidationOk() -> i32 { return 0; }
+public fn appValidationRequired() -> i32 { return 1; }
+public fn appValidationTooLong() -> i32 { return 2; }
+public fn appValidationOutOfRange() -> i32 { return 3; }
+public fn appValidationNotANumber() -> i32 { return 4; }
+public fn appValidationNotAChoice() -> i32 { return 5; }
+public fn appValidationBadDate() -> i32 { return 6; }
+public fn appValidationBadTime() -> i32 { return 7; }
+public fn appValidationCustom() -> i32 { return 8; }
+public fn appValidationPending() -> i32 { return 9; }
+
+// ------------------------------------------------------------------
+// Typed values
+// ------------------------------------------------------------------
+
+public class AppFieldValue {
+    public text: string;
+    public number: f32;
+    public flag: bool;
+    public is_set: bool;
+
+    public static fn create(text: string, number: f32, flag: bool, is_set: bool) -> AppFieldValue {
+        return AppFieldValue { text: text, number: number, flag: flag, is_set: is_set };
+    }
+
+    public static fn empty() -> AppFieldValue {
+        return AppFieldValue.create("", 0.0, false, false);
+    }
+
+    public static fn ofText(value: string) -> AppFieldValue {
+        return AppFieldValue.create(value, 0.0, false, true);
+    }
+
+    public static fn ofNumber(value: f32) -> AppFieldValue {
+        return AppFieldValue.create(app_format_f32(value), value, false, true);
+    }
+
+    public static fn ofFlag(value: bool) -> AppFieldValue {
+        var text = "false";
+        if (value) { text = "true"; }
+        return AppFieldValue.create(text, 0.0, value, true);
+    }
+
+    public fn asText(&self) -> string { return self.text; }
+
+    public fn asNumber(&self, fallback: f32) -> f32 {
+        if (!self.is_set) { return fallback; }
+        return app_parse_f32_or(self.text, fallback);
+    }
+
+    public fn asFlag(&self) -> bool { return self.flag; }
+
+    public fn isEmpty(&self) -> bool {
+        if (!self.is_set) { return true; }
+        if (self.text.len > 0) { return false; }
+        return self.flag == false && self.number == 0.0;
+    }
+
+    public fn dup(&self) -> AppFieldValue {
+        return AppFieldValue.create(self.text, self.number, self.flag, self.is_set);
+    }
+}
+
+// ------------------------------------------------------------------
+// Option lists, stored as world resources
+// ------------------------------------------------------------------
+
+public class FormOptions {
+    public static fn keyFor(field_id: string) -> string {
+        return "options:" + field_id;
+    }
+
+    @[borrow_args]
+    public static fn declare(world: AppWorld, field_id: string, values: Vec<string>) -> AppWorld {
+        if (field_id.len == 0) { return world; }
+        var out = world;
+        var i: i32 = 0;
+        while (i < (values.len as i32)) {
+            out = out.appendStringListResource(FormOptions.keyFor(field_id), values.get(i as i64));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn count(world: AppWorld, field_id: string) -> i32 {
+        if (field_id.len == 0) { return 0; }
+        return world.stringListResourceCount(FormOptions.keyFor(field_id));
+    }
+
+    public static fn at(world: AppWorld, field_id: string, index: i32) -> string {
+        if (field_id.len == 0 || index < 0 || index >= FormOptions.count(world, field_id)) { return ""; }
+        return world.stringListResourceAt(FormOptions.keyFor(field_id), index);
+    }
+
+    public static fn indexOf(world: AppWorld, field_id: string, value: string) -> i32 {
+        var i: i32 = 0;
+        let total = FormOptions.count(world, field_id);
+        while (i < total) {
+            if (FormOptions.at(world, field_id, i) == value) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
+
+// ------------------------------------------------------------------
+// Field specification
+// ------------------------------------------------------------------
+
+public class AppFieldSpec {
+    public id: string;
+    public kind: i32;
+    public label: string;
+    public hint: string;
+    public is_required: bool;
+    public has_range: bool;
+    public min_number: f32;
+    public max_number: f32;
+    public max_length: i32;
+    public validator_id: string;
+
+    public static fn create(id: string, kind: i32, label: string) -> AppFieldSpec {
+        return AppFieldSpec {
+            id: id,
+            kind: kind,
+            label: label,
+            hint: "",
+            is_required: false,
+            has_range: false,
+            min_number: 0.0,
+            max_number: 0.0,
+            max_length: 0,
+            validator_id: ""
+        };
+    }
+
+    public fn withHint(mut self, value: string) -> AppFieldSpec {
+        self.hint = value;
+        return self;
+    }
+
+    public fn required(mut self) -> AppFieldSpec {
+        self.is_required = true;
+        return self;
+    }
+
+    public fn withRange(mut self, min_value: f32, max_value: f32) -> AppFieldSpec {
+        self.has_range = true;
+        self.min_number = min_value;
+        self.max_number = max_value;
+        return self;
+    }
+
+    // Counted in graphemes, so a limit never cuts a CJK string in half.
+    public fn withMaxLength(mut self, value: i32) -> AppFieldSpec {
+        self.max_length = value;
+        return self;
+    }
+
+    public fn withValidator(mut self, value: string) -> AppFieldSpec {
+        self.validator_id = value;
+        return self;
+    }
+
+    public fn isPopup(&self) -> bool {
+        return self.kind == appFieldChoice() || self.kind == appFieldDate()
+            || self.kind == appFieldTime() || self.kind == appFieldFile();
+    }
+
+    public fn dup(&self) -> AppFieldSpec {
+        var out = AppFieldSpec.create(self.id, self.kind, self.label);
+        out.hint = self.hint;
+        out.is_required = self.is_required;
+        out.has_range = self.has_range;
+        out.min_number = self.min_number;
+        out.max_number = self.max_number;
+        out.max_length = self.max_length;
+        out.validator_id = self.validator_id;
+        return out;
+    }
+}
+
+// ------------------------------------------------------------------
+// Issues and validators
+// ------------------------------------------------------------------
+
+public class AppValidationIssue {
+    public field_id: string;
+    public code: i32;
+    public message: string;
+
+    public static fn create(field_id: string, code: i32, message: string) -> AppValidationIssue {
+        return AppValidationIssue { field_id: field_id, code: code, message: message };
+    }
+
+    public static fn none() -> AppValidationIssue {
+        return AppValidationIssue.create("", appValidationOk(), "");
+    }
+
+    public fn isOk(&self) -> bool { return self.code == appValidationOk(); }
+
+    public fn dup(&self) -> AppValidationIssue {
+        return AppValidationIssue.create(self.field_id, self.code, self.message);
+    }
+}
+
+// `world` is passed in because a choice field's legal values live in a
+// resource, not in the spec.
+public interface AppValidator {
+    fn validate(&self, world: AppWorld, spec: AppFieldSpec, value: AppFieldValue) -> AppValidationIssue;
+}
+
+// The rules a commercial form always needs, so an application only writes a
+// custom validator for its own domain checks.
+public class AppBuiltinValidator : AppValidator {
+    public static fn create() -> AppBuiltinValidator {
+        return AppBuiltinValidator {};
+    }
+
+    public fn validate(&self, world: AppWorld, spec: AppFieldSpec, value: AppFieldValue) -> AppValidationIssue {
+        if (spec.is_required && value.isEmpty()) {
+            return AppValidationIssue.create(spec.id, appValidationRequired(), spec.label + " is required");
+        }
+        if (value.isEmpty()) { return AppValidationIssue.none(); }
+        if (spec.kind == appFieldText() || spec.kind == appFieldMultiline() || spec.kind == appFieldPassword()) {
+            if (spec.max_length > 0 && appTextClusterCount(value.text) > spec.max_length) {
+                return AppValidationIssue.create(spec.id, appValidationTooLong(),
+                    spec.label + " is longer than " + format("%d", spec.max_length as i64) + " characters");
+            }
+            return AppValidationIssue.none();
+        }
+        if (spec.kind == appFieldNumber()) {
+            if (!appLooksLikeNumber(value.text)) {
+                return AppValidationIssue.create(spec.id, appValidationNotANumber(), spec.label + " is not a number");
+            }
+            let parsed = app_parse_f32_or(value.text, 0.0);
+            if (spec.has_range && (parsed < spec.min_number || parsed > spec.max_number)) {
+                return AppValidationIssue.create(spec.id, appValidationOutOfRange(),
+                    spec.label + " must be between " + app_format_f32(spec.min_number) + " and " + app_format_f32(spec.max_number));
+            }
+            return AppValidationIssue.none();
+        }
+        if (spec.kind == appFieldCheckbox()) {
+            if (spec.is_required && !value.flag) {
+                return AppValidationIssue.create(spec.id, appValidationRequired(), spec.label + " must be accepted");
+            }
+            return AppValidationIssue.none();
+        }
+        if (spec.kind == appFieldChoice() || spec.kind == appFieldRadio()) {
+            if (FormOptions.indexOf(world, spec.id, value.text) < 0) {
+                return AppValidationIssue.create(spec.id, appValidationNotAChoice(), spec.label + " is not one of the options");
+            }
+            return AppValidationIssue.none();
+        }
+        if (spec.kind == appFieldDate()) {
+            if (!AppDate.parse(value.text).isValid()) {
+                return AppValidationIssue.create(spec.id, appValidationBadDate(), spec.label + " is not a valid date");
+            }
+            return AppValidationIssue.none();
+        }
+        if (spec.kind == appFieldTime()) {
+            if (!AppTime.parse(value.text).isValid()) {
+                return AppValidationIssue.create(spec.id, appValidationBadTime(), spec.label + " is not a valid time");
+            }
+            return AppValidationIssue.none();
+        }
+        return AppValidationIssue.none();
+    }
+}
+
+// Digits with an optional single leading sign and one decimal point.
+public fn appLooksLikeNumber(text: string) -> bool {
+    if (text.len == 0) { return false; }
+    var digits: i32 = 0;
+    var dots: i32 = 0;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let code = text.charAt(i as i64);
+        if (code >= 48 && code <= 57) {
+            digits = digits + 1;
+        } else if (code == 45) {
+            if (i != 0) { return false; }
+        } else if (code == 46) {
+            dots = dots + 1;
+            if (dots > 1) { return false; }
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    return digits > 0;
+}
+
+// ------------------------------------------------------------------
+// Date and time values
+// ------------------------------------------------------------------
+
+public class AppDate {
+    public year: i32;
+    public month: i32;
+    public day: i32;
+
+    public static fn create(year: i32, month: i32, day: i32) -> AppDate {
+        return AppDate { year: year, month: month, day: day };
+    }
+
+    public static fn empty() -> AppDate {
+        return AppDate.create(0, 0, 0);
+    }
+
+    public fn isLeapYear(&self) -> bool {
+        if ((self.year % 400) == 0) { return true; }
+        if ((self.year % 100) == 0) { return false; }
+        return (self.year % 4) == 0;
+    }
+
+    public fn daysInMonth(&self) -> i32 {
+        if (self.month == 2) {
+            if (self.isLeapYear()) { return 29; }
+            return 28;
+        }
+        if (self.month == 4 || self.month == 6 || self.month == 9 || self.month == 11) { return 30; }
+        if (self.month >= 1 && self.month <= 12) { return 31; }
+        return 0;
+    }
+
+    public fn isValid(&self) -> bool {
+        if (self.year < 1 || self.month < 1 || self.month > 12) { return false; }
+        return self.day >= 1 && self.day <= self.daysInMonth();
+    }
+
+    public fn toIso(&self) -> string {
+        return format("%d", self.year as i64) + "-" + AppDate.pad2(self.month) + "-" + AppDate.pad2(self.day);
+    }
+
+    public static fn pad2(value: i32) -> string {
+        if (value < 10) { return "0" + format("%d", value as i64); }
+        return format("%d", value as i64);
+    }
+
+    // Accepts exactly `YYYY-MM-DD`; anything else is empty, which `isValid()`
+    // then rejects. A permissive parser here would hide typos in a form.
+    public static fn parse(text: string) -> AppDate {
+        if (text.len != 10) { return AppDate.empty(); }
+        if (text.charAt(4 as i64) != 45 || text.charAt(7 as i64) != 45) { return AppDate.empty(); }
+        var i: i32 = 0;
+        while (i < text.len) {
+            if (i != 4 && i != 7) {
+                let code = text.charAt(i as i64);
+                if (code < 48 || code > 57) { return AppDate.empty(); }
+            }
+            i = i + 1;
+        }
+        let year = app_parse_i32_or(text.substring(0 as i64, 4 as i64), -1);
+        let month = app_parse_i32_or(text.substring(5 as i64, 7 as i64), -1);
+        let day = app_parse_i32_or(text.substring(8 as i64, 10 as i64), -1);
+        let out = AppDate.create(year, month, day);
+        if (!out.isValid()) { return AppDate.empty(); }
+        return out;
+    }
+
+    public fn dup(&self) -> AppDate {
+        return AppDate.create(self.year, self.month, self.day);
+    }
+}
+
+public class AppTime {
+    public hour: i32;
+    public minute: i32;
+    public second: i32;
+
+    public static fn create(hour: i32, minute: i32, second: i32) -> AppTime {
+        return AppTime { hour: hour, minute: minute, second: second };
+    }
+
+    public static fn empty() -> AppTime {
+        return AppTime.create(0, 0, 0);
+    }
+
+    public fn isValid(&self) -> bool {
+        if (self.hour < 0 || self.hour > 23) { return false; }
+        if (self.minute < 0 || self.minute > 59) { return false; }
+        return self.second >= 0 && self.second <= 59;
+    }
+
+    public fn toText(&self) -> string {
+        return AppDate.pad2(self.hour) + ":" + AppDate.pad2(self.minute);
+    }
+
+    public static fn parse(text: string) -> AppTime {
+        if (text.len != 5) { return AppTime.empty(); }
+        if (text.indexOf(":") != 2) { return AppTime.empty(); }
+        let hour = app_parse_i32_or(text.substring(0 as i64, 2 as i64), -1);
+        let minute = app_parse_i32_or(text.substring(3 as i64, 5 as i64), -1);
+        let out = AppTime.create(hour, minute, 0);
+        if (!out.isValid()) { return AppTime.empty(); }
+        return out;
+    }
+
+    public fn dup(&self) -> AppTime {
+        return AppTime.create(self.hour, self.minute, self.second);
+    }
+}
+
+// ------------------------------------------------------------------
+// Form state
+// ------------------------------------------------------------------
+
+public class AppFormState {
+    private specs: Vec<AppFieldSpec>;
+    private values: Vec<AppFieldValue>;
+    private issues: Vec<AppValidationIssue>;
+    private touched: Vec<string>;
+    private pending: Vec<string>;
+    public submit_attempted: bool;
+
+    public static fn create() -> AppFormState {
+        return AppFormState {
+            specs: Vec::<AppFieldSpec>.new(),
+            values: Vec::<AppFieldValue>.new(),
+            issues: Vec::<AppValidationIssue>.new(),
+            touched: Vec::<string>.new(),
+            pending: Vec::<string>.new(),
+            submit_attempted: false
+        };
+    }
+
+    public fn fieldCount(&self) -> i32 { return self.specs.len as i32; }
+
+    public fn fieldIndex(&self, id: string) -> i32 {
+        var i: i32 = 0;
+        while (i < self.fieldCount()) {
+            if (self.specs.get(i as i64).id == id) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn specAt(&self, index: i32) -> AppFieldSpec {
+        if (index < 0 || index >= self.fieldCount()) { return AppFieldSpec.create("", 0, ""); }
+        return self.specs.get(index as i64).dup();
+    }
+
+    public fn specOf(&self, id: string) -> AppFieldSpec {
+        return self.specAt(self.fieldIndex(id));
+    }
+
+    public fn addField(mut self, spec: AppFieldSpec) -> AppFormState {
+        if (spec.id.len == 0 || self.fieldIndex(spec.id) >= 0) { return self; }
+        self.specs.push(spec.dup());
+        self.values.push(AppFieldValue.empty());
+        return self;
+    }
+
+    public fn valueAt(&self, index: i32) -> AppFieldValue {
+        if (index < 0 || index >= (self.values.len as i32)) { return AppFieldValue.empty(); }
+        return self.values.get(index as i64).dup();
+    }
+
+    public fn valueOf(&self, id: string) -> AppFieldValue {
+        return self.valueAt(self.fieldIndex(id));
+    }
+
+    // Setting a value clears the field's issue: the old message would otherwise
+    // describe text the user already replaced.
+    public fn setValue(mut self, id: string, value: AppFieldValue) -> AppFormState {
+        let index = self.fieldIndex(id);
+        if (index < 0) { return self; }
+        self.values.set(index as i64, value.dup());
+        self = self.touch(id);
+        self = self.clearIssue(id);
+        return self;
+    }
+
+    public fn setText(mut self, id: string, value: string) -> AppFormState {
+        return self.setValue(id, AppFieldValue.ofText(value));
+    }
+
+    public fn setNumber(mut self, id: string, value: f32) -> AppFormState {
+        return self.setValue(id, AppFieldValue.ofNumber(value));
+    }
+
+    public fn setFlag(mut self, id: string, value: bool) -> AppFormState {
+        return self.setValue(id, AppFieldValue.ofFlag(value));
+    }
+
+    // ------------------------------------------------------------------
+    // Touched tracking: an untouched empty field is not an error yet.
+    // ------------------------------------------------------------------
+
+    public fn touch(mut self, id: string) -> AppFormState {
+        if (id.len == 0 || self.isTouched(id)) { return self; }
+        self.touched.push(id);
+        return self;
+    }
+
+    public fn isTouched(&self, id: string) -> bool {
+        var i: i32 = 0;
+        while (i < (self.touched.len as i32)) {
+            if (self.touched.get(i as i64) == id) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Issues
+    // ------------------------------------------------------------------
+
+    public fn issueCount(&self) -> i32 { return self.issues.len as i32; }
+
+    public fn issueAt(&self, index: i32) -> AppValidationIssue {
+        if (index < 0 || index >= self.issueCount()) { return AppValidationIssue.none(); }
+        return self.issues.get(index as i64).dup();
+    }
+
+    public fn issueOf(&self, id: string) -> AppValidationIssue {
+        var i: i32 = 0;
+        while (i < self.issueCount()) {
+            if (self.issues.get(i as i64).field_id == id) { return self.issues.get(i as i64).dup(); }
+            i = i + 1;
+        }
+        return AppValidationIssue.none();
+    }
+
+    public fn hasIssue(&self, id: string) -> bool {
+        return !self.issueOf(id).isOk();
+    }
+
+    private fn clearIssue(mut self, id: string) -> AppFormState {
+        var i: i32 = self.issueCount() - 1;
+        while (i >= 0) {
+            if (self.issues.get(i as i64).field_id == id) { self.issues.remove(i as i64); }
+            i = i - 1;
+        }
+        return self;
+    }
+
+    public fn clearIssues(mut self) -> AppFormState {
+        self.issues.clear();
+        return self;
+    }
+
+    // The field the UI should focus after a failed submit. Empty when valid.
+    public fn firstInvalidField(&self) -> string {
+        var i: i32 = 0;
+        while (i < self.fieldCount()) {
+            let id = self.specs.get(i as i64).id;
+            if (self.hasIssue(id)) { return id; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public fn isValid(&self) -> bool {
+        return self.issueCount() == 0 && self.pendingCount() == 0;
+    }
+
+    // ------------------------------------------------------------------
+    // Synchronous validation
+    // ------------------------------------------------------------------
+
+    public fn validateField(mut self, world: AppWorld, validator: dyn AppValidator, id: string) -> AppFormState {
+        let index = self.fieldIndex(id);
+        if (index < 0) { return self; }
+        self = self.clearIssue(id);
+        let issue = validator.validate(world, self.specs.get(index as i64), self.values.get(index as i64));
+        if (!issue.isOk()) { self.issues.push(issue.dup()); }
+        return self;
+    }
+
+    // Runs the built-in rules, then the application validator for fields that
+    // declare one. Untouched fields are still checked on submit, which is why
+    // this marks everything touched first.
+    public fn validateAll(mut self, world: AppWorld, validator: dyn AppValidator, app_validator: dyn AppValidator) -> AppFormState {
+        self.issues.clear();
+        var i: i32 = 0;
+        while (i < self.fieldCount()) {
+            let spec = self.specs.get(i as i64);
+            self = self.touch(spec.id);
+            let issue = validator.validate(world, spec, self.values.get(i as i64));
+            if (!issue.isOk()) {
+                self.issues.push(issue.dup());
+            } else if (spec.validator_id.len > 0) {
+                let custom = app_validator.validate(world, spec, self.values.get(i as i64));
+                if (!custom.isOk()) { self.issues.push(custom.dup()); }
+            }
+            i = i + 1;
+        }
+        return self;
+    }
+
+    // ------------------------------------------------------------------
+    // Asynchronous validation (through the ZC-06 effect boundary)
+    // ------------------------------------------------------------------
+
+    public fn markPending(mut self, id: string) -> AppFormState {
+        if (id.len == 0 || self.isPending(id)) { return self; }
+        self.pending.push(id);
+        self = self.clearIssue(id);
+        self.issues.push(AppValidationIssue.create(id, appValidationPending(), ""));
+        return self;
+    }
+
+    public fn isPending(&self, id: string) -> bool {
+        var i: i32 = 0;
+        while (i < (self.pending.len as i32)) {
+            if (self.pending.get(i as i64) == id) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn pendingCount(&self) -> i32 { return self.pending.len as i32; }
+
+    // Called on the UI scheduler when the async result is committed. A result
+    // for a field that no longer exists is dropped, matching ZC-06's rule that
+    // a completion never writes into a component that is gone.
+    public fn applyValidationResult(mut self, id: string, ok: bool, message: string) -> AppFormState {
+        if (self.fieldIndex(id) < 0) { return self; }
+        var i: i32 = (self.pending.len as i32) - 1;
+        while (i >= 0) {
+            if (self.pending.get(i as i64) == id) { self.pending.remove(i as i64); }
+            i = i - 1;
+        }
+        self = self.clearIssue(id);
+        if (!ok) {
+            self.issues.push(AppValidationIssue.create(id, appValidationCustom(), message));
+        }
+        return self;
+    }
+
+    // Requests the effect that will later produce a result. Returns the world
+    // with the request queued and the field marked pending. The pending marker
+    // lives in a world resource rather than on the state object, because this
+    // method returns the world and cannot also hand back a modified self.
+    public fn requestAsyncValidation(mut self, world: AppWorld, owner_id: string, id: string, timeout_frames: u64) -> AppWorld {
+        if (self.fieldIndex(id) < 0) { return world; }
+        var out = world.setStringResource("validate.pending." + id, "1");
+        out = out.setStringResource("validate.value." + id, self.valueOf(id).text);
+        return out.requestEffect(appEffectTimer(), owner_id, "validate." + id, id, timeout_frames);
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence and reset
+    // ------------------------------------------------------------------
+
+    public fn saveValuesTo(&self, world: AppWorld, prefix: string) -> AppWorld {
+        if (prefix.len == 0) { return world; }
+        var out = world;
+        var i: i32 = 0;
+        while (i < self.fieldCount()) {
+            let spec = self.specs.get(i as i64);
+            out = out.setStringResource(prefix + "." + spec.id, self.values.get(i as i64).text);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn loadValuesFrom(mut self, world: AppWorld, prefix: string) -> AppFormState {
+        if (prefix.len == 0) { return self; }
+        var i: i32 = 0;
+        while (i < self.fieldCount()) {
+            let id = self.specs.get(i as i64).id;
+            let stored = world.stringResource(prefix + "." + id, "");
+            if (stored.len > 0) {
+                self.values.set(i as i64, AppFieldValue.ofText(stored));
+            }
+            i = i + 1;
+        }
+        return self;
+    }
+
+    public fn reset(mut self) -> AppFormState {
+        var i: i32 = 0;
+        while (i < (self.values.len as i32)) {
+            self.values.set(i as i64, AppFieldValue.empty());
+            i = i + 1;
+        }
+        self.issues.clear();
+        self.touched.clear();
+        self.pending.clear();
+        self.submit_attempted = false;
+        return self;
+    }
+
+    public fn dup(&self) -> AppFormState {
+        var out = AppFormState.create();
+        var i: i32 = 0;
+        while (i < self.fieldCount()) {
+            out.specs.push(self.specs.get(i as i64).dup());
+            out.values.push(self.values.get(i as i64).dup());
+            i = i + 1;
+        }
+        i = 0;
+        while (i < self.issueCount()) {
+            out.issues.push(self.issues.get(i as i64).dup());
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (self.touched.len as i32)) {
+            out.touched.push(self.touched.get(i as i64));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (self.pending.len as i32)) {
+            out.pending.push(self.pending.get(i as i64));
+            i = i + 1;
+        }
+        out.submit_attempted = self.submit_attempted;
+        return out;
+    }
+
+    // No nested Vec lives inside these elements, so freeing the outer buffers
+    // is the whole job.
+    public fn destroy(&mut self) {
+        self.specs.destroy();
+        self.values.destroy();
+        self.issues.destroy();
+        self.touched.destroy();
+        self.pending.destroy();
+    }
+}
+
+// ------------------------------------------------------------------
+// File dialog boundary (the native dialog itself is ZC-18 work)
+// ------------------------------------------------------------------
+
+public class AppFileDialogRequest {
+    public title: string;
+    public start_dir: string;
+    // Semicolon separated, e.g. "png;jpg". Empty accepts anything.
+    public extensions: string;
+    public allow_multiple: bool;
+
+    public static fn create(title: string) -> AppFileDialogRequest {
+        return AppFileDialogRequest {
+            title: title,
+            start_dir: "",
+            extensions: "",
+            allow_multiple: false
+        };
+    }
+
+    public fn withExtensions(mut self, value: string) -> AppFileDialogRequest {
+        self.extensions = value;
+        return self;
+    }
+
+    public fn withStartDir(mut self, value: string) -> AppFileDialogRequest {
+        self.start_dir = value;
+        return self;
+    }
+
+    public fn accept(&self, extension: string) -> bool {
+        if (self.extensions.len == 0) { return true; }
+        var token = "";
+        var i: i32 = 0;
+        while (i <= self.extensions.len) {
+            if (i == self.extensions.len || self.extensions.charAt(i as i64) == 59) {
+                if (token == extension) { return true; }
+                token = "";
+            } else {
+                token = token + self.extensions.substring(i as i64, (i + 1) as i64);
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+public interface AppFileDialogBridge {
+    fn open(&self, request: AppFileDialogRequest) -> string;
+    fn save(&self, request: AppFileDialogRequest) -> string;
+}
+
+// ------------------------------------------------------------------
+// Popup and input controls (composed from existing View kinds)
+// ------------------------------------------------------------------
+
+public class ComboBox {
+    // The popup itself is an overlay layer, so Tab cannot leave it and Esc
+    // closes it through the same code path as a dialog.
+    @[borrow_args]
+    public static fn popup(id: string, layer_id: string, options: Vec<string>, action_prefix: string) -> View {
+        var out = Column.create().id(id).gap(4.0).layer(layer_id)
+            .padding(8.0)
+            .background(Color.rgba(1.0, 1.0, 1.0, 1.0))
+            .cornerRadius(8.0);
+        var i: i32 = 0;
+        while (i < (options.len as i32)) {
+            let label = options.get(i as i64);
+            out = out.child(Button.tonalAction(id + ".option." + format("%d", i as i64), label, action_prefix + format("%d", i as i64))
+                .height(40.0)
+                .accessibility("menuitem", label, ""));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Same popup, but the options come from the resource the form declared.
+    public static fn popupBound(id: string, layer_id: string, options_resource: string, action_prefix: string, world: AppWorld) -> View {
+        var out = Column.create().id(id).gap(4.0).layer(layer_id)
+            .padding(8.0)
+            .background(Color.rgba(1.0, 1.0, 1.0, 1.0))
+            .cornerRadius(8.0);
+        var i: i32 = 0;
+        let total = world.stringListResourceCount(options_resource);
+        while (i < total) {
+            let label = world.stringListResourceAt(options_resource, i);
+            out = out.child(Button.tonalAction(id + ".option." + format("%d", i as i64), label, action_prefix + format("%d", i as i64))
+                .height(40.0)
+                .accessibility("menuitem", label, ""));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn create(id: string, label: string, current: string, action_name: string) -> View {
+        return Column.create().id(id).gap(6.0)
+            .child(Text.body(label).id(id + ".label").height(24.0))
+            .child(Button.tonalAction(id + ".trigger", current, action_name).height(44.0)
+                .accessibility("combobox", label, current));
+    }
+}
+
+public class RadioGroup {
+    @[borrow_args]
+    public static fn create(id: string, label: string, options: Vec<string>, selected: i32, action_prefix: string) -> View {
+        var out = Column.create().id(id).gap(6.0)
+            .child(Text.body(label).id(id + ".label").height(24.0));
+        var i: i32 = 0;
+        while (i < (options.len as i32)) {
+            let option_label = options.get(i as i64);
+            var row = Row.create().id(id + ".row." + format("%d", i as i64)).gap(8.0).height(40.0);
+            if (i == selected) {
+                row = row.child(Button.filledAction(id + ".radio." + format("%d", i as i64), option_label, action_prefix + format("%d", i as i64)).expanded().height(40.0));
+            } else {
+                row = row.child(Button.tonalAction(id + ".radio." + format("%d", i as i64), option_label, action_prefix + format("%d", i as i64)).expanded().height(40.0));
+            }
+            out = out.child(row);
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+public class NumberInput {
+    // Keeps only the characters a number can contain, so the text field never
+    // holds something the number parser would reject later.
+    public static fn sanitize(text: string, allow_decimal: bool, allow_negative: bool) -> string {
+        var out = "";
+        var seen_dot: bool = false;
+        var i: i32 = 0;
+        while (i < text.len) {
+            let code = text.charAt(i as i64);
+            if (code >= 48 && code <= 57) {
+                out = out + text.substring(i as i64, (i + 1) as i64);
+            } else if (code == 45 && allow_negative && out.len == 0) {
+                out = out + "-";
+            } else if (code == 46 && allow_decimal && !seen_dot) {
+                seen_dot = true;
+                out = out + ".";
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn clamp(value: f32, min_value: f32, max_value: f32) -> f32 {
+        var out = value;
+        if (out < min_value) { out = min_value; }
+        if (out > max_value) { out = max_value; }
+        return out;
+    }
+
+    public static fn create(id: string, label: string, value_resource: string, change_action: string, step_action: string, step: f32) -> View {
+        return Column.create().id(id).gap(6.0)
+            .child(Text.body(label).id(id + ".label").height(24.0))
+            .child(Row.create().id(id + ".row").gap(8.0).height(44.0)
+                .child(Button.tonalAction(id + ".down", "-", step_action + "down").size(48.0, 44.0)
+                    .accessibility("button", "Decrease", "Decrease by " + app_format_f32(step)))
+                .child(TextField.bound(id + ".input", "0", value_resource, change_action).expanded().height(44.0))
+                .child(Button.tonalAction(id + ".up", "+", step_action + "up").size(48.0, 44.0)
+                    .accessibility("button", "Increase", "Increase by " + app_format_f32(step))));
+    }
+}
+
+public class DatePicker {
+    // The calendar is a popup layer with one focusable button per day, so
+    // keyboard selection and Esc dismissal come from M0 unchanged.
+    public static fn popup(id: string, layer_id: string, date: AppDate, action_prefix: string) -> View {
+        var out = Column.create().id(id).gap(6.0).layer(layer_id)
+            .padding(10.0)
+            .background(Color.rgba(1.0, 1.0, 1.0, 1.0))
+            .cornerRadius(10.0);
+        if (!date.isValid()) {
+            return out.child(Text.muted("No date selected").id(id + ".empty").height(40.0));
+        }
+        out = out.child(Text.title(format("%d", date.year as i64) + "-" + AppDate.pad2(date.month)).id(id + ".header").height(36.0));
+        var week = Row.create().id(id + ".week").gap(4.0).height(28.0);
+        week = week.child(Text.muted("M").id(id + ".dow.0").expanded().textCenter());
+        week = week.child(Text.muted("T").id(id + ".dow.1").expanded().textCenter());
+        week = week.child(Text.muted("W").id(id + ".dow.2").expanded().textCenter());
+        week = week.child(Text.muted("T").id(id + ".dow.3").expanded().textCenter());
+        week = week.child(Text.muted("F").id(id + ".dow.4").expanded().textCenter());
+        week = week.child(Text.muted("S").id(id + ".dow.5").expanded().textCenter());
+        week = week.child(Text.muted("S").id(id + ".dow.6").expanded().textCenter());
+        out = out.child(week);
+        var row = Row.create().id(id + ".row.0").gap(4.0).height(36.0);
+        var day: i32 = 1;
+        let total = date.daysInMonth();
+        while (day <= total) {
+            let label = format("%d", day as i64);
+            let cell_id = id + ".day." + label;
+            let action = action_prefix + label;
+            if (day == date.day) {
+                row = row.child(Button.filledAction(cell_id, label, action).expanded().height(36.0)
+                    .accessibility("button", label, "Selected day " + label));
+            } else {
+                row = row.child(Button.tonalAction(cell_id, label, action).expanded().height(36.0)
+                    .accessibility("button", label, "Day " + label));
+            }
+            if ((day % 7) == 0) {
+                out = out.child(row);
+                row = Row.create().id(id + ".row." + format("%d", (day / 7) as i64)).gap(4.0).height(36.0);
+            }
+            day = day + 1;
+        }
+        out = out.child(row);
+        return out;
+    }
+}
+
+public class TimePicker {
+    @[borrow_args]
+    public static fn popup(id: string, layer_id: string, time: AppTime, hours: Vec<string>, action_prefix: string) -> View {
+        var out = Column.create().id(id).gap(4.0).layer(layer_id)
+            .padding(8.0)
+            .background(Color.rgba(1.0, 1.0, 1.0, 1.0))
+            .cornerRadius(8.0)
+            .child(Text.title(time.toText()).id(id + ".header").height(32.0));
+        var i: i32 = 0;
+        while (i < (hours.len as i32)) {
+            let label = hours.get(i as i64);
+            out = out.child(Button.tonalAction(id + ".hour." + format("%d", i as i64), label, action_prefix + label)
+                .height(36.0)
+                .accessibility("menuitem", label, ""));
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+public class FileField {
+    public static fn create(id: string, label: string, value_resource: string, browse_action: string, clear_action: string) -> View {
+        return Column.create().id(id).gap(6.0)
+            .child(Text.body(label).id(id + ".label").height(24.0))
+            .child(Row.create().id(id + ".row").gap(8.0).height(44.0)
+                .child(Text.bodyBound(value_resource, "No file selected").id(id + ".path").expanded().height(44.0))
+                .child(Button.tonalAction(id + ".browse", "Browse", browse_action).size(96.0, 44.0)
+                    .accessibility("button", "Browse", "Choose a file"))
+                .child(Button.outlinedAction(id + ".clear", "Clear", clear_action).size(80.0, 44.0)
+                    .accessibility("button", "Clear", "Clear the selected file")));
+    }
+}

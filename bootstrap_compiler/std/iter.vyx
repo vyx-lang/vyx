@@ -1,0 +1,354 @@
+module std.collections;
+
+use std.core;
+
+/// Vyx Standard Library — Iterator<T>
+///
+/// Lazy iterator over a contiguous T-typed buffer with map/filter/take/collect.
+/// Element layout honors `sizeof::<T>()`, so Iterator<i32> / Iterator<string> /
+/// Iterator<SomeStruct> all work without hard-coded byte widths.
+///
+/// `next()` returns `Option<T>` (`Some(v)` / `None`), matching std.core's ADT.
+/// `map`/`filter`/`for_each` take real function values (`fn(T) -> U`, ...) so
+/// the compiler can inline them and sema can type-check them.
+///
+/// min()/max() work for any T that supports `<` / `>` (primitives: i8/i16/i32/i64/f32/f64).
+/// For struct/class T, call `.map(to_key)` to project to a comparable scalar first.
+///
+/// Trait protocol (Phase 7): `trait Iter<T>` below formalises pull-style
+/// iteration — one method, `next() -> Option<T>`, which yields the next
+/// element or `None` when exhausted.  Mirrors Rust's `Iterator` with the
+/// associated `Item` type surfaced as an explicit type parameter (Vyx has
+/// no associated-type sugar today).
+///
+/// Naming: the *trait* is `Iter<T>` (not `Iterator<T>`) because the
+/// concrete stdlib *class* in this file is already named `Iterator<T>`
+/// and Vyx's symbol table does not permit a class and a trait to share a
+/// single name.  Relation summary:
+///
+///   * `trait Iter<T>`      — the *protocol*: anything with `next() -> Option<T>`.
+///   * `class Iterator<T>`  — the canonical stdlib *impl*: owns a
+///                            contiguous T-typed buffer, carries
+///                            map/filter/take/collect/etc.  Declares
+///                            `: Iter<T>` conformance below.
+///   * `trait Iterable`     — a *separate* concept (see collections.vyx):
+///                            indexed-access containers
+///                            (`len()`/`get(idx)`/`set(idx,v)`), implemented
+///                            by Vec<T>/Dict<K,V>.  Not related to
+///                            pull-style iteration; kept distinct mirroring
+///                            Rust's `IntoIterator` vs `Iterator` split.
+///
+/// Any user type whose `next()` matches the signature can opt into
+/// `: Iter<T>` and be accepted by generic functions bounded
+/// `where I: Iter<T>`.
+
+extern "C" {
+    fn malloc(size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: i64) -> rawptr;
+    fn realloc(ptr: rawptr, size: i64) -> rawptr;
+}
+
+/// Pull-style iteration protocol.  Satisfied by any type whose
+/// `next() -> Option<T>` yields the next element or `None` when exhausted.
+/// See the module-level docstring above for the relation to
+/// `class Iterator<T>` / `trait Iterable`.
+trait Iter<T> {
+    fn next() -> Option<T>;
+}
+
+class Iterator<T> : Iter<T> {
+    public data: rawptr;
+    public len: i64;
+    public pos: i64;
+    // Iterator-invalidation guard. When non-null, `source_gen` points to
+    // the source container's generation counter (e.g. `&Vec<T>.gen`), and
+    // `gen_snapshot` is the value sampled at iter-creation time. If the
+    // source's counter has changed by the time `.next()` is called, the
+    // container was mutated (push/pop/insert/remove/clear/realloc-grow)
+    // and the cached `data` pointer is potentially dangling — we panic
+    // instead of silently reading corrupted memory.
+    //
+    // Iterators built via `Iterator.from_raw()` (no source) leave these
+    // zeroed, skipping the check.
+    public source_gen: rawptr;
+    public gen_snapshot: i64;
+
+    public static fn from_raw(data: rawptr, len: i64) -> Iterator<T> {
+        return Iterator::<T> { data: data, len: len, pos: 0, source_gen: null, gen_snapshot: 0 };
+    }
+
+    public fn has_next() -> bool {
+        return self.pos < self.len;
+    }
+
+    public fn reset() {
+        self.pos = 0;
+    }
+
+    fn _check_invalidation() {
+        if (self.source_gen == null) { return; }
+        var cur: i64 = 0;
+        memcpy(to_rawptr(&cur), self.source_gen, 8);
+        if (cur != self.gen_snapshot) {
+            panic("Iterator invalidated: source container was modified during iteration");
+        }
+    }
+
+    public fn next() -> Option<T> {
+        self._check_invalidation();
+        if (self.pos >= self.len) { return None; }
+        let es = sizeof::<T>();
+        let slot = self.data + self.pos * es;
+        var out: T;
+        memcpy(to_rawptr(&out), slot, es);
+        self.pos = self.pos + 1;
+        return Some(out);
+    }
+
+    public fn count() -> i64 {
+        let remaining = self.len - self.pos;
+        self.pos = self.len;
+        return remaining;
+    }
+
+    public fn sum() -> i64 {
+        var total: i64 = 0;
+        let es = sizeof::<T>();
+        while (self.pos < self.len) {
+            let slot = self.data + self.pos * es;
+            var val: i64 = 0;
+            memcpy(to_rawptr(&val), slot, es);
+            total = total + val;
+            self.pos = self.pos + 1;
+        }
+        return total;
+    }
+
+    public fn for_each(f: fn(T) -> void) {
+        let es = sizeof::<T>();
+        while (self.pos < self.len) {
+            let slot = self.data + self.pos * es;
+            var val: T;
+            memcpy(to_rawptr(&val), slot, es);
+            f(val);
+            self.pos = self.pos + 1;
+        }
+    }
+
+    public fn map<U>(f: fn(T) -> U) -> Iterator<U> {
+        let remaining = self.len - self.pos;
+        let ts = sizeof::<T>();
+        let us = sizeof::<U>();
+        let new_data = malloc(remaining * us);
+        var i: i64 = 0;
+        while (i < remaining) {
+            let slot = self.data + (self.pos + i) * ts;
+            var val: T;
+            memcpy(to_rawptr(&val), slot, ts);
+            var mapped: U = f(val);
+            memcpy(new_data + i * us, to_rawptr(&mapped), us);
+            i = i + 1;
+        }
+        return Iterator::<U>.from_raw(new_data, remaining);
+    }
+
+    public fn filter(f: fn(T) -> bool) -> Iterator<T> {
+        let remaining = self.len - self.pos;
+        let es = sizeof::<T>();
+        let new_data = malloc(remaining * es);
+        var new_len: i64 = 0;
+        var i: i64 = 0;
+        while (i < remaining) {
+            let slot = self.data + (self.pos + i) * es;
+            var val: T;
+            memcpy(to_rawptr(&val), slot, es);
+            if (f(val)) {
+                memcpy(new_data + new_len * es, to_rawptr(&val), es);
+                new_len = new_len + 1;
+            }
+            i = i + 1;
+        }
+        self.pos = self.len;
+        return Iterator::<T> { data: new_data, len: new_len, pos: 0, source_gen: null, gen_snapshot: 0 };
+    }
+
+    public fn take(n: i64) -> Iterator<T> {
+        let es = sizeof::<T>();
+        var take_n = n;
+        let available = self.len - self.pos;
+        if (take_n < 0) { take_n = 0; }
+        if (take_n > available) { take_n = available; }
+        let new_data = malloc(take_n * es);
+        if (take_n > 0) {
+            memcpy(new_data, self.data + self.pos * es, take_n * es);
+        }
+        self.pos = self.pos + take_n;
+        return Iterator::<T> { data: new_data, len: take_n, pos: 0, source_gen: null, gen_snapshot: 0 };
+    }
+
+    public fn skip(n: i64) -> Iterator<T> {
+        var skip_n = n;
+        if (skip_n < 0) { skip_n = 0; }
+        self.pos = self.pos + skip_n;
+        if (self.pos > self.len) { self.pos = self.len; }
+        let remaining = self.len - self.pos;
+        let es = sizeof::<T>();
+        let new_data = malloc(remaining * es);
+        if (remaining > 0) {
+            memcpy(new_data, self.data + self.pos * es, remaining * es);
+        }
+        self.pos = self.len;
+        return Iterator::<T> { data: new_data, len: remaining, pos: 0, source_gen: null, gen_snapshot: 0 };
+    }
+
+    public fn collect() -> Vec<T> {
+        var out = Vec::<T>.new();
+        let es = sizeof::<T>();
+        while (self.pos < self.len) {
+            let slot = self.data + self.pos * es;
+            var val: T;
+            memcpy(to_rawptr(&val), slot, es);
+            out.push(val);
+            self.pos = self.pos + 1;
+        }
+        return out;
+    }
+
+    public fn min() -> Option<T> {
+        if (self.pos >= self.len) { return None; }
+        let es = sizeof::<T>();
+        var best: T;
+        memcpy(to_rawptr(&best), self.data + self.pos * es, es);
+        self.pos = self.pos + 1;
+        while (self.pos < self.len) {
+            var val: T;
+            memcpy(to_rawptr(&val), self.data + self.pos * es, es);
+            if (val < best) { best = val; }
+            self.pos = self.pos + 1;
+        }
+        return Some(best);
+    }
+
+    public fn max() -> Option<T> {
+        if (self.pos >= self.len) { return None; }
+        let es = sizeof::<T>();
+        var best: T;
+        memcpy(to_rawptr(&best), self.data + self.pos * es, es);
+        self.pos = self.pos + 1;
+        while (self.pos < self.len) {
+            var val: T;
+            memcpy(to_rawptr(&val), self.data + self.pos * es, es);
+            if (val > best) { best = val; }
+            self.pos = self.pos + 1;
+        }
+        return Some(best);
+    }
+}
+
+// ============================================================
+// Generic combinators over `Iter<T>`
+//
+// Free functions that consume any type satisfying `trait Iter<T>` by
+// repeatedly calling `.next()`.  Mirrors Rust's `Iterator` default-method
+// family (`fold` / `reduce` / `count` / `any` / `all`) but spelled as free
+// functions for consistency with the precedent set by `std/algorithm.vyx`
+// (`min` / `max` / `sort` / `clamp` are all free `fn<T> where T: Ord`
+// rather than default methods on `trait Ord`).  Vyx traits *do* support
+// default method bodies (see `[CodeGen] Phase: emit default trait method
+// implementations` in CodeGenGenerate.cpp:281), but placing the combinators
+// on `trait Iter` would force every Iter impl to re-emit each body.
+//
+// The numeric reducer `sum_iter<T, I> where T: Zero + Add` lives in
+// `std/algorithm.vyx` (module `std.algorithm`) rather than here — adding
+// `use std.ops;` / `use std.num;` to this file would transitively pollute
+// every `use std.collections;` importer with the operator / numeric trait
+// names (`Add`, `Sub`, `Neg`, ...), breaking user code that re-uses those
+// names for its own types (see tests/cases/conformance/generics/industrial/
+// trait_obj_storage.vyx which defines `class Neg`).
+//
+// Two-parameter generics `<T, I>` with `where I: Iter<T>` mirror the
+// dispatch shape already used by the Phase 7 verify tests
+// (tests/cases/conformance/stdlib/iter_trait/verify_iter_trait_*.vyx):
+//
+//     fold::<i32, Iterator<i32>, i32>(v.iter(), 0, add_i32)
+//
+// The `T` param surfaces the iterator's item type explicitly since Vyx
+// has no associated-type sugar.
+//
+// Naming — `fold` / `reduce` / `any` / `all` are unique in the stdlib.
+// `count_iter` is suffixed to avoid overload-clash with
+// `std.algorithm::count<T>(Vec<T>, T) -> i64` (same name, same 1-type-
+// param arity, different argument shape).
+// ============================================================
+
+/// Generic reduction.  Starts from `init`, combines with each element via
+/// `f`, returns the final accumulator.  Consumes the iterator.
+public fn fold<T, I, Acc>(it: I, init: Acc, f: fn(Acc, T) -> Acc) -> Acc where I: Iter<T> {
+    var acc = init;
+    var cur = it.next();
+    while (cur.isSome()) {
+        acc = f(acc, cur.unwrap());
+        cur = it.next();
+    }
+    return acc;
+}
+
+/// Reduce without a seed.  Returns `None` if the iterator is empty,
+/// `Some(acc)` otherwise where `acc = f(f(f(e0, e1), e2), ...)`.  Consumes
+/// the iterator.
+public fn reduce<T, I>(it: I, f: fn(T, T) -> T) -> Option<T> where I: Iter<T> {
+    let first = it.next();
+    if (first.isNone()) { return None; }
+    var acc = first.unwrap();
+    var cur = it.next();
+    while (cur.isSome()) {
+        acc = f(acc, cur.unwrap());
+        cur = it.next();
+    }
+    return Some(acc);
+}
+
+/// Exhaust the iterator and return the number of elements yielded.
+/// Suffixed `_iter` to avoid an overload clash with
+/// `std.algorithm::count<T>(Vec<T>, T) -> i64` (same name, same 1-type-
+/// param arity, different argument shape — the Phase 9b overload
+/// dispatcher would have no signal to pick between them).
+public fn count_iter<T, I>(it: I) -> i64 where I: Iter<T> {
+    var n: i64 = 0;
+    var cur = it.next();
+    while (cur.isSome()) { n = n + 1; cur = it.next(); }
+    return n;
+}
+
+/// Short-circuiting disjunction: `true` iff `pred(e)` is `true` for any
+/// element.  Stops at the first `true`.
+public fn any<T, I>(it: I, pred: fn(T) -> bool) -> bool where I: Iter<T> {
+    var cur = it.next();
+    while (cur.isSome()) {
+        if (pred(cur.unwrap())) { return true; }
+        cur = it.next();
+    }
+    return false;
+}
+
+/// Short-circuiting conjunction: `true` iff `pred(e)` is `true` for every
+/// element.  Stops at the first `false`.  Returns `true` on an empty
+/// iterator (vacuous truth, matching Rust's `Iterator::all`).
+public fn all<T, I>(it: I, pred: fn(T) -> bool) -> bool where I: Iter<T> {
+    var cur = it.next();
+    while (cur.isSome()) {
+        if (!pred(cur.unwrap())) { return false; }
+        cur = it.next();
+    }
+    return true;
+}
+
+// Note on `sum` / numeric reduction: a `Zero + Add`-bounded `sum_iter` would
+// force every consumer of `std.collections` to transitively pull `std.ops`
+// and `std.num` into scope, which breaks user code that defines its own
+// class named `Neg` / `Add` / etc. (see tests/cases/conformance/generics/industrial/
+// trait_obj_storage.vyx).  The numeric iter reducer therefore lives in
+// `std/algorithm.vyx` (module `std.algorithm`) where trait-bounded numeric
+// algorithms already reside — callers `use std.algorithm;` explicitly.

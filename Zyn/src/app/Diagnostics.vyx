@@ -1,0 +1,1796 @@
+module Zyn.App;
+
+use std.collections;
+use std.encoding;
+use FileSystem = Zyn.Platform.Platform.FileSystem;
+use Color = Zyn.Nut.Types.Color;
+use colorRgbaMilli = Zyn.Nut.Types.colorRgbaMilli;
+
+// ---------------------------------------------------------------------------
+// ZC-17 errors, logging and diagnostics
+//
+// The roadmap asks for five things, and they share one idea: *a failure has to
+// stay attributable after it has left the code that produced it*.
+//
+//   1. structured errors. `AppError` is a code plus a message, which is what a
+//      `Result` needs and not what a diagnosis needs. `AppDiagnostic` adds the
+//      three axes an operator actually filters on - category (what went
+//      wrong), severity (how loud), and *origin* (which component, command or
+//      effect). The origin is the whole point: "user can see why it failed and
+//      retry" and "a test can point at the component/command/effect" are the
+//      same requirement seen from two sides.
+//
+//   2. crash context. `AppBreadcrumb` keeps a bounded trail of what the app was
+//      doing, and `AppCrashContext` freezes the trail plus a resource digest
+//      into a checksummed file. A crash report that cannot say what the app was
+//      doing is a stack trace with extra steps.
+//
+//   3. performance trace. `AppPerfTrace` records named spans in frames, because
+//      frame count is the unit that survives being compared across machines
+//      while wall-clock milliseconds do not.
+//
+//   4. configurable log redaction. The log sink is the last place a secret
+//      leaks, so redaction is applied at write time by the sink itself, not by
+//      every call site remembering to. `AppLogConfig` owns the level and the
+//      secret list.
+//
+//   5. a developer inspector. `AppDevInspector` composes the existing
+//      `AppInspector`/`AppDebugReport` with the diagnostic, breadcrumb and
+//      trace views into one panel.
+//
+// Two rules are inherited from the rest of the app layer and are not
+// negotiable here:
+//
+//   * no new view kinds. The inspector and the error banner are built from the
+//     existing `View` primitives (column/row/text/divider/button).
+//   * collections live in resources, not in nested `Vec` fields, because a
+//     `Vec` field inside a class that is copied by value double-frees. The one
+//     exception is `AppDiagnostic.causes`, which is kept *flat* - see the note
+//     on `pushCause`.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Closed vocabularies
+// ---------------------------------------------------------------------------
+
+// Severity is ordered: a sink may filter on "warning and above".
+public fn appSeverityDebug() -> i32 { return 0; }
+public fn appSeverityInfo() -> i32 { return 1; }
+public fn appSeverityWarning() -> i32 { return 2; }
+public fn appSeverityError() -> i32 { return 3; }
+public fn appSeverityCritical() -> i32 { return 4; }
+
+// Category answers "whose fault is this", which is what decides whether the
+// user should retry, fix their input, or contact support.
+public fn appDiagInput() -> i32 { return 1; }
+public fn appDiagValidation() -> i32 { return 2; }
+public fn appDiagPersistence() -> i32 { return 3; }
+public fn appDiagNetwork() -> i32 { return 4; }
+public fn appDiagAuth() -> i32 { return 5; }
+public fn appDiagEffect() -> i32 { return 6; }
+public fn appDiagPlatform() -> i32 { return 7; }
+public fn appDiagInternal() -> i32 { return 8; }
+
+// Retry policy. `None` means the same input cannot succeed, so offering a retry
+// button would be a lie.
+public fn appRetryNone() -> i32 { return 0; }
+public fn appRetryManual() -> i32 { return 1; }
+public fn appRetryAutomatic() -> i32 { return 2; }
+
+public fn appLogTrace() -> i32 { return 0; }
+public fn appLogDebug() -> i32 { return 1; }
+public fn appLogInfo() -> i32 { return 2; }
+public fn appLogWarn() -> i32 { return 3; }
+public fn appLogError() -> i32 { return 4; }
+public fn appLogOff() -> i32 { return 5; }
+
+// What produced the diagnostic. This is the field a test asserts on.
+public fn appOriginComponent() -> i32 { return 1; }
+public fn appOriginCommand() -> i32 { return 2; }
+public fn appOriginEffect() -> i32 { return 3; }
+public fn appOriginPlatform() -> i32 { return 4; }
+public fn appOriginSystem() -> i32 { return 5; }
+
+// Diagnostic codes. Codes are stable and greppable; messages are not, because
+// they get localised and reworded.
+public fn appDiagCodeUnknown() -> i32 { return 9000; }
+public fn appDiagCodeBadRecord() -> i32 { return 9001; }
+public fn appDiagCodeEffectFailed() -> i32 { return 9002; }
+public fn appDiagCodeEffectExpired() -> i32 { return 9003; }
+public fn appDiagCodeEffectCancelled() -> i32 { return 9004; }
+public fn appDiagCodeUnhandled() -> i32 { return 9005; }
+public fn appDiagCodeAssertion() -> i32 { return 9006; }
+public fn appDiagCodeCrash() -> i32 { return 9007; }
+
+public fn appBreadcrumbDefaultLimit() -> i32 { return 64; }
+public fn appLogDefaultLimit() -> i32 { return 512; }
+
+// ---------------------------------------------------------------------------
+// Vocabulary names
+// ---------------------------------------------------------------------------
+
+public fn appDiagSeverityName(severity: i32) -> string {
+    if (severity == appSeverityDebug()) { return "debug"; }
+    if (severity == appSeverityInfo()) { return "info"; }
+    if (severity == appSeverityWarning()) { return "warn"; }
+    if (severity == appSeverityError()) { return "error"; }
+    if (severity == appSeverityCritical()) { return "critical"; }
+    return "unknown";
+}
+
+public fn appDiagCategoryName(category: i32) -> string {
+    if (category == appDiagInput()) { return "input"; }
+    if (category == appDiagValidation()) { return "validation"; }
+    if (category == appDiagPersistence()) { return "persistence"; }
+    if (category == appDiagNetwork()) { return "network"; }
+    if (category == appDiagAuth()) { return "auth"; }
+    if (category == appDiagEffect()) { return "effect"; }
+    if (category == appDiagPlatform()) { return "platform"; }
+    if (category == appDiagInternal()) { return "internal"; }
+    return "unknown";
+}
+
+public fn appDiagOriginName(kind: i32) -> string {
+    if (kind == appOriginComponent()) { return "component"; }
+    if (kind == appOriginCommand()) { return "command"; }
+    if (kind == appOriginEffect()) { return "effect"; }
+    if (kind == appOriginPlatform()) { return "platform"; }
+    if (kind == appOriginSystem()) { return "system"; }
+    return "unknown";
+}
+
+public fn appDiagRetryName(policy: i32) -> string {
+    if (policy == appRetryNone()) { return "none"; }
+    if (policy == appRetryManual()) { return "manual"; }
+    if (policy == appRetryAutomatic()) { return "automatic"; }
+    return "unknown";
+}
+
+public fn appDiagLogLevelName(level: i32) -> string {
+    if (level == appLogTrace()) { return "trace"; }
+    if (level == appLogDebug()) { return "debug"; }
+    if (level == appLogInfo()) { return "info"; }
+    if (level == appLogWarn()) { return "warn"; }
+    if (level == appLogError()) { return "error"; }
+    if (level == appLogOff()) { return "off"; }
+    return "unknown";
+}
+
+// Severity and log level share a spelling but not a numbering, so they get
+// separate parsers rather than a clever shared one.
+public fn appDiagSeverityOf(text: string) -> i32 {
+    if (text == "debug") { return appSeverityDebug(); }
+    if (text == "info") { return appSeverityInfo(); }
+    if (text == "warn") { return appSeverityWarning(); }
+    if (text == "error") { return appSeverityError(); }
+    if (text == "critical") { return appSeverityCritical(); }
+    return appSeverityError();
+}
+
+public fn appDiagLogLevelOf(text: string) -> i32 {
+    if (text == "trace") { return appLogTrace(); }
+    if (text == "debug") { return appLogDebug(); }
+    if (text == "info") { return appLogInfo(); }
+    if (text == "warn") { return appLogWarn(); }
+    if (text == "error") { return appLogError(); }
+    if (text == "off") { return appLogOff(); }
+    return appLogInfo();
+}
+
+// The clock a world-side diagnostic is stamped with. `AppWorld` has no frame
+// counter of its own; the effect clock is the monotonic tick that both the
+// effect scheduler and the replay harness already agree on.
+public fn appDiagNow(world: AppWorld) -> u64 {
+    return world.effectClock();
+}
+
+public fn appDiagBoolText(value: bool) -> string {
+    if (value) { return "1"; }
+    return "0";
+}
+
+// `app_parse_i32_or` caps out at 32 bits, and frames/clocks are u64. Parsing
+// digit by digit into u64 keeps a long session's tick count intact.
+public fn appDiagParseU64(text: string, fallback: u64) -> u64 {
+    if (text.len == 0) { return fallback; }
+    var out: u64 = 0 as u64;
+    var any: bool = false;
+    var i: i32 = 0;
+    while (i < (text.len as i32)) {
+        let c = text.charAt(i as i64);
+        if (c < 48 || c > 57) { return fallback; }
+        out = (out * (10 as u64)) + ((c - 48) as u64);
+        any = true;
+        i = i + 1;
+    }
+    if (!any) { return fallback; }
+    return out;
+}
+
+// The same parser narrowed to an i32 for the fields that are counts, indices
+// and enum values rather than ticks.
+//
+// It deliberately goes through an i64 local instead of casting straight from
+// u64: `u64 as i64` is what `TimelineStep.serialize()` already does and
+// `i64 as i32` is everywhere in this tree, so both links of the chain are known
+// good - whereas a direct `u64 as i32` narrowing had no precedent to lean on.
+public fn appDiagParseI32(text: string, fallback: u64) -> i32 {
+    let wide = appDiagParseU64(text, fallback) as i64;
+    return wide as i32;
+}
+
+// ---------------------------------------------------------------------------
+// Field helpers
+// ---------------------------------------------------------------------------
+
+// Every record below is one line of pipe-separated fields. Free text is
+// hex-encoded so a message containing a pipe or a newline cannot break the
+// record, and so the whole record can be stored in a string-list resource
+// (which is line-oriented) without a second escaping layer.
+public class AppDiagText {
+    public static fn pipe() -> i32 { return 124; }
+    public static fn newline() -> i32 { return 10; }
+
+    public static fn fieldCount(text: string, sep: i32) -> i32 {
+        var count: i32 = 1;
+        var i: i32 = 0;
+        while (i < (text.len as i32)) {
+            if (text.charAt(i as i64) == sep) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    // The nth field. Out-of-range asks return "" rather than an error: every
+    // caller here is decoding a record it already validated.
+    public static fn fieldAt(text: string, sep: i32, index: i32) -> string {
+        if (index < 0) { return ""; }
+        var current: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        let len = text.len as i32;
+        while (i <= len) {
+            var at_end = i == len;
+            if (at_end || text.charAt(i as i64) == sep) {
+                if (current == index) { return text.substring(start as i64, i as i64); }
+                current = current + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // Lines are just fields separated by newline, so the same scan does both.
+    public static fn lineCount(text: string) -> i32 {
+        if (text.len == 0) { return 0; }
+        return AppDiagText.fieldCount(text, AppDiagText.newline());
+    }
+
+    public static fn lineAt(text: string, index: i32) -> string {
+        return AppDiagText.fieldAt(text, AppDiagText.newline(), index);
+    }
+
+    public static fn hexField(value: string) -> string {
+        return hex_encode(value);
+    }
+
+    public static fn unhexField(value: string) -> string {
+        return hex_decode(value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structured error
+// ---------------------------------------------------------------------------
+
+public class AppDiagnostic {
+    public code: i32;
+    public category: i32;
+    public severity: i32;
+    public origin_kind: i32;
+    public origin: string;
+    public tag: string;
+    public message: string;
+    public detail: string;
+    public retry: i32;
+    public frame: u64;
+    public clock: u64;
+    // Always a *flat* list: no element of `causes` has causes of its own. That
+    // invariant is what lets `destroy` be a single `Vec.destroy()` without
+    // walking into a nested allocation it would then free twice.
+    private causes: Vec<AppDiagnostic>;
+
+    public static fn create(code: i32, message: string) -> AppDiagnostic {
+        return AppDiagnostic {
+            code: code,
+            category: appDiagInternal(),
+            severity: appSeverityError(),
+            origin_kind: appOriginSystem(),
+            origin: "",
+            tag: "",
+            message: message,
+            detail: "",
+            retry: appRetryNone(),
+            frame: 0 as u64,
+            clock: 0 as u64,
+            causes: Vec::<AppDiagnostic>.new()
+        };
+    }
+
+    public static fn of(code: i32, category: i32, message: string) -> AppDiagnostic {
+        var out = AppDiagnostic.create(code, message);
+        out.category = category;
+        return out;
+    }
+
+    // Lifts the minimal `AppError` that a `Result` carries into the richer
+    // record, so an existing call site does not have to change.
+    public static fn fromError(value: AppError) -> AppDiagnostic {
+        return AppDiagnostic.create(value.code, value.message);
+    }
+
+    public fn withDetail(mut self, value: string) -> AppDiagnostic {
+        self.detail = value;
+        return self;
+    }
+
+    public fn withOrigin(mut self, kind: i32, value: string) -> AppDiagnostic {
+        self.origin_kind = kind;
+        self.origin = value;
+        return self;
+    }
+
+    public fn withTag(mut self, value: string) -> AppDiagnostic {
+        self.tag = value;
+        return self;
+    }
+
+    public fn withSeverity(mut self, value: i32) -> AppDiagnostic {
+        self.severity = value;
+        return self;
+    }
+
+    public fn withCategory(mut self, value: i32) -> AppDiagnostic {
+        self.category = value;
+        return self;
+    }
+
+    public fn withRetry(mut self, value: i32) -> AppDiagnostic {
+        self.retry = value;
+        return self;
+    }
+
+    public fn withFrame(mut self, value: u64) -> AppDiagnostic {
+        self.frame = value;
+        return self;
+    }
+
+    public fn withClock(mut self, value: u64) -> AppDiagnostic {
+        self.clock = value;
+        return self;
+    }
+
+    public fn withCause(mut self, cause: &AppDiagnostic) -> AppDiagnostic {
+        self.pushCause(cause);
+        return self;
+    }
+
+    // Folding the chain flat on the way in means `causeAt` is always O(1) and
+    // no node ever owns a second heap vector. The outer node keeps the reason
+    // ("save failed") and the inner ones keep the cause ("disk full"), in the
+    // order they were attached.
+    public fn pushCause(&mut self, cause: &AppDiagnostic) {
+        self.causes.push(cause.headCopy());
+        var i: i32 = 0;
+        while (i < cause.causeCount()) {
+            self.causes.push(cause.causeAt(i));
+            i = i + 1;
+        }
+    }
+
+    public fn isError(&self) -> bool {
+        return self.severity >= appSeverityError();
+    }
+
+    public fn isCritical(&self) -> bool {
+        return self.severity == appSeverityCritical();
+    }
+
+    // "Can the same request be tried again", not "is there a retry button".
+    public fn canRetry(&self) -> bool {
+        return self.retry != appRetryNone();
+    }
+
+    public fn causeCount(&self) -> i32 {
+        return self.causes.len as i32;
+    }
+
+    public fn causeAt(&self, index: i32) -> AppDiagnostic {
+        if (index < 0 || index >= self.causeCount()) {
+            return AppDiagnostic.create(0, "");
+        }
+        return self.causes.get(index as i64).headCopy();
+    }
+
+    // Same fields, empty cause list. The building block for every copy in this
+    // file, which is why nothing here ever nests a heap vector.
+    private fn headCopy(&self) -> AppDiagnostic {
+        return AppDiagnostic {
+            code: self.code,
+            category: self.category,
+            severity: self.severity,
+            origin_kind: self.origin_kind,
+            origin: self.origin,
+            tag: self.tag,
+            message: self.message,
+            detail: self.detail,
+            retry: self.retry,
+            frame: self.frame,
+            clock: self.clock,
+            causes: Vec::<AppDiagnostic>.new()
+        };
+    }
+
+    public fn dup(&self) -> AppDiagnostic {
+        var out = self.headCopy();
+        var i: i32 = 0;
+        while (i < self.causeCount()) {
+            out.causes.push(self.causes.get(i as i64).headCopy());
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(&mut self) {
+        self.causes.destroy();
+    }
+
+    // The one-line identity a log line or a test assertion prints.
+    public fn key(&self) -> string {
+        return appDiagCategoryName(self.category) + "/" + appDiagOriginName(self.origin_kind)
+            + ":" + self.origin + "#" + format("%d", self.code as i64);
+    }
+
+    public fn summary(&self) -> string {
+        var out = appDiagSeverityName(self.severity) + " [" + self.key() + "] " + self.message;
+        if (self.detail.len > 0) { out = out + " (" + self.detail + ")"; }
+        if (self.tag.len > 0) { out = out + " tag=" + self.tag; }
+        if (self.canRetry()) { out = out + " retry=" + appDiagRetryName(self.retry); }
+        if (self.causeCount() > 0) {
+            out = out + " caused_by=" + self.causeAt(0).summary();
+        }
+        return out;
+    }
+
+    // `D|code|category|severity|origin_kind|retry|frame|clock|origin|tag|message|detail|cause_count`
+    // followed by `cause_count` lines of `C|code|category|severity|origin_kind|retry|frame|clock|origin|tag|message|detail`.
+    public fn serialize(&self) -> string {
+        var out = "D"
+            + "|" + format("%d", self.code as i64)
+            + "|" + format("%d", self.category as i64)
+            + "|" + format("%d", self.severity as i64)
+            + "|" + format("%d", self.origin_kind as i64)
+            + "|" + format("%d", self.retry as i64)
+            + "|" + format("%d", self.frame as i64)
+            + "|" + format("%d", self.clock as i64)
+            + "|" + hex_encode(self.origin)
+            + "|" + hex_encode(self.tag)
+            + "|" + hex_encode(self.message)
+            + "|" + hex_encode(self.detail)
+            + "|" + format("%d", self.causeCount() as i64);
+        var i: i32 = 0;
+        while (i < self.causeCount()) {
+            let cause = self.causeAt(i);
+            out = out + "\n" + AppDiagnostic.causeLine(cause);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    private static fn causeLine(value: AppDiagnostic) -> string {
+        return "C"
+            + "|" + format("%d", value.code as i64)
+            + "|" + format("%d", value.category as i64)
+            + "|" + format("%d", value.severity as i64)
+            + "|" + format("%d", value.origin_kind as i64)
+            + "|" + format("%d", value.retry as i64)
+            + "|" + format("%d", value.frame as i64)
+            + "|" + format("%d", value.clock as i64)
+            + "|" + hex_encode(value.origin)
+            + "|" + hex_encode(value.tag)
+            + "|" + hex_encode(value.message)
+            + "|" + hex_encode(value.detail);
+    }
+
+    public static fn parse(text: string) -> AppDiagnostic {
+        if (text.len == 0) {
+            return AppDiagnostic.create(appDiagCodeBadRecord(), "empty diagnostic record");
+        }
+        let head = AppDiagText.lineAt(text, 0);
+        if (AppDiagText.fieldAt(head, 124, 0) != "D" || AppDiagText.fieldCount(head, 124) != 13) {
+            return AppDiagnostic.create(appDiagCodeBadRecord(), "corrupt diagnostic record");
+        }
+        var out = AppDiagnostic.create(
+            app_parse_i32_or(AppDiagText.fieldAt(head, 124, 1), 0),
+            hex_decode(AppDiagText.fieldAt(head, 124, 10)));
+        out.category = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 2), appDiagInternal());
+        out.severity = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 3), appSeverityError());
+        out.origin_kind = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 4), appOriginSystem());
+        out.retry = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 5), appRetryNone());
+        out.frame = appDiagParseU64(AppDiagText.fieldAt(head, 124, 6), 0 as u64);
+        out.clock = appDiagParseU64(AppDiagText.fieldAt(head, 124, 7), 0 as u64);
+        out.origin = hex_decode(AppDiagText.fieldAt(head, 124, 8));
+        out.tag = hex_decode(AppDiagText.fieldAt(head, 124, 9));
+        out.detail = hex_decode(AppDiagText.fieldAt(head, 124, 11));
+        let declared = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 12), 0);
+        var i: i32 = 0;
+        while (i < declared) {
+            let line = AppDiagText.lineAt(text, i + 1);
+            if (AppDiagText.fieldAt(line, 124, 0) != "C" || AppDiagText.fieldCount(line, 124) != 12) {
+                break;
+            }
+            var cause = AppDiagnostic.create(
+                app_parse_i32_or(AppDiagText.fieldAt(line, 124, 1), 0),
+                hex_decode(AppDiagText.fieldAt(line, 124, 10)));
+            cause.category = app_parse_i32_or(AppDiagText.fieldAt(line, 124, 2), appDiagInternal());
+            cause.severity = app_parse_i32_or(AppDiagText.fieldAt(line, 124, 3), appSeverityError());
+            cause.origin_kind = app_parse_i32_or(AppDiagText.fieldAt(line, 124, 4), appOriginSystem());
+            cause.retry = app_parse_i32_or(AppDiagText.fieldAt(line, 124, 5), appRetryNone());
+            cause.frame = appDiagParseU64(AppDiagText.fieldAt(line, 124, 6), 0 as u64);
+            cause.clock = appDiagParseU64(AppDiagText.fieldAt(line, 124, 7), 0 as u64);
+            cause.origin = hex_decode(AppDiagText.fieldAt(line, 124, 8));
+            cause.tag = hex_decode(AppDiagText.fieldAt(line, 124, 9));
+            cause.detail = hex_decode(AppDiagText.fieldAt(line, 124, 11));
+            out.causes.push(cause);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Storage form: the multi-line record hex-encoded so it survives a
+    // string-list resource untouched.
+    public fn encodeBlob(&self) -> string {
+        return hex_encode(self.serialize());
+    }
+
+    public static fn decodeBlob(text: string) -> AppDiagnostic {
+        return AppDiagnostic.parse(hex_decode(text));
+    }
+
+    // Redaction runs over the two free-text fields only. The code, category and
+    // origin are framework vocabulary and cannot contain a secret; the message
+    // and detail are application prose and can.
+    public fn redact(&self, secrets: string) -> AppDiagnostic {
+        if (secrets.len == 0) { return self.dup(); }
+        var out = self.headCopy();
+        out.message = AppCredentialRedactor.redact(self.message, secrets);
+        out.detail = AppCredentialRedactor.redact(self.detail, secrets);
+        var i: i32 = 0;
+        while (i < self.causeCount()) {
+            let raw = self.causes.get(i as i64);
+            var cause = raw.headCopy();
+            cause.message = AppCredentialRedactor.redact(raw.message, secrets);
+            cause.detail = AppCredentialRedactor.redact(raw.detail, secrets);
+            out.causes.push(cause);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Severity and log level are different scales; this is the one place the
+    // mapping is written down.
+    public static fn severityToLogLevel(severity: i32) -> i32 {
+        if (severity == appSeverityDebug()) { return appLogDebug(); }
+        if (severity == appSeverityInfo()) { return appLogInfo(); }
+        if (severity == appSeverityWarning()) { return appLogWarn(); }
+        return appLogError();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic list (per owner)
+// ---------------------------------------------------------------------------
+
+// One list per owner, so "the failures of the save panel" is a resource query
+// rather than a walk over everything that ever went wrong.
+public class AppDiagList {
+    public static fn itemKey(owner: string) -> string { return "diag:" + owner + ":item"; }
+
+    public static fn record(world: AppWorld, owner: string, diag: &AppDiagnostic) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        return world.appendStringListResource(AppDiagList.itemKey(owner), diag.encodeBlob());
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        if (owner.len == 0) { return 0; }
+        return world.stringListResourceCount(AppDiagList.itemKey(owner));
+    }
+
+    public static fn at(world: AppWorld, owner: string, index: i32) -> AppDiagnostic {
+        if (owner.len == 0 || index < 0) {
+            return AppDiagnostic.create(0, "");
+        }
+        return AppDiagnostic.decodeBlob(world.stringListResourceAt(AppDiagList.itemKey(owner), index));
+    }
+
+    public static fn last(world: AppWorld, owner: string) -> AppDiagnostic {
+        let total = AppDiagList.count(world, owner);
+        if (total == 0) { return AppDiagnostic.create(0, ""); }
+        return AppDiagList.at(world, owner, total - 1);
+    }
+
+    // Derived rather than cached: a counter resource would be one more thing
+    // that can disagree with the list it counts.
+    public static fn errorCount(world: AppWorld, owner: string) -> i32 {
+        var out: i32 = 0;
+        var i: i32 = 0;
+        while (i < AppDiagList.count(world, owner)) {
+            if (AppDiagList.at(world, owner, i).isError()) { out = out + 1; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn lastError(world: AppWorld, owner: string) -> AppDiagnostic {
+        var i = AppDiagList.count(world, owner) - 1;
+        while (i >= 0) {
+            let candidate = AppDiagList.at(world, owner, i);
+            if (candidate.isError()) { return candidate; }
+            i = i - 1;
+        }
+        return AppDiagnostic.create(0, "");
+    }
+
+    public static fn firstError(world: AppWorld, owner: string) -> AppDiagnostic {
+        var i: i32 = 0;
+        while (i < AppDiagList.count(world, owner)) {
+            let candidate = AppDiagList.at(world, owner, i);
+            if (candidate.isError()) { return candidate; }
+            i = i + 1;
+        }
+        return AppDiagnostic.create(0, "");
+    }
+
+    public static fn retryableCount(world: AppWorld, owner: string) -> i32 {
+        var out: i32 = 0;
+        var i: i32 = 0;
+        while (i < AppDiagList.count(world, owner)) {
+            if (AppDiagList.at(world, owner, i).canRetry()) { out = out + 1; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Deliberately no `all() -> Vec<AppDiagnostic>`: no other module in the app
+    // layer hands a `Vec` of owned class values back across a boundary, and the
+    // count/at pair covers every caller.
+    public static fn text(world: AppWorld, owner: string) -> string {
+        var out: string = "";
+        var i: i32 = 0;
+        while (i < AppDiagList.count(world, owner)) {
+            out = out + AppDiagList.at(world, owner, i).summary() + "\n";
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn clear(world: AppWorld, owner: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        return AppRowStore.clearList(world, AppDiagList.itemKey(owner));
+    }
+
+    // Convenience for the common "something failed, remember why" step, which
+    // also stamps the world clock so the report can order events.
+    public static fn note(world: AppWorld, owner: string, diag: &AppDiagnostic) -> AppWorld {
+        var stamped = diag.dup();
+        if (stamped.clock == 0 as u64) { stamped.clock = appDiagNow(world); }
+        return AppDiagList.record(world, owner, &stamped);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Breadcrumbs (crash context)
+// ---------------------------------------------------------------------------
+
+// A bounded trail of "what was the app doing". Two parallel string lists rather
+// than one joined record, so a label may contain any character at all and no
+// escaping layer is needed.
+public class AppBreadcrumb {
+    public static fn labelKey(owner: string) -> string { return "crumb:" + owner + ":label"; }
+    public static fn metaKey(owner: string) -> string { return "crumb:" + owner + ":meta"; }
+
+    public static fn note(world: AppWorld, owner: string, kind: string, label: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        return AppBreadcrumb.noteAt(world, owner, kind, label, appDiagNow(world));
+    }
+
+    public static fn noteAt(world: AppWorld, owner: string, kind: string, label: string, clock: u64) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        var out = world.appendStringListResource(AppBreadcrumb.labelKey(owner), label);
+        out = out.appendStringListResource(AppBreadcrumb.metaKey(owner),
+            format("%d", clock as i64) + "|" + kind);
+        return AppBreadcrumb.trim(out, owner, appBreadcrumbDefaultLimit());
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        if (owner.len == 0) { return 0; }
+        return world.stringListResourceCount(AppBreadcrumb.labelKey(owner));
+    }
+
+    public static fn labelAt(world: AppWorld, owner: string, index: i32) -> string {
+        if (owner.len == 0 || index < 0) { return ""; }
+        return world.stringListResourceAt(AppBreadcrumb.labelKey(owner), index);
+    }
+
+    public static fn kindAt(world: AppWorld, owner: string, index: i32) -> string {
+        if (owner.len == 0 || index < 0) { return ""; }
+        return AppDiagText.fieldAt(world.stringListResourceAt(AppBreadcrumb.metaKey(owner), index), 124, 1);
+    }
+
+    public static fn clockAt(world: AppWorld, owner: string, index: i32) -> u64 {
+        if (owner.len == 0 || index < 0) { return 0 as u64; }
+        return appDiagParseU64(
+            AppDiagText.fieldAt(world.stringListResourceAt(AppBreadcrumb.metaKey(owner), index), 124, 0),
+            0 as u64);
+    }
+
+    public static fn at(world: AppWorld, owner: string, index: i32) -> string {
+        if (index < 0 || index >= AppBreadcrumb.count(world, owner)) { return ""; }
+        return format("%d", AppBreadcrumb.clockAt(world, owner, index) as i64)
+            + " " + AppBreadcrumb.kindAt(world, owner, index)
+            + ": " + AppBreadcrumb.labelAt(world, owner, index);
+    }
+
+    // The trail a crash report wants: the last `limit` steps, oldest first.
+    public static fn tail(world: AppWorld, owner: string, limit: i32) -> string {
+        let total = AppBreadcrumb.count(world, owner);
+        var first: i32 = 0;
+        if (limit > 0 && limit < total) { first = total - limit; }
+        var out: string = "";
+        var i = first;
+        while (i < total) {
+            out = out + AppBreadcrumb.at(world, owner, i) + "\n";
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn dump(world: AppWorld, owner: string) -> string {
+        return AppBreadcrumb.tail(world, owner, 0);
+    }
+
+    // Drops the oldest entries until the ring is back inside its bound. The
+    // `guard` and the "did the count actually fall" test exist because a
+    // remove that silently does nothing would otherwise spin forever.
+    public static fn trim(world: AppWorld, owner: string, max_entries: i32) -> AppWorld {
+        if (max_entries <= 0) { return world; }
+        var out = world;
+        var guard: i32 = 0;
+        while (AppBreadcrumb.count(out, owner) > max_entries && guard < 4096) {
+            let before = AppBreadcrumb.count(out, owner);
+            out = out.removeStringListResourceAt(AppBreadcrumb.labelKey(owner), 0);
+            out = out.removeStringListResourceAt(AppBreadcrumb.metaKey(owner), 0);
+            if (AppBreadcrumb.count(out, owner) >= before) { break; }
+            guard = guard + 1;
+        }
+        return out;
+    }
+
+    public static fn clear(world: AppWorld, owner: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        var out = AppRowStore.clearList(world, AppBreadcrumb.labelKey(owner));
+        return AppRowStore.clearList(out, AppBreadcrumb.metaKey(owner));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Effect failures become diagnostics
+// ---------------------------------------------------------------------------
+
+// The effect boundary is where the framework knows the most and the application
+// knows the least: the scheduler has the request id, the owner and the status,
+// and the app only sees "it failed". Turning a result into a diagnostic at that
+// boundary is what makes "a test can point at the effect" true.
+public class AppEffectDiagnostics {
+    public static fn fromResult(result: AppEffectResult) -> AppDiagnostic {
+        var out = AppDiagnostic.create(appDiagCodeEffectFailed(), "an operation did not finish");
+        out = out.withCategory(appDiagEffect());
+        out = out.withSeverity(appSeverityError());
+        out = out.withOrigin(appOriginEffect(), result.owner_id);
+        out = out.withTag(result.tag);
+        out = out.withDetail(result.error_message);
+        out = out.withRetry(appRetryManual());
+        if (result.status == appEffectExpired()) {
+            var timed_out = out.withDetail("timed out: " + result.error_message);
+            return timed_out.withRetry(appRetryAutomatic());
+        }
+        if (result.status == appEffectCancelled()) {
+            // A cancellation is usually the user's own doing, so it is not an
+            // error and must not offer a retry.
+            var cancelled = out.withSeverity(appSeverityInfo());
+            cancelled = cancelled.withCategory(appDiagEffect());
+            return cancelled.withRetry(appRetryNone());
+        }
+        return out;
+    }
+
+    public static fn failedCount(world: AppWorld) -> i32 {
+        var out: i32 = 0;
+        var i: i32 = 0;
+        while (i < world.effectResultCount()) {
+            if (world.effectResultAt(i).isFailure()) { out = out + 1; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn failedAt(world: AppWorld, index: i32) -> AppEffectResult {
+        var seen: i32 = 0;
+        var i: i32 = 0;
+        while (i < world.effectResultCount()) {
+            let candidate = world.effectResultAt(i);
+            if (candidate.isFailure()) {
+                if (seen == index) { return candidate; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return AppEffectResult.create(0 as u64, 0, "", "", appEffectFailed(), "", "");
+    }
+
+    public static fn pendingCount(world: AppWorld) -> i32 {
+        return world.effectInFlightCount();
+    }
+
+    public static fn droppedCount(world: AppWorld) -> i32 {
+        return world.effectDroppedCount();
+    }
+
+    public static fn unhandledCount(world: AppWorld) -> i32 {
+        return world.unhandledEffectErrorCount();
+    }
+
+    public static fn summary(world: AppWorld) -> string {
+        return "pending=" + AppEffectDiagnostics.pendingCount(world).toString()
+            + " completed=" + world.effectCompletionCount().toString()
+            + " failed=" + AppEffectDiagnostics.failedCount(world).toString()
+            + " dropped=" + AppEffectDiagnostics.droppedCount(world).toString()
+            + " unhandled=" + AppEffectDiagnostics.unhandledCount(world).toString();
+    }
+
+    // Folds every failed effect into the owner's diagnostic list. Called once
+    // per frame by an app that wants the inspector to show effect failures next
+    // to its own.
+    public static fn collect(world: AppWorld, owner: string) -> AppWorld {
+        var out = world;
+        // Read through `out`, not the parameter: binding `out` moves `world`,
+        // so the parameter is dead from here on.
+        var i: i32 = 0;
+        let total = out.effectResultCount();
+        while (i < total) {
+            let candidate = out.effectResultAt(i);
+            if (candidate.isFailure()) {
+                let diag = AppEffectDiagnostics.fromResult(candidate);
+                out = AppDiagList.record(out, owner, &diag);
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // The action an app can bind to "try that again". Deterministic from the
+    // result so the caller does not have to invent a naming scheme.
+    public static fn retryActionName(result: AppEffectResult) -> string {
+        if (result.tag.len == 0) { return "retry:effect"; }
+        return "retry:" + result.tag;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Crash context
+// ---------------------------------------------------------------------------
+
+// A crash report is only useful if it says what the app was doing and can be
+// checked for integrity. The payload is line-oriented, wrapped in the same
+// checksummed envelope the persistence layer uses, so a report that was
+// truncated by the crash that produced it is detected as corrupt instead of
+// being parsed as a shorter report.
+public class AppCrashContext {
+    public static fn schema() -> string { return "crash"; }
+    public static fn revision() -> i32 { return 1; }
+
+    public static fn digest(world: AppWorld) -> string {
+        return "revision=" + format("%d", world.stateRevision() as i64)
+            + " components=" + world.componentCount().toString()
+            + " accessibility=" + world.accessibilityCount().toString()
+            + " pending=" + world.pendingActionCount().toString()
+            + " strings=" + world.stringResourceCount().toString()
+            + " ints=" + world.intResourceCount().toString()
+            + " floats=" + world.floatResourceCount().toString()
+            + " bools=" + world.boolResourceCount().toString();
+    }
+
+    public static fn payload(world: AppWorld, app_id: string, version: string, owner: string) -> string {
+        var out = "ZYNC|1\n"
+            + "app=" + hex_encode(app_id) + "\n"
+            + "version=" + hex_encode(version) + "\n"
+            + "clock=" + format("%d", appDiagNow(world) as i64) + "\n"
+            + "digest=" + hex_encode(AppCrashContext.digest(world)) + "\n"
+            + "effects=" + hex_encode(AppEffectDiagnostics.summary(world)) + "\n";
+        let diagnostics = AppDiagList.count(world, owner);
+        out = out + "diagnostics=" + format("%d", diagnostics as i64) + "\n";
+        var i: i32 = 0;
+        while (i < diagnostics) {
+            out = out + "D|" + AppDiagList.at(world, owner, i).encodeBlob() + "\n";
+            i = i + 1;
+        }
+        let crumbs = AppBreadcrumb.count(world, owner);
+        out = out + "breadcrumbs=" + format("%d", crumbs as i64) + "\n";
+        i = 0;
+        while (i < crumbs) {
+            out = out + "B|" + format("%d", AppBreadcrumb.clockAt(world, owner, i) as i64)
+                + "|" + hex_encode(AppBreadcrumb.kindAt(world, owner, i))
+                + "|" + hex_encode(AppBreadcrumb.labelAt(world, owner, i)) + "\n";
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn report(world: AppWorld, app_id: string, version: string, owner: string) -> string {
+        return AppDocumentEnvelope.encode(
+            AppCrashContext.schema(),
+            AppCrashContext.revision(),
+            AppCrashContext.payload(world, app_id, version, owner));
+    }
+
+    // Same report with the secret list applied to every free-text field.
+    public static fn reportRedacted(world: AppWorld, app_id: string, version: string, owner: string, secrets: string) -> string {
+        let raw = AppCrashContext.report(world, app_id, version, owner);
+        if (secrets.len == 0) { return raw; }
+        return AppCredentialRedactor.redact(raw, secrets);
+    }
+
+    // The header fields of a report, for a tool that wants to decide whether to
+    // read the body before parsing it.
+    public static fn reportIsValid(text: string) -> bool {
+        let envelope = AppDocumentEnvelope.decode(text);
+        return envelope.isOk();
+    }
+
+    public static fn reportAppId(text: string) -> string {
+        let envelope = AppDocumentEnvelope.decode(text);
+        if (!envelope.isOk()) { return ""; }
+        return hex_decode(AppCrashContext.payloadField(envelope.payload, 1));
+    }
+
+    public static fn reportVersion(text: string) -> string {
+        let envelope = AppDocumentEnvelope.decode(text);
+        if (!envelope.isOk()) { return ""; }
+        return hex_decode(AppCrashContext.payloadField(envelope.payload, 2));
+    }
+
+    // Line 0 of the payload is the `ZYNC|1` banner, so field 1 is `app=...`.
+    private static fn payloadField(payload: string, line: i32) -> string {
+        return AppDiagText.fieldAt(AppDiagText.lineAt(payload, line), 61, 1);
+    }
+
+    public static fn write(path: string, text: string) -> Result<bool, AppError> {
+        if (path.len == 0) { return Err(AppError.create(appDiagCodeCrash(), "crash report path is empty")); }
+        match (FileSystem.writeText(path, text)) {
+            case Ok(_) => { return Ok(true); }
+            case Err(e) => { return Err(AppError.create(appDiagCodeCrash(), "cannot write crash report: " + e.message)); }
+        }
+    }
+
+    public static fn read(path: string) -> Result<string, AppError> {
+        if (path.len == 0 || !FileSystem.exists(path)) {
+            return Err(AppError.create(appDiagCodeCrash(), "crash report not found: " + path));
+        }
+        match (FileSystem.readText(path)) {
+            case Ok(text) => { return Ok(text); }
+            case Err(e) => { return Err(AppError.create(appDiagCodeCrash(), "cannot read crash report: " + e.message)); }
+        }
+    }
+
+    public static fn captureToFile(world: AppWorld, app_id: string, version: string, owner: string, path: string) -> Result<bool, AppError> {
+        return AppCrashContext.write(path, AppCrashContext.report(world, app_id, version, owner));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+public class AppLogEntry {
+    public level: i32;
+    public clock: u64;
+    public frame: u64;
+    public origin: string;
+    public tag: string;
+    public message: string;
+
+    public static fn create(level: i32, origin: string, tag: string, message: string) -> AppLogEntry {
+        return AppLogEntry {
+            level: level, clock: 0 as u64, frame: 0 as u64,
+            origin: origin, tag: tag, message: message
+        };
+    }
+
+    public fn withClock(mut self, clock: u64) -> AppLogEntry {
+        self.clock = clock;
+        self.frame = clock;
+        return self;
+    }
+
+    public fn dup(&self) -> AppLogEntry {
+        return AppLogEntry {
+            level: self.level, clock: self.clock, frame: self.frame,
+            origin: self.origin, tag: self.tag, message: self.message
+        };
+    }
+
+    public fn isError(&self) -> bool {
+        return self.level >= appLogError();
+    }
+
+    public fn summary(&self) -> string {
+        var out = appDiagLogLevelName(self.level) + " @" + format("%d", self.clock as i64);
+        if (self.origin.len > 0) { out = out + " [" + self.origin + "]"; }
+        if (self.tag.len > 0) { out = out + " " + self.tag + ":"; }
+        return out + " " + self.message;
+    }
+
+    // `L|level|clock|frame|origin|tag|message`
+    public fn serialize(&self) -> string {
+        return "L"
+            + "|" + format("%d", self.level as i64)
+            + "|" + format("%d", self.clock as i64)
+            + "|" + format("%d", self.frame as i64)
+            + "|" + hex_encode(self.origin)
+            + "|" + hex_encode(self.tag)
+            + "|" + hex_encode(self.message);
+    }
+
+    public static fn parse(text: string) -> AppLogEntry {
+        if (AppDiagText.fieldAt(text, 124, 0) != "L" || AppDiagText.fieldCount(text, 124) != 7) {
+            return AppLogEntry.create(appLogError(), "", "", "corrupt log record");
+        }
+        var out = AppLogEntry.create(
+            app_parse_i32_or(AppDiagText.fieldAt(text, 124, 1), appLogInfo()),
+            hex_decode(AppDiagText.fieldAt(text, 124, 4)),
+            hex_decode(AppDiagText.fieldAt(text, 124, 5)),
+            hex_decode(AppDiagText.fieldAt(text, 124, 6)));
+        out.clock = appDiagParseU64(AppDiagText.fieldAt(text, 124, 2), 0 as u64);
+        out.frame = appDiagParseU64(AppDiagText.fieldAt(text, 124, 3), 0 as u64);
+        return out;
+    }
+
+    public fn encodeBlob(&self) -> string {
+        return hex_encode(self.serialize());
+    }
+
+    public static fn decodeBlob(text: string) -> AppLogEntry {
+        return AppLogEntry.parse(hex_decode(text));
+    }
+
+    public fn redact(&self, secrets: string) -> AppLogEntry {
+        var out = self.dup();
+        if (secrets.len == 0) { return out; }
+        out.message = AppCredentialRedactor.redact(self.message, secrets);
+        out.origin = AppCredentialRedactor.redact(self.origin, secrets);
+        out.tag = AppCredentialRedactor.redact(self.tag, secrets);
+        return out;
+    }
+}
+
+// Level, secrets and retention. Kept as a plain value so a caller can hand a
+// different config to one sink without touching global state.
+public class AppLogConfig {
+    public level: i32;
+    public secrets: string;
+    public max_entries: i32;
+    public console: bool;
+
+    public static fn create() -> AppLogConfig {
+        return AppLogConfig {
+            level: appLogInfo(), secrets: "", max_entries: appLogDefaultLimit(), console: false
+        };
+    }
+
+    public static fn verbose() -> AppLogConfig {
+        var out = AppLogConfig.create();
+        out.level = appLogTrace();
+        return out;
+    }
+
+    public static fn off() -> AppLogConfig {
+        var out = AppLogConfig.create();
+        out.level = appLogOff();
+        return out;
+    }
+
+    public fn withLevel(mut self, level: i32) -> AppLogConfig {
+        self.level = level;
+        return self;
+    }
+
+    public fn withSecrets(mut self, secrets: string) -> AppLogConfig {
+        self.secrets = secrets;
+        return self;
+    }
+
+    public fn addSecret(mut self, secret: string) -> AppLogConfig {
+        if (secret.len == 0) { return self; }
+        self.secrets = AppCredentialRedactor.appendEntry(self.secrets, secret);
+        return self;
+    }
+
+    public fn withMaxEntries(mut self, max_entries: i32) -> AppLogConfig {
+        self.max_entries = max_entries;
+        return self;
+    }
+
+    public fn toConsole(mut self, value: bool) -> AppLogConfig {
+        self.console = value;
+        return self;
+    }
+
+    public fn allows(&self, level: i32) -> bool {
+        if (self.level == appLogOff()) { return false; }
+        return level >= self.level;
+    }
+
+    public fn format(&self, entry: AppLogEntry) -> string {
+        return entry.redact(self.secrets).summary();
+    }
+}
+
+// The in-memory sink. Redaction happens here rather than at the call sites: a
+// sink is the last place a secret can escape, so the sink is the only place the
+// secret list has to be consulted.
+public class AppMemoryLogSink {
+    public static fn itemKey(owner: string) -> string { return "log:" + owner + ":item"; }
+    public static fn levelKey(owner: string) -> string { return "log:" + owner + ":level"; }
+    public static fn secretsKey(owner: string) -> string { return "log:" + owner + ":secrets"; }
+
+    public static fn setLevel(world: AppWorld, owner: string, level: i32) -> AppWorld {
+        return world.setIntResource(AppMemoryLogSink.levelKey(owner), level);
+    }
+
+    public static fn level(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppMemoryLogSink.levelKey(owner), appLogInfo());
+    }
+
+    public static fn setSecrets(world: AppWorld, owner: string, secrets: string) -> AppWorld {
+        return world.setStringResource(AppMemoryLogSink.secretsKey(owner), secrets);
+    }
+
+    public static fn secrets(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppMemoryLogSink.secretsKey(owner), "");
+    }
+
+    // The config actually in force for this owner: the level and secrets live in
+    // resources so a developer toggle can change them at runtime.
+    public static fn configFor(world: AppWorld, owner: string) -> AppLogConfig {
+        var out = AppLogConfig.create();
+        out.level = AppMemoryLogSink.level(world, owner);
+        out.secrets = AppMemoryLogSink.secrets(world, owner);
+        return out;
+    }
+
+    public static fn write(world: AppWorld, owner: string, config: AppLogConfig, entry: AppLogEntry) -> AppWorld {
+        if (owner.len == 0 || !config.allows(entry.level)) { return world; }
+        let stamped = entry.redact(config.secrets);
+        var out = world.appendStringListResource(AppMemoryLogSink.itemKey(owner), stamped.encodeBlob());
+        if (config.max_entries > 0) {
+            var guard: i32 = 0;
+            while (AppMemoryLogSink.count(out, owner) > config.max_entries && guard < 65536) {
+                let before = AppMemoryLogSink.count(out, owner);
+                out = out.removeStringListResourceAt(AppMemoryLogSink.itemKey(owner), 0);
+                if (AppMemoryLogSink.count(out, owner) >= before) { break; }
+                guard = guard + 1;
+            }
+        }
+        return out;
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        if (owner.len == 0) { return 0; }
+        return world.stringListResourceCount(AppMemoryLogSink.itemKey(owner));
+    }
+
+    public static fn at(world: AppWorld, owner: string, index: i32) -> AppLogEntry {
+        if (owner.len == 0 || index < 0) {
+            return AppLogEntry.create(appLogInfo(), "", "", "");
+        }
+        return AppLogEntry.decodeBlob(world.stringListResourceAt(AppMemoryLogSink.itemKey(owner), index));
+    }
+
+    public static fn text(world: AppWorld, owner: string) -> string {
+        var out: string = "";
+        var i: i32 = 0;
+        while (i < AppMemoryLogSink.count(world, owner)) {
+            out = out + AppMemoryLogSink.at(world, owner, i).summary() + "\n";
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn errorCount(world: AppWorld, owner: string) -> i32 {
+        var out: i32 = 0;
+        var i: i32 = 0;
+        while (i < AppMemoryLogSink.count(world, owner)) {
+            if (AppMemoryLogSink.at(world, owner, i).isError()) { out = out + 1; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn clear(world: AppWorld, owner: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        return AppRowStore.clearList(world, AppMemoryLogSink.itemKey(owner));
+    }
+}
+
+// The facade an application calls. It exists so that "log an info line" is one
+// call that already knows the clock, the level filter and the redaction rules.
+public class AppLog {
+    public static fn write(world: AppWorld, owner: string, level: i32, tag: string, message: string) -> AppWorld {
+        let config = AppMemoryLogSink.configFor(world, owner);
+        var entry = AppLogEntry.create(level, owner, tag, message).withClock(appDiagNow(world));
+        return AppMemoryLogSink.write(world, owner, config, entry);
+    }
+
+    public static fn trace(world: AppWorld, owner: string, tag: string, message: string) -> AppWorld {
+        return AppLog.write(world, owner, appLogTrace(), tag, message);
+    }
+
+    public static fn debug(world: AppWorld, owner: string, tag: string, message: string) -> AppWorld {
+        return AppLog.write(world, owner, appLogDebug(), tag, message);
+    }
+
+    public static fn info(world: AppWorld, owner: string, tag: string, message: string) -> AppWorld {
+        return AppLog.write(world, owner, appLogInfo(), tag, message);
+    }
+
+    public static fn warn(world: AppWorld, owner: string, tag: string, message: string) -> AppWorld {
+        return AppLog.write(world, owner, appLogWarn(), tag, message);
+    }
+
+    // `error` is a reserved word in Vyx, so the error-level entry point is
+    // spelled `errorLine`.
+    public static fn errorLine(world: AppWorld, owner: string, tag: string, message: string) -> AppWorld {
+        return AppLog.write(world, owner, appLogError(), tag, message);
+    }
+
+    // Logs a diagnostic and records it in the owner's list, so the two views of
+    // the same failure never drift apart.
+    public static fn diagnostic(world: AppWorld, owner: string, diag: &AppDiagnostic) -> AppWorld {
+        var out = AppDiagList.note(world, owner, diag);
+        var entry = AppLogEntry.create(
+            AppDiagnostic.severityToLogLevel(diag.severity), owner, diag.tag, diag.summary());
+        return AppMemoryLogSink.write(out, owner, AppMemoryLogSink.configFor(out, owner), entry.withClock(appDiagNow(out)));
+    }
+
+    public static fn setLevel(world: AppWorld, owner: string, level: i32) -> AppWorld {
+        return AppMemoryLogSink.setLevel(world, owner, level);
+    }
+
+    public static fn level(world: AppWorld, owner: string) -> i32 {
+        return AppMemoryLogSink.level(world, owner);
+    }
+
+    public static fn setSecrets(world: AppWorld, owner: string, secrets: string) -> AppWorld {
+        return AppMemoryLogSink.setSecrets(world, owner, secrets);
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        return AppMemoryLogSink.count(world, owner);
+    }
+
+    public static fn at(world: AppWorld, owner: string, index: i32) -> AppLogEntry {
+        return AppMemoryLogSink.at(world, owner, index);
+    }
+
+    public static fn text(world: AppWorld, owner: string) -> string {
+        return AppMemoryLogSink.text(world, owner);
+    }
+
+    public static fn clear(world: AppWorld, owner: string) -> AppWorld {
+        return AppMemoryLogSink.clear(world, owner);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Performance trace
+// ---------------------------------------------------------------------------
+
+public class AppTraceSpan {
+    public name: string;
+    public start_clock: u64;
+    public end_clock: u64;
+    public closed: bool;
+
+    public static fn create(name: string, start_clock: u64) -> AppTraceSpan {
+        return AppTraceSpan {
+            name: name, start_clock: start_clock, end_clock: start_clock, closed: false
+        };
+    }
+
+    public fn duration(&self) -> i32 {
+        if (self.end_clock < self.start_clock) { return 0; }
+        return (self.end_clock - self.start_clock) as i32;
+    }
+
+    public fn dup(&self) -> AppTraceSpan {
+        return AppTraceSpan {
+            name: self.name, start_clock: self.start_clock,
+            end_clock: self.end_clock, closed: self.closed
+        };
+    }
+
+    public fn summary(&self) -> string {
+        var state = "open";
+        if (self.closed) { state = "closed"; }
+        return self.name + " " + self.duration().toString() + " frames (" + state + ")";
+    }
+
+    // `S|name|start|end|closed`
+    public fn serialize(&self) -> string {
+        return "S|" + hex_encode(self.name)
+            + "|" + format("%d", self.start_clock as i64)
+            + "|" + format("%d", self.end_clock as i64)
+            + "|" + appDiagBoolText(self.closed);
+    }
+
+    public static fn parse(text: string) -> AppTraceSpan {
+        if (AppDiagText.fieldAt(text, 124, 0) != "S" || AppDiagText.fieldCount(text, 124) != 5) {
+            return AppTraceSpan.create("", 0 as u64);
+        }
+        var out = AppTraceSpan.create(hex_decode(AppDiagText.fieldAt(text, 124, 1)),
+            appDiagParseU64(AppDiagText.fieldAt(text, 124, 2), 0 as u64));
+        out.end_clock = appDiagParseU64(AppDiagText.fieldAt(text, 124, 3), 0 as u64);
+        out.closed = AppDiagText.fieldAt(text, 124, 4) == "1";
+        return out;
+    }
+}
+
+// Spans are measured in frames, not milliseconds. A millisecond budget is not
+// portable across machines, and the roadmap explicitly refuses "a single FPS
+// number" as evidence - a frame count is comparable between two runs of the
+// same build on the same machine, which is what a regression gate needs.
+//
+// An open span is a *stack* of start clocks per name, not a mutable list slot:
+// the world's resource API can append and remove-at-index but cannot overwrite
+// a list element, and a stack is the right shape anyway because it makes
+// `begin`/`end` nest the way the call stack did.
+public class AppPerfTrace {
+    public static fn spanKey(owner: string) -> string { return "trace:" + owner + ":span"; }
+    public static fn openKey(owner: string, name: string) -> string { return "trace:" + owner + ":open:" + name; }
+
+    public static fn begin(world: AppWorld, owner: string, name: string) -> AppWorld {
+        if (owner.len == 0 || name.len == 0) { return world; }
+        return world.appendStringListResource(
+            AppPerfTrace.openKey(owner, name), format("%d", appDiagNow(world) as i64));
+    }
+
+    // Closes the innermost open span with this name and appends the finished
+    // record. Ending a span that was never begun is a no-op rather than an
+    // error: a trace is diagnostic, and it must not be able to fail a build.
+    public static fn end(world: AppWorld, owner: string, name: string) -> AppWorld {
+        if (owner.len == 0 || name.len == 0) { return world; }
+        let depth = AppPerfTrace.openDepth(world, owner, name);
+        if (depth <= 0) { return world; }
+        let start = AppPerfTrace.openStartAt(world, owner, name, depth - 1);
+        var span = AppTraceSpan.create(name, start);
+        span.end_clock = appDiagNow(world);
+        span.closed = true;
+        var out = world.removeStringListResourceAt(AppPerfTrace.openKey(owner, name), depth - 1);
+        return out.appendStringListResource(AppPerfTrace.spanKey(owner), hex_encode(span.serialize()));
+    }
+
+    public static fn openDepth(world: AppWorld, owner: string, name: string) -> i32 {
+        if (owner.len == 0 || name.len == 0) { return 0; }
+        return world.stringListResourceCount(AppPerfTrace.openKey(owner, name));
+    }
+
+    public static fn openStartAt(world: AppWorld, owner: string, name: string, index: i32) -> u64 {
+        if (owner.len == 0 || name.len == 0 || index < 0) { return 0 as u64; }
+        return appDiagParseU64(world.stringListResourceAt(AppPerfTrace.openKey(owner, name), index), 0 as u64);
+    }
+
+    public static fn isActive(world: AppWorld, owner: string, name: string) -> bool {
+        return AppPerfTrace.openDepth(world, owner, name) > 0;
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        if (owner.len == 0) { return 0; }
+        return world.stringListResourceCount(AppPerfTrace.spanKey(owner));
+    }
+
+    public static fn at(world: AppWorld, owner: string, index: i32) -> AppTraceSpan {
+        if (owner.len == 0 || index < 0) { return AppTraceSpan.create("", 0 as u64); }
+        return AppTraceSpan.parse(hex_decode(world.stringListResourceAt(AppPerfTrace.spanKey(owner), index)));
+    }
+
+    public static fn totalFrames(world: AppWorld, owner: string) -> i32 {
+        var out: i32 = 0;
+        var i: i32 = 0;
+        while (i < AppPerfTrace.count(world, owner)) {
+            out = out + AppPerfTrace.at(world, owner, i).duration();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn slowestIndex(world: AppWorld, owner: string) -> i32 {
+        var best: i32 = -1;
+        var best_duration: i32 = -1;
+        var i: i32 = 0;
+        while (i < AppPerfTrace.count(world, owner)) {
+            let duration = AppPerfTrace.at(world, owner, i).duration();
+            if (duration > best_duration) {
+                best_duration = duration;
+                best = i;
+            }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    // Aggregated by name, so "how much of the frame is layout" is answerable
+    // without the caller having kept a separate counter.
+    public static fn totalFor(world: AppWorld, owner: string, name: string) -> i32 {
+        var out: i32 = 0;
+        var i: i32 = 0;
+        while (i < AppPerfTrace.count(world, owner)) {
+            let span = AppPerfTrace.at(world, owner, i);
+            if (span.name == name) { out = out + span.duration(); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn countFor(world: AppWorld, owner: string, name: string) -> i32 {
+        var out: i32 = 0;
+        var i: i32 = 0;
+        while (i < AppPerfTrace.count(world, owner)) {
+            if (AppPerfTrace.at(world, owner, i).name == name) { out = out + 1; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn report(world: AppWorld, owner: string) -> string {
+        var out = "spans=" + AppPerfTrace.count(world, owner).toString()
+            + " total=" + AppPerfTrace.totalFrames(world, owner).toString() + " frames\n";
+        var i: i32 = 0;
+        while (i < AppPerfTrace.count(world, owner)) {
+            out = out + "  " + AppPerfTrace.at(world, owner, i).summary() + "\n";
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn reset(world: AppWorld, owner: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        // Finished spans only. The per-name open stacks are keyed by name, which
+        // this call has no way to enumerate; a span still open across a reset is
+        // closed (and dropped) by its own `end`.
+        return AppRowStore.clearList(world, AppPerfTrace.spanKey(owner));
+    }
+}
+
+// A named running total. Spans answer "how long", counters answer "how many".
+public class AppPerfCounter {
+    public static fn key(owner: string, name: string) -> string { return "count:" + owner + ":" + name; }
+
+    public static fn bump(world: AppWorld, owner: string, name: string, delta: i32) -> AppWorld {
+        if (owner.len == 0 || name.len == 0) { return world; }
+        let current = world.intResource(AppPerfCounter.key(owner, name), 0);
+        return world.setIntResource(AppPerfCounter.key(owner, name), current + delta);
+    }
+
+    public static fn value(world: AppWorld, owner: string, name: string) -> i32 {
+        return world.intResource(AppPerfCounter.key(owner, name), 0);
+    }
+
+    public static fn reset(world: AppWorld, owner: string, name: string) -> AppWorld {
+        return world.setIntResource(AppPerfCounter.key(owner, name), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry
+// ---------------------------------------------------------------------------
+
+// A failure the user can act on becomes a queued action. Keeping the queue in
+// resources means the retry survives a rebuild, and an idempotent retry can be
+// replayed by the record/reply harness like any other action.
+public class AppRetryQueue {
+    public static fn actionKey(owner: string) -> string { return "retry:" + owner + ":action"; }
+    public static fn diagKey(owner: string) -> string { return "retry:" + owner + ":diag"; }
+
+    public static fn schedule(world: AppWorld, owner: string, action_name: string, diag: &AppDiagnostic) -> AppWorld {
+        if (owner.len == 0 || action_name.len == 0) { return world; }
+        var out = world.appendStringListResource(AppRetryQueue.actionKey(owner), action_name);
+        return out.appendStringListResource(AppRetryQueue.diagKey(owner), diag.encodeBlob());
+    }
+
+    // The common case: derive the action name from the diagnostic's origin so
+    // the caller does not have to invent one.
+    public static fn scheduleFor(world: AppWorld, owner: string, diag: &AppDiagnostic) -> AppWorld {
+        if (!diag.canRetry()) { return world; }
+        return AppRetryQueue.schedule(world, owner, AppErrorPresenter.retryAction(diag), diag);
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        if (owner.len == 0) { return 0; }
+        return world.stringListResourceCount(AppRetryQueue.actionKey(owner));
+    }
+
+    public static fn hasPending(world: AppWorld, owner: string) -> bool {
+        return AppRetryQueue.count(world, owner) > 0;
+    }
+
+    public static fn actionAt(world: AppWorld, owner: string, index: i32) -> string {
+        if (owner.len == 0 || index < 0) { return ""; }
+        return world.stringListResourceAt(AppRetryQueue.actionKey(owner), index);
+    }
+
+    public static fn diagAt(world: AppWorld, owner: string, index: i32) -> AppDiagnostic {
+        if (owner.len == 0 || index < 0) { return AppDiagnostic.create(0, ""); }
+        return AppDiagnostic.decodeBlob(world.stringListResourceAt(AppRetryQueue.diagKey(owner), index));
+    }
+
+    // Removes one entry and returns the action to dispatch. The diagnostic is
+    // dropped with it: a retry that failed again will queue a fresh one.
+    public static fn take(world: AppWorld, owner: string, index: i32) -> AppWorld {
+        if (owner.len == 0 || index < 0 || index >= AppRetryQueue.count(world, owner)) { return world; }
+        var out = world.removeStringListResourceAt(AppRetryQueue.actionKey(owner), index);
+        return out.removeStringListResourceAt(AppRetryQueue.diagKey(owner), index);
+    }
+
+    public static fn clear(world: AppWorld, owner: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        var out = AppRowStore.clearList(world, AppRetryQueue.actionKey(owner));
+        return AppRowStore.clearList(out, AppRetryQueue.diagKey(owner));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User-facing presentation
+// ---------------------------------------------------------------------------
+
+public class AppErrorPresentation {
+    public title: string;
+    public body: string;
+    public retry_label: string;
+    public retry_action: string;
+    public severity: i32;
+    public code: i32;
+
+    public static fn create(diag: &AppDiagnostic) -> AppErrorPresentation {
+        return AppErrorPresentation {
+            title: AppErrorPresenter.title(diag),
+            body: AppErrorPresenter.body(diag),
+            retry_label: AppErrorPresenter.retryLabel(diag),
+            retry_action: AppErrorPresenter.retryAction(diag),
+            severity: diag.severity,
+            code: diag.code
+        };
+    }
+
+    public fn canRetry(&self) -> bool {
+        return self.retry_action.len > 0;
+    }
+}
+
+// "The user can see why it failed and retry" is a UI contract, so it lives in
+// one place. The title and body are chosen from the category, which is what
+// makes the message actionable: an input error should not say "try again", and
+// a network error should not say "check your entry".
+//
+// Every entry point borrows the diagnostic. `AppDiagnostic` owns a `Vec`, and a
+// by-value parameter would be a bit-copy of that vector - the one shape this
+// codebase has learned to avoid.
+public class AppErrorPresenter {
+    public static fn title(diag: &AppDiagnostic) -> string {
+        if (diag.severity == appSeverityCritical()) { return "Something went wrong"; }
+        if (diag.category == appDiagInput()) { return "That value cannot be used"; }
+        if (diag.category == appDiagValidation()) { return "Please check the highlighted field"; }
+        if (diag.category == appDiagNetwork()) { return "No connection"; }
+        if (diag.category == appDiagAuth()) { return "Sign-in required"; }
+        if (diag.category == appDiagPersistence()) { return "Your changes could not be saved"; }
+        if (diag.category == appDiagEffect()) { return "The operation did not finish"; }
+        return "Something went wrong";
+    }
+
+    public static fn body(diag: &AppDiagnostic) -> string {
+        var out = diag.message;
+        if (out.len == 0) { out = AppErrorPresenter.title(diag); }
+        if (diag.detail.len > 0) { out = out + "\n" + diag.detail; }
+        if (diag.causeCount() > 0) {
+            out = out + "\n" + diag.causeAt(0).message;
+        }
+        return out;
+    }
+
+    public static fn retryLabel(diag: &AppDiagnostic) -> string {
+        if (!diag.canRetry()) { return ""; }
+        if (diag.category == appDiagNetwork()) { return "Try again"; }
+        if (diag.category == appDiagPersistence()) { return "Save again"; }
+        return "Retry";
+    }
+
+    // Empty when there is nothing honest to offer.
+    public static fn retryAction(diag: &AppDiagnostic) -> string {
+        if (!diag.canRetry()) { return ""; }
+        if (diag.origin_kind == appOriginEffect() && diag.tag.len > 0) {
+            return "retry:" + diag.tag;
+        }
+        if (diag.origin.len > 0) { return "retry:" + diag.origin; }
+        return "retry:last";
+    }
+
+    public static fn present(diag: &AppDiagnostic) -> AppErrorPresentation {
+        return AppErrorPresentation.create(diag);
+    }
+
+    public static fn severityColor(severity: i32) -> Color {
+        if (severity == appSeverityDebug()) { return colorRgbaMilli(120, 120, 120, 1000); }
+        if (severity == appSeverityInfo()) { return colorRgbaMilli(33, 150, 243, 1000); }
+        if (severity == appSeverityWarning()) { return colorRgbaMilli(245, 124, 0, 1000); }
+        if (severity == appSeverityError()) { return colorRgbaMilli(211, 47, 47, 1000); }
+        return colorRgbaMilli(140, 20, 20, 1000);
+    }
+
+    public static fn severityLabel(severity: i32) -> string {
+        return appDiagSeverityName(severity);
+    }
+
+    // An inline banner for the owning region: severity stripe, message, and the
+    // retry button only when a retry is actually meaningful.
+    public static fn banner(world: AppWorld, owner: string) -> View {
+        let diag = AppDiagList.lastError(world, owner);
+        if (diag.code == 0) { return View.box(); }
+        var parts = Vec::<View>.new();
+        parts.push(Text.title(AppErrorPresenter.title(&diag)));
+        parts.push(Text.body(AppErrorPresenter.body(&diag)));
+        if (diag.canRetry()) {
+            parts.push(AppErrorPresenter.retryButtons(&diag));
+        }
+        return View.column()
+            .id("error-banner:" + owner)
+            .gap(4.0)
+            .padding(8.0)
+            .background(colorRgbaMilli(255, 240, 240, 1000))
+            .children(parts);
+    }
+
+    // Returns a row, not a `Vec<View>`: no function in the app layer hands a
+    // collection of owned views back across a boundary, and a row is what the
+    // caller wanted anyway.
+    public static fn retryButtons(diag: &AppDiagnostic) -> View {
+        var out = Vec::<View>.new();
+        out.push(View.button(AppErrorPresenter.retryLabel(diag))
+            .id("error-retry:" + diag.origin)
+            .onClick(AppErrorPresenter.retryAction(diag)));
+        out.push(View.button("Dismiss")
+            .id("error-dismiss:" + diag.origin)
+            .onClick("dismiss:" + diag.origin));
+        return View.row().id("error-actions:" + diag.origin).gap(8.0).children(out);
+    }
+
+    // The modal body for a failure that blocks the task. The dialog layer and
+    // the focus trap are M0's job; this only supplies the content.
+    public static fn dialogBody(world: AppWorld, owner: string) -> View {
+        let diag = AppDiagList.lastError(world, owner);
+        if (diag.code == 0) { return View.box(); }
+        var parts = Vec::<View>.new();
+        parts.push(Text.title(AppErrorPresenter.title(&diag)));
+        parts.push(View.divider());
+        parts.push(Text.body(AppErrorPresenter.body(&diag)));
+        if (diag.causeCount() > 0) {
+            parts.push(Text.muted("Details: " + diag.causeAt(0).summary()));
+        }
+        parts.push(AppErrorPresenter.retryButtons(&diag));
+        return View.column()
+            .id("error-dialog:" + owner)
+            .gap(8.0)
+            .padding(16.0)
+            .children(parts);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Developer inspector
+// ---------------------------------------------------------------------------
+
+// Composes what already exists (`AppInspector`, `AppDebugReport`) with the
+// three views this module adds. The panel is built from the ordinary primitives
+// so it renders through the same path as application content - a developer
+// overlay that needs its own renderer is a second source of truth.
+public class AppDevInspector {
+    public static fn summary(world: AppWorld, owner: string) -> string {
+        return AppInspector.world(world).summary()
+            + "\n" + AppCrashContext.digest(world)
+            + "\n" + AppEffectDiagnostics.summary(world)
+            + "\n diagnostics: total=" + AppDiagList.count(world, owner).toString()
+            + " errors=" + AppDiagList.errorCount(world, owner).toString()
+            + " retryable=" + AppDiagList.retryableCount(world, owner).toString()
+            + "\n log: level=" + appDiagLogLevelName(AppLog.level(world, owner))
+            + " entries=" + AppLog.count(world, owner).toString()
+            + " errors=" + AppMemoryLogSink.errorCount(world, owner).toString()
+            + "\n trace: spans=" + AppPerfTrace.count(world, owner).toString()
+            + " total=" + AppPerfTrace.totalFrames(world, owner).toString() + " frames"
+            + "\n breadcrumbs: " + AppBreadcrumb.count(world, owner).toString();
+    }
+
+    public static fn diagnosticReport(world: AppWorld, owner: string) -> string {
+        return AppDiagList.text(world, owner);
+    }
+
+    public static fn traceReport(world: AppWorld, owner: string) -> string {
+        return AppPerfTrace.report(world, owner);
+    }
+
+    public static fn logReport(world: AppWorld, owner: string) -> string {
+        return AppLog.text(world, owner);
+    }
+
+    public static fn breadcrumbReport(world: AppWorld, owner: string) -> string {
+        return AppBreadcrumb.dump(world, owner);
+    }
+
+    public static fn section(title: string, body: string) -> View {
+        var parts = Vec::<View>.new();
+        parts.push(Text.title(title));
+        parts.push(Text.muted(body));
+        return View.column().gap(2.0).children(parts);
+    }
+
+    public static fn panel(world: AppWorld, owner: string) -> View {
+        var parts = Vec::<View>.new();
+        parts.push(Text.title("Inspector"));
+        parts.push(View.divider());
+        parts.push(AppDevInspector.section("World", AppInspector.world(world).summary()));
+        parts.push(View.divider());
+        parts.push(AppDevInspector.section("Diagnostics", AppDevInspector.diagnosticReport(world, owner)));
+        parts.push(View.divider());
+        parts.push(AppDevInspector.section("Trace", AppDevInspector.traceReport(world, owner)));
+        parts.push(View.divider());
+        parts.push(AppDevInspector.section("Log", AppDevInspector.logReport(world, owner)));
+        parts.push(View.divider());
+        parts.push(AppDevInspector.section("Breadcrumbs", AppDevInspector.breadcrumbReport(world, owner)));
+        return View.column()
+            .id("inspector:" + owner)
+            .gap(8.0)
+            .padding(12.0)
+            .children(parts);
+    }
+
+    // A compact strip suitable for a debug build's status area: the numbers a
+    // developer watches while clicking around.
+    public static fn statusStrip(world: AppWorld, owner: string) -> View {
+        var parts = Vec::<View>.new();
+        parts.push(Text.muted("rev " + format("%d", world.stateRevision() as i64)));
+        parts.push(Text.muted("diag " + AppDiagList.errorCount(world, owner).toString()));
+        parts.push(Text.muted("fx " + AppEffectDiagnostics.pendingCount(world).toString()));
+        parts.push(Text.muted("spans " + AppPerfTrace.count(world, owner).toString()));
+        parts.push(Text.muted("log " + AppLog.count(world, owner).toString()));
+        return View.row().id("inspector-strip:" + owner).gap(8.0).children(parts);
+    }
+
+    // Records the current inspector state as a diagnostic, so "the panel looked
+    // wrong" is itself reproducible through the same channel as a real failure.
+    public static fn snapshotAsDiagnostic(world: AppWorld, owner: string) -> AppWorld {
+        var diag = AppDiagnostic.create(appDiagCodeAssertion(), "inspector snapshot");
+        diag = diag.withCategory(appDiagInternal());
+        diag = diag.withSeverity(appSeverityInfo());
+        diag = diag.withOrigin(appOriginSystem(), "inspector");
+        diag = diag.withDetail(AppDevInspector.summary(world, owner));
+        return AppDiagList.record(world, owner, &diag);
+    }
+}

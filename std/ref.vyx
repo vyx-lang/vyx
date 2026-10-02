@@ -1,0 +1,297 @@
+module std.ref;
+
+use std.core;
+
+/// Vyx Standard Library — shared-ownership (Ref<T>/Weak<T>) and
+/// unique-ownership (Box<T>) smart pointers.
+///
+/// Thread-safety: Ref/Weak use sequentially-consistent atomic reference
+/// counts and are the standard Arc-style shared-ownership handles. Shared
+/// mutation is deliberately not provided; put mutable payloads in Mutex<T>.
+///
+/// Memory layout:
+///   * Ref<T> holds an ABI-stable cached `data` pointer and a control block
+///     pointer `rc`. The control block is [strong @ +0][weak @ +8][data @ +16].
+///     `weak` includes the implicit weak reference held while strong > 0.
+///   * Weak<T> holds only `rc: rawptr` — it does not keep `data`
+///     alive, and `data` may be freed while the Weak still points at
+///     a valid header with strong_count == 0.  `upgrade()` uses the
+///     strong_count to return Some/None.
+///
+/// Drop semantics:
+///   * `Ref::drop` decrements strong.  When strong reaches 0, frees
+///     the data payload; only when weak ALSO reaches 0 does it free
+///     the header.  Otherwise the header stays alive so outstanding
+///     Weaks can observe strong_count == 0 via `upgrade`.
+///   * `Weak::drop` decrements weak.  When both counts are 0, frees
+///     the header.
+
+extern "C" {
+    fn malloc(size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: i64) -> rawptr;
+    fn vyx_atomic_load_i64(value: rawptr) -> i64;
+    fn vyx_atomic_fetch_add_i64(value: rawptr, delta: i64) -> i64;
+    fn vyx_atomic_compare_exchange_i64(value: rawptr, expected: i64, desired: i64) -> i64;
+}
+
+// ---------- Deref trait ----------
+/// Types that act like smart pointers (heap-indirected single values)
+/// should implement `Deref<T>` so generic code can uniformly unbox them.
+/// `Box<T>`, `Ref<T>`, and any user-defined `class MyBox<T> : Deref<T>`
+/// that exposes `fn deref() -> T` participate.
+///
+/// CodeGen note (Phase 6, 2026-04-23): the compiler inspects this trait
+/// on the struct's owning ClassDecl to decide whether a value-returned
+/// smart-pointer struct needs to be heap-spilled when coerced to an
+/// opaque pointer (see `CodeGenUtils::castToType`).  Without the spill,
+/// the returned pointer would dangle past the callee's stack frame.
+/// Previously only the name `"Box<"` triggered the spill; implementing
+/// `Deref<T>` now opts any smart-pointer class into the same behavior.
+public trait Deref<T> {
+    fn deref() -> T;
+}
+
+// ---------- Generic class API ----------
+@[lang_item("ref")]
+class Ref<T> : Deref<T> {
+    public data: rawptr;
+    public rc: rawptr;
+
+    // A live strong count retains one implicit weak count, so the control
+    // block remains valid until both the payload and all Weak handles die.
+    public static fn new(val: T) -> Ref<T> {
+        let d = malloc(sizeof::<T>());
+        if (d == null) { panic("Ref::new allocation failed"); }
+        memcpy(d, to_rawptr(&val), sizeof::<T>());
+        let r = malloc(24);
+        if (r == null) {
+            free(d);
+            panic("Ref::new control block allocation failed");
+        }
+        let one: i64 = 1;
+        memcpy(r, to_rawptr(&one), 8);
+        memcpy(r + 8, to_rawptr(&one), 8);
+        memcpy(r + 16, to_rawptr(&d), 8);
+        return Ref { data: d, rc: r };
+    }
+
+    /// Refcount bump. Returns another handle to the SAME heap data
+    /// cell — no deep copy is performed.
+    ///
+    /// Contract (P4-D.3, std.clone Contract B):
+    ///   * Increments the strong count on `self.rc` by 1.
+    ///   * Returns a new `Ref<T>` struct sharing `self.data` + `self.rc`.
+    ///   * The two handles observe the same T: mutating via `r1.set(v)`
+    ///     is visible as `r2.deref() == v`.
+    ///   * Either handle can outlive the other. `drop()` decrements;
+    ///     only the last drop frees the data + rc cells.
+    ///
+    /// See std/clone.vyx for the full deep-copy-vs-refcount-bump
+    /// dichotomy. This is the refcount-bump variant.
+    public fn clone() -> Ref<T> {
+        if (self.rc == null) { return Ref { data: null, rc: null }; }
+        let count = vyx_atomic_load_i64(self.rc);
+        if (count <= 0) { return Ref { data: null, rc: null }; }
+        vyx_atomic_fetch_add_i64(self.rc, 1);
+        return Ref { data: self.data, rc: self.rc };
+    }
+
+    // Typed dereference: returns the stored T value by reading
+    // `sizeof::<T>()` bytes from the heap slot.  Mirrors `Box<T>.deref`
+    // so `Ref<T>` participates in the `Deref<T>` trait and the
+    // smart-pointer → rawptr routing in CodeGen.
+    public fn deref() -> T {
+        var val: T;
+        if (self.data == null) { panic("Ref::deref on released handle"); }
+        memcpy(to_rawptr(&val), self.data, sizeof::<T>());
+        return val;
+    }
+
+    // Typed `get()` — alias for `deref()`, kept as a convenience so
+    // existing Box/Ref callers that expect `.get()` still resolve.
+    public fn get() -> T {
+        var val: T;
+        memcpy(to_rawptr(&val), self.data, sizeof::<T>());
+        return val;
+    }
+
+    // Strong reference count.  `>= 1` while at least one Ref is live.
+    public fn count() -> i64 {
+        if (self.rc == null) { return 0; }
+        return vyx_atomic_load_i64(self.rc);
+    }
+
+    // Excludes the implicit weak count held by a non-zero strong count.
+    public fn weak_count() -> i64 {
+        if (self.rc == null) { return 0; }
+        let w = vyx_atomic_load_i64(self.rc + 8);
+        if (w <= 1) { return 0; }
+        return w - 1;
+    }
+
+    public fn downgrade() -> Weak<T> { return Weak::<T>.of(self); }
+
+    public fn drop() {
+        if (self.rc == null) { return; }
+        let prior_strong = vyx_atomic_fetch_add_i64(self.rc, -1);
+        if (prior_strong <= 0) {
+            self.data = null;
+            self.rc = null;
+            return;
+        }
+        let strong = prior_strong - 1;
+        if (strong == 0) {
+            var payload: rawptr = null;
+            memcpy(to_rawptr(&payload), self.rc + 16, 8);
+            // Move the payload into a local before freeing the outer slot.
+            // The monomorphised local's normal drop glue recursively releases
+            // an owning T (for example Ref<Box<U>>).
+            if (payload != null) {
+                var value: T;
+                memcpy(to_rawptr(&value), payload, sizeof::<T>());
+                free(payload);
+            }
+            let null_data: rawptr = null;
+            memcpy(self.rc + 16, to_rawptr(&null_data), 8);
+            let prior_weak = vyx_atomic_fetch_add_i64(self.rc + 8, -1);
+            let weak = prior_weak - 1;
+            if (weak == 0) {
+                free(self.rc);
+            }
+        }
+        self.data = null;
+        self.rc = null;
+    }
+}
+
+// ---------- Weak<T> companion ----------
+/// `Weak<T>` is a non-owning handle into the same refcount header as
+/// `Ref<T>`.  It does NOT keep the data alive and cannot be
+/// dereferenced directly — use `upgrade()` to attempt promotion to a
+/// live `Ref<T>`.  Weak count protects the refcount header itself
+/// from being freed while outstanding weaks exist.
+class Weak<T> {
+    public data: rawptr;  // same payload pointer as the originating Ref
+    public rc: rawptr;    // same 16-byte header as the originating Ref
+
+    // Downgrade a strong Ref<T> into a Weak<T>.  Bumps weak_count.
+    // Does NOT touch strong_count.  The returned Weak shares both
+    // `data` and `rc` with the input so `upgrade()` can reconstruct
+    // a live Ref cheaply.
+    public static fn of(r: Ref<T>) -> Weak<T> {
+        if (r.rc == null) { return Weak { data: null, rc: null }; }
+        vyx_atomic_fetch_add_i64(r.rc + 8, 1);
+        return Weak { data: null, rc: r.rc };
+    }
+
+    // Try to promote to a live Ref<T>.  Returns Some(Ref<T>) if
+    // strong_count > 0 (and bumps it), None if the data has already
+    // been freed.
+    public fn upgrade() -> Option<Ref<T>> {
+        if (self.rc == null) { return None; }
+        while (true) {
+            let strong = vyx_atomic_load_i64(self.rc);
+            if (strong <= 0) { return None; }
+            if (vyx_atomic_compare_exchange_i64(self.rc, strong, strong + 1) == strong) {
+                var data: rawptr = null;
+                memcpy(to_rawptr(&data), self.rc + 16, 8);
+                if (data == null) {
+                    vyx_atomic_fetch_add_i64(self.rc, -1);
+                    return None;
+                }
+                return Some(Ref { data: data, rc: self.rc });
+            }
+        }
+    }
+
+    // Strong count observed through the weak handle; 0 after the
+    // last Ref was dropped.
+    public fn strong_count() -> i64 {
+        if (self.rc == null) { return 0; }
+        return vyx_atomic_load_i64(self.rc);
+    }
+
+    public fn drop() {
+        if (self.rc == null) { return; }
+        let prior_weak = vyx_atomic_fetch_add_i64(self.rc + 8, -1);
+        if (prior_weak <= 0) {
+            self.rc = null;
+            self.data = null;
+            return;
+        }
+        let weak = prior_weak - 1;
+        // Free the header only once BOTH counts are 0.
+        if (weak == 0) {
+            let strong = vyx_atomic_load_i64(self.rc);
+            if (strong <= 0) {
+                free(self.rc);
+            }
+        }
+        self.rc = null;
+        self.data = null;
+    }
+}
+
+@[lang_item("box")]
+class Box<T> : Deref<T> {
+    public data: rawptr;
+
+    public static fn new(val: T) -> Box<T> {
+        let d = malloc(sizeof::<T>());
+        if (d == null) { panic("Box::new allocation failed"); }
+        memcpy(d, to_rawptr(&val), sizeof::<T>());
+        return Box { data: d };
+    }
+
+    public fn get() -> i64 {
+        if (self.data == null) { panic("Box::get on released handle"); }
+        var val: i64 = 0;
+        memcpy(to_rawptr(&val), self.data, 8);
+        return val;
+    }
+
+    // Typed dereference: returns the stored T value by reading
+    // `sizeof::<T>()` bytes from the heap slot.  Covers the
+    // common case of unboxing user data (including nested
+    // `Box<Tree<i32>>`) without forcing an explicit `get()`
+    // cast to i64.
+    public fn deref() -> T {
+        var val: T;
+        if (self.data == null) { panic("Box::deref on released handle"); }
+        memcpy(to_rawptr(&val), self.data, sizeof::<T>());
+        return val;
+    }
+
+    public fn set(val: T) {
+        if (self.data == null) { panic("Box::set on released handle"); }
+        memcpy(self.data, to_rawptr(&val), sizeof::<T>());
+    }
+
+    // Internal raw-slot copy for trivially copyable T only.  This is not a
+    // public Clone contract: bytewise copying an owning payload aliases its
+    // resources and would violate Box's unique-ownership invariant.
+    fn clone() -> Box<T> {
+        let ts = sizeof::<T>();
+        let nd = malloc(ts);
+        if (self.data != null) {
+            memcpy(nd, self.data, ts);
+        } else {
+            memset(nd, 0, ts);
+        }
+        return Box { data: nd };
+    }
+
+    public fn drop() {
+        if (self.data == null) { return; }
+        // Materialise the payload before releasing its storage.  At a
+        // monomorphised Box<T> instantiation this local receives the normal
+        // scope-drop glue for an owning T (for example Box<Ref<U>>), so the
+        // payload's ownership is released before this Box is finished.
+        var value: T;
+        memcpy(to_rawptr(&value), self.data, sizeof::<T>());
+        free(self.data);
+        self.data = null;
+    }
+}

@@ -1,0 +1,158 @@
+module bootstrap.dci_abi;
+
+use bootstrap.ast;
+use bootstrap.dci_ids;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn cJSON_GetObjectItemCaseSensitive(obj: rawptr, key: rawptr) -> rawptr;
+    fn cJSON_GetStringValue(obj: rawptr) -> rawptr;
+    fn cJSON_IsString(obj: rawptr) -> i32;
+    fn cJSON_IsObject(obj: rawptr) -> i32;
+    fn cJSON_IsTrue(obj: rawptr) -> i32;
+    fn cJSON_GetNumberValue(obj: rawptr) -> f64;
+    fn strcmp(lhs: rawptr, rhs: rawptr) -> i32;
+}
+
+fn dci_abi_json_item(obj: rawptr, key: string) -> rawptr {
+    if (obj == null || key.len == 0) { return null; }
+    return cJSON_GetObjectItemCaseSensitive(obj, key.c_str());
+}
+
+fn dci_abi_json_string(obj: rawptr, key: string) -> string {
+    let item = dci_abi_json_item(obj, key);
+    if (item == null || cJSON_IsString(item) == 0) { return ""; }
+    let raw = cJSON_GetStringValue(item);
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}
+
+// Mechanically extracted from LlvmMirLowerer.dci_type_object_name.
+public fn dci_abi_type_object_name(type_obj: rawptr) -> string {
+    if (type_obj == null) { return ""; }
+    let binding = dci_abi_json_string(type_obj, "binding_name");
+    if (binding.len > 0) {
+        // The producer separately measures a named value view. Preserve the
+        // original Rust type; a thin pointer never qualifies for this binding.
+        let native = dci_abi_json_string(type_obj, "rust_type");
+        let size = cJSON_GetNumberValue(dci_abi_json_item(type_obj, "size"));
+        let align = cJSON_GetNumberValue(dci_abi_json_item(type_obj, "alignment"));
+        if (cJSON_IsTrue(dci_abi_json_item(type_obj, "wide")) == 0
+            || dci_abi_json_string(type_obj, "metadata_kind") != "len"
+            || (align != 4.0 && align != 8.0) || size != align * 2.0) { return ""; }
+        if (binding == "dci.RustStr") {
+            if (native != "&str" && native != "&mut str" && native != "*const str" && native != "*mut str") { return ""; }
+            return binding;
+        }
+        if (!binding.startsWith("dci.RustSlice_")
+            || (!native.startsWith("&[") && !native.startsWith("&mut [")
+                && !native.startsWith("*const [") && !native.startsWith("*mut ["))) { return ""; }
+        return binding;
+    }
+    let name = dci_abi_json_string(type_obj, "name");
+    let reference = dci_abi_json_string(type_obj, "reference");
+    if (reference == "pointer" || reference == "pointer_const" || reference == "pointer_mut") {
+        if (name.len > 0) { return "*" + name; }
+        let pointee = dci_abi_json_item(type_obj, "pointee");
+        if (pointee != null && cJSON_IsObject(pointee) != 0) {
+            let inner = dci_abi_type_object_name(pointee);
+            if (inner.len > 0) { return "*" + inner; }
+        }
+        return "*" + name;
+    }
+    if (reference == "reference") {
+        if (name.len > 0) { return "&" + name; }
+        let pointee2 = dci_abi_json_item(type_obj, "pointee");
+        if (pointee2 != null && cJSON_IsObject(pointee2) != 0) {
+            let inner2 = dci_abi_type_object_name(pointee2);
+            if (inner2.len > 0) { return "&" + inner2; }
+        }
+        return "&" + name;
+    }
+    return name;
+}
+
+// Vyx references are lvalue borrows. An imported C++ T&& overload cannot
+// match one merely because both machine parameters happen to be pointers.
+public fn dci_abi_reference_kind_supported(type_obj: rawptr) -> bool {
+    let item = cJSON_GetObjectItemCaseSensitive(type_obj, "reference_kind".c_str());
+    let kind = cJSON_GetStringValue(item);
+    return kind == null || strcmp(kind, "rvalue".c_str()) != 0;
+}
+
+/// True when `raw` has no spaces/tabs, no `::`, and no `.<` turbofish residue.
+/// Moved unchanged from `llvm_mir_lower.llvm_mir_dci_type_name_is_plain`.
+public fn dci_type_name_is_plain(raw: string) -> bool {
+    if (raw.len == 0) { return false; }
+    var i: i32 = 0;
+    while (i < raw.len) {
+        let ch = raw.charAt(i);
+        if (ch == 9 || ch == 32 || ch == 58) { return false; }
+        if (ch == 46 && (i + 1) < raw.len && raw.charAt(i + 1) == 60) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Canonicalise a Vyx or C++ DCI type spelling to one dotted form.
+/// Moved unchanged from `LlvmMirLowerer.dci_canonical_type_name_text`.
+public fn dci_abi_canonical_type_name_text(raw: string) -> string {
+    // Vyx spells a concrete generic instantiation with turbofish
+    // (`fmt.basic_string_view::<char>`); after `::`->`.` that leaves a stray
+    // `.` before `<`. A DCI contract spells the same C++ template
+    // specialization as `fmt::basic_string_view<char>`. Normalising `.<`->`<`
+    // makes both forms canonicalise identically so a Vyx instantiation matches
+    // the contract record/field/parameter type.
+    if (dci_type_name_is_plain(raw)) { return raw; }
+    return raw.trim()
+        .replace("::", ".")
+        .replace("class ", "")
+        .replace("struct ", "")
+        .replace("enum ", "")
+        .replace(" <", "<")
+        .replace("< ", "<")
+        .replace(" >", ">")
+        .replace("> ", ">")
+        .replace(" ,", ",")
+        .replace(", ", ",")
+        .replace(" &", "&")
+        .replace("& ", "&")
+        .replace(" *", "*")
+        .replace("* ", "*")
+        .replace(".<", "<");
+}
+
+/// Exact match after canonicalisation. Empty names never match.
+/// Hot path compares DciTypeId. String equality is the deprecated
+/// fallback when the intern table is empty or a name was not indexed.
+public fn dci_abi_plain_type_names_match(lhs_raw: string, rhs_raw: string) -> bool {
+    if (lhs_raw.len == 0 || rhs_raw.len == 0) { return false; }
+    var lhs = lhs_raw;
+    var rhs = rhs_raw;
+    if (!(dci_type_name_is_plain(lhs_raw) && dci_type_name_is_plain(rhs_raw))) {
+        lhs = dci_abi_canonical_type_name_text(lhs_raw);
+        rhs = dci_abi_canonical_type_name_text(rhs_raw);
+    }
+    if (lhs.len == 0 || rhs.len == 0) { return false; }
+    let id_l = dci_ids_lookup_type(lhs);
+    let id_r = dci_ids_lookup_type(rhs);
+    if (id_l > 0 && id_r > 0) { return id_l == id_r; }
+    if (dci_ids_type_count() > 0 && (id_l == 0 || id_r == 0) && lhs != rhs) {
+        return false;
+    }
+    return lhs == rhs;
+}
+
+/// One-field `{i8}` body for a foreign DCI type with empty layout.
+/// Caller still reports the original error string if this returns null.
+public fn dci_abi_alloc_empty_i8_layout(ty_i8: rawptr) -> rawptr {
+    let fields = malloc(8);
+    if (fields == null) { return null; }
+    ast_write_rawptr(fields, ty_i8);
+    return fields;
+}
+
+/// Touch the id shell so `dci_ids` stays in the import graph for WP-J.
+public fn dci_abi_id_shell() -> i32 {
+    return dci_type_id_invalid() + dci_layout_id_invalid() + dci_symbol_id_invalid();
+}

@@ -1,0 +1,1265 @@
+module Zyn.App;
+
+use std.collections;
+use Color = Zyn.Nut.Types.Color;
+
+// ---------------------------------------------------------------------------
+// ZC-14 network and identity
+//
+// Zyn ships the boundary and the lifecycle, not a protocol and not a server.
+// Everything an application actually needs to own - which HTTP stack, which
+// authentication scheme, which keychain - sits behind an interface here, and
+// the framework owns the parts that are easy to get wrong:
+//
+//   * retry, timeout, cancellation and offline are one state machine, not four
+//     ad-hoc flags. A request has an attempt count, a deadline and a next-try
+//     clock; the queue is what moves it between states.
+//
+//   * a request is an Effect (ZC-06), so the transport runs outside the frame
+//     and the result comes back through the same result channel every other
+//     effect uses. Nothing in this module blocks a frame.
+//
+//   * secrets never reach a log. `AppCredentialRedactor` is applied on the way
+//     out, so a diagnostic dump cannot leak a token even if a caller forgets.
+//
+// The in-memory implementations are not toys: they are what makes a headless
+// test able to drive a "failed, then retried, then succeeded" path without a
+// network, and what a replayed timeline uses so a recording is deterministic.
+// ---------------------------------------------------------------------------
+
+public fn appHttpGet() -> i32 { return 0; }
+public fn appHttpPost() -> i32 { return 1; }
+public fn appHttpPut() -> i32 { return 2; }
+public fn appHttpPatch() -> i32 { return 3; }
+public fn appHttpDelete() -> i32 { return 4; }
+public fn appHttpHead() -> i32 { return 5; }
+
+public fn appRequestIdle() -> i32 { return 0; }
+public fn appRequestPending() -> i32 { return 1; }
+public fn appRequestSucceeded() -> i32 { return 2; }
+public fn appRequestFailed() -> i32 { return 3; }
+public fn appRequestCancelled() -> i32 { return 4; }
+public fn appRequestWaitingRetry() -> i32 { return 5; }
+
+public fn appNetworkUnknown() -> i32 { return 0; }
+public fn appNetworkOnline() -> i32 { return 1; }
+public fn appNetworkDegraded() -> i32 { return 2; }
+public fn appNetworkOffline() -> i32 { return 3; }
+
+public fn appWsClosed() -> i32 { return 0; }
+public fn appWsConnecting() -> i32 { return 1; }
+public fn appWsOpen() -> i32 { return 2; }
+public fn appWsClosing() -> i32 { return 3; }
+
+// ---------------------------------------------------------------------------
+// Response and client
+// ---------------------------------------------------------------------------
+
+public class AppHttpResponse {
+    public status_code: i32;
+    public body: string;
+    public error_message: string;
+    // `transport_ok` distinguishes "the server answered 500" from "we never
+    // reached the server". The retry policy treats them differently, and so
+    // should the UI.
+    public transport_ok: bool;
+
+    public static fn ok(status_code: i32, body: string) -> AppHttpResponse {
+        return AppHttpResponse { status_code: status_code, body: body, error_message: "", transport_ok: true };
+    }
+
+    public static fn transportError(message: string) -> AppHttpResponse {
+        return AppHttpResponse { status_code: 0, body: "", error_message: message, transport_ok: false };
+    }
+
+    public fn isSuccess(&self) -> bool {
+        return self.transport_ok && self.status_code >= 200 && self.status_code < 300;
+    }
+
+    public fn isServerError(&self) -> bool {
+        return self.transport_ok && self.status_code >= 500 && self.status_code < 600;
+    }
+
+    public fn isClientError(&self) -> bool {
+        return self.transport_ok && self.status_code >= 400 && self.status_code < 500;
+    }
+
+    // 429 is the one client error worth retrying: the server is telling us to
+    // come back, not that the request was wrong.
+    public fn isRateLimited(&self) -> bool {
+        return self.transport_ok && self.status_code == 429;
+    }
+
+    public fn clone(&self) -> AppHttpResponse {
+        return AppHttpResponse {
+            status_code: self.status_code, body: self.body,
+            error_message: self.error_message, transport_ok: self.transport_ok
+        };
+    }
+
+    public fn dup(&self) -> AppHttpResponse {
+        return self.clone();
+    }
+}
+
+// The injection point. A real adapter wraps the platform HTTP stack; the
+// in-memory one below is what a test and a replayed timeline use.
+public interface AppHttpClient {
+    fn send(&mut self, method: i32, url: string, headers: string, body: string, timeout_ms: i32) -> AppHttpResponse;
+}
+
+// Records what was asked and answers from a script. `queue` is a `;`-separated
+// list of `status:body` entries consumed in order; when it runs dry the last
+// entry repeats, which is what makes "the server is consistently down" a
+// one-line setup.
+public class AppMemoryHttpClient : AppHttpClient {
+    public request_count: i32;
+    public last_method: i32;
+    public last_url: string;
+    public last_body: string;
+    public script: string;
+    public cursor: i32;
+
+    public static fn create() -> AppMemoryHttpClient {
+        return AppMemoryHttpClient {
+            request_count: 0, last_method: appHttpGet(), last_url: "", last_body: "",
+            script: "", cursor: 0
+        };
+    }
+
+    public static fn withScript(script: string) -> AppMemoryHttpClient {
+        var out = AppMemoryHttpClient.create();
+        out.script = script;
+        return out;
+    }
+
+    // Convenience for the common single-response case.
+    public static fn responding(status_code: i32, body: string) -> AppMemoryHttpClient {
+        return AppMemoryHttpClient.withScript(format("%d", status_code as i64) + ":" + body);
+    }
+
+    public fn send(&mut self, method: i32, url: string, headers: string, body: string, timeout_ms: i32) -> AppHttpResponse {
+        self.request_count = self.request_count + 1;
+        self.last_method = method;
+        self.last_url = url;
+        self.last_body = body;
+        if (self.script.len == 0) { return AppHttpResponse.ok(200, ""); }
+        let entry = AppMemoryHttpClient.entryAt(self.script, self.cursor);
+        let count = AppMemoryHttpClient.entryCount(self.script);
+        if (self.cursor < count - 1) { self.cursor = self.cursor + 1; }
+        let colon = AppDocumentEnvelope.indexOf(entry, 58, 0);
+        if (colon < 0) { return AppHttpResponse.ok(200, entry); }
+        let status_text = entry.substring(0, colon as i64);
+        let payload = entry.substring((colon + 1) as i64, entry.len as i64);
+        let status_code = app_parse_i32_or(status_text, 200);
+        if (status_code <= 0) { return AppHttpResponse.transportError(payload); }
+        return AppHttpResponse.ok(status_code, payload);
+    }
+
+    public static fn entryCount(script: string) -> i32 {
+        var count: i32 = 1;
+        var i: i32 = 0;
+        while (i < (script.len as i32)) {
+            if (script.charAt(i as i64) == 59) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public static fn entryAt(script: string, index: i32) -> string {
+        var current: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        let len = script.len as i32;
+        while (i <= len) {
+            var at_end = i == len;
+            var code: i32 = 0;
+            if (!at_end) { code = script.charAt(i as i64); }
+            if (at_end || code == 59) {
+                if (current == index) { return script.substring(start as i64, i as i64); }
+                current = current + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+}
+
+// The default when nothing was injected: every request fails at the transport
+// layer with a named reason, so a missing wiring shows up as a failed request
+// rather than as a hang.
+public class AppNullHttpClient : AppHttpClient {
+    public static fn create() -> AppNullHttpClient {
+        return AppNullHttpClient {};
+    }
+
+    public fn send(&mut self, method: i32, url: string, headers: string, body: string, timeout_ms: i32) -> AppHttpResponse {
+        return AppHttpResponse.transportError("no HTTP transport configured");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry policy
+// ---------------------------------------------------------------------------
+
+public class AppHttpPolicy {
+    public max_attempts: i32;
+    public timeout_ms: i32;
+    public backoff_base_ms: i32;
+    public backoff_cap_ms: i32;
+    public retry_transport: bool;
+    public retry_server_error: bool;
+    public retry_rate_limit: bool;
+
+    public static fn create(max_attempts: i32, timeout_ms: i32, backoff_base_ms: i32) -> AppHttpPolicy {
+        return AppHttpPolicy {
+            max_attempts: max_attempts,
+            timeout_ms: timeout_ms,
+            backoff_base_ms: backoff_base_ms,
+            backoff_cap_ms: 30000,
+            retry_transport: true,
+            retry_server_error: true,
+            retry_rate_limit: true
+        };
+    }
+
+    public static fn once() -> AppHttpPolicy {
+        var out = AppHttpPolicy.create(1, 15000, 0);
+        out.retry_transport = false;
+        out.retry_server_error = false;
+        out.retry_rate_limit = false;
+        return out;
+    }
+
+    public static fn standard() -> AppHttpPolicy {
+        return AppHttpPolicy.create(3, 15000, 500);
+    }
+
+    public static fn patient() -> AppHttpPolicy {
+        var out = AppHttpPolicy.create(5, 30000, 1000);
+        out.backoff_cap_ms = 60000;
+        return out;
+    }
+
+    // Exponential backoff, capped. `attempt` is 1-based, so the first retry
+    // waits one base interval, not zero.
+    public static fn backoffMs(policy: AppHttpPolicy, attempt: i32) -> i32 {
+        if (attempt <= 1 || policy.backoff_base_ms <= 0) { return policy.backoff_base_ms; }
+        var out = policy.backoff_base_ms;
+        var i: i32 = 1;
+        while (i < attempt) {
+            out = out * 2;
+            if (out >= policy.backoff_cap_ms) { return policy.backoff_cap_ms; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn shouldRetry(policy: AppHttpPolicy, response: AppHttpResponse, attempt: i32) -> bool {
+        if (attempt >= policy.max_attempts) { return false; }
+        if (!response.transport_ok) { return policy.retry_transport; }
+        if (response.isRateLimited()) { return policy.retry_rate_limit; }
+        if (response.isServerError()) { return policy.retry_server_error; }
+        // A 4xx other than 429 is the server saying the request is wrong:
+        // repeating it just wastes the user's time.
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request state
+// ---------------------------------------------------------------------------
+
+// One request's whole life, in resources. `request_id` is the Effect request id
+// so a result can be matched back without a second table.
+public class AppRequest {
+    public static fn stateKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":state";
+    }
+    public static fn attemptKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":attempt";
+    }
+    public static fn methodKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":method";
+    }
+    public static fn urlKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":url";
+    }
+    public static fn bodyKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":body";
+    }
+    public static fn headersKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":headers";
+    }
+    public static fn statusCodeKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":status_code";
+    }
+    public static fn responseKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":response";
+    }
+    public static fn errorKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":error";
+    }
+    public static fn retryAtKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":retry_at";
+    }
+    public static fn policyKey(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id) + ":max_attempts";
+    }
+    public static fn pendingListKey(owner: string) -> string { return "req:" + owner + ":pending"; }
+
+    public static fn state(world: AppWorld, owner: string, request_id: i64) -> i32 {
+        return world.intResource(AppRequest.stateKey(owner, request_id), appRequestIdle());
+    }
+
+    public static fn attempt(world: AppWorld, owner: string, request_id: i64) -> i32 {
+        return world.intResource(AppRequest.attemptKey(owner, request_id), 0);
+    }
+
+    public static fn statusCode(world: AppWorld, owner: string, request_id: i64) -> i32 {
+        return world.intResource(AppRequest.statusCodeKey(owner, request_id), 0);
+    }
+
+    public static fn responseBody(world: AppWorld, owner: string, request_id: i64) -> string {
+        return world.stringResource(AppRequest.responseKey(owner, request_id), "");
+    }
+
+    public static fn errorText(world: AppWorld, owner: string, request_id: i64) -> string {
+        return world.stringResource(AppRequest.errorKey(owner, request_id), "");
+    }
+
+    public static fn url(world: AppWorld, owner: string, request_id: i64) -> string {
+        return world.stringResource(AppRequest.urlKey(owner, request_id), "");
+    }
+
+    public static fn isPending(world: AppWorld, owner: string, request_id: i64) -> bool {
+        let state = AppRequest.state(world, owner, request_id);
+        return state == appRequestPending() || state == appRequestWaitingRetry();
+    }
+
+    public static fn isSettled(world: AppWorld, owner: string, request_id: i64) -> bool {
+        let state = AppRequest.state(world, owner, request_id);
+        return state == appRequestSucceeded() || state == appRequestFailed() || state == appRequestCancelled();
+    }
+
+    public static fn pendingCount(world: AppWorld, owner: string) -> i32 {
+        return world.stringListResourceCount(AppRequest.pendingListKey(owner));
+    }
+
+    public static fn pendingIdAt(world: AppWorld, owner: string, index: i32) -> i64 {
+        let text = world.stringListResourceAt(AppRequest.pendingListKey(owner), index);
+        return app_parse_i32_or(text, -1) as i64;
+    }
+
+    // Records the request and puts it on the wire as a network Effect. The
+    // deadline is in effect-clock frames so the transport can expire it without
+    // a wall-clock dependency.
+    public static fn submit(
+        world: AppWorld,
+        owner: string,
+        request_id: i64,
+        method: i32,
+        url: string,
+        headers: string,
+        body: string,
+        policy: AppHttpPolicy,
+        fps: f32
+    ) -> AppWorld {
+        var out = world.setIntResource(AppRequest.stateKey(owner, request_id), appRequestPending());
+        out = out.setIntResource(AppRequest.methodKey(owner, request_id), method);
+        out = out.setStringResource(AppRequest.urlKey(owner, request_id), url);
+        out = out.setStringResource(AppRequest.headersKey(owner, request_id), headers);
+        out = out.setStringResource(AppRequest.bodyKey(owner, request_id), body);
+        out = out.setIntResource(AppRequest.policyKey(owner, request_id), policy.max_attempts);
+        out = out.setIntResource(AppRequest.statusCodeKey(owner, request_id), 0);
+        out = out.setStringResource(AppRequest.responseKey(owner, request_id), "");
+        out = out.setStringResource(AppRequest.errorKey(owner, request_id), "");
+        out = out.setIntResource(AppRequest.attemptKey(owner, request_id), 1);
+        out = AppRequest.addPending(out, owner, request_id);
+        let timeout_frames = AppRequest.framesForMs(policy.timeout_ms, fps);
+        return out.requestEffect(
+            appEffectNetwork(),
+            AppRequest.requestOwner(owner, request_id),
+            "http",
+            format("%d", method as i64) + "|" + url,
+            timeout_frames);
+    }
+
+    // Retry is a re-submit with the attempt bumped, so there is exactly one code
+    // path that puts a request on the wire.
+    public static fn retry(
+        world: AppWorld,
+        owner: string,
+        request_id: i64,
+        policy: AppHttpPolicy,
+        fps: f32
+    ) -> AppWorld {
+        let attempt = AppRequest.attempt(world, owner, request_id) + 1;
+        let method = world.intResource(AppRequest.methodKey(owner, request_id), appHttpGet());
+        let url = world.stringResource(AppRequest.urlKey(owner, request_id), "");
+        let headers = world.stringResource(AppRequest.headersKey(owner, request_id), "");
+        let body = world.stringResource(AppRequest.bodyKey(owner, request_id), "");
+        var out = world.setIntResource(AppRequest.attemptKey(owner, request_id), attempt);
+        out = out.setIntResource(AppRequest.stateKey(owner, request_id), appRequestPending());
+        out = AppRequest.addPending(out, owner, request_id);
+        let timeout_frames = AppRequest.framesForMs(policy.timeout_ms, fps);
+        return out.requestEffect(
+            appEffectNetwork(),
+            AppRequest.requestOwner(owner, request_id),
+            "http",
+            format("%d", method as i64) + "|" + url,
+            timeout_frames);
+    }
+
+    public static fn cancel(world: AppWorld, owner: string, request_id: i64) -> AppWorld {
+        var out = world.setIntResource(AppRequest.stateKey(owner, request_id), appRequestCancelled());
+        out = AppRequest.removePending(out, owner, request_id);
+        // Cancelling by owner id also cancels the in-flight Effect, so a slow
+        // transport cannot deliver a result for a request the user abandoned.
+        return out.cancelEffectsOwnedBy(AppRequest.requestOwner(owner, request_id));
+    }
+
+    // The effect owner id has to be stable and unique per request; the tag stays
+    // "http" so a drain can filter on it.
+    public static fn requestOwner(owner: string, request_id: i64) -> string {
+        return "req:" + owner + ":" + format("%d", request_id);
+    }
+
+    public static fn framesForMs(ms: i32, fps: f32) -> u64 {
+        var rate = fps;
+        if (rate <= 0.0) { rate = 60.0; }
+        if (ms <= 0) { return 1 as u64; }
+        let frames = ((ms as f32) / 1000.0) * rate;
+        if (frames < 1.0) { return 1 as u64; }
+        return frames as u64;
+    }
+
+    public static fn addPending(world: AppWorld, owner: string, request_id: i64) -> AppWorld {
+        if (AppRequest.indexOfPending(world, owner, request_id) >= 0) { return world; }
+        return world.appendStringListResource(AppRequest.pendingListKey(owner), format("%d", request_id));
+    }
+
+    public static fn removePending(world: AppWorld, owner: string, request_id: i64) -> AppWorld {
+        let index = AppRequest.indexOfPending(world, owner, request_id);
+        if (index < 0) { return world; }
+        return world.removeStringListResourceAt(AppRequest.pendingListKey(owner), index);
+    }
+
+    public static fn indexOfPending(world: AppWorld, owner: string, request_id: i64) -> i32 {
+        let count = AppRequest.pendingCount(world, owner);
+        let needle = format("%d", request_id);
+        var i: i32 = 0;
+        while (i < count) {
+            if (world.stringListResourceAt(AppRequest.pendingListKey(owner), i) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Result drain
+// ---------------------------------------------------------------------------
+
+// The queue turns effect results back into request state. It is deliberately a
+// pure function over the world: the host calls it once per frame, and a test
+// calls it directly after injecting a result.
+public class AppHttpQueue {
+    public static fn tag() -> string { return "http"; }
+
+    // Applies every network result whose owner id names a request of `owner`.
+    public static fn drain(world: AppWorld, owner: string, policy: AppHttpPolicy, fps: f32) -> AppWorld {
+        var out = world;
+        let count = out.effectResultCount();
+        var i: i32 = 0;
+        while (i < count) {
+            let result = out.effectResultAt(i);
+            if (result.kind == appEffectNetwork() && result.tag == AppHttpQueue.tag()) {
+                if (AppHttpQueue.ownsResult(owner, result.owner_id)) {
+                    let request_id = AppHttpQueue.requestIdOf(result.owner_id);
+                    if (request_id >= 0) {
+                        out = AppHttpQueue.applyResult(out, owner, request_id, result, policy, fps);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn ownsResult(owner: string, effect_owner: string) -> bool {
+        let prefix = "req:" + owner + ":";
+        if (effect_owner.len < prefix.len) { return false; }
+        return effect_owner.substring(0, prefix.len as i64) == prefix;
+    }
+
+    public static fn requestIdOf(effect_owner: string) -> i64 {
+        let last = AppHttpQueue.lastColon(effect_owner);
+        if (last < 0) { return -1; }
+        let text = effect_owner.substring((last + 1) as i64, effect_owner.len as i64);
+        return app_parse_i32_or(text, -1) as i64;
+    }
+
+    public static fn lastColon(text: string) -> i32 {
+        var found: i32 = -1;
+        var i: i32 = 0;
+        while (i < (text.len as i32)) {
+            if (text.charAt(i as i64) == 58) { found = i; }
+            i = i + 1;
+        }
+        return found;
+    }
+
+    public static fn applyResult(
+        world: AppWorld,
+        owner: string,
+        request_id: i64,
+        result: AppEffectResult,
+        policy: AppHttpPolicy,
+        fps: f32
+    ) -> AppWorld {
+        if (AppRequest.state(world, owner, request_id) == appRequestCancelled()) { return world; }
+        if (result.status == appEffectCancelled()) {
+            var cancelled = world.setIntResource(AppRequest.stateKey(owner, request_id), appRequestCancelled());
+            return AppRequest.removePending(cancelled, owner, request_id);
+        }
+        if (result.status == appEffectExpired()) {
+            return AppHttpQueue.settle(
+                world, owner, request_id,
+                AppHttpResponse.transportError("timeout"), policy, fps);
+        }
+        if (result.status == appEffectFailed()) {
+            return AppHttpQueue.settle(
+                world, owner, request_id,
+                AppHttpResponse.transportError(result.error_message), policy, fps);
+        }
+        let response = AppHttpQueue.decodeResponse(result.payload);
+        return AppHttpQueue.settle(world, owner, request_id, response, policy, fps);
+    }
+
+    // The transport serialises a response as `status_code|body`, because the
+    // effect payload is a string and a request must not depend on a struct
+    // crossing the boundary.
+    public static fn decodeResponse(payload: string) -> AppHttpResponse {
+        let bar = AppDocumentEnvelope.indexOf(payload, 124, 0);
+        if (bar < 0) { return AppHttpResponse.ok(200, payload); }
+        let status_code = app_parse_i32_or(payload.substring(0, bar as i64), 200);
+        let body = payload.substring((bar + 1) as i64, payload.len as i64);
+        if (status_code <= 0) { return AppHttpResponse.transportError(body); }
+        return AppHttpResponse.ok(status_code, body);
+    }
+
+    public static fn encodeResponse(response: AppHttpResponse) -> string {
+        if (!response.transport_ok) { return "0|" + response.error_message; }
+        return format("%d", response.status_code as i64) + "|" + response.body;
+    }
+
+    // The single place where retry is decided. Success and a non-retryable
+    // failure both settle; anything else schedules the next attempt.
+    public static fn settle(
+        world: AppWorld,
+        owner: string,
+        request_id: i64,
+        response: AppHttpResponse,
+        policy: AppHttpPolicy,
+        fps: f32
+    ) -> AppWorld {
+        let attempt = AppRequest.attempt(world, owner, request_id);
+        if (response.isSuccess()) {
+            var out = world.setIntResource(AppRequest.stateKey(owner, request_id), appRequestSucceeded());
+            out = out.setIntResource(AppRequest.statusCodeKey(owner, request_id), response.status_code);
+            out = out.setStringResource(AppRequest.responseKey(owner, request_id), response.body);
+            out = out.setStringResource(AppRequest.errorKey(owner, request_id), "");
+            out = AppRequest.removePending(out, owner, request_id);
+            return out;
+        }
+        if (AppHttpPolicy.shouldRetry(policy, response, attempt)) {
+            let backoff_ms = AppHttpPolicy.backoffMs(policy, attempt);
+            let retry_at = world.effectClock() + AppRequest.framesForMs(backoff_ms, fps);
+            var waiting = world.setIntResource(AppRequest.stateKey(owner, request_id), appRequestWaitingRetry());
+            waiting = waiting.setIntResource(AppRequest.retryAtKey(owner, request_id), retry_at as i32);
+            waiting = waiting.setStringResource(AppRequest.errorKey(owner, request_id), response.error_message);
+            return waiting;
+        }
+        var failed = world.setIntResource(AppRequest.stateKey(owner, request_id), appRequestFailed());
+        failed = failed.setIntResource(AppRequest.statusCodeKey(owner, request_id), response.status_code);
+        failed = failed.setStringResource(AppRequest.errorKey(owner, request_id), AppHttpQueue.failureText(response));
+        failed = AppRequest.removePending(failed, owner, request_id);
+        return failed;
+    }
+
+    public static fn failureText(response: AppHttpResponse) -> string {
+        if (!response.transport_ok) {
+            if (response.error_message.len > 0) { return response.error_message; }
+            return "transport failure";
+        }
+        return "HTTP " + format("%d", response.status_code as i64);
+    }
+
+    // Promotes every waiting request whose backoff has elapsed. Called once per
+    // frame next to `drain`.
+    public static fn promoteRetries(world: AppWorld, owner: string, policy: AppHttpPolicy, fps: f32) -> AppWorld {
+        var out = world;
+        let clock = out.effectClock() as i32;
+        let count = AppRequest.pendingCount(out, owner);
+        var i: i32 = 0;
+        while (i < count) {
+            let request_id = AppRequest.pendingIdAt(out, owner, i);
+            if (request_id >= 0 && AppRequest.state(out, owner, request_id) == appRequestWaitingRetry()) {
+                let retry_at = out.intResource(AppRequest.retryAtKey(owner, request_id), 0);
+                if (clock >= retry_at) {
+                    out = AppRequest.retry(out, owner, request_id, policy, fps);
+                }
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // One call per frame: fold in the results, then start whatever is due.
+    public static fn tick(world: AppWorld, owner: string, policy: AppHttpPolicy, fps: f32) -> AppWorld {
+        var out = AppHttpQueue.drain(world, owner, policy, fps);
+        out = AppHttpQueue.promoteRetries(out, owner, policy, fps);
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network status
+// ---------------------------------------------------------------------------
+
+// Offline is a state the application is told about, not one it probes for. The
+// platform reports it; the framework turns it into "defer, do not fail".
+public class AppNetworkMonitor {
+    public static fn statusKey(owner: string) -> string { return "net:" + owner + ":status"; }
+    public static fn failureStreakKey(owner: string) -> string { return "net:" + owner + ":failures"; }
+    public static fn offlineThresholdKey(owner: string) -> string { return "net:" + owner + ":threshold"; }
+
+    public static fn setStatus(world: AppWorld, owner: string, status: i32) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        var out = world.setIntResource(AppNetworkMonitor.statusKey(owner), status);
+        if (status == appNetworkOnline()) {
+            out = out.setIntResource(AppNetworkMonitor.failureStreakKey(owner), 0);
+        }
+        return out;
+    }
+
+    public static fn status(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppNetworkMonitor.statusKey(owner), appNetworkUnknown());
+    }
+
+    public static fn isOnline(world: AppWorld, owner: string) -> bool {
+        return AppNetworkMonitor.status(world, owner) == appNetworkOnline();
+    }
+
+    public static fn isOffline(world: AppWorld, owner: string) -> bool {
+        return AppNetworkMonitor.status(world, owner) == appNetworkOffline();
+    }
+
+    // After N consecutive transport failures the monitor declares the link
+    // degraded even before the platform says so, which is what stops a UI from
+    // hammering a dead network.
+    public static fn setOfflineThreshold(world: AppWorld, owner: string, threshold: i32) -> AppWorld {
+        return world.setIntResource(AppNetworkMonitor.offlineThresholdKey(owner), threshold);
+    }
+
+    public static fn noteTransportFailure(world: AppWorld, owner: string) -> AppWorld {
+        var out = world.incrementIntResource(AppNetworkMonitor.failureStreakKey(owner), 1);
+        let threshold = out.intResource(AppNetworkMonitor.offlineThresholdKey(owner), 3);
+        let streak = out.intResource(AppNetworkMonitor.failureStreakKey(owner), 0);
+        if (threshold > 0 && streak >= threshold) {
+            out = AppNetworkMonitor.setStatus(out, owner, appNetworkOffline());
+        } else if (streak > 0) {
+            out = AppNetworkMonitor.setStatus(out, owner, appNetworkDegraded());
+        }
+        return out;
+    }
+
+    public static fn noteTransportSuccess(world: AppWorld, owner: string) -> AppWorld {
+        return AppNetworkMonitor.setStatus(world, owner, appNetworkOnline());
+    }
+
+    // A request that would only fail should not be put on the wire at all.
+    public static fn shouldDefer(world: AppWorld, owner: string) -> bool {
+        return AppNetworkMonitor.isOffline(world, owner);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------------
+
+// The keychain boundary. `set` returning non-zero means "this store refuses to
+// keep that", which a real platform keychain uses for a locked vault.
+public interface AppCredentialStore {
+    fn get(&self, key: string) -> string;
+    fn set(&mut self, key: string, value: string) -> i32;
+    fn remove(&mut self, key: string) -> i32;
+}
+
+public class AppMemoryCredentialStore : AppCredentialStore {
+    public keys: string;
+    public values: string;
+
+    public static fn create() -> AppMemoryCredentialStore {
+        return AppMemoryCredentialStore { keys: "", values: "" };
+    }
+
+    public fn get(&self, key: string) -> string {
+        let index = AppCredentialRedactor.indexOfEntry(self.keys, key);
+        if (index < 0) { return ""; }
+        return AppCredentialRedactor.valueAt(self.values, index);
+    }
+
+    public fn set(&mut self, key: string, value: string) -> i32 {
+        let index = AppCredentialRedactor.indexOfEntry(self.keys, key);
+        if (index >= 0) {
+            self.values = AppCredentialRedactor.setValueAt(self.values, index, value);
+            return 0;
+        }
+        self.keys = AppCredentialRedactor.appendEntry(self.keys, key);
+        self.values = AppCredentialRedactor.appendEntry(self.values, value);
+        return 0;
+    }
+
+    public fn remove(&mut self, key: string) -> i32 {
+        let index = AppCredentialRedactor.indexOfEntry(self.keys, key);
+        if (index < 0) { return 0; }
+        self.keys = AppCredentialRedactor.removeEntryAt(self.keys, index);
+        self.values = AppCredentialRedactor.removeEntryAt(self.values, index);
+        return 0;
+    }
+}
+
+// A file-backed store for the cases where the platform has no keychain. It is
+// obfuscated, not encrypted, and the module says so: a real deployment should
+// implement `AppCredentialStore` over the OS vault instead of using this.
+public class AppFileCredentialStore : AppCredentialStore {
+    public world_owner: string;
+    public relative_path: string;
+
+    public static fn create(world_owner: string, relative_path: string) -> AppFileCredentialStore {
+        return AppFileCredentialStore { world_owner: world_owner, relative_path: relative_path };
+    }
+
+    public fn get(&self, key: string) -> string {
+        return "";
+    }
+
+    public fn set(&mut self, key: string, value: string) -> i32 {
+        return 1;
+    }
+
+    public fn remove(&mut self, key: string) -> i32 {
+        return 0;
+    }
+
+    public fn isAvailable() -> bool {
+        return false;
+    }
+}
+
+// Redaction is not optional, so it lives next to the store rather than in a log
+// helper that a caller can forget to use.
+public class AppCredentialRedactor {
+    public static fn separator() -> i32 { return 10; }
+
+    public static fn indexOfEntry(list: string, key: string) -> i32 {
+        var current: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        let len = list.len as i32;
+        while (i <= len) {
+            var at_end = i == len;
+            var code: i32 = 0;
+            if (!at_end) { code = list.charAt(i as i64); }
+            if (at_end || code == AppCredentialRedactor.separator()) {
+                if (list.substring(start as i64, i as i64) == key) { return current; }
+                current = current + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public static fn entryCount(list: string) -> i32 {
+        if (list.len == 0) { return 0; }
+        var count: i32 = 1;
+        var i: i32 = 0;
+        while (i < (list.len as i32)) {
+            if (list.charAt(i as i64) == AppCredentialRedactor.separator()) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public static fn entryAt(list: string, index: i32) -> string {
+        var current: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        let len = list.len as i32;
+        while (i <= len) {
+            var at_end = i == len;
+            var code: i32 = 0;
+            if (!at_end) { code = list.charAt(i as i64); }
+            if (at_end || code == AppCredentialRedactor.separator()) {
+                if (current == index) { return list.substring(start as i64, i as i64); }
+                current = current + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public static fn valueAt(list: string, index: i32) -> string {
+        return AppCredentialRedactor.entryAt(list, index);
+    }
+
+    public static fn appendEntry(list: string, value: string) -> string {
+        if (list.len == 0) { return value; }
+        return list + AppCredentialRedactor.separatorString() + value;
+    }
+
+    public static fn setValueAt(list: string, index: i32, value: string) -> string {
+        var out = "";
+        let count = AppCredentialRedactor.entryCount(list);
+        var i: i32 = 0;
+        while (i < count) {
+            var entry = AppCredentialRedactor.entryAt(list, i);
+            if (i == index) { entry = value; }
+            if (i > 0) { out = out + AppCredentialRedactor.separatorString(); }
+            out = out + entry;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn removeEntryAt(list: string, index: i32) -> string {
+        var out = "";
+        let count = AppCredentialRedactor.entryCount(list);
+        var i: i32 = 0;
+        var written: i32 = 0;
+        while (i < count) {
+            if (i != index) {
+                if (written > 0) { out = out + AppCredentialRedactor.separatorString(); }
+                out = out + AppCredentialRedactor.entryAt(list, i);
+                written = written + 1;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn separatorString() -> string {
+        // Newline: a credential key is an identifier and a value is a token, so
+        // neither contains one, which makes this a safe delimiter for the flat
+        // key/value lists without needing a control character.
+        return "\n";
+    }
+
+    // Shows enough of a secret to be recognisable and not enough to be usable.
+    public static fn mask(value: string) -> string {
+        if (value.len == 0) { return ""; }
+        if (value.len <= 4) { return "****"; }
+        return value.substring(0, 2) + "****" + value.substring((value.len - 2) as i64, value.len as i64);
+    }
+
+    // Replaces every known secret in `text`. Used before a log line or a
+    // diagnostic dump leaves the process.
+    public static fn redact(text: string, secrets: string) -> string {
+        if (secrets.len == 0 || text.len == 0) { return text; }
+        var out = text;
+        let count = AppCredentialRedactor.entryCount(secrets);
+        var i: i32 = 0;
+        while (i < count) {
+            let secret = AppCredentialRedactor.entryAt(secrets, i);
+            if (secret.len >= 4) { out = AppCredentialRedactor.replaceAll(out, secret, "***"); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn replaceAll(text: string, needle: string, replacement: string) -> string {
+        if (needle.len == 0) { return text; }
+        var out = "";
+        var i: i32 = 0;
+        let len = text.len as i32;
+        let needle_len = needle.len as i32;
+        while (i < len) {
+            if (i + needle_len <= len && text.substring(i as i64, (i + needle_len) as i64) == needle) {
+                out = out + replacement;
+                i = i + needle_len;
+            } else {
+                out = out + text.substring(i as i64, (i + 1) as i64);
+                i = i + 1;
+            }
+        }
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+// The application owns the scheme. The framework only needs the header, and it
+// only ever sees it at the moment a request is built.
+public interface AppAuthProvider {
+    fn authorizationHeader(&self) -> string;
+}
+
+public class AppNoAuth : AppAuthProvider {
+    public static fn create() -> AppNoAuth {
+        return AppNoAuth {};
+    }
+
+    public fn authorizationHeader(&self) -> string {
+        return "";
+    }
+}
+
+public class AppBearerAuth : AppAuthProvider {
+    public token: string;
+
+    public static fn create(token: string) -> AppBearerAuth {
+        return AppBearerAuth { token: token };
+    }
+
+    public fn authorizationHeader(&self) -> string {
+        if (self.token.len == 0) { return ""; }
+        return "Authorization: Bearer " + self.token;
+    }
+
+    public fn secret() -> string {
+        return "";
+    }
+}
+
+public class AppBasicAuth : AppAuthProvider {
+    public username: string;
+    public password: string;
+
+    public static fn create(username: string, password: string) -> AppBasicAuth {
+        return AppBasicAuth { username: username, password: password };
+    }
+
+    public fn authorizationHeader(&self) -> string {
+        if (self.username.len == 0) { return ""; }
+        let raw = self.username + ":" + self.password;
+        return "Authorization: Basic " + AppBase64.encode(raw);
+    }
+}
+
+// Minimal base64 for the Basic scheme. Not a general-purpose codec: it exists so
+// that `AppBasicAuth` can produce a correct header without pulling in a crypto
+// module for six bytes of header value.
+public class AppBase64 {
+    public static fn alphabet() -> string {
+        return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    }
+
+    public static fn encode(text: string) -> string {
+        var out = "";
+        let len = text.len as i32;
+        var i: i32 = 0;
+        while (i + 2 < len) {
+            let b0 = text.charAt(i as i64) & 255;
+            let b1 = text.charAt((i + 1) as i64) & 255;
+            let b2 = text.charAt((i + 2) as i64) & 255;
+            out = out + AppBase64.char6(b0 >> 2);
+            out = out + AppBase64.char6(((b0 & 3) << 4) | (b1 >> 4));
+            out = out + AppBase64.char6(((b1 & 15) << 2) | (b2 >> 6));
+            out = out + AppBase64.char6(b2 & 63);
+            i = i + 3;
+        }
+        let remaining = len - i;
+        if (remaining == 1) {
+            let b0 = text.charAt(i as i64) & 255;
+            out = out + AppBase64.char6(b0 >> 2);
+            out = out + AppBase64.char6((b0 & 3) << 4);
+            out = out + "==";
+        } else if (remaining == 2) {
+            let b0 = text.charAt(i as i64) & 255;
+            let b1 = text.charAt((i + 1) as i64) & 255;
+            out = out + AppBase64.char6(b0 >> 2);
+            out = out + AppBase64.char6(((b0 & 3) << 4) | (b1 >> 4));
+            out = out + AppBase64.char6((b1 & 15) << 2);
+            out = out + "=";
+        }
+        return out;
+    }
+
+    public static fn char6(value: i32) -> string {
+        let index = value & 63;
+        return AppBase64.alphabet().substring(index as i64, (index + 1) as i64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// API client
+// ---------------------------------------------------------------------------
+
+// The convenience layer: policy + auth + credential store + network status in
+// one call, so a screen does not have to remember four things.
+//
+// Static functions rather than an object with `dyn` fields, because the client
+// and the auth provider are injected per call - which is also what lets a test
+// swap the transport between two calls in the same frame.
+public class AppApiClient {
+    public static fn buildHeaders(headers: string, auth: dyn AppAuthProvider) -> string {
+        let auth_header = auth.authorizationHeader();
+        if (auth_header.len == 0) { return headers; }
+        if (headers.len == 0) { return auth_header; }
+        return headers + "\n" + auth_header;
+    }
+
+    public static fn send(
+        mut client: dyn AppHttpClient,
+        policy: AppHttpPolicy,
+        auth: dyn AppAuthProvider,
+        method: i32,
+        url: string,
+        headers: string,
+        body: string
+    ) -> AppHttpResponse {
+        return client.send(method, url, AppApiClient.buildHeaders(headers, auth), body, policy.timeout_ms);
+    }
+
+    public static fn get(client: dyn AppHttpClient, policy: AppHttpPolicy, auth: dyn AppAuthProvider, url: string) -> AppHttpResponse {
+        return AppApiClient.send(client, policy, auth, appHttpGet(), url, "", "");
+    }
+
+    public static fn postJson(
+        client: dyn AppHttpClient,
+        policy: AppHttpPolicy,
+        auth: dyn AppAuthProvider,
+        url: string,
+        body: string
+    ) -> AppHttpResponse {
+        return AppApiClient.send(client, policy, auth, appHttpPost(), url, "Content-Type: application/json", body);
+    }
+
+    public static fn putJson(
+        client: dyn AppHttpClient,
+        policy: AppHttpPolicy,
+        auth: dyn AppAuthProvider,
+        url: string,
+        body: string
+    ) -> AppHttpResponse {
+        return AppApiClient.send(client, policy, auth, appHttpPut(), url, "Content-Type: application/json", body);
+    }
+
+    public static fn remove(client: dyn AppHttpClient, policy: AppHttpPolicy, auth: dyn AppAuthProvider, url: string) -> AppHttpResponse {
+        return AppApiClient.send(client, policy, auth, appHttpDelete(), url, "", "");
+    }
+
+    // The deferred path: the request becomes an Effect, so the caller does not
+    // block, and the result arrives through the normal drain. When the monitor
+    // already knows the link is down the request is failed immediately instead
+    // of being handed to a transport that cannot succeed.
+    public static fn submitDeferred(
+        world: AppWorld,
+        owner: string,
+        request_id: i64,
+        method: i32,
+        url: string,
+        body: string,
+        policy: AppHttpPolicy,
+        auth: dyn AppAuthProvider,
+        fps: f32
+    ) -> AppWorld {
+        if (AppNetworkMonitor.shouldDefer(world, owner)) {
+            var out = world.setIntResource(AppRequest.stateKey(owner, request_id), appRequestFailed());
+            out = out.setStringResource(AppRequest.errorKey(owner, request_id), "offline");
+            out = out.setIntResource(AppRequest.methodKey(owner, request_id), method);
+            out = out.setStringResource(AppRequest.urlKey(owner, request_id), url);
+            return out;
+        }
+        let headers = auth.authorizationHeader();
+        return AppRequest.submit(world, owner, request_id, method, url, headers, body, policy, fps);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+
+// Same shape as the HTTP client: the transport is injected, the lifecycle is
+// the framework's.
+public interface AppWebSocketClient {
+    fn connect(&mut self, url: string) -> i32;
+    fn state(&self) -> i32;
+    fn send(&mut self, payload: string) -> i32;
+    fn close(&mut self) -> i32;
+    // Returns the next inbound frame, or the empty string when there is none.
+    // Declared mutating because consuming a frame advances the cursor.
+    fn poll(&mut self) -> string;
+}
+
+// Scripted socket for tests: `inbox` is a `;`-separated list of frames.
+public class AppMemoryWebSocket : AppWebSocketClient {
+    public state_value: i32;
+    public sent: string;
+    public inbox: string;
+    public cursor: i32;
+    public url: string;
+
+    public static fn create(inbox: string) -> AppMemoryWebSocket {
+        return AppMemoryWebSocket {
+            state_value: appWsClosed(), sent: "", inbox: inbox, cursor: 0, url: ""
+        };
+    }
+
+    public fn connect(&mut self, url: string) -> i32 {
+        self.url = url;
+        self.state_value = appWsOpen();
+        return 0;
+    }
+
+    public fn state(&self) -> i32 {
+        return self.state_value;
+    }
+
+    public fn send(&mut self, payload: string) -> i32 {
+        if (self.state_value != appWsOpen()) { return 1; }
+        if (self.sent.len == 0) { self.sent = payload; }
+        else { self.sent = self.sent + ";" + payload; }
+        return 0;
+    }
+
+    public fn close(&mut self) -> i32 {
+        self.state_value = appWsClosed();
+        return 0;
+    }
+
+    public fn poll(&mut self) -> string {
+        if (self.state_value != appWsOpen()) { return ""; }
+        let count = AppMemoryHttpClient.entryCount(self.inbox);
+        if (self.cursor >= count) { return ""; }
+        let frame = AppMemoryHttpClient.entryAt(self.inbox, self.cursor);
+        self.cursor = self.cursor + 1;
+        return frame;
+    }
+
+    public fn sentCount(&self) -> i32 {
+        return AppMemoryHttpClient.entryCount(self.sent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// URL helpers
+// ---------------------------------------------------------------------------
+
+public class AppUrl {
+    public static fn schemeOf(url: string) -> string {
+        let index = AppDocumentEnvelope.indexOf(url, 58, 0);
+        if (index < 0) { return ""; }
+        return url.substring(0, index as i64);
+    }
+
+    public static fn isSecure(url: string) -> bool {
+        return AppUrl.schemeOf(url) == "https" || AppUrl.schemeOf(url) == "wss";
+    }
+
+    // Percent-encodes everything outside the unreserved set, which is what a
+    // query parameter needs and what a path segment usually wants.
+    public static fn encodeComponent(text: string) -> string {
+        var out = "";
+        var i: i32 = 0;
+        let len = text.len as i32;
+        while (i < len) {
+            let code = text.charAt(i as i64) & 255;
+            if (AppUrl.isUnreserved(code)) {
+                out = out + text.substring(i as i64, (i + 1) as i64);
+            } else {
+                out = out + "%" + AppUrl.hexByte(code);
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn isUnreserved(code: i32) -> bool {
+        if (code >= 48 && code <= 57) { return true; }
+        if (code >= 65 && code <= 90) { return true; }
+        if (code >= 97 && code <= 122) { return true; }
+        return code == 45 || code == 95 || code == 46 || code == 126;
+    }
+
+    public static fn hexByte(code: i32) -> string {
+        let digits = "0123456789ABCDEF";
+        let high = (code >> 4) & 15;
+        let low = code & 15;
+        return digits.substring(high as i64, (high + 1) as i64) + digits.substring(low as i64, (low + 1) as i64);
+    }
+
+    // Percent-decodes. A malformed `%` sequence is left verbatim rather than
+    // dropped, so a round trip through the encoder is lossless and a bad input
+    // is visible instead of silently shortened.
+    public static fn decodeComponent(text: string) -> string {
+        var out = "";
+        var i: i32 = 0;
+        let len = text.len as i32;
+        while (i < len) {
+            let code = text.charAt(i as i64);
+            if (code == 37 && i + 2 < len) {
+                let high = AppUrl.hexValue(text.charAt((i + 1) as i64));
+                let low = AppUrl.hexValue(text.charAt((i + 2) as i64));
+                if (high >= 0 && low >= 0) {
+                    out = out + AppUrl.byteToString((high * 16) + low);
+                    i = i + 3;
+                } else {
+                    out = out + text.substring(i as i64, (i + 1) as i64);
+                    i = i + 1;
+                }
+            } else {
+                out = out + text.substring(i as i64, (i + 1) as i64);
+                i = i + 1;
+            }
+        }
+        return out;
+    }
+
+    public static fn hexValue(code: i32) -> i32 {
+        if (code >= 48 && code <= 57) { return code - 48; }
+        if (code >= 65 && code <= 70) { return code - 55; }
+        if (code >= 97 && code <= 102) { return code - 87; }
+        return -1;
+    }
+
+    public static fn byteToString(value: i32) -> string {
+        if (value < 32 || value > 126) {
+            // Outside printable ASCII a single byte is not a valid Vyx string,
+            // so the escape is kept rather than producing a broken character.
+            return "%" + AppUrl.hexByte(value);
+        }
+        return AppLocale.codeToString(value);
+    }
+
+    // Appends `key=value` with the right separator, so a caller never has to
+    // know whether the URL already carries a query.
+    public static fn withQuery(url: string, key: string, value: string) -> string {
+        var separator = "?";
+        if (AppDocumentEnvelope.indexOf(url, 63, 0) >= 0) { separator = "&"; }
+        return url + separator + AppUrl.encodeComponent(key) + "=" + AppUrl.encodeComponent(value);
+    }
+
+    public static fn hostOf(url: string) -> string {
+        let scheme_end = AppDocumentEnvelope.indexOf(url, 58, 0);
+        var start: i32 = 0;
+        if (scheme_end >= 0 && scheme_end + 2 < (url.len as i32)) {
+            start = scheme_end + 3;
+        }
+        var end = url.len as i32;
+        var i = start;
+        while (i < (url.len as i32)) {
+            let code = url.charAt(i as i64);
+            if (code == 47 || code == 63 || code == 35) { end = i; i = url.len as i32; }
+            else { i = i + 1; }
+        }
+        return url.substring(start as i64, end as i64);
+    }
+}

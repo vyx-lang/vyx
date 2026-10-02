@@ -1,0 +1,769 @@
+module std.algorithm;
+
+/// Vyx Standard Library — Generic Algorithms (Ord trait dispatch).
+///
+/// Parallels C++ `<algorithm>` / Rust `std::slice` operations, but every
+/// free function here is generic over `T` with an `Ord` (and occasionally
+/// `Eq`) trait bound.  Dispatch on `x.compare(y)` routes through the
+/// primitive-impl plumbing in std/hash.vyx when T binds to a primitive
+/// (i32/i64/f32/f64/bool/char/string), and through the user's
+/// `impl Ord for MyType` when T binds to a class or enum.
+///
+/// Naming — this module contains both the concrete `Vec<i64>` algorithms
+/// (kept for existing test surface + `-1`-on-miss return shape) and the
+/// trait-dispatched generic siblings.  Vyx's free-function overload dispatch
+/// (Phase 9b) picks the right one at every call site based on argument types /
+/// turbofish.
+///
+///   * `min(Vec<i64>) -> i64` / `min<T: Ord>(T, T) -> T`.
+///   * `sort(Vec<i64>)` / `sort<T: Ord>(Vec<T>)`.
+///   * `binary_search_ord<T: Ord + Eq>(Vec<T>, T) -> Option<i64>` kept its
+///     `_ord` suffix.  Collections already exposes a generic
+///     `binary_search<T>(Vec<T>, T) -> i64` (primitive `==`/`<` dispatch,
+///     `-1`-on-miss), so merging into a single name would be an ODR
+///     conflict — both decls are generic with the same 1-type-param arity
+///     and the overload dispatcher has no way to separate them on a
+///     `Vec<MyType>` call.  The two return shapes (`i64` vs `Option<i64>`)
+///     also mean a unified name would be a breaking change.  If you want
+///     the trait-dispatched miss → `None` behaviour, spell it
+///     `binary_search_ord::<T>(v, target)`.
+///
+/// Usage:
+///   use std.algorithm;
+///
+///   let m = min::<i32>(3, 7);                    // 3
+///   sort::<string>(strs);                         // in-place
+///   let idx = binary_search_ord::<i32>(v, 5);     // Option<i64>
+///   if (is_sorted::<i32>(v)) { ... }
+///
+/// NaN note: `impl Ord for f32/f64` (std/hash.vyx) treats NaN as equal to
+/// everything rather than unordered.  Sorting a Vec containing NaN with
+/// `sort::<f64>` will finish in O(n log n) but the resulting order is
+/// unspecified for the NaN slots.  Filter NaN first if you need a strict
+/// total order.
+
+use std.collections;
+use std.core;
+use std.hash;
+use std.ops;
+use std.num;
+use std.string;
+
+extern "C" {
+    fn malloc(size: i64) -> rawptr;
+    fn memcpy(dest: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dest: rawptr, val: i32, n: i64) -> rawptr;
+    fn strstr(haystack: rawptr, needle: rawptr) -> rawptr;
+    fn vyx_sort_i64_abi(data: rawptr, len: i64);
+    fn vyx_sort_string_abi(data: rawptr, len: i64);
+}
+
+// ============================================================
+// Concrete Vec algorithms.
+//
+// These are the legacy `Vec<i64>` and primitive-comparison algorithms that
+// used to live in `std.collections`.  They belong here with the rest of the
+// free algorithm surface; callers opt in with `use std.algorithm;`.
+// ============================================================
+
+@[borrow_args]
+public fn sort(v: Vec<i64>) {
+    if (v.len <= 1) { return; }
+    vyx_sort_i64_abi(v.data, v.len);
+}
+
+@[borrow_args]
+public fn _sort_depth_limit(n: i64) -> i64 {
+    var depth: i64 = 0;
+    var m = n;
+    while (m > 1) {
+        depth = depth + 1;
+        m = m / 2;
+    }
+    return depth * 2;
+}
+
+@[borrow_args]
+public fn _median3_i64(v: Vec<i64>, lo: i64, mid: i64, hi: i64) -> i64 {
+    let a = v.get_unchecked(lo);
+    let b = v.get_unchecked(mid);
+    let c = v.get_unchecked(hi);
+    if (a < b) {
+        if (b < c) { return b; }
+        if (a < c) { return c; }
+        return a;
+    }
+    if (a < c) { return a; }
+    if (b < c) { return c; }
+    return b;
+}
+
+@[borrow_args]
+public fn _insertion_sort_i64(v: Vec<i64>, lo: i64, hi: i64) {
+    var i = lo + 1;
+    while (i <= hi) {
+        let key = v.get_unchecked(i);
+        var j = i - 1;
+        var keep_scanning = true;
+        while (j >= lo && keep_scanning) {
+            let cur = v.get_unchecked(j);
+            if (cur > key) {
+                v.set_unchecked(j + 1, cur);
+                j = j - 1;
+            } else {
+                keep_scanning = false;
+            }
+        }
+        v.set_unchecked(j + 1, key);
+        i = i + 1;
+    }
+}
+
+@[borrow_args]
+public fn _heap_sift_down_i64(v: Vec<i64>, lo: i64, start: i64, end: i64) {
+    var root = start;
+    var done = false;
+    while (!done) {
+        let left = lo + (root - lo) * 2 + 1;
+        if (left > end) { return; }
+        var child = left;
+        let right = left + 1;
+        if (right <= end && v.get_unchecked(child) < v.get_unchecked(right)) {
+            child = right;
+        }
+        if (v.get_unchecked(root) < v.get_unchecked(child)) {
+            v.swap(root, child);
+            root = child;
+        } else {
+            done = true;
+        }
+    }
+}
+
+@[borrow_args]
+public fn _heap_sort_i64_range(v: Vec<i64>, lo: i64, hi: i64) {
+    if (lo >= hi) { return; }
+    let count = hi - lo + 1;
+    var start = lo + (count / 2) - 1;
+    while (start >= lo) {
+        _heap_sift_down_i64(v, lo, start, hi);
+        if (start == lo) { break; }
+        start = start - 1;
+    }
+    var end = hi;
+    while (end > lo) {
+        v.swap(lo, end);
+        end = end - 1;
+        _heap_sift_down_i64(v, lo, lo, end);
+    }
+}
+
+@[borrow_args]
+public fn _sort_i64_range(v: Vec<i64>, lo0: i64, hi0: i64) {
+    if (lo0 >= hi0) { return; }
+    var lo_stack = Vec::<i64>.with_capacity(64);
+    var hi_stack = Vec::<i64>.with_capacity(64);
+    var depth_stack = Vec::<i64>.with_capacity(64);
+    lo_stack.push(lo0);
+    hi_stack.push(hi0);
+    depth_stack.push(_sort_depth_limit(hi0 - lo0 + 1));
+
+    while (lo_stack.len > 0) {
+        let top = lo_stack.len - 1;
+        let lo = lo_stack.get_unchecked(top);
+        let hi = hi_stack.get_unchecked(top);
+        let depth = depth_stack.get_unchecked(top);
+        lo_stack.len = top;
+        hi_stack.len = top;
+        depth_stack.len = top;
+        if (lo >= hi) { continue; }
+
+        if (hi - lo <= 32) {
+            _insertion_sort_i64(v, lo, hi);
+            continue;
+        }
+
+        if (depth <= 0) {
+            _heap_sort_i64_range(v, lo, hi);
+            continue;
+        }
+
+        let mid = lo + (hi - lo) / 2;
+        let pivot = _median3_i64(v, lo, mid, hi);
+        var lt = lo;
+        var i = lo;
+        var gt = hi;
+        while (i <= gt) {
+            let cur = v.get_unchecked(i);
+            if (cur < pivot) {
+                v.swap(lt, i);
+                lt = lt + 1;
+                i = i + 1;
+            } else if (cur > pivot) {
+                v.swap(i, gt);
+                gt = gt - 1;
+            } else {
+                i = i + 1;
+            }
+        }
+
+        let next_depth = depth - 1;
+        let left_lo = lo;
+        let left_hi = lt - 1;
+        let right_lo = gt + 1;
+        let right_hi = hi;
+        let left_size = left_hi - left_lo + 1;
+        let right_size = right_hi - right_lo + 1;
+        if (left_size > right_size) {
+            if (left_lo < left_hi) {
+                lo_stack.push(left_lo);
+                hi_stack.push(left_hi);
+                depth_stack.push(next_depth);
+            }
+            if (right_lo < right_hi) {
+                lo_stack.push(right_lo);
+                hi_stack.push(right_hi);
+                depth_stack.push(next_depth);
+            }
+        } else {
+            if (right_lo < right_hi) {
+                lo_stack.push(right_lo);
+                hi_stack.push(right_hi);
+                depth_stack.push(next_depth);
+            }
+            if (left_lo < left_hi) {
+                lo_stack.push(left_lo);
+                hi_stack.push(left_hi);
+                depth_stack.push(next_depth);
+            }
+        }
+    }
+}
+
+@[borrow_args]
+public fn is_sorted(v: Vec<i64>) -> bool {
+    if (v.len <= 1) { return true; }
+    for (i in 0..v.len-1) {
+        if (v.get_unchecked(i) > v.get_unchecked(i+1)) { return false; }
+    }
+    return true;
+}
+
+@[borrow_args]
+public fn binary_search<T>(v: Vec<T>, target: T) -> i64 {
+    var lo: i64 = 0;
+    var hi = v.len - 1;
+    while (lo <= hi) {
+        let mid = lo + (hi - lo) / 2;
+        let val = v.get_unchecked(mid);
+        if (val == target) { return mid; }
+        if (val < target) { lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    return -1;
+}
+
+@[borrow_args]
+public fn find<T>(v: Vec<T>, target: T) -> i64 {
+    for (i in 0..v.len) {
+        if (v.get_unchecked(i) == target) { return i; }
+    }
+    return -1;
+}
+
+@[borrow_args]
+public fn count<T>(v: Vec<T>, target: T) -> i64 {
+    var c: i64 = 0;
+    for (i in 0..v.len) { if (v.get_unchecked(i) == target) { c = c + 1; } }
+    return c;
+}
+
+@[borrow_args]
+public fn sum(v: Vec<i64>) -> i64 {
+    var total: i64 = 0;
+    for (i in 0..v.len) { total = total + v.get_unchecked(i); }
+    return total;
+}
+
+@[borrow_args]
+public fn product(v: Vec<i64>) -> i64 {
+    if (v.len == 0) { return 0; }
+    var result: i64 = 1;
+    for (i in 0..v.len) { result = result * v.get_unchecked(i); }
+    return result;
+}
+
+@[borrow_args]
+public fn max(v: Vec<i64>) -> i64 {
+    if (v.len == 0) { panic("max on empty"); }
+    var m = v.get_unchecked(0);
+    for (i in 1..v.len) { let val = v.get_unchecked(i); if (val > m) { m = val; } }
+    return m;
+}
+
+@[borrow_args]
+public fn min(v: Vec<i64>) -> i64 {
+    if (v.len == 0) { panic("min on empty"); }
+    var m = v.get_unchecked(0);
+    for (i in 1..v.len) { let val = v.get_unchecked(i); if (val < m) { m = val; } }
+    return m;
+}
+
+@[borrow_args]
+public fn reverse(v: Vec<i64>) {
+    var lo: i64 = 0;
+    var hi = v.len - 1;
+    while (lo < hi) { v.swap(lo, hi); lo = lo + 1; hi = hi - 1; }
+}
+
+@[borrow_args]
+public fn unique(v: Vec<i64>) -> Vec<i64> {
+    var result = Vec::<i64>.with_capacity(v.len);
+    if (v.len == 0) { return result; }
+    result.push_unchecked(v.get_unchecked(0));
+    for (i in 1..v.len) {
+        let cur = v.get_unchecked(i);
+        if (cur != v.get_unchecked(i-1)) { result.push_unchecked(cur); }
+    }
+    return result;
+}
+
+@[borrow_args]
+public fn fill<T>(v: Vec<T>, value: T) {
+    for (i in 0..v.len) { v.set_unchecked(i, value); }
+}
+
+@[borrow_args]
+public fn all_equal<T>(v: Vec<T>, target: T) -> bool {
+    for (i in 0..v.len) { if (v.get_unchecked(i) != target) { return false; } }
+    return true;
+}
+
+@[borrow_args]
+public fn any_equal<T>(v: Vec<T>, target: T) -> bool {
+    for (i in 0..v.len) { if (v.get_unchecked(i) == target) { return true; } }
+    return false;
+}
+
+@[borrow_args]
+public fn none_equal<T>(v: Vec<T>, target: T) -> bool {
+    return !any_equal::<T>(v, target);
+}
+
+public fn heap_sort(v: Vec<i64>) {
+    if (v.len <= 1) { return; }
+    var h = PriorityQueue::<i64>.new();
+    for (i in 0..v.len) { h.push(v.get(i)); }
+    var idx: i64 = 0;
+    while (!h.isEmpty()) {
+        match (h.pop()) {
+            case Some(val) => { v.set(idx, val); idx = idx + 1; }
+            case None => {}
+        }
+    }
+    h.destroy();
+}
+
+public fn heap_sort_desc(v: Vec<i64>) {
+    if (v.len <= 1) { return; }
+    var h = PriorityQueue::<i64>.new();
+    h.as_max_heap();
+    for (i in 0..v.len) { h.push(v.get(i)); }
+    var idx: i64 = 0;
+    while (!h.isEmpty()) {
+        match (h.pop()) {
+            case Some(val) => { v.set(idx, val); idx = idx + 1; }
+            case None => {}
+        }
+    }
+    h.destroy();
+}
+
+// ============================================================
+// Two-value min / max — the C++ `std::min(a, b)` / `std::max(a, b)`.
+// ============================================================
+
+public fn min<T>(a: T, b: T) -> T where T: Ord {
+    if (a.compare(b) <= 0) { return a; }
+    return b;
+}
+
+public fn max<T>(a: T, b: T) -> T where T: Ord {
+    if (a.compare(b) >= 0) { return a; }
+    return b;
+}
+
+/// `clamp(value, lo, hi)` — if `value < lo` return `lo`, if
+/// `value > hi` return `hi`, otherwise return `value`.  Precondition:
+/// `lo.compare(hi) <= 0`; we don't panic on a reversed range but the
+/// result is unspecified in that case (matches Rust's `Ord::clamp`).
+public fn clamp<T>(value: T, lo: T, hi: T) -> T where T: Ord {
+    return max::<T>(lo, min::<T>(value, hi));
+}
+
+// ============================================================
+// is_sorted — non-decreasing check.
+// ============================================================
+
+/// True iff consecutive elements satisfy `a.compare(b) <= 0` everywhere.
+/// Empty / single-element Vecs are trivially sorted.
+@[borrow_args]
+public fn is_sorted<T>(v: Vec<T>) -> bool where T: Ord {
+    if (v.len <= 1) { return true; }
+    var i: i64 = 0;
+    while (i + 1 < v.len) {
+        let a = v.get_unchecked(i);
+        let b = v.get_unchecked(i + 1);
+        if (a.compare(b) > 0) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ============================================================
+// sort — in-place introsort with Hoare partition.
+//
+// Non-recursive quicksort front-end, insertion sort for small ranges, and
+// heap-sort fallback after 2*log2(n) partitions.  Median-of-three pivot
+// selection plus Hoare's bidirectional partition keeps the common high-
+// entropy path fast, while the depth budget prevents adversarial O(n^2)
+// behaviour.  The contract remains unstable and in-place.
+// ============================================================
+
+@[borrow_args]
+public fn sort<T>(v: Vec<T>) where T: Ord {
+    if (v.len <= 1) { return; }
+    let sort_type_name = type_name::<T>();
+    if (str_equals(sort_type_name, "i64")) {
+        vyx_sort_i64_abi(v.data, v.len);
+        return;
+    }
+    if (str_equals(sort_type_name, "string") || str_equals(sort_type_name, "str")) {
+        vyx_sort_string_abi(v.data, v.len);
+        return;
+    }
+    var sorted_i: i64 = 1;
+    var sorted_prev = v.get_unchecked(0);
+    while (sorted_i < v.len) {
+        let sorted_cur = v.get_unchecked(sorted_i);
+        if (sorted_prev.compare(sorted_cur) > 0) { break; }
+        sorted_prev = sorted_cur;
+        sorted_i = sorted_i + 1;
+    }
+    if (sorted_i == v.len) { return; }
+
+    var lo_stack = Vec::<i64>.with_capacity(64);
+    var hi_stack = Vec::<i64>.with_capacity(64);
+    var depth_stack = Vec::<i64>.with_capacity(64);
+    lo_stack.push(0);
+    hi_stack.push(v.len - 1);
+    depth_stack.push(_sort_depth_limit(v.len));
+    while (lo_stack.len > 0) {
+        let top = lo_stack.len - 1;
+        let lo = lo_stack.get_unchecked(top);
+        let hi = hi_stack.get_unchecked(top);
+        let depth = depth_stack.get_unchecked(top);
+        lo_stack.len = top;
+        hi_stack.len = top;
+        depth_stack.len = top;
+        if (lo >= hi) { continue; }
+
+        if (hi - lo <= 32) {
+            var ins_i = lo + 1;
+            while (ins_i <= hi) {
+                let key = v.get_unchecked(ins_i);
+                var ins_j = ins_i - 1;
+                var keep_scanning = true;
+                while (ins_j >= lo && keep_scanning) {
+                    let ins_val = v.get_unchecked(ins_j);
+                    if (ins_val.compare(key) > 0) {
+                        v.set_unchecked(ins_j + 1, ins_val);
+                        ins_j = ins_j - 1;
+                    } else {
+                        keep_scanning = false;
+                    }
+                }
+                v.set_unchecked(ins_j + 1, key);
+                ins_i = ins_i + 1;
+            }
+            continue;
+        }
+
+        if (depth <= 0) {
+            let heap_count = hi - lo + 1;
+            var heap_start = lo + (heap_count / 2) - 1;
+            while (heap_start >= lo) {
+                var root = heap_start;
+                var sift_done = false;
+                while (!sift_done) {
+                    let left = lo + (root - lo) * 2 + 1;
+                    if (left > hi) {
+                        sift_done = true;
+                    } else {
+                        var child = left;
+                        let right = left + 1;
+                        if (right <= hi) {
+                            let child_val = v.get_unchecked(child);
+                            let right_val = v.get_unchecked(right);
+                            if (child_val.compare(right_val) < 0) { child = right; }
+                        }
+                        let root_val = v.get_unchecked(root);
+                        let child_best = v.get_unchecked(child);
+                        if (root_val.compare(child_best) < 0) {
+                            v.swap(root, child);
+                            root = child;
+                        } else {
+                            sift_done = true;
+                        }
+                    }
+                }
+                if (heap_start == lo) { break; }
+                heap_start = heap_start - 1;
+            }
+            var heap_end = hi;
+            while (heap_end > lo) {
+                v.swap(lo, heap_end);
+                heap_end = heap_end - 1;
+                var root2 = lo;
+                var sift_done2 = false;
+                while (!sift_done2) {
+                    let left2 = lo + (root2 - lo) * 2 + 1;
+                    if (left2 > heap_end) {
+                        sift_done2 = true;
+                    } else {
+                        var child2 = left2;
+                        let right2 = left2 + 1;
+                        if (right2 <= heap_end) {
+                            let child2_val = v.get_unchecked(child2);
+                            let right2_val = v.get_unchecked(right2);
+                            if (child2_val.compare(right2_val) < 0) { child2 = right2; }
+                        }
+                        let root2_val = v.get_unchecked(root2);
+                        let child2_best = v.get_unchecked(child2);
+                        if (root2_val.compare(child2_best) < 0) {
+                            v.swap(root2, child2);
+                            root2 = child2;
+                        } else {
+                            sift_done2 = true;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        let mid = lo + (hi - lo) / 2;
+        let a = v.get_unchecked(lo);
+        let b = v.get_unchecked(mid);
+        let c = v.get_unchecked(hi);
+        var pivot = b;
+        if (a.compare(b) < 0) {
+            if (b.compare(c) < 0) { pivot = b; }
+            else if (a.compare(c) < 0) { pivot = c; }
+            else { pivot = a; }
+        } else {
+            if (a.compare(c) < 0) { pivot = a; }
+            else if (b.compare(c) < 0) { pivot = c; }
+            else { pivot = b; }
+        }
+        var i = lo;
+        var j = hi;
+        var partition_done = false;
+        while (!partition_done) {
+            var left_done = false;
+            while (!left_done) {
+                let iv = v.get_unchecked(i);
+                if (iv.compare(pivot) < 0) { i = i + 1; }
+                else { left_done = true; }
+            }
+
+            var right_done = false;
+            while (!right_done) {
+                let jv = v.get_unchecked(j);
+                if (jv.compare(pivot) > 0) { j = j - 1; }
+                else { right_done = true; }
+            }
+
+            if (i >= j) {
+                partition_done = true;
+            } else {
+                v.swap(i, j);
+                i = i + 1;
+                j = j - 1;
+            }
+        }
+
+        let next_depth = depth - 1;
+        let left_lo = lo;
+        let left_hi = j;
+        let right_lo = j + 1;
+        let right_hi = hi;
+        let left_size = left_hi - left_lo;
+        let right_size = right_hi - right_lo;
+        if (left_size > right_size) {
+            if (left_lo < left_hi) {
+                lo_stack.push(left_lo);
+                hi_stack.push(left_hi);
+                depth_stack.push(next_depth);
+            }
+            if (right_lo < right_hi) {
+                lo_stack.push(right_lo);
+                hi_stack.push(right_hi);
+                depth_stack.push(next_depth);
+            }
+        } else {
+            if (right_lo < right_hi) {
+                lo_stack.push(right_lo);
+                hi_stack.push(right_hi);
+                depth_stack.push(next_depth);
+            }
+            if (left_lo < left_hi) {
+                lo_stack.push(left_lo);
+                hi_stack.push(left_hi);
+                depth_stack.push(next_depth);
+            }
+        }
+    }
+}
+
+// ============================================================
+// binary_search_ord — O(log n) search in a sorted Vec.
+//
+// Returns `Some(index)` on hit, `None` on miss.  The `Eq` bound is
+// included for symmetry with Rust's `BinarySearch` contract — having both
+// traits in the where clause documents that callers should maintain the
+// `a.compare(b) == 0  ⇔  a == b` invariant for the result to be
+// meaningful.  The loop body itself only consults `compare`; equality on
+// hit is implied by `compare == 0`.
+// ============================================================
+
+@[borrow_args]
+public fn binary_search_ord<T>(v: Vec<T>, target: T) -> Option<i64> where T: Ord + Eq {
+    if (v.len == 0) { return None; }
+    var lo: i64 = 0;
+    var hi: i64 = v.len - 1;
+    while (lo <= hi) {
+        let mid = lo + (hi - lo) / 2;
+        let val = v.get_unchecked(mid);
+        let c = val.compare(target);
+        if (c == 0) { return Some(mid); }
+        if (c < 0) { lo = mid + 1; }
+        else { hi = mid - 1; }
+    }
+    return None;
+}
+
+// ============================================================
+// String/container algorithms.
+//
+// These live in `std.algorithm` because they combine primitive `string`
+// operations with container types (`Vec<string>`).  Importing `std.string`
+// alone keeps the core string surface small; callers who want split/join
+// explicitly opt into the algorithm layer.
+// ============================================================
+
+public fn str_join(parts: Vec<string>, sep: string) -> string {
+    let n = parts.size();
+    if (n == 0) { return ""; }
+    var total: i64 = 0;
+    var i: i64 = 0;
+    while (i < n) {
+        let p = parts.get(i);
+        total = total + p.len;
+        if (i < n - 1) { total = total + sep.len; }
+        i = i + 1;
+    }
+    let cap = total + 1;
+    let buf = malloc(cap);
+    if (buf == null) { return ""; }
+    var out: i64 = 0;
+    i = 0;
+    while (i < n) {
+        let p = parts.get(i);
+        memcpy(buf + out, p.ptr, p.len);
+        out = out + p.len;
+        if (i < n - 1) {
+            memcpy(buf + out, sep.ptr, sep.len);
+            out = out + sep.len;
+        }
+        i = i + 1;
+    }
+    memset(buf + out, 0, 1);
+    return str_from_parts(buf, total, cap, 1);
+}
+
+public fn str_split(s: string, delim: string) -> Vec<string> {
+    var result = Vec::<string>.new();
+    let slen = s.len;
+    let dlen = delim.len;
+
+    if (dlen == 0 || slen == 0) {
+        result.push(s);
+        return result;
+    }
+
+    var cursor: i64 = 0;
+    while (cursor <= slen) {
+        var found: i64 = -1;
+        if (cursor + dlen <= slen) {
+            let remaining_ptr = s.ptr + cursor;
+            let f = strstr(remaining_ptr, delim.ptr);
+            if (f != null) {
+                unsafe {
+                    found = cursor + (f as i64 - remaining_ptr as i64);
+                }
+            }
+        }
+
+        if (found < 0) {
+            result.push(str_substring(s, cursor, slen));
+            break;
+        }
+
+        result.push(str_substring(s, cursor, found));
+        cursor = found + dlen;
+
+        if (cursor == slen) {
+            result.push("");
+            break;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================
+// sum_iter — numeric reduction over any `Iter<T>` impl.
+//
+// Companion to the `fold` / `reduce` / `count_iter` / `any` / `all`
+// combinators in `std/iter.vyx` (module `std.collections`).  This one
+// lives here because it needs `T: Zero + Add` bounds, which would force
+// every `use std.collections;` importer to transitively pull `std.ops` /
+// `std.num` into scope and collide with user-defined `class Neg` / etc.
+// `std.algorithm` is already the home for trait-bounded numeric helpers,
+// and callers who want `sum_iter` `use std.algorithm;` explicitly.
+//
+// Seeded with `T::zero()` (from `std.num::Zero`), accumulated via
+// `operator_add` (from `std.ops::Add`).  Dispatches through the primitive
+// impls for i32/i64/f32/f64/u32/u64 and through user-defined
+// `impl Zero for MyType` / `impl Add for MyType` for nominal types.
+// Returns `T::zero()` on an empty iterator (matches Rust's
+// `Iterator::sum`, which delegates to `Sum::sum` that also returns
+// `Zero::zero()` for an empty iterator).
+//
+// Suffixed `_iter` to avoid overload clash with
+// `std.algorithm::sum(Vec<i64>) -> i64`.  The Phase 9b overload
+// dispatcher could in principle separate them by argument type (Vec<i64>
+// vs any Iter<T> impl), but keeping distinct names is simpler and lets
+// callers pick the semantics they want by name alone.
+// ============================================================
+
+public fn sum_iter<T, I>(it: I) -> T where I: Iter<T>, T: Zero + Add {
+    var acc = T::zero();
+    var cur = it.next();
+    while (cur.isSome()) {
+        acc = acc.operator_add(cur.unwrap());
+        cur = it.next();
+    }
+    return acc;
+}

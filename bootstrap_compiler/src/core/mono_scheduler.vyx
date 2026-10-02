@@ -1,0 +1,568 @@
+module bootstrap.mono_scheduler;
+
+use std.string;
+use bootstrap.ast;
+use bootstrap.policy;
+
+/// SCAFFOLD (WP-A): telemetry ledger only. Request/ready/failed counts are
+/// recorded for CI comparison. The monomorphization worklist is not wired —
+/// nothing here drives codegen or changes compiler output. sema / lang_items /
+/// fact_base / diag still call the ledger for stats. Do not treat this as a
+/// live scheduler.
+///
+/// Host-era `src/Sema/MonoScheduler.h` / `vyx::Sema::dumpMonoSchedulerStats`
+/// are dead references. The `[S4 mono-sched]` line is kept so existing
+/// telemetry greps still match.
+///
+/// ════════════════════════════════════════════════════════════════════
+///   STATE LAYOUT (malloc-backed, 144 B, LE/packed)
+/// ════════════════════════════════════════════════════════════════════
+///   0..7     unique_buf       : rawptr   (slot table — uniqueKeys_)
+///   8..11    unique_cap       : i32
+///   12..15   unique_count     : i32
+///   16..23   ready_buf        : rawptr   (readyKeys_)
+///   24..27   ready_cap        : i32
+///   28..31   ready_count      : i32
+///   32..39   failed_buf       : rawptr   (failedKeys_)
+///   40..43   failed_cap       : i32
+///   44..47   failed_count     : i32
+///   48..55   total_requests   : i64
+///   56..63   sema_requests    : i64
+///   64..71   mono_requests    : i64
+///   72..79   class_requests   : i64
+///   80..87   fn_requests      : i64
+///   88..95   method_requests  : i64
+///   96..103  ready_class      : i64
+///   104..111 ready_fn         : i64
+///   112..119 ready_method     : i64
+///   120..127 fail_count       : i64
+///   128..131 frozen           : i32
+///   132..135 _pad             : i32
+///
+/// ════════════════════════════════════════════════════════════════════
+///   SLOT LAYOUT (32 B, LE/packed)  — used by unique_buf / ready_buf / failed_buf
+/// ════════════════════════════════════════════════════════════════════
+///   0..7   key_ptr   : rawptr   (null = empty slot, owned by table)
+///   8..15  key_len   : i64
+///   16..19 kind      : i32      (1=Class, 2=FreeFn, 3=Method, 0=empty)
+///   20..23 extra     : i32      (diag_code for failed table, 0 otherwise)
+///   24..31 _pad      : i64
+///
+/// Open-addressing with linear probing. Capacity always a power of two
+/// (start 64, double when load > 60%). Composite key for hashing is
+/// `kind_byte || '\x1f' || raw_key` — matches the host
+/// `compositeKey(key, kind)` helper. No tombstones: scheduler entries
+/// are never deleted, only inserted/looked-up.
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+}
+
+/// Local byte dup using EXE-side `malloc` rather than the runtime's
+/// `vyx_dup_bytes_raw` from `bootstrap.ast`. The two are not
+/// interchangeable across the `vyx_codegen.dll` boundary on Windows:
+/// `vyx_dup_bytes_raw` allocates on the DLL's static-CRT heap, while
+/// `mono_scheduler_dispose` calls the EXE-side `free`. Cross-CRT free
+/// surfaces as STATUS_HEAP_CORRUPTION (0xC0000374) at process exit.
+/// This mirrors the `canon_dup_bytes` workaround in `bootstrap.canon`.
+fn ms_dup_string(s: string) -> rawptr {
+    let n: i64 = s.len;
+    if (n < 0) { return null; }
+    let alloc_len: i64 = n + 1;
+    let p = malloc(alloc_len as u64);
+    if (p == null) { return null; }
+    if (n > 0) {
+        memcpy(p, s.c_str(), n as u64);
+    }
+    var nul: i32 = 0;
+    memcpy(ptr_offset(p, n as i32), to_rawptr(&nul), 1);
+    return p;
+}
+
+// NOTE: previously declared as `let MS_*` module-level constants. The host
+// vyxc codegen interns same-valued i32/i64 module `let`s into a single
+// global initializer, which collides with constants of the same value in
+// `canon.vyx` / `ast.vyx` / `diag.vyx` and surfaces as
+// `verifyModule failed: Global variable initializer type does not match
+// global variable type` on `g_diag_current_file`. To keep the bootstrap
+// build deterministic, every internal magic number lives as a `fn` that
+// returns the literal — same dodge as the inline `256` clone-depth cap
+// in `sema.vyx`.
+
+fn ms_kind_class()   -> i32 { return 1; }
+fn ms_kind_free_fn() -> i32 { return 2; }
+fn ms_kind_method()  -> i32 { return 3; }
+
+fn ms_slot_size()  -> i32 { return 32; }
+fn ms_state_size() -> i32 { return 144; }
+fn ms_init_cap()   -> i32 { return 64; }
+
+// ════════════════════════════════════════════════════════════════════
+//   State accessors (no class shell — host vyxc strands class writes
+//   when the instance crosses a function-return boundary).
+// ════════════════════════════════════════════════════════════════════
+
+public fn mono_scheduler_alloc() -> rawptr {
+    let s = malloc(ms_state_size() as u64);
+    if (s == null) { return null; }
+    memset(s, 0, ms_state_size() as u64);
+    ms_set_table(s, 0, ms_table_alloc(ms_init_cap()), ms_init_cap(), 0);
+    ms_set_table(s, 1, ms_table_alloc(ms_init_cap()), ms_init_cap(), 0);
+    ms_set_table(s, 2, ms_table_alloc(ms_init_cap()), ms_init_cap(), 0);
+    return s;
+}
+
+public fn mono_scheduler_dispose(s: rawptr) {
+    if (s == null) { return; }
+    ms_table_dispose(ms_get_buf(s, 0), ms_get_cap(s, 0));
+    ms_table_dispose(ms_get_buf(s, 1), ms_get_cap(s, 1));
+    ms_table_dispose(ms_get_buf(s, 2), ms_get_cap(s, 2));
+    free(s);
+}
+
+// ── Recording API (Sema origin) ─────────────────────────────────────
+
+public fn mono_scheduler_record_class_request(s: rawptr, decl: rawptr, args_key: string) {
+    if (s == null || ms_is_frozen(s)) { return; }
+    let mangled = ms_build_mangled(decl, args_key);
+    if (mangled.len == 0) { return; }
+    ms_record(s, mangled, ms_kind_class(), false);
+}
+
+public fn mono_scheduler_record_fn_request(s: rawptr, decl: rawptr, args_key: string) {
+    if (s == null || ms_is_frozen(s)) { return; }
+    let mangled = ms_build_mangled(decl, args_key);
+    if (mangled.len == 0) { return; }
+    ms_record(s, mangled, ms_kind_free_fn(), false);
+}
+
+public fn mono_scheduler_record_method_request(s: rawptr,
+                                               class_mangled: string,
+                                               method_name: string) {
+    if (s == null || ms_is_frozen(s)) { return; }
+    if (class_mangled.len == 0 || method_name.len == 0) { return; }
+    ms_record(s, class_mangled + "::" + method_name, ms_kind_method(), false);
+}
+
+// ── Recording API (Sema origin, pre-mangled — turbofish callsites) ─
+//   Use these when the caller has already built the mangled key string
+//   and does not have a `Decl*` handle. Origin is still Sema because
+//   the observation point lives inside `resolve_unit`/`resolve_call`.
+
+public fn mono_scheduler_record_class_request_named(s: rawptr, mangled: string) {
+    if (s == null || ms_is_frozen(s) || mangled.len == 0) { return; }
+    ms_record(s, mangled, ms_kind_class(), false);
+}
+
+public fn mono_scheduler_record_fn_request_named(s: rawptr, mangled: string) {
+    if (s == null || ms_is_frozen(s) || mangled.len == 0) { return; }
+    ms_record(s, mangled, ms_kind_free_fn(), false);
+}
+
+public fn mono_scheduler_record_method_request_named(s: rawptr,
+                                                     class_mangled: string,
+                                                     method_name: string) {
+    if (s == null || ms_is_frozen(s)) { return; }
+    if (class_mangled.len == 0 || method_name.len == 0) { return; }
+    ms_record(s, class_mangled + "::" + method_name, ms_kind_method(), false);
+}
+
+// ── Recording API (Mono origin — reserved for WU9 worklist hook-up) ─
+
+public fn mono_scheduler_record_mono_class_request(s: rawptr, mangled: string) {
+    if (s == null || ms_is_frozen(s) || mangled.len == 0) { return; }
+    ms_record(s, mangled, ms_kind_class(), true);
+}
+
+public fn mono_scheduler_record_mono_fn_request(s: rawptr, mangled: string) {
+    if (s == null || ms_is_frozen(s) || mangled.len == 0) { return; }
+    ms_record(s, mangled, ms_kind_free_fn(), true);
+}
+
+public fn mono_scheduler_record_mono_method_request(s: rawptr,
+                                                    class_mangled: string,
+                                                    method_name: string) {
+    if (s == null || ms_is_frozen(s)) { return; }
+    if (class_mangled.len == 0 || method_name.len == 0) { return; }
+    ms_record(s, class_mangled + "::" + method_name, ms_kind_method(), true);
+}
+
+// ── Ready API ───────────────────────────────────────────────────────
+
+public fn mono_scheduler_mark_class_ready(s: rawptr, key: string) {
+    ms_mark_ready(s, key, ms_kind_class());
+}
+
+public fn mono_scheduler_mark_fn_ready(s: rawptr, key: string) {
+    ms_mark_ready(s, key, ms_kind_free_fn());
+}
+
+public fn mono_scheduler_mark_method_ready(s: rawptr,
+                                           class_mangled: string,
+                                           method_name: string) {
+    if (s == null || class_mangled.len == 0 || method_name.len == 0) { return; }
+    ms_mark_ready(s, class_mangled + "::" + method_name, ms_kind_method());
+}
+
+// ── Failure API ─────────────────────────────────────────────────────
+
+public fn mono_scheduler_mark_failed(s: rawptr, key: string, diag_code: i32) {
+    if (s == null || key.len == 0) { return; }
+    let buf = ms_get_buf(s, 2);
+    let cap = ms_get_cap(s, 2);
+    let cnt = ms_get_count(s, 2);
+    let slot = ms_lookup_or_insert(buf, cap, key, ms_kind_class());
+    if (slot == null) { return; }
+    if (ast_read_rawptr(slot) == null) {
+        ms_slot_install(slot, key, ms_kind_class(), diag_code);
+        ms_set_count(s, 2, cnt + 1);
+        let new_total = ptr_read_i64(ptr_offset(s, 120)) + 1;
+        ptr_write_i64(ptr_offset(s, 120), new_total);
+        if (ms_needs_grow(cnt + 1, cap)) {
+            ms_grow(s, 2);
+        }
+    } else {
+        ptr_write_i32(ptr_offset(slot, 20), diag_code);
+    }
+}
+
+// ── Lifecycle ───────────────────────────────────────────────────────
+
+public fn mono_scheduler_is_frozen(s: rawptr) -> bool {
+    return ms_is_frozen(s);
+}
+
+public fn mono_scheduler_freeze(s: rawptr) {
+    if (s == null) { return; }
+    ptr_write_i32(ptr_offset(s, 128), 1);
+}
+
+public fn mono_scheduler_clear(s: rawptr) {
+    if (s == null) { return; }
+    ms_table_dispose(ms_get_buf(s, 0), ms_get_cap(s, 0));
+    ms_table_dispose(ms_get_buf(s, 1), ms_get_cap(s, 1));
+    ms_table_dispose(ms_get_buf(s, 2), ms_get_cap(s, 2));
+    ms_set_table(s, 0, ms_table_alloc(ms_init_cap()), ms_init_cap(), 0);
+    ms_set_table(s, 1, ms_table_alloc(ms_init_cap()), ms_init_cap(), 0);
+    ms_set_table(s, 2, ms_table_alloc(ms_init_cap()), ms_init_cap(), 0);
+    ptr_write_i64(ptr_offset(s, 48), 0);
+    ptr_write_i64(ptr_offset(s, 56), 0);
+    ptr_write_i64(ptr_offset(s, 64), 0);
+    ptr_write_i64(ptr_offset(s, 72), 0);
+    ptr_write_i64(ptr_offset(s, 80), 0);
+    ptr_write_i64(ptr_offset(s, 88), 0);
+    ptr_write_i64(ptr_offset(s, 96), 0);
+    ptr_write_i64(ptr_offset(s, 104), 0);
+    ptr_write_i64(ptr_offset(s, 112), 0);
+    ptr_write_i64(ptr_offset(s, 120), 0);
+    ptr_write_i32(ptr_offset(s, 128), 0);
+}
+
+// ── Counter accessors (mirror host getters) ─────────────────────────
+
+public fn mono_scheduler_total_requests(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 48));
+}
+public fn mono_scheduler_sema_requests(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 56));
+}
+public fn mono_scheduler_mono_requests(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 64));
+}
+public fn mono_scheduler_unique_requests(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ms_get_count(s, 0) as i64;
+}
+public fn mono_scheduler_class_requests(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 72));
+}
+public fn mono_scheduler_fn_requests(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 80));
+}
+public fn mono_scheduler_method_requests(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 88));
+}
+public fn mono_scheduler_ready_items(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ms_get_count(s, 1) as i64;
+}
+public fn mono_scheduler_ready_class_items(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 96));
+}
+public fn mono_scheduler_ready_fn_items(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 104));
+}
+public fn mono_scheduler_ready_method_items(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 112));
+}
+public fn mono_scheduler_fail_count(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 120));
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   dump_stats — byte-exact replica of `Sema::dumpMonoSchedulerStats`
+//   (src/Sema/Sema.cpp L182–L192).
+//
+//   Format (single line, no trailing colon, fields in this order):
+//     [S4 mono-sched] requests=N unique=N sema=N mono=N classes=N \
+//                     free_fns=N methods=N
+//
+//   When totalRequests == 0 nothing is printed (matches host early-exit).
+// ════════════════════════════════════════════════════════════════════
+
+public fn mono_scheduler_dump_stats(s: rawptr) {
+    if (s == null) { return; }
+    let total = mono_scheduler_total_requests(s);
+    if (total == 0) { return; }
+    print("[S4 mono-sched] requests=" + policy_i64_to_string(total)
+          + " unique="   + policy_i64_to_string(mono_scheduler_unique_requests(s))
+          + " sema="     + policy_i64_to_string(mono_scheduler_sema_requests(s))
+          + " mono="     + policy_i64_to_string(mono_scheduler_mono_requests(s))
+          + " classes="  + policy_i64_to_string(mono_scheduler_class_requests(s))
+          + " free_fns=" + policy_i64_to_string(mono_scheduler_fn_requests(s))
+          + " methods="  + policy_i64_to_string(mono_scheduler_method_requests(s)));
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Internal helpers
+// ════════════════════════════════════════════════════════════════════
+
+fn ms_is_frozen(s: rawptr) -> bool {
+    if (s == null) { return false; }
+    return ptr_read_i32(ptr_offset(s, 128)) != 0;
+}
+
+fn ms_build_mangled(decl: rawptr, args_key: string) -> string {
+    var base: string = "";
+    if (decl != null) {
+        base = decl_get_name(decl);
+    }
+    if (base.len == 0) { return ""; }
+    if (args_key.len == 0) { return base; }
+    return base + "::<" + args_key + ">";
+}
+
+fn ms_record(s: rawptr, key: string, kind: i32, from_mono: bool) {
+    let buf = ms_get_buf(s, 0);
+    let cap = ms_get_cap(s, 0);
+    let cnt = ms_get_count(s, 0);
+    let slot = ms_lookup_or_insert(buf, cap, key, kind);
+    if (slot == null) { return; }
+    if (ast_read_rawptr(slot) == null) {
+        ms_slot_install(slot, key, kind, 0);
+        ms_set_count(s, 0, cnt + 1);
+        if (ms_needs_grow(cnt + 1, cap)) {
+            ms_grow(s, 0);
+        }
+    }
+    let new_total = ptr_read_i64(ptr_offset(s, 48)) + 1;
+    ptr_write_i64(ptr_offset(s, 48), new_total);
+    if (from_mono) {
+        let nm = ptr_read_i64(ptr_offset(s, 64)) + 1;
+        ptr_write_i64(ptr_offset(s, 64), nm);
+    } else {
+        let ns = ptr_read_i64(ptr_offset(s, 56)) + 1;
+        ptr_write_i64(ptr_offset(s, 56), ns);
+    }
+    if (kind == ms_kind_class()) {
+        let nc = ptr_read_i64(ptr_offset(s, 72)) + 1;
+        ptr_write_i64(ptr_offset(s, 72), nc);
+    } else if (kind == ms_kind_free_fn()) {
+        let nf = ptr_read_i64(ptr_offset(s, 80)) + 1;
+        ptr_write_i64(ptr_offset(s, 80), nf);
+    } else if (kind == ms_kind_method()) {
+        let nmm = ptr_read_i64(ptr_offset(s, 88)) + 1;
+        ptr_write_i64(ptr_offset(s, 88), nmm);
+    }
+}
+
+fn ms_mark_ready(s: rawptr, key: string, kind: i32) {
+    if (s == null || key.len == 0) { return; }
+    let buf = ms_get_buf(s, 1);
+    let cap = ms_get_cap(s, 1);
+    let cnt = ms_get_count(s, 1);
+    let slot = ms_lookup_or_insert(buf, cap, key, kind);
+    if (slot == null) { return; }
+    if (ast_read_rawptr(slot) != null) { return; }
+    ms_slot_install(slot, key, kind, 0);
+    ms_set_count(s, 1, cnt + 1);
+    if (kind == ms_kind_class()) {
+        let nc = ptr_read_i64(ptr_offset(s, 96)) + 1;
+        ptr_write_i64(ptr_offset(s, 96), nc);
+    } else if (kind == ms_kind_free_fn()) {
+        let nf = ptr_read_i64(ptr_offset(s, 104)) + 1;
+        ptr_write_i64(ptr_offset(s, 104), nf);
+    } else if (kind == ms_kind_method()) {
+        let nmm = ptr_read_i64(ptr_offset(s, 112)) + 1;
+        ptr_write_i64(ptr_offset(s, 112), nmm);
+    }
+    if (ms_needs_grow(cnt + 1, cap)) {
+        ms_grow(s, 1);
+    }
+}
+
+// ── Table layout selector (which == 0:unique, 1:ready, 2:failed) ────
+
+fn ms_table_offset(which: i32) -> i32 {
+    if (which == 0) { return 0; }
+    if (which == 1) { return 16; }
+    if (which == 2) { return 32; }
+    return 0;
+}
+
+fn ms_get_buf(s: rawptr, which: i32) -> rawptr {
+    if (s == null) { return null; }
+    return ast_read_rawptr(ptr_offset(s, ms_table_offset(which)));
+}
+
+fn ms_get_cap(s: rawptr, which: i32) -> i32 {
+    if (s == null) { return 0; }
+    return ptr_read_i32(ptr_offset(s, ms_table_offset(which) + 8));
+}
+
+fn ms_get_count(s: rawptr, which: i32) -> i32 {
+    if (s == null) { return 0; }
+    return ptr_read_i32(ptr_offset(s, ms_table_offset(which) + 12));
+}
+
+fn ms_set_count(s: rawptr, which: i32, count: i32) {
+    if (s == null) { return; }
+    ptr_write_i32(ptr_offset(s, ms_table_offset(which) + 12), count);
+}
+
+fn ms_set_table(s: rawptr, which: i32, buf: rawptr, cap: i32, count: i32) {
+    if (s == null) { return; }
+    let base = ms_table_offset(which);
+    ast_write_rawptr(ptr_offset(s, base), buf);
+    ptr_write_i32(ptr_offset(s, base + 8), cap);
+    ptr_write_i32(ptr_offset(s, base + 12), count);
+}
+
+// ── Hash table primitives ──────────────────────────────────────────
+
+fn ms_table_alloc(cap: i32) -> rawptr {
+    let bytes = (cap * ms_slot_size()) as u64;
+    let buf = malloc(bytes);
+    if (buf != null) { memset(buf, 0, bytes); }
+    return buf;
+}
+
+fn ms_table_dispose(buf: rawptr, cap: i32) {
+    if (buf == null) { return; }
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * ms_slot_size());
+        let kp = ast_read_rawptr(slot);
+        if (kp != null) {
+            free(kp);
+        }
+        i = i + 1;
+    }
+    free(buf);
+}
+
+fn ms_slot_install(slot: rawptr, key: string, kind: i32, extra: i32) {
+    ast_write_rawptr(slot, ms_dup_string(key));
+    ptr_write_i64(ptr_offset(slot, 8), key.len);
+    ptr_write_i32(ptr_offset(slot, 16), kind);
+    ptr_write_i32(ptr_offset(slot, 20), extra);
+}
+
+fn ms_slot_matches(slot: rawptr, key: string, kind: i32) -> bool {
+    let kp = ast_read_rawptr(slot);
+    if (kp == null) { return false; }
+    if (ptr_read_i32(ptr_offset(slot, 16)) != kind) { return false; }
+    let kl = ptr_read_i64(ptr_offset(slot, 8));
+    if (kl != key.len) { return false; }
+    if (kl == 0) { return true; }
+    return memcmp(kp, key.c_str(), kl as u64) == 0;
+}
+
+/// FNV-1a 64-bit over the composite `(kind_byte || 0x1f || key_bytes)`.
+/// Offset basis `1469598103934665603` matches `bootstrap.canon` (drops the
+/// original FNV top bit so it fits in i64; irrelevant for `& (cap-1)` use).
+fn ms_hash_composite(key: string, kind: i32) -> i64 {
+    var h: i64 = 1469598103934665603;
+    h = (h ^ (kind as i64)) * 1099511628211;
+    h = (h ^ 31) * 1099511628211;
+    var i: i32 = 0;
+    while (i < key.len) {
+        h = (h ^ (key.charAt(i) as i64)) * 1099511628211;
+        i = i + 1;
+    }
+    if (h < 0) { h = 0 - h; }
+    if (h < 0) { h = 0; }
+    return h;
+}
+
+fn ms_lookup_or_insert(buf: rawptr, cap: i32, key: string, kind: i32) -> rawptr {
+    if (buf == null || cap <= 0) { return null; }
+    let mask = (cap - 1) as i64;
+    var idx = (ms_hash_composite(key, kind) & mask) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = ptr_offset(buf, idx * ms_slot_size());
+        if (ast_read_rawptr(slot) == null) {
+            return slot;
+        }
+        if (ms_slot_matches(slot, key, kind)) {
+            return slot;
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn ms_needs_grow(count: i32, cap: i32) -> bool {
+    return (count * 5) > (cap * 3);
+}
+
+fn ms_grow(s: rawptr, which: i32) {
+    let old_buf = ms_get_buf(s, which);
+    let old_cap = ms_get_cap(s, which);
+    if (old_buf == null || old_cap <= 0) { return; }
+    let new_cap = old_cap * 2;
+    let new_buf = ms_table_alloc(new_cap);
+    if (new_buf == null) { return; }
+    var i: i32 = 0;
+    while (i < old_cap) {
+        let slot = ptr_offset(old_buf, i * ms_slot_size());
+        let kp = ast_read_rawptr(slot);
+        if (kp != null) {
+            let kl = ptr_read_i64(ptr_offset(slot, 8));
+            let kind = ptr_read_i32(ptr_offset(slot, 16));
+            let extra = ptr_read_i32(ptr_offset(slot, 20));
+            let key_str = from_cstr_len(kp, kl);
+            let dst = ms_lookup_or_insert(new_buf, new_cap, key_str, kind);
+            if (dst != null && ast_read_rawptr(dst) == null) {
+                // Move ownership of the existing key buffer instead of
+                // re-duplicating it; ms_table_dispose on `old_buf` will
+                // see a null slot and skip the free.
+                ast_write_rawptr(dst, kp);
+                ptr_write_i64(ptr_offset(dst, 8), kl);
+                ptr_write_i32(ptr_offset(dst, 16), kind);
+                ptr_write_i32(ptr_offset(dst, 20), extra);
+                ast_write_rawptr(slot, null);
+            }
+        }
+        i = i + 1;
+    }
+    ms_table_dispose(old_buf, old_cap);
+    ms_set_table(s, which, new_buf, new_cap, ms_get_count(s, which));
+}

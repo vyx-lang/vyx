@@ -1,0 +1,717 @@
+module std.reflect;
+
+use std.collections;
+use std.string;
+
+// ═══════════════════════════════════════════════════════════════
+//  RTTM-style Runtime Reflection for Vyx
+//  Three API layers matching RTTM (C++20 reflection):
+//    1. Compile-time: typeinfo(T).fields, sizeof::<T>()
+//    2. Cached:       reflect<T>(obj) → TypeMeta auto-populated
+//    3. Dynamic:      TypeBuilder + offset-based access
+// ═══════════════════════════════════════════════════════════════
+
+// ── Member Category (mirrors RTTM MemberCategory) ──
+
+public fn CATEGORY_PRIMITIVE()   -> i32 { return 0; }
+public fn CATEGORY_CLASS()       -> i32 { return 1; }
+public fn CATEGORY_SEQUENTIAL()  -> i32 { return 2; }
+public fn CATEGORY_ASSOCIATIVE() -> i32 { return 3; }
+public fn CATEGORY_ENUM()        -> i32 { return 4; }
+public fn CATEGORY_FUNCTION()    -> i32 { return 5; }
+public fn CATEGORY_STRING()      -> i32 { return 6; }
+
+public fn category_name(cat: i32) -> string {
+    if (cat == 0) { return "primitive"; }
+    if (cat == 1) { return "class"; }
+    if (cat == 2) { return "sequential"; }
+    if (cat == 3) { return "associative"; }
+    if (cat == 4) { return "enum"; }
+    if (cat == 5) { return "function"; }
+    if (cat == 6) { return "string"; }
+    return "unknown";
+}
+
+// ── FNV-1a String Hash ──
+
+public fn hash_name(s: string) -> i64 {
+    var hash: i64 = -3750763034362895579;
+    var i = 0;
+    while (i < s.len) {
+        var c: i64 = 0;
+        memcpy(to_rawptr(&c), s.ptr + i, 1);
+        hash = hash ^ c;
+        hash = hash * 1099511628211;
+        i = i + 1;
+    }
+    return hash;
+}
+
+// ── Size helpers ──
+
+public fn size_of_type(type_name: string) -> i64 {
+    if (type_name == "i8" || type_name == "u8" || type_name == "bool") { return 1; }
+    if (type_name == "i16" || type_name == "u16") { return 2; }
+    if (type_name == "i32" || type_name == "u32" || type_name == "f32" || type_name == "char") { return 4; }
+    if (type_name == "i64" || type_name == "u64" || type_name == "f64" || type_name == "rawptr") { return 8; }
+    if (type_name == "string") { return 32; }
+    return 8;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  FieldMeta — mirrors RTTM MemberInfo + PropertyHandle
+// ═══════════════════════════════════════════════════════════════
+
+class FieldMeta {
+    public name: string;
+    public type_name: string;
+    public index: i32;
+    public offset: i64;
+    public size: i64;
+    public category: i32;
+    public name_hash: i64;
+    public is_readonly: bool;
+
+    public static fn new(name: string, index: i32) -> FieldMeta {
+        return FieldMeta {
+            name: name, type_name: "", index: index,
+            offset: -1, size: -1, category: 0,
+            name_hash: hash_name(name), is_readonly: false
+        };
+    }
+
+    public static fn full(name: string, type_name: string, index: i32,
+                          offset: i64, size: i64, category: i32) -> FieldMeta {
+        return FieldMeta {
+            name: name, type_name: type_name, index: index,
+            offset: offset, size: size, category: category,
+            name_hash: hash_name(name), is_readonly: false
+        };
+    }
+
+    public fn is_primitive()   -> bool { return self.category == 0; }
+    public fn is_class()       -> bool { return self.category == 1; }
+    public fn is_sequential()  -> bool { return self.category == 2; }
+    public fn is_associative() -> bool { return self.category == 3; }
+    public fn is_string()      -> bool { return self.category == 6; }
+    public fn has_offset()     -> bool { return self.offset >= 0; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MethodMeta — mirrors RTTM MethodInfo
+// ═══════════════════════════════════════════════════════════════
+
+class MethodMeta {
+    public name: string;
+    public signature: string;
+    public return_type: string;
+    public param_count: i32;
+    public is_static: bool;
+    public is_const: bool;
+    public name_hash: i64;
+    public fn_ptr: rawptr;
+
+    public static fn new(name: string, sig: string, is_static: bool) -> MethodMeta {
+        return MethodMeta {
+            name: name, signature: sig, return_type: "",
+            param_count: 0, is_static: is_static, is_const: false,
+            name_hash: hash_name(name), fn_ptr: null
+        };
+    }
+
+    public static fn full(name: string, sig: string, ret: string,
+                          params: i32, is_static: bool, is_const: bool) -> MethodMeta {
+        return MethodMeta {
+            name: name, signature: sig, return_type: ret,
+            param_count: params, is_static: is_static, is_const: is_const,
+            name_hash: hash_name(name), fn_ptr: null
+        };
+    }
+
+    public static fn with_ptr(name: string, sig: string, ret: string,
+                              params: i32, ptr: rawptr) -> MethodMeta {
+        return MethodMeta {
+            name: name, signature: sig, return_type: ret,
+            param_count: params, is_static: false, is_const: false,
+            name_hash: hash_name(name), fn_ptr: ptr
+        };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TypeMeta — mirrors RTTM TypeInfo
+// ═══════════════════════════════════════════════════════════════
+
+// Force Mono to instantiate Iterator<FieldMeta> / Iterator<MethodMeta>
+// by referencing them in a (dead) function. Without this, the cascade
+// from `Vec<FieldMeta>`/`Vec<MethodMeta>` field types into
+// `Iterator<T>` (Vec<T>.iter's return type) doesn't fire for user-defined
+// T in the current Mono scan path.
+fn __force_iter_instances() {
+    let _a = Vec::<FieldMeta>.new();
+    let _b = Vec::<MethodMeta>.new();
+    let _ia = _a.iter();
+    let _ib = _b.iter();
+}
+
+class TypeMeta {
+    public name: string;
+    public size: i64;
+    public alignment: i64;
+    public field_count: i32;
+    public fields: Vec<FieldMeta>;
+    public methods: Vec<MethodMeta>;
+    public base_types: Vec<string>;
+    public is_enum: bool;
+    public name_hash: i64;
+
+    public static fn new(name: string, size: i64) -> TypeMeta {
+        return TypeMeta {
+            name: name, size: size, alignment: 0, field_count: 0,
+            fields: Vec::<FieldMeta>.new(),
+            methods: Vec::<MethodMeta>.new(),
+            base_types: Vec::<string>.new(),
+            is_enum: false,
+            name_hash: hash_name(name)
+        };
+    }
+
+    public fn find_field(name: string) -> Option<FieldMeta> {
+        let h = hash_name(name);
+        var i = 0;
+        while (i < self.fields.count()) {
+            let f = self.fields.get(i);
+            if (f.name_hash == h) {
+                if (f.name == name) { return Some(f); }
+            }
+            i = i + 1;
+        }
+        return None;
+    }
+
+    public fn has_field(name: string) -> bool {
+        let h = hash_name(name);
+        var i = 0;
+        while (i < self.fields.count()) {
+            let f = self.fields.get(i);
+            if (f.name_hash == h) {
+                if (f.name == name) { return true; }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn field_index(name: string) -> i64 {
+        let h = hash_name(name);
+        for (i in 0..self.fields.count()) {
+            let f = self.fields.get(i);
+            if (f.name_hash == h) {
+                if (f.name == name) { return i; }
+            }
+        }
+        return -1;
+    }
+
+    public fn find_method(name: string) -> Option<MethodMeta> {
+        let h = hash_name(name);
+        var i = 0;
+        while (i < self.methods.count()) {
+            let m = self.methods.get(i);
+            if (m.name_hash == h) {
+                if (m.name == name) { return Some(m); }
+            }
+            i = i + 1;
+        }
+        return None;
+    }
+
+    public fn has_method(name: string) -> bool {
+        let h = hash_name(name);
+        var i = 0;
+        while (i < self.methods.count()) {
+            let m = self.methods.get(i);
+            if (m.name_hash == h) {
+                if (m.name == name) { return true; }
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn is_base_of(other_name: string) -> bool {
+        var i = 0;
+        while (i < self.base_types.count()) {
+            if (self.base_types.get(i) == other_name) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn field_names() -> Vec<string> {
+        var names = Vec::<string>.new();
+        var i = 0;
+        while (i < self.fields.count()) {
+            names.push(self.fields.get(i).name);
+            i = i + 1;
+        }
+        return names;
+    }
+
+    public fn method_names() -> Vec<string> {
+        var names = Vec::<string>.new();
+        var i = 0;
+        while (i < self.methods.count()) {
+            names.push(self.methods.get(i).name);
+            i = i + 1;
+        }
+        return names;
+    }
+
+    public fn total_size() -> i64 {
+        if (self.size > 0) { return self.size; }
+        var total: i64 = 0;
+        var i = 0;
+        while (i < self.fields.count()) {
+            let f = self.fields.get(i);
+            if (f.size > 0) { total = total + f.size; }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    // ── Offset-based field access ──
+
+    public fn get_field_i64(obj: rawptr, name: string) -> i64 {
+        let idx = self.field_index(name);
+        if (idx < 0) { panic("TypeMeta: field not found"); return 0; }
+        let f = self.fields.get(idx);
+        var val: i64 = 0;
+        unsafe { memcpy(to_rawptr(&val), obj + f.offset, 8); }
+        return val;
+    }
+
+    public fn set_field_i64(obj: rawptr, name: string, val: i64) {
+        let idx = self.field_index(name);
+        if (idx < 0) { panic("TypeMeta: field not found"); }
+        let f = self.fields.get(idx);
+        unsafe { memcpy(obj + f.offset, to_rawptr(&val), 8); }
+    }
+
+    public fn clone_into(src: rawptr, dst: rawptr) {
+        if (self.size > 0) {
+            unsafe { memcpy(dst, src, self.size); }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Offset-based field access (free functions)
+//  Mirrors RTTM PropertyHandle::get/set
+// ═══════════════════════════════════════════════════════════════
+
+public fn read_i64(obj: rawptr, offset: i64) -> i64 {
+    var val: i64 = 0;
+    memcpy(to_rawptr(&val), obj + offset, 8);
+    return val;
+}
+
+public fn write_i64(obj: rawptr, offset: i64, val: i64) {
+    memcpy(obj + offset, to_rawptr(&val), 8);
+}
+
+public fn read_i32(obj: rawptr, offset: i64) -> i32 {
+    var val: i32 = 0;
+    memcpy(to_rawptr(&val), obj + offset, 4);
+    return val;
+}
+
+public fn write_i32(obj: rawptr, offset: i64, val: i32) {
+    memcpy(obj + offset, to_rawptr(&val), 4);
+}
+
+public fn read_f64(obj: rawptr, offset: i64) -> f64 {
+    var val: f64 = 0.0;
+    memcpy(to_rawptr(&val), obj + offset, 8);
+    return val;
+}
+
+public fn write_f64(obj: rawptr, offset: i64, val: f64) {
+    memcpy(obj + offset, to_rawptr(&val), 8);
+}
+
+public fn read_bool(obj: rawptr, offset: i64) -> bool {
+    var val: i64 = 0;
+    memcpy(to_rawptr(&val), obj + offset, 1);
+    return val != 0;
+}
+
+public fn write_bool(obj: rawptr, offset: i64, val: bool) {
+    var v: i64 = 0;
+    if (val) { v = 1; }
+    memcpy(obj + offset, to_rawptr(&v), 1);
+}
+
+public fn copy_field(src: rawptr, dst: rawptr, offset: i64, size: i64) {
+    memcpy(dst + offset, src + offset, size);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Global Type Registry (mirrors RTTM TypeManager)
+// ═══════════════════════════════════════════════════════════════
+
+var g_type_registry: Dict<i64, TypeMeta>;
+var g_type_names: Vec<string>;
+var g_registry_initialized: bool = false;
+
+public fn ensure_registry() {
+    if (!g_registry_initialized) {
+        g_type_registry = Dict::<i64, TypeMeta>.new();
+        g_type_names = Vec::<string>.new();
+        g_registry_initialized = true;
+    }
+}
+
+public fn register_type(meta: TypeMeta) {
+    ensure_registry();
+    let h = hash_name(meta.name);
+    if (!g_type_registry.contains(h)) {
+        g_type_names.push(meta.name);
+    }
+    g_type_registry.put(h, meta);
+}
+
+public fn get_type(name: string) -> Option<TypeMeta> {
+    ensure_registry();
+    let h = hash_name(name);
+    if (g_type_registry.contains(h)) {
+        return Some(g_type_registry.get(h));
+    }
+    return None;
+}
+
+public fn has_type(name: string) -> bool {
+    ensure_registry();
+    return g_type_registry.contains(hash_name(name));
+}
+
+public fn type_count() -> i64 {
+    ensure_registry();
+    return g_type_registry.count();
+}
+
+public fn all_type_names() -> Vec<string> {
+    ensure_registry();
+    // Return a fresh copy so the global retains ownership; the caller can
+    // mutate its result without invalidating the registry-side Vec.
+    var out = Vec::<string>.new();
+    var i: i64 = 0;
+    while (i < g_type_names.len) { out.push(g_type_names.get(i)); i = i + 1; }
+    return out;
+}
+
+public fn unregister_type(name: string) -> bool {
+    ensure_registry();
+    let h = hash_name(name);
+    if (g_type_registry.contains(h)) {
+        g_type_registry.remove(h);
+        return true;
+    }
+    return false;
+}
+
+// ── Type Hierarchy ──
+
+public fn is_a(type_name: string, base_name: string) -> bool {
+    if (type_name == base_name) { return true; }
+    let maybe = get_type(type_name);
+    match (maybe) {
+        case Some(meta) => {
+            if (meta.is_base_of(base_name)) { return true; }
+        }
+        default => {}
+    }
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Automatic Registration (Layer 2)
+// ═══════════════════════════════════════════════════════════════
+
+public fn reflect<T>(obj: T) -> TypeMeta {
+    let name = type_name::<T>();
+    ensure_registry();
+    let h = hash_name(name);
+    if (g_type_registry.contains(h)) {
+        return g_type_registry.get(h);
+    }
+    var meta = TypeMeta.new(name, sizeof::<T>());
+    var idx: i32 = 0;
+    for (field_name in typeinfo(T).fields) {
+        meta.fields.push(FieldMeta.new(field_name, idx));
+        idx = idx + 1;
+    }
+    meta.field_count = idx;
+    g_type_names.push(name);
+    g_type_registry.put(h, meta);
+    return meta;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TypeBuilder (mirrors RTTM Registry<T>)
+// ═══════════════════════════════════════════════════════════════
+
+class TypeBuilder {
+    public meta: TypeMeta;
+
+    public static fn begin(name: string, size: i64) -> TypeBuilder {
+        return TypeBuilder { meta: TypeMeta.new(name, size) };
+    }
+
+    public fn set_alignment(align: i64) {
+        self.meta.alignment = align;
+    }
+
+    public fn set_enum() {
+        self.meta.is_enum = true;
+    }
+
+    public fn add_field(name: string, type_name: string) {
+        let idx = self.meta.field_count;
+        self.meta.fields.push(FieldMeta {
+            name: name, type_name: type_name, index: idx,
+            offset: -1, size: -1, category: CATEGORY_PRIMITIVE(),
+            name_hash: hash_name(name), is_readonly: false
+        });
+        self.meta.field_count = idx + 1;
+    }
+
+    public fn add_field_full(name: string, type_name: string,
+                             offset: i64, size: i64) {
+        let idx = self.meta.field_count;
+        let cat = infer_category(type_name);
+        self.meta.fields.push(FieldMeta {
+            name: name, type_name: type_name, index: idx,
+            offset: offset, size: size, category: cat,
+            name_hash: hash_name(name), is_readonly: false
+        });
+        self.meta.field_count = idx + 1;
+    }
+
+    public fn add_field_readonly(name: string, type_name: string,
+                                 offset: i64, size: i64) {
+        let idx = self.meta.field_count;
+        let cat = infer_category(type_name);
+        self.meta.fields.push(FieldMeta {
+            name: name, type_name: type_name, index: idx,
+            offset: offset, size: size, category: cat,
+            name_hash: hash_name(name), is_readonly: true
+        });
+        self.meta.field_count = idx + 1;
+    }
+
+    public fn add_field_cat(name: string, type_name: string,
+                            offset: i64, size: i64, category: i32) {
+        let idx = self.meta.field_count;
+        self.meta.fields.push(FieldMeta {
+            name: name, type_name: type_name, index: idx,
+            offset: offset, size: size, category: category,
+            name_hash: hash_name(name), is_readonly: false
+        });
+        self.meta.field_count = idx + 1;
+    }
+
+    public fn add_method(name: string, sig: string) {
+        self.meta.methods.push(MethodMeta.new(name, sig, false));
+    }
+
+    public fn add_method_full(name: string, sig: string, ret: string,
+                              params: i32, is_const: bool) {
+        self.meta.methods.push(MethodMeta.full(name, sig, ret, params, false, is_const));
+    }
+
+    public fn add_static_method(name: string, sig: string) {
+        self.meta.methods.push(MethodMeta.new(name, sig, true));
+    }
+
+    public fn add_method_with_ptr(name: string, sig: string, ret: string,
+                                  params: i32, ptr: rawptr) {
+        self.meta.methods.push(MethodMeta.with_ptr(name, sig, ret, params, ptr));
+    }
+
+    public fn add_base(base_name: string) {
+        self.meta.base_types.push(base_name);
+        let maybe_base = get_type(base_name);
+        match (maybe_base) {
+            case Some(base_meta) => {
+                var i = 0;
+                while (i < base_meta.fields.count()) {
+                    let f = base_meta.fields.get(i);
+                    if (!self.meta.has_field(f.name)) {
+                        self.meta.fields.push(f);
+                        self.meta.field_count = self.meta.field_count + 1;
+                    }
+                    i = i + 1;
+                }
+                var j = 0;
+                while (j < base_meta.methods.count()) {
+                    let m = base_meta.methods.get(j);
+                    if (!self.meta.has_method(m.name)) {
+                        self.meta.methods.push(m);
+                    }
+                    j = j + 1;
+                }
+            }
+            default => {}
+        }
+    }
+
+    public fn register() -> TypeMeta {
+        // Delegate to the free function so the move-analysis only sees a
+        // single mutation site on g_type_names — avoids Sema's conservative
+        // "moved value" error when both this method and the free helper
+        // mutate the same global.
+        register_type(self.meta);
+        return self.meta;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Category Inference
+// ═══════════════════════════════════════════════════════════════
+
+fn infer_category(type_name: string) -> i32 {
+    if (type_name == "i8" || type_name == "i16" || type_name == "i32" || type_name == "i64" ||
+        type_name == "u8" || type_name == "u16" || type_name == "u32" || type_name == "u64" ||
+        type_name == "f32" || type_name == "f64" || type_name == "bool" || type_name == "char") {
+        return CATEGORY_PRIMITIVE();
+    }
+    if (type_name == "string") { return CATEGORY_STRING(); }
+    if (str_starts_with(type_name, "Vec<") || str_starts_with(type_name, "Stack<") ||
+        str_starts_with(type_name, "Queue<") || str_starts_with(type_name, "Set<")) {
+        return CATEGORY_SEQUENTIAL();
+    }
+    if (str_starts_with(type_name, "Dict<") || str_starts_with(type_name, "HashMap<")) {
+        return CATEGORY_ASSOCIATIVE();
+    }
+    if (str_starts_with(type_name, "Option<") || str_starts_with(type_name, "Result<")) {
+        return CATEGORY_ENUM();
+    }
+    if (str_starts_with(type_name, "fn(")) {
+        return CATEGORY_FUNCTION();
+    }
+    return CATEGORY_CLASS();
+}
+
+fn str_starts_with(s: string, prefix: string) -> bool {
+    if (s.len < prefix.len) { return false; }
+    var i = 0;
+    while (i < prefix.len) {
+        if (s[i] != prefix[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Dump Utilities
+// ═══════════════════════════════════════════════════════════════
+
+public fn dump_type(name: string) {
+    let maybe_meta = get_type(name);
+    match (maybe_meta) {
+        case Some(meta) => {
+            print("=== ");
+            print(meta.name);
+            print(" ===\n");
+            print("  size: ");
+            print(meta.size);
+            if (meta.alignment > 0) {
+                print(", align: ");
+                print(meta.alignment);
+            }
+            print(", fields: ");
+            print(meta.field_count);
+            if (meta.is_enum) { print(" [enum]"); }
+            print("\n");
+
+            if (meta.base_types.count() > 0) {
+                print("  bases: ");
+                var b = 0;
+                while (b < meta.base_types.count()) {
+                    if (b > 0) { print(", "); }
+                    print(meta.base_types.get(b));
+                    b = b + 1;
+                }
+                print("\n");
+            }
+
+            var i = 0;
+            while (i < meta.fields.count()) {
+                let f = meta.fields.get(i);
+                print("  [");
+                print(f.index);
+                print("] ");
+                print(f.name);
+                if (f.type_name != "") {
+                    print(": ");
+                    print(f.type_name);
+                }
+                if (f.offset >= 0) {
+                    print(" @");
+                    print(f.offset);
+                    print("+");
+                    print(f.size);
+                }
+                if (f.category != 0) {
+                    print(" (");
+                    print(category_name(f.category));
+                    print(")");
+                }
+                if (f.is_readonly) { print(" [readonly]"); }
+                print("\n");
+                i = i + 1;
+            }
+
+            if (meta.methods.count() > 0) {
+                print("  methods:\n");
+                var j = 0;
+                while (j < meta.methods.count()) {
+                    let m = meta.methods.get(j);
+                    print("    ");
+                    if (m.is_static) { print("static "); }
+                    if (m.is_const) { print("const "); }
+                    print(m.name);
+                    if (m.signature != "") {
+                        print(": ");
+                        print(m.signature);
+                    }
+                    if (m.return_type != "") {
+                        print(" -> ");
+                        print(m.return_type);
+                    }
+                    print("\n");
+                    j = j + 1;
+                }
+            }
+        }
+        default => {
+            print("Type '");
+            print(name);
+            print("' not registered\n");
+        }
+    }
+}
+
+public fn dump_all_types() {
+    ensure_registry();
+    let names = g_type_names;
+    print("=== Registered Types (");
+    print(type_count());
+    print(") ===\n");
+    var i = 0;
+    while (i < names.count()) {
+        dump_type(names.get(i));
+        i = i + 1;
+    }
+}

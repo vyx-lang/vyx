@@ -1,0 +1,495 @@
+module bootstrap.hir_type_table;
+
+use bootstrap.ast;
+use bootstrap.hir_ids;
+use bootstrap.policy;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn vyx_forget_string_len(s: rawptr);
+}
+
+fn hir_type_record_size() -> i32 { return 40; }
+
+public fn hir_type_flag_value_struct() -> i32 { return 1; }
+
+/// Structured openness marker: set when the type is known (by construction,
+/// not by text heuristics) to mention an unbound template param. Interning
+/// propagates the flag from element types; the builder sets it on generic
+/// env params/args it registers. This is the ID-level replacement path for
+/// the single-uppercase-letter heuristic.
+public fn hir_type_flag_open() -> i32 { return 2; }
+
+/// Type layout and lifecycle are owned by a verified DCI descriptor, not by
+/// Vyx record emission.
+public fn hir_type_flag_foreign_dci() -> i32 { return 4; }
+
+/// Source compatibility for the first C++ DCI profile.
+public fn hir_type_flag_foreign_cpp() -> i32 { return hir_type_flag_foreign_dci(); }
+public fn hir_type_flag_repr_c() -> i32 { return 8; }
+public fn hir_type_flag_repr_packed() -> i32 { return 16; }
+public fn hir_type_repr_align_from_flags(flags: i32) -> i32 {
+    return (flags >> 16) & 255;
+}
+public fn hir_type_flag_repr_align(align: i32) -> i32 {
+    return (align & 255) << 16;
+}
+
+fn hir_type_record_at(buf: rawptr, id: i32) -> rawptr {
+    if (buf == null || id <= 0) { return null; }
+    return ptr_offset(buf, (id - 1) * hir_type_record_size());
+}
+
+fn hir_type_write_string(rec: rawptr, text: string) {
+    if (rec == null) { return; }
+    let slot = ptr_offset(rec, 16);
+    let old_ptr = ast_read_rawptr(slot);
+    if (old_ptr != null) {
+        vyx_forget_string_len(old_ptr);
+        free(old_ptr);
+    }
+    if (text.len <= 0) {
+        ast_write_rawptr(slot, null);
+        ast_write_i64(ptr_offset(rec, 24), 0);
+        return;
+    }
+    ast_write_rawptr(slot, ast_dup_c_string(text));
+    ast_write_i64(ptr_offset(rec, 24), text.len);
+}
+
+fn hir_type_read_string(rec: rawptr) -> string {
+    if (rec == null) { return ""; }
+    let ptr = ast_read_rawptr(ptr_offset(rec, 16));
+    let len = ast_read_i64(ptr_offset(rec, 24));
+    if (ptr == null || len <= 0) { return ""; }
+    return from_cstr_view_len(ptr, len);
+}
+
+fn hir_type_record_text_equals(rec: rawptr, text: string) -> bool {
+    if (rec == null) { return false; }
+    let ptr = ast_read_rawptr(ptr_offset(rec, 16));
+    let len = ast_read_i64(ptr_offset(rec, 24));
+    if (len != text.len) { return false; }
+    if (len <= 0) { return true; }
+    if (ptr == null) { return false; }
+    return memcmp(ptr, text.c_str(), len as u64) == 0;
+}
+
+fn hir_type_expr_text(e: rawptr) -> string {
+    if (e == null) { return ""; }
+    let k = expr_get_kind(e);
+    if (k == ex_INT_LIT()) { return policy_i64_to_string(expr_get_int_val(e)); }
+    if (k == ex_IDENT()) { return expr_get_name(e); }
+    if (k == ex_BOOL_LIT()) {
+        if (expr_get_int_val(e) == 0) { return "false"; }
+        return "true";
+    }
+    if (k == ex_BIN()) {
+        return hir_type_expr_text(expr_get_lhs(e))
+            + "#" + policy_i64_to_string(expr_get_op(e) as i64)
+            + "#" + hir_type_expr_text(expr_get_rhs(e));
+    }
+    if (k == ex_UNARY()) {
+        return "u" + policy_i64_to_string(expr_get_op(e) as i64)
+            + "(" + hir_type_expr_text(expr_get_lhs(e)) + ")";
+    }
+    let name = expr_get_name(e);
+    if (name.len > 0) {
+        return "expr" + policy_i64_to_string(k as i64) + ":" + name;
+    }
+    return "expr" + policy_i64_to_string(k as i64);
+}
+
+fn hir_type_append_csv(base: string, next: string) -> string {
+    if (next.len == 0) { return base; }
+    if (base.len == 0) { return next; }
+    return base + "," + next;
+}
+
+fn hir_type_normalize_name(name: string) -> string {
+    if (name.len == 0) { return ""; }
+    if (name == "string" || name == "__String") { return "str"; }
+    if (policy_generic_call_has_args(name.clone()) != 0) {
+        let base = policy_generic_call_base(name.clone());
+        let raw_args = policy_generic_call_args(name.clone());
+        var out_args = "";
+        var i: i32 = 0;
+        while (i < 64) {
+            let raw_arg = policy_generic_arg_at(raw_args, i);
+            if (raw_arg.len == 0) {
+                if (out_args.len == 0) { return hir_type_normalize_name(base); }
+                return hir_type_normalize_name(base) + "::<" + out_args + ">";
+            }
+            out_args = hir_type_append_csv(out_args, hir_type_normalize_name(raw_arg));
+            i = i + 1;
+        }
+        return hir_type_normalize_name(base) + "::<" + out_args + ">";
+    }
+    return name;
+}
+
+fn hir_type_primitive_kind_for_name(name: string) -> i32 {
+    if (name == "i32") { return ty_I32(); }
+    if (name == "i64") { return ty_I64(); }
+    if (name == "bool") { return ty_BOOL(); }
+    if (name == "char") { return ty_CHAR(); }
+    if (name == "str" || name == "string" || name == "__String") { return ty_STRING(); }
+    if (name == "rawptr") { return ty_RAWPTR(); }
+    if (name == "void") { return ty_VOID(); }
+    if (name == "f32") { return ty_F32(); }
+    if (name == "f64") { return ty_F64(); }
+    if (name == "i8") { return ty_I8(); }
+    if (name == "i16") { return ty_I16(); }
+    if (name == "u8") { return ty_U8(); }
+    if (name == "u16") { return ty_U16(); }
+    if (name == "u32") { return ty_U32(); }
+    if (name == "u64") { return ty_U64(); }
+    if (name == "isize") { return ty_ISIZE(); }
+    if (name == "usize") { return ty_USIZE(); }
+    return hir_type_unknown();
+}
+
+/// `(A,B,...)` is a tuple row, not a class row.
+///
+/// Codegen derives a tuple's elements, layout and member addresses from its
+/// text alone (llvm_lower's `tuple_element_count_for_type` /
+/// `tuple_element_type_id`), and a class row for the same text is an aggregate
+/// that has fields but no record layout -- I0100 "class aggregate has fields
+/// but no record layout for (f64,i32)".  Generic substitution rebuilds an
+/// instantiated tuple from text (`substitute_type_id` has no TUPLE branch), so
+/// every instantiated tuple reaches `intern_name`; interning it as CLASS is
+/// what made a generic tuple unusable.
+///
+/// `(T)` is grouping, not a 1-tuple, so a top-level comma is required, and a
+/// `->` marks a function type whose parameter list is not a tuple row.
+fn hir_type_table_text_is_tuple(name: string) -> bool {
+    if (name.len < 3) { return false; }
+    if (name.charAt(0) != 40) { return false; }
+    if (name.charAt(name.len - 1) != 41) { return false; }
+    var depth: i32 = 0;
+    var i: i32 = 1;
+    while (i < name.len - 1) {
+        let c = name.charAt(i);
+        if (c == 40 || c == 60) { depth = depth + 1; }
+        else if (c == 41 || c == 62) { depth = depth - 1; }
+        else if (c == 45 && i + 1 < name.len - 1 && name.charAt(i + 1) == 62) {
+            return false;
+        } else if (c == 44 && depth == 0) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+public class HirTypeTable {
+    public buf: rawptr
+    public count: i32
+    public cap: i32
+
+    public static fn create() -> HirTypeTable {
+        let initial_cap: i32 = 128;
+        let bytes = initial_cap * hir_type_record_size();
+        let p = malloc(bytes as u64);
+        if (p != null) { memset(p, 0, bytes as u64); }
+        return HirTypeTable {
+            buf: p,
+            count: 0,
+            cap: initial_cap
+        };
+    }
+
+    public fn ensure_cap(self, want_count: i32) {
+        if (want_count <= self.cap) { return; }
+        var new_cap = self.cap;
+        if (new_cap <= 0) { new_cap = 128; }
+        while (new_cap < want_count) {
+            new_cap = new_cap * 2;
+        }
+        let new_bytes = new_cap * hir_type_record_size();
+        let new_buf = malloc(new_bytes as u64);
+        if (new_buf == null) { return; }
+        memset(new_buf, 0, new_bytes as u64);
+        if (self.buf != null && self.count > 0) {
+            let copy_count: i64 = self.count as i64;
+            let copy_rec_size: i64 = hir_type_record_size() as i64;
+            let copy_bytes: i64 = copy_count * copy_rec_size;
+            memcpy(new_buf, self.buf, copy_bytes as u64);
+        }
+        if (self.buf != null) { free(self.buf); }
+        self.buf = new_buf;
+        self.cap = new_cap;
+    }
+
+    public fn record(self, id: i32) -> rawptr {
+        return hir_type_record_at(self.buf, id);
+    }
+
+    public fn kind(self, id: i32) -> i32 {
+        let rec = self.record(id);
+        if (rec == null) { return hir_type_unknown(); }
+        return ast_read_i32(ptr_offset(rec, 4));
+    }
+
+    public fn text(self, id: i32) -> string {
+        return hir_type_read_string(self.record(id));
+    }
+
+    public fn elem(self, id: i32) -> i32 {
+        let rec = self.record(id);
+        if (rec == null) { return hir_id_invalid(); }
+        return ast_read_i32(ptr_offset(rec, 8));
+    }
+
+    public fn aux(self, id: i32) -> i32 {
+        let rec = self.record(id);
+        if (rec == null) { return hir_id_invalid(); }
+        return ast_read_i32(ptr_offset(rec, 12));
+    }
+
+    public fn flags(self, id: i32) -> i32 {
+        let rec = self.record(id);
+        if (rec == null) { return 0; }
+        return ast_read_i32(ptr_offset(rec, 32));
+    }
+
+    public fn add_flags(self, id: i32, flags: i32) {
+        let rec = self.record(id);
+        if (rec == null) { return; }
+        ast_write_i32(ptr_offset(rec, 32), ast_read_i32(ptr_offset(rec, 32)) | flags);
+    }
+
+    public fn find(self, kind: i32, text: string, elem_id: i32, aux_id: i32) -> i32 {
+        var id: i32 = 1;
+        while (id <= self.count) {
+            let rec = self.record(id);
+            if (rec != null
+                && ast_read_i32(ptr_offset(rec, 4)) == kind
+                && ast_read_i32(ptr_offset(rec, 8)) == elem_id
+                && ast_read_i32(ptr_offset(rec, 12)) == aux_id
+                && hir_type_record_text_equals(rec, text)) {
+                return id;
+            }
+            id = id + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    public fn intern(self, kind: i32, text: string, elem_id: i32, aux_id: i32) -> i32 {
+        let found = self.find(kind, text, elem_id, aux_id);
+        if (found != hir_id_invalid()) { return found; }
+        var new_id: i32 = self.count;
+        new_id = new_id + 1;
+        self.ensure_cap(new_id);
+        let rec = self.record(new_id);
+        if (rec == null) { return hir_id_invalid(); }
+        ast_write_i32(rec, new_id);
+        ast_write_i32(ptr_offset(rec, 4), kind);
+        ast_write_i32(ptr_offset(rec, 8), elem_id);
+        ast_write_i32(ptr_offset(rec, 12), aux_id);
+        hir_type_write_string(rec, text);
+        self.count = new_id;
+        if (elem_id != hir_id_invalid()
+            && (self.flags(elem_id) & hir_type_flag_open()) != 0) {
+            self.add_flags(new_id, hir_type_flag_open());
+        }
+        return new_id;
+    }
+
+    /// Single intern path for a type name: normalize `Vec<i32>` / `Vec::<i32>`
+    /// / nested args to one text, intern arg TypeIds into elem/aux/extra
+    /// (3rd generic arg at record offset 36), then intern the class row.
+    public fn intern_name(self, name: string) -> i32 {
+        if (name.len == 0) { return self.intern(ty_VOID(), "void", 0, 0); }
+        let normalized = hir_type_normalize_name(name);
+        let pk = hir_type_primitive_kind_for_name(normalized);
+        if (pk != hir_type_unknown()) {
+            return self.intern(pk, self.primitive_name(pk), 0, 0);
+        }
+        var elem_id: i32 = 0;
+        var aux_id: i32 = 0;
+        var extra_id: i32 = 0;
+        if (policy_generic_call_has_args(normalized.clone()) != 0) {
+            let raw_args = policy_generic_call_args(normalized.clone());
+            let a0 = policy_generic_arg_at(raw_args.clone(), 0);
+            if (a0.len > 0) { elem_id = self.intern_name(a0); }
+            let a1 = policy_generic_arg_at(raw_args.clone(), 1);
+            if (a1.len > 0) { aux_id = self.intern_name(a1); }
+            let a2 = policy_generic_arg_at(raw_args.clone(), 2);
+            if (a2.len > 0) { extra_id = self.intern_name(a2); }
+            var gi: i32 = 3;
+            while (gi < 64) {
+                let ax = policy_generic_arg_at(raw_args.clone(), gi);
+                if (ax.len == 0) { gi = 64; }
+                else {
+                    self.intern_name(ax);
+                    gi = gi + 1;
+                }
+            }
+        }
+        var row_kind: i32 = ty_CLASS();
+        if (hir_type_table_text_is_tuple(normalized.clone())) { row_kind = ty_TUPLE(); }
+        let id = self.intern(row_kind, normalized, elem_id, aux_id);
+        if (extra_id > 0) {
+            let rec = self.record(id);
+            if (rec != null) { ast_write_i32(ptr_offset(rec, 36), extra_id); }
+        }
+        return id;
+    }
+
+    public fn extra(self, id: i32) -> i32 {
+        let rec = self.record(id);
+        if (rec == null) { return hir_id_invalid(); }
+        return ast_read_i32(ptr_offset(rec, 36));
+    }
+
+    public fn is_open(self, id: i32) -> bool {
+        return (self.flags(id) & hir_type_flag_open()) != 0;
+    }
+
+    public fn primitive_name(self, kind: i32) -> string {
+        if (kind == ty_I32()) { return "i32"; }
+        if (kind == ty_I64()) { return "i64"; }
+        if (kind == ty_BOOL()) { return "bool"; }
+        if (kind == ty_CHAR()) { return "char"; }
+        if (kind == ty_STRING()) { return "str"; }
+        if (kind == ty_RAWPTR()) { return "rawptr"; }
+        if (kind == ty_VOID()) { return "void"; }
+        if (kind == ty_F32()) { return "f32"; }
+        if (kind == ty_F64()) { return "f64"; }
+        if (kind == ty_I8()) { return "i8"; }
+        if (kind == ty_I16()) { return "i16"; }
+        if (kind == ty_U8()) { return "u8"; }
+        if (kind == ty_U16()) { return "u16"; }
+        if (kind == ty_U32()) { return "u32"; }
+        if (kind == ty_U64()) { return "u64"; }
+        if (kind == ty_ISIZE()) { return "isize"; }
+        if (kind == ty_USIZE()) { return "usize"; }
+        if (kind == ty_RANGE()) { return "Range"; }
+        return "";
+    }
+
+    public fn intern_type_ref(self, ty: rawptr) -> i32 {
+        if (ty == null) { return self.intern(ty_VOID(), "void", 0, 0); }
+        let kind = tref_get_kind(ty);
+        let primitive = self.primitive_name(kind);
+        if (primitive.len > 0) {
+            return self.intern(kind, primitive, 0, 0);
+        }
+        if (kind == ty_CLASS()) {
+            return self.intern_name(tref_get_name(ty));
+        }
+        if (kind == ty_PTR() || kind == ty_REF() || kind == ty_MUTREF()) {
+            let elem_id = self.intern_type_ref(tref_pointee(ty));
+            var prefix = "ptr";
+            if (kind == ty_REF()) { prefix = "ref"; }
+            if (kind == ty_MUTREF()) { prefix = "mutref"; }
+            return self.intern(kind, prefix + "<" + self.text(elem_id) + ">", elem_id, 0);
+        }
+        if (kind == ty_ARRAY()) {
+            let elem_arr = self.intern_type_ref(tref_array_elem(ty));
+            let len_text = hir_type_expr_text(tref_array_size_expr(ty));
+            return self.intern(kind,
+                               "[" + self.text(elem_arr) + ";" + len_text + "]",
+                               elem_arr,
+                               0);
+        }
+        if (kind == ty_TUPLE()) {
+            var text = "(";
+            var tuple_open: bool = false;
+            let n = tref_tuple_count(ty);
+            var i: i64 = 0;
+            while (i < n) {
+                if (i > 0) { text = text + ","; }
+                let elem_tuple = self.intern_type_ref(tref_tuple_elem_at(ty, i));
+                if ((self.flags(elem_tuple) & hir_type_flag_open()) != 0) {
+                    tuple_open = true;
+                }
+                text = text + self.text(elem_tuple);
+                i = i + 1;
+            }
+            text = text + ")";
+            let tuple_id = self.intern(kind, text, 0, 0);
+            if (tuple_open) { self.add_flags(tuple_id, hir_type_flag_open()); }
+            return tuple_id;
+        }
+        if (kind == ty_FN() || kind == ty_CFN()) {
+            var params_text = "(";
+            var param_open: bool = false;
+            let param_count = tref_fn_param_count(ty);
+            var pi: i64 = 0;
+            while (pi < param_count) {
+                if (pi > 0) { params_text = params_text + ","; }
+                let param_ty = self.intern_type_ref(tref_fn_param_at(ty, pi));
+                if ((self.flags(param_ty) & hir_type_flag_open()) != 0) {
+                    param_open = true;
+                }
+                params_text = params_text + self.text(param_ty);
+                pi = pi + 1;
+            }
+            params_text = params_text + ")";
+            let ret_id = self.intern_type_ref(tref_fn_ret(ty));
+            var fn_prefix = "fn";
+            if (kind == ty_CFN()) { fn_prefix = "cfn"; }
+            let fn_id = self.intern(kind,
+                                    fn_prefix + params_text + "->" + self.text(ret_id),
+                                    ret_id,
+                                    0);
+            if (param_open) { self.add_flags(fn_id, hir_type_flag_open()); }
+            return fn_id;
+        }
+        let name2 = tref_get_name(ty);
+        if (name2.len > 0) {
+            return self.intern(kind, name2, 0, 0);
+        }
+        return self.intern(kind, "type#" + policy_i64_to_string(kind as i64), 0, 0);
+    }
+}
+
+public fn hir_type_table_record(table: HirTypeTable, id: i32) -> rawptr {
+    return table.record(id);
+}
+
+public fn hir_type_table_kind(table: HirTypeTable, id: i32) -> i32 {
+    return table.kind(id);
+}
+
+public fn hir_type_table_text(table: HirTypeTable, id: i32) -> string {
+    return table.text(id);
+}
+
+public fn hir_type_table_elem(table: HirTypeTable, id: i32) -> i32 {
+    return table.elem(id);
+}
+
+public fn hir_type_table_aux(table: HirTypeTable, id: i32) -> i32 {
+    return table.aux(id);
+}
+
+public fn hir_type_table_extra(table: HirTypeTable, id: i32) -> i32 {
+    return table.extra(id);
+}
+
+public fn hir_type_table_flags(table: HirTypeTable, id: i32) -> i32 {
+    return table.flags(id);
+}
+
+public fn hir_type_table_add_flags(table: &mut HirTypeTable, id: i32, flags: i32) {
+    table.add_flags(id, flags);
+}
+
+public fn hir_type_table_is_open(table: HirTypeTable, id: i32) -> bool {
+    return table.is_open(id);
+}
+
+public fn hir_type_table_mark_open(table: &mut HirTypeTable, id: i32) {
+    table.add_flags(id, hir_type_flag_open());
+}
+
+public fn hir_type_table_intern_type_ref(table: &mut HirTypeTable, ty: rawptr) -> i32 {
+    return table.intern_type_ref(ty);
+}

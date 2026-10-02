@@ -1,0 +1,152 @@
+module std.clone;
+
+use std.string;
+
+/// Vyx Standard Library — Clone trait (P4 memory model, explicit escape
+/// hatch for move-by-default).
+///
+/// # Two contracts under one name
+///
+/// `.clone()` means two fundamentally different things in Vyx depending
+/// on what the receiver owns. The distinction is load-bearing: mixing
+/// the two leads to either silent double-frees (deep-copy expected,
+/// refcount-bump delivered) or runaway memory (refcount-bump expected,
+/// deep-copy delivered on every handle pass). Every `impl Clone for X`
+/// in std picks exactly one of the two and documents it at the method
+/// site.
+///
+/// ## Contract A — Deep copy (heap-owning containers, `Box<T>`)
+///
+/// Applies to: `Vec<T>`, `Dict<K,V>`, `HashMap<K,V>`, `HashSet<T>`,
+/// `Set<T>`, `Stack<T>`, `Queue<T>`, `Deque<T>`, `List<T>`,
+/// `BTreeMap<K,V>`, `BTreeSet<T>`, `PriorityQueue<T>`, `String` / the
+/// primitive `string`, `Box<T>`, `Json` (std.json.cjson).
+///
+///   Clone allocates a fresh backing buffer and element-clones each
+///   live slot. The result is logically independent from `self`:
+///   pushing, popping, mutating, or dropping either side must not
+///   affect the other. For nested containers this recurses — `Vec<Vec<i32>>.clone()`
+///   calls `inner.clone()` on each inner Vec, which itself allocates.
+///
+///   Double-drop safety: because both sides own independent heap, both
+///   sides' `drop()` run and each frees its own buffer. No shared state.
+///
+/// ## Contract B — Refcount bump (shared-ownership smart pointers)
+///
+/// Applies to: `Ref<T>` / `Rc<T>` (reference-counted shared pointers).
+///
+///   Clone increments the strong count on the shared refcount cell and
+///   returns another handle pointing at the same data cell. The two
+///   handles are independent lifetimes — either can outlive the other
+///   — but they observe the same T. Mutating through one handle is
+///   visible through the other.
+///
+///   Double-drop safety: idempotent `drop()` decrements the count;
+///   only the last handle to drop frees the underlying data + rc cell.
+///
+/// # Move-model escape hatch
+///
+/// Under P4's move-by-default semantics, `var b = a` transfers
+/// ownership of `a` into `b`; subsequent use of `a` fires the
+/// V-MOVE-001 diagnostic. Writing `var b = a.clone()` instead
+/// suppresses the diagnostic because the compiler sees a CallExpr
+/// (`clone`) rather than a bare Identifier (`a`) on the RHS — the
+/// call produces a fresh rvalue whose ownership is what gets bound.
+///
+///   // heap-owning: two independent Vecs after clone
+///   var v1 = Vec::<i64>.new();
+///   v1.push(1);
+///   var v2 = v1.clone();   // deep copy; v1 still valid
+///   v2.push(99);           // does not affect v1
+///
+///   // shared pointer: two handles to same cell after clone
+///   var r1 = Ref::<i64>.new(100);
+///   var r2 = r1.clone();   // refcount bump; r1 still valid
+///   // r1.deref() == r2.deref() (same heap cell)
+///
+/// # What `clone()` is NOT
+///
+///   * It is NOT a bitwise-`memcpy` of the struct header. For an owning
+///     container that would share the backing buffer and cause a
+///     double-free on scope exit. Std implementations deliberately go
+///     through the per-element path even when `T` is a primitive.
+///   * It is NOT weakly-typed "duplicate anything": call-site dispatch
+///     needs the exact type to implement `Clone` (or to be a compiler
+///     -recognised primitive / POD for which the fallback is identity).
+///     Generic container methods are tagged `@[lazy]` so missing
+///     `T: Clone` surfaces only when the user actually invokes
+///     `container.clone()` — not when they merely build the container.
+///
+/// # Primitive / POD types
+///
+/// Primitives (`i8..i64`, `u8..u64`, `f32`/`f64`, `bool`, `char`,
+/// `rawptr`) are `Copy`: assignment already produces an independent
+/// value, so `.clone()` is just identity-return. `str`/`string` are fat
+/// UTF-8 views with ownership metadata; `.clone()` deep-copies bytes so
+/// cloned map/set keys outlive temporary builders and borrowed views.
+/// User-defined POD
+/// structs without a custom `fn clone()` get a memberwise-shallow
+/// default when the compiler needs to call `.clone()` on them (e.g.
+/// from inside `Vec<MyPod>.clone`); this is safe as long as none of
+/// the fields owns heap storage. If any field IS heap-owning, the
+/// struct SHOULD provide an explicit `fn clone()` that deep-clones
+/// those fields.
+///
+/// # Lang-item wiring
+///
+/// This trait is registered under the lang_item slot `"clone_trait"`,
+/// matching the pattern used by `std.drop::Drop` (`"drop_trait"`). The
+/// compiler does not currently synthesise `Clone` impls automatically
+/// — registration is informational, so future passes (auto-derive, a
+/// move-checker refinement that wants to know whether a type is
+/// trivially cloneable, `@[derive(Clone)]`, ...) can look it up by
+/// slot name instead of hard-coding `"Clone"` throughout the frontend.
+
+extern "C" {
+    fn malloc(size: i64) -> rawptr;
+    fn memcpy(dest: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dest: rawptr, val: i32, n: i64) -> rawptr;
+}
+
+fn clone_str_dup(s: string) -> string {
+    if (s.len == 0) { return ""; }
+    let buf = malloc(s.len + 1);
+    if (buf == null) { return ""; }
+    memcpy(buf, s.ptr, s.len);
+    memset(buf + s.len, 0, 1);
+    return from_cstr(buf);
+}
+
+@[lang_item("clone_trait")]
+public trait Clone {
+    /// Return an independent copy of `self`.
+    ///
+    ///   * Heap-owning containers / `Box<T>`: deep copy — fresh backing
+    ///     storage, per-element clones. Mutating the result MUST NOT
+    ///     affect `self`.
+    ///   * `Ref<T>` / `Rc<T>`: refcount bump — same data cell, +1 on
+    ///     the strong count. Two handles with independent lifetimes.
+    ///
+    /// See the module-level doc for the full contract.
+    fn clone() -> Self;
+}
+
+// ============================================================
+// Primitive Clone impls — identity return (primitives are Copy).
+//
+// Registered into `primitiveMethodImpls_[(typeName, "clone")]` so
+// method dispatch on `x: T where T: Clone` instantiated at T=i32 (etc.)
+// routes through `i32.clone`. Previously these lived in std/hash.vyx
+// alongside the trait declaration; factored out here in P4-D.3 so the
+// Clone contract (deep-vs-refcount) has a single home in the stdlib.
+// ============================================================
+impl Clone for i32    { fn clone() -> i32    { return self; } }
+impl Clone for i64    { fn clone() -> i64    { return self; } }
+impl Clone for f32    { fn clone() -> f32    { return self; } }
+impl Clone for f64    { fn clone() -> f64    { return self; } }
+impl Clone for bool   { fn clone() -> bool   { return self; } }
+impl Clone for char   { fn clone() -> char   { return self; } }
+impl Clone for str    { fn clone() -> str    { return clone_str_dup(self); } }
+
+// Lowercase `string` compatibility alias uses the same deep-copy contract.
+impl Clone for string { fn clone() -> string { return clone_str_dup(self); } }
