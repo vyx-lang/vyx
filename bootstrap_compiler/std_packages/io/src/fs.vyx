@@ -1,0 +1,445 @@
+module std.fs;
+
+use std.string;
+use std.collections;
+
+/// std/fs.vyx — File System Module
+/// High-level file I/O built on C stdio
+
+extern "C" {
+    fn fopen(filename: rawptr, mode: rawptr) -> rawptr;
+    fn fclose(fp: rawptr) -> i32;
+    fn fread(buf: rawptr, size: i64, count: i64, fp: rawptr) -> i64;
+    fn fwrite(buf: rawptr, size: i64, count: i64, fp: rawptr) -> i64;
+    fn fgetc(fp: rawptr) -> i32;
+    fn fputc(c: i32, fp: rawptr) -> i32;
+    fn feof(fp: rawptr) -> i32;
+    fn fseek(fp: rawptr, offset: i64, whence: i32) -> i32;
+    fn ftell(fp: rawptr) -> i64;
+    fn remove(filename: rawptr) -> i32;
+    fn rename(oldname: rawptr, newname: rawptr) -> i32;
+    fn calloc(count: i64, size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dest: rawptr, src: rawptr, n: i64) -> rawptr;
+}
+
+@[platform("windows")]
+extern "C" {
+    fn FindFirstFileA(pattern: rawptr, data: rawptr) -> rawptr;
+    fn FindNextFileA(handle: rawptr, data: rawptr) -> i32;
+    fn FindClose(handle: rawptr) -> i32;
+    fn GetFileAttributesA(path: rawptr) -> u32;
+}
+
+@[platform("posix")]
+extern "C" {
+    fn opendir(name: rawptr) -> rawptr;
+    fn readdir(dirp: rawptr) -> rawptr;
+    fn closedir(dirp: rawptr) -> i32;
+}
+
+error FSError { FileNotFound, PermissionDenied, IOError }
+
+fn fs_c_path(path: string) -> rawptr {
+    if (path.len < 0) { return null; }
+    let buf = calloc(path.len + 1, 1);
+    if (buf == null) { return null; }
+    if (path.len > 0) {
+        memcpy(buf, path.c_str(), path.len);
+    }
+    return buf;
+}
+
+/// Open-time behavior for File. Set binary=true for protocol data such as DCI.
+public struct FileOptions {
+    public read: bool;
+    public write: bool;
+    public create: bool;
+    public truncate: bool;
+    public binary: bool;
+}
+
+/// Stateful byte stream backed by C stdio. File does not own the path string.
+public class File {
+    private handle: rawptr;
+    private readable: bool;
+    private writable: bool;
+
+    public static fn open(path: string, options: FileOptions) -> File {
+        if (!options.read && !options.write) {
+            return File { handle: null, readable: false, writable: false };
+        }
+        let cpath = fs_c_path(path);
+        if (cpath == null) { return File { handle: null, readable: false, writable: false }; }
+        var handle: rawptr = null;
+        if (options.read && options.write) {
+            if (options.truncate) {
+                handle = if (options.binary) { fopen(cpath, "w+b".c_str()) } else { fopen(cpath, "w+".c_str()) };
+            } else {
+                handle = if (options.binary) { fopen(cpath, "r+b".c_str()) } else { fopen(cpath, "r+".c_str()) };
+            }
+        } else if (options.write) {
+            if (options.truncate) {
+                handle = if (options.binary) { fopen(cpath, "wb".c_str()) } else { fopen(cpath, "w".c_str()) };
+            } else if (options.create) {
+                handle = if (options.binary) { fopen(cpath, "ab".c_str()) } else { fopen(cpath, "a".c_str()) };
+            } else {
+                handle = if (options.binary) { fopen(cpath, "r+b".c_str()) } else { fopen(cpath, "r+".c_str()) };
+            }
+        } else {
+            handle = if (options.binary) { fopen(cpath, "rb".c_str()) } else { fopen(cpath, "r".c_str()) };
+        }
+        free(cpath);
+        // r+ does not create files. Honor create without changing existing
+        // files unless truncation was explicitly requested.
+        if (handle == null && options.create && options.read && options.write && !options.truncate) {
+            let create_path = fs_c_path(path);
+            if (create_path != null) {
+                handle = if (options.binary) { fopen(create_path, "w+b".c_str()) } else { fopen(create_path, "w+".c_str()) };
+                free(create_path);
+            }
+        }
+        return File { handle: handle, readable: options.read, writable: options.write };
+    }
+
+    public fn is_open() -> bool { return self.handle != null; }
+
+    /// Read the whole stream from offset zero as raw bytes.
+    public fn read_all_bytes() -> Vec<u8> {
+        let empty = Vec::<u8>.new();
+        if (self.handle == null || !self.readable) { return empty; }
+        if (fseek(self.handle, 0, 2) != 0) { return empty; }
+        let size = ftell(self.handle);
+        if (size < 0 || fseek(self.handle, 0, 0) != 0 || size == 0) { return empty; }
+        var bytes = Vec::<u8>.with_capacity(size);
+        if (bytes.data == null) { return empty; }
+        let read = fread(bytes.data, 1, size, self.handle);
+        if (read != size) { bytes.destroy(); return empty; }
+        bytes.len = size;
+        return bytes;
+    }
+
+    /// Read the whole stream from offset zero as text. Text mode permits the
+    /// platform's newline translation; binary protocols must use bytes.
+    public fn read_all_text() -> string {
+        if (self.handle == null || !self.readable) { return ""; }
+        if (fseek(self.handle, 0, 2) != 0) { return ""; }
+        let size = ftell(self.handle);
+        if (size <= 0 || fseek(self.handle, 0, 0) != 0) { return ""; }
+        let buffer = calloc(size + 1, 1);
+        if (buffer == null) { return ""; }
+        let read = fread(buffer, 1, size, self.handle);
+        if (read != size) { free(buffer); return ""; }
+        return from_cstr(buffer);
+    }
+
+    /// Write every byte at the current stream position.
+    public fn write_all(content: Vec<u8>) -> i32 {
+        if (self.handle == null || !self.writable) { return -1; }
+        if (content.len == 0) { return 0; }
+        if (content.data == null) { return -1; }
+        let written = fwrite(content.data, 1, content.len, self.handle);
+        if (written != content.len) { return -1; }
+        return 0;
+    }
+
+    /// Write text at the current stream position.
+    public fn write_text(content: string) -> i32 {
+        if (self.handle == null || !self.writable) { return -1; }
+        if (content.len == 0) { return 0; }
+        let written = fwrite(content.c_str(), 1, content.len as i64, self.handle);
+        if (written != content.len as i64) { return -1; }
+        return 0;
+    }
+
+    public fn close() -> i32 {
+        if (self.handle == null) { return 0; }
+        let result = fclose(self.handle);
+        self.handle = null;
+        return result;
+    }
+}
+
+/// Read entire file into a string. Returns empty string on failure.
+public fn readFile(path: string) -> string {
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return ""; }
+    let fp = fopen(cpath, "rb".c_str());
+    free(cpath);
+    if (fp == null) { return ""; }
+    fseek(fp, 0, 2);
+    let size = ftell(fp);
+    fseek(fp, 0, 0);
+    if (size <= 0) { fclose(fp); return ""; }
+    let buffer = calloc(size + 1, 1);
+    if (buffer == null) { fclose(fp); return ""; }
+    let read = fread(buffer, 1, size, fp);
+    fclose(fp);
+    if (read != size) { free(buffer); return ""; }
+    let result = from_cstr(buffer);
+    return result;
+}
+
+/// Write string content to a file. Returns 0 on success.
+public fn writeFile(path: string, content: string) -> i32 {
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return -1; }
+    let fp = fopen(cpath, "wb".c_str());
+    free(cpath);
+    if (fp == null) { return -1; }
+    let written = fwrite(content.c_str(), 1, content.len as i64, fp);
+    fclose(fp);
+    if (written != content.len as i64) { return -1; }
+    return 0;
+}
+
+/// Append string content to a file. Returns 0 on success.
+public fn appendFile(path: string, content: string) -> i32 {
+    if (path.len == 0) { return -1; }
+    let mode = "ab";
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return -1; }
+    let fp = fopen(cpath, mode.c_str());
+    free(cpath);
+    if (fp == null) { return -1; }
+    fwrite(content.c_str(), 1, content.len as i64, fp);
+    fclose(fp);
+    return 0;
+}
+
+/// Check if a file exists
+public fn fileExists(path: string) -> bool {
+    let mode = "r";
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return false; }
+    let fp = fopen(cpath, mode.c_str());
+    free(cpath);
+    if (fp == null) { return false; }
+    fclose(fp);
+    return true;
+}
+
+/// Delete a file
+public fn deleteFile(path: string) -> i32 {
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return -1; }
+    let rc = remove(cpath);
+    free(cpath);
+    return rc;
+}
+
+/// Rename/move a file
+public fn renameFile(oldpath: string, newpath: string) -> i32 {
+    let cold = fs_c_path(oldpath);
+    if (cold == null) { return -1; }
+    let cnew = fs_c_path(newpath);
+    if (cnew == null) {
+        free(cold);
+        return -1;
+    }
+    let rc = rename(cold, cnew);
+    free(cold);
+    free(cnew);
+    return rc;
+}
+
+/// Get file size in bytes. Returns -1 on failure.
+public fn fileSize(path: string) -> i64 {
+    let mode = "rb";
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return -1; }
+    let fp = fopen(cpath, mode.c_str());
+    free(cpath);
+    if (fp == null) { return -1; }
+    fseek(fp, 0, 2);
+    let size = ftell(fp);
+    fclose(fp);
+    return size;
+}
+
+fn fs_join_path(dir: string, name: string) -> string {
+    if (dir.len == 0) { return name; }
+    let last = dir.charAt(dir.len - 1);
+    if (last == 47 || last == 92) { return str_concat(dir, name); }
+    return str_concat(str_concat(dir, "/"), name);
+}
+
+fn fs_has_extension(name: string, extension: string) -> bool {
+    if (extension.len == 0) { return true; }
+    if (extension.charAt(0) == 46) { return str_ends_with(name, extension); }
+    return str_ends_with(name, str_concat(".", extension));
+}
+
+/// Copy a file. Returns 0 on success.
+public fn copyFile(src: string, dst: string) -> i32 {
+    let in_mode = "rb";
+    let out_mode = "wb";
+    let in_path = fs_c_path(src);
+    if (in_path == null) { return -1; }
+    let input = fopen(in_path, in_mode.c_str());
+    free(in_path);
+    if (input == null) { return -1; }
+
+    let out_path = fs_c_path(dst);
+    if (out_path == null) { fclose(input); return -1; }
+    let output = fopen(out_path, out_mode.c_str());
+    free(out_path);
+    if (output == null) { fclose(input); return -1; }
+
+    let buffer_size: i64 = 65536;
+    let buffer = calloc(buffer_size, 1);
+    if (buffer == null) { fclose(output); fclose(input); return -1; }
+
+    while (true) {
+        let read = fread(buffer, 1, buffer_size, input);
+        if (read < 0) { free(buffer); fclose(output); fclose(input); return -1; }
+        if (read == 0) { break; }
+        let written = fwrite(buffer, 1, read, output);
+        if (written != read) { free(buffer); fclose(output); fclose(input); return -1; }
+    }
+
+    free(buffer);
+    fclose(output);
+    fclose(input);
+    return 0;
+}
+
+@[platform("windows")]
+fn fs_win_find_data_name(data: rawptr) -> string {
+    return from_cstr(data + 44);
+}
+
+@[platform("windows")]
+public fn copyFilesWithExtension(src_dir: string, dst_dir: string, extension: string) -> i32 {
+    let pattern = fs_join_path(src_dir, "*");
+    let cpattern = fs_c_path(pattern);
+    if (cpattern == null) { return -1; }
+    let data = calloc(592, 1);
+    if (data == null) { free(cpattern); return -1; }
+    let handle = FindFirstFileA(cpattern, data);
+    free(cpattern);
+    if (handle == null || handle as i64 == -1) { free(data); return -1; }
+
+    var copied: i32 = 0;
+    var keep_going = true;
+    while (keep_going) {
+        let name = fs_win_find_data_name(data);
+        if (name != "." && name != ".." && fs_has_extension(name, extension)) {
+            let src = fs_join_path(src_dir, name);
+            let dst = fs_join_path(dst_dir, name);
+            if (copyFile(src, dst) != 0) { FindClose(handle); free(data); return -1; }
+            copied = copied + 1;
+        }
+        keep_going = FindNextFileA(handle, data) != 0;
+    }
+
+    FindClose(handle);
+    free(data);
+    return copied;
+}
+
+@[platform("linux")]
+fn fs_posix_dirent_name(entry: rawptr) -> string {
+    return from_cstr(entry + 19);
+}
+
+@[platform("android")]
+fn fs_posix_dirent_name(entry: rawptr) -> string {
+    return from_cstr(entry + 19);
+}
+
+@[platform("macos")]
+fn fs_posix_dirent_name(entry: rawptr) -> string {
+    return from_cstr(entry + 12);
+}
+
+@[platform("posix")]
+public fn copyFilesWithExtension(src_dir: string, dst_dir: string, extension: string) -> i32 {
+    let cdir = fs_c_path(src_dir);
+    if (cdir == null) { return -1; }
+    let dir = opendir(cdir);
+    free(cdir);
+    if (dir == null) { return -1; }
+
+    var copied: i32 = 0;
+    var entry = readdir(dir);
+    while (entry != null) {
+        let name = fs_posix_dirent_name(entry);
+        if (name != "." && name != ".." && fs_has_extension(name, extension)) {
+            let src = fs_join_path(src_dir, name);
+            let dst = fs_join_path(dst_dir, name);
+            if (copyFile(src, dst) != 0) { closedir(dir); return -1; }
+            copied = copied + 1;
+        }
+        entry = readdir(dir);
+    }
+
+    closedir(dir);
+    return copied;
+}
+
+// --- Directory operations (via system() for portability) ---
+
+extern "C" {
+    fn system(cmd: rawptr) -> i32;
+}
+
+/// Create a directory. Returns 0 on success.
+public fn makeDir(path: string) -> i32 {
+    if (isDir(path)) { return 0; }
+    let cmd = "mkdir \"" + path + "\"";
+    return system(cmd.c_str());
+}
+
+/// Remove an empty directory. Returns 0 on success.
+public fn removeDir(path: string) -> i32 {
+    let cmd = "rmdir \"" + path + "\"";
+    return system(cmd.c_str());
+}
+
+@[platform("windows")]
+public fn isDir(path: string) -> bool {
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return false; }
+    let attrs = GetFileAttributesA(cpath);
+    free(cpath);
+    if (attrs == 4294967295 as u32) { return false; }
+    return (attrs & 16 as u32) != 0 as u32;
+}
+
+@[platform("posix")]
+public fn isDir(path: string) -> bool {
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return false; }
+    let dir = opendir(cpath);
+    free(cpath);
+    if (dir == null) { return false; }
+    closedir(dir);
+    return true;
+}
+
+/// Check if path is a regular file.
+public fn isFile(path: string) -> bool {
+    return fileExists(path) && !isDir(path);
+}
+
+// ── Path Utilities ───────────────────────────────────────
+
+@[platform("windows")]
+public fn path_separator() -> i32 {
+    return 92;
+}
+
+@[platform("posix")]
+public fn path_separator() -> i32 {
+    return 47;
+}
+
+public fn is_absolute(path: string) -> bool {
+    if (path.len >= 2 && path.charAt(1) == 58) { return true; }
+    if (path.len >= 1) {
+        let ch = path.charAt(0);
+        if (ch == 47 || ch == 92) { return true; }
+    }
+    return false;
+}

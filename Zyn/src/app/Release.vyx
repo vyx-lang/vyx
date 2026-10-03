@@ -1,0 +1,1130 @@
+module Zyn.App;
+
+use std.collections;
+use std.encoding;
+use std.fs;
+use FileSystem = Zyn.Platform.Platform.FileSystem;
+use Publish = Zyn.Toolchain.Publish;
+
+// ---------------------------------------------------------------------------
+// ZC-19 release and upgrade
+//
+// "One-click build" is the easy half. The half that actually decides whether a
+// release is safe is reproducibility and rollback:
+//
+//   * reproducible products. An artifact is only evidence if the bytes can be
+//     re-checked later, so every artifact carries its size and a checksum, and
+//     the set of artifact checksums folds into one release digest. Two builds
+//     that produce the same digest produced the same product; two that do not
+//     cannot be compared, and the roadmap's "every optimisation is compared
+//     against the same baseline" depends on being able to say which is which.
+//
+//   * signing as configuration, never as a secret. `AppSigningConfig` holds a
+//     *reference* to key material (an identity name, a keychain label, a
+//     profile id). The key itself never enters the release manifest, so a
+//     manifest can be attached to a bug report.
+//
+//   * upgrades as a plan, not a version comparison. `AppUpgradePlan` is the
+//     ordered step list between two versions, and it says up front whether it
+//     is a no-op, a downgrade, or a data migration - the three cases that need
+//     different handling before anything is written.
+//
+//   * rollback as state that survives the crash. `AppUpgradeState` lives in
+//     resources, so an upgrade interrupted by a crash is still resumable or
+//     revertible on the next launch, and `AppReleaseHistory` remembers the last
+//     version that actually ran.
+//
+// The platform vocabulary is deliberately *not* redefined here: it comes from
+// `Zyn.Toolchain.Publish`, which already owns the host/target/package names.
+// Two spellings of "android" is how a release tool ends up shipping the wrong
+// artifact.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Vocabulary
+// ---------------------------------------------------------------------------
+
+public fn appReleaseChannelStable() -> i32 { return 1; }
+public fn appReleaseChannelBeta() -> i32 { return 2; }
+public fn appReleaseChannelDev() -> i32 { return 3; }
+
+public fn appReleaseChannelName(channel: i32) -> string {
+    if (channel == appReleaseChannelStable()) { return "stable"; }
+    if (channel == appReleaseChannelBeta()) { return "beta"; }
+    if (channel == appReleaseChannelDev()) { return "dev"; }
+    return "unknown";
+}
+
+// What a signing configuration is backed by. `none` is a legal answer for a
+// debug build and an illegal one for a store build, so it is recorded rather
+// than inferred from the absence of a key.
+public fn appSigningNone() -> i32 { return 0; }
+public fn appSigningDebug() -> i32 { return 1; }
+public fn appSigningRelease() -> i32 { return 2; }
+public fn appSigningHardware() -> i32 { return 3; }
+
+public fn appSigningName(kind: i32) -> string {
+    if (kind == appSigningNone()) { return "none"; }
+    if (kind == appSigningDebug()) { return "debug"; }
+    if (kind == appSigningRelease()) { return "release"; }
+    if (kind == appSigningHardware()) { return "hardware"; }
+    return "unknown";
+}
+
+// Artifact kinds. Kept in step with the package kinds in Publish so a manifest
+// line and a publish target can be read side by side.
+public fn appArtifactBinary() -> i32 { return 1; }
+public fn appArtifactLibrary() -> i32 { return 2; }
+public fn appArtifactAssets() -> i32 { return 3; }
+public fn appArtifactInstaller() -> i32 { return 4; }
+public fn appArtifactManifest() -> i32 { return 5; }
+
+public fn appArtifactKindName(kind: i32) -> string {
+    if (kind == appArtifactBinary()) { return "binary"; }
+    if (kind == appArtifactLibrary()) { return "library"; }
+    if (kind == appArtifactAssets()) { return "assets"; }
+    if (kind == appArtifactInstaller()) { return "installer"; }
+    if (kind == appArtifactManifest()) { return "manifest"; }
+    return "unknown";
+}
+
+// The upgrade state machine. `staged` means the new version is on disk but the
+// old one is still the one that runs - which is what makes an interrupted
+// upgrade recoverable rather than half-applied.
+public fn appUpgradeIdle() -> i32 { return 0; }
+public fn appUpgradeStaged() -> i32 { return 1; }
+public fn appUpgradeApplied() -> i32 { return 2; }
+public fn appUpgradeVerified() -> i32 { return 3; }
+public fn appUpgradeFailed() -> i32 { return 4; }
+public fn appUpgradeRolledBack() -> i32 { return 5; }
+
+public fn appUpgradeStateName(state: i32) -> string {
+    if (state == appUpgradeIdle()) { return "idle"; }
+    if (state == appUpgradeStaged()) { return "staged"; }
+    if (state == appUpgradeApplied()) { return "applied"; }
+    if (state == appUpgradeVerified()) { return "verified"; }
+    if (state == appUpgradeFailed()) { return "failed"; }
+    if (state == appUpgradeRolledBack()) { return "rolled-back"; }
+    return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Version
+// ---------------------------------------------------------------------------
+
+// A version is compared numerically, not as text: "0.10.0" must sort after
+// "0.9.0", and a lexicographic compare gets that wrong.
+public class AppVersion {
+    public major: i32;
+    public minor: i32;
+    public patch: i32;
+
+    public static fn create(major: i32, minor: i32, patch: i32) -> AppVersion {
+        return AppVersion { major: major, minor: minor, patch: patch };
+    }
+
+    public static fn zero() -> AppVersion {
+        return AppVersion.create(0, 0, 0);
+    }
+
+    public static fn parse(text: string) -> AppVersion {
+        var out = AppVersion.zero();
+        var field: i32 = 0;
+        var i: i32 = 0;
+        var value: i32 = 0;
+        var any: bool = false;
+        while (i < (text.len as i32)) {
+            let c = text.charAt(i as i64);
+            if (c >= 48 && c <= 57) {
+                value = (value * 10) + (c - 48);
+                any = true;
+            } else {
+                if (any) {
+                    if (field == 0) { out.major = value; }
+                    else if (field == 1) { out.minor = value; }
+                    else if (field == 2) { out.patch = value; }
+                    field = field + 1;
+                    value = 0;
+                    any = false;
+                }
+                if (field > 2) { return out; }
+            }
+            i = i + 1;
+        }
+        if (any) {
+            if (field == 0) { out.major = value; }
+            else if (field == 1) { out.minor = value; }
+            else if (field == 2) { out.patch = value; }
+        }
+        return out;
+    }
+
+    public fn toText(&self) -> string {
+        return format("%d", self.major as i64) + "." + format("%d", self.minor as i64)
+            + "." + format("%d", self.patch as i64);
+    }
+
+    public fn dup(&self) -> AppVersion {
+        return AppVersion.create(self.major, self.minor, self.patch);
+    }
+
+    public fn compare(&self, other: AppVersion) -> i32 {
+        if (self.major != other.major) {
+            if (self.major > other.major) { return 1; }
+            return -1;
+        }
+        if (self.minor != other.minor) {
+            if (self.minor > other.minor) { return 1; }
+            return -1;
+        }
+        if (self.patch != other.patch) {
+            if (self.patch > other.patch) { return 1; }
+            return -1;
+        }
+        return 0;
+    }
+
+    public fn isZero(&self) -> bool {
+        return self.major == 0 && self.minor == 0 && self.patch == 0;
+    }
+
+    public fn isNewerThan(&self, other: AppVersion) -> bool {
+        return self.compare(other) > 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signing
+// ---------------------------------------------------------------------------
+
+// References only. A `key_ref` is a keychain label or a CI secret *name*; the
+// material is never written here, which is what makes a manifest safe to attach
+// to a bug report.
+public class AppSigningConfig {
+    public kind: i32;
+    public identity: string;
+    public key_ref: string;
+    public profile_ref: string;
+    public notarize: bool;
+
+    public static fn create(kind: i32, identity: string) -> AppSigningConfig {
+        return AppSigningConfig {
+            kind: kind, identity: identity,
+            key_ref: "", profile_ref: "", notarize: false
+        };
+    }
+
+    public static fn unsigned() -> AppSigningConfig {
+        return AppSigningConfig.create(appSigningNone(), "");
+    }
+
+    public fn withKeyRef(mut self, key_ref: string) -> AppSigningConfig {
+        self.key_ref = key_ref;
+        return self;
+    }
+
+    public fn withProfileRef(mut self, profile_ref: string) -> AppSigningConfig {
+        self.profile_ref = profile_ref;
+        return self;
+    }
+
+    public fn withNotarization(mut self, value: bool) -> AppSigningConfig {
+        self.notarize = value;
+        return self;
+    }
+
+    public fn dup(&self) -> AppSigningConfig {
+        return AppSigningConfig {
+            kind: self.kind, identity: self.identity, key_ref: self.key_ref,
+            profile_ref: self.profile_ref, notarize: self.notarize
+        };
+    }
+
+    public fn isConfigured(&self) -> bool {
+        return self.kind != appSigningNone();
+    }
+
+    // A store build needs a release or hardware identity *and* a key reference.
+    // Checking both is what stops "we set a signing kind" from passing for
+    // "we can actually sign".
+    public fn isUsableForStore(&self) -> bool {
+        if (self.kind != appSigningRelease() && self.kind != appSigningHardware()) { return false; }
+        return self.key_ref.len > 0;
+    }
+
+    // `S|kind|identity|key_ref|profile_ref|notarize`
+    public fn serialize(&self) -> string {
+        return "S|" + format("%d", self.kind as i64)
+            + "|" + hex_encode(self.identity)
+            + "|" + hex_encode(self.key_ref)
+            + "|" + hex_encode(self.profile_ref)
+            + "|" + appDiagBoolText(self.notarize);
+    }
+
+    public static fn parse(text: string) -> AppSigningConfig {
+        if (AppDiagText.fieldAt(text, 124, 0) != "S" || AppDiagText.fieldCount(text, 124) != 6) {
+            return AppSigningConfig.unsigned();
+        }
+        var out = AppSigningConfig.create(
+            app_parse_i32_or(AppDiagText.fieldAt(text, 124, 1), appSigningNone()),
+            hex_decode(AppDiagText.fieldAt(text, 124, 2)));
+        out.key_ref = hex_decode(AppDiagText.fieldAt(text, 124, 3));
+        out.profile_ref = hex_decode(AppDiagText.fieldAt(text, 124, 4));
+        out.notarize = AppDiagText.fieldAt(text, 124, 5) == "1";
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Artifacts
+// ---------------------------------------------------------------------------
+
+public class AppReleaseArtifact {
+    public kind: i32;
+    public path: string;
+    public checksum: string;
+    public size: i64;
+
+    public static fn create(kind: i32, path: string) -> AppReleaseArtifact {
+        return AppReleaseArtifact { kind: kind, path: path, checksum: "", size: 0 as i64 };
+    }
+
+    // Hashes the file as it is on disk right now. `readFile` returns the raw
+    // bytes, so this is correct for binaries as well as text - at the cost of
+    // holding the artifact in memory, which is why a release tool hashes one
+    // artifact at a time.
+    public static fn ofFile(kind: i32, path: string) -> Result<AppReleaseArtifact, AppError> {
+        if (path.len == 0 || !fileExists(path)) {
+            return Err(AppError.create(appDiagCodeUnhandled(), "artifact not found: " + path));
+        }
+        var out = AppReleaseArtifact.create(kind, path);
+        out.checksum = AppChecksum.of(readFile(path));
+        out.size = fileSize(path);
+        return Ok(out);
+    }
+
+    public fn dup(&self) -> AppReleaseArtifact {
+        return AppReleaseArtifact {
+            kind: self.kind, path: self.path, checksum: self.checksum, size: self.size
+        };
+    }
+
+    // Re-reads the file and compares. A missing file is a failure, not a pass:
+    // an artifact that has been deleted is not reproducible either.
+    public fn verify(&self) -> bool {
+        if (self.path.len == 0 || !fileExists(self.path)) { return false; }
+        if (fileSize(self.path) != self.size) { return false; }
+        return AppChecksum.of(readFile(self.path)) == self.checksum;
+    }
+
+    public fn isBinary(&self) -> bool { return self.kind == appArtifactBinary() || self.kind == appArtifactInstaller(); }
+
+    public fn summary(&self) -> string {
+        return appArtifactKindName(self.kind) + " " + self.path
+            + " " + self.checksum + " " + format("%d", self.size) + "B";
+    }
+
+    // `A|kind|size|checksum|path`
+    public fn serialize(&self) -> string {
+        return "A|" + format("%d", self.kind as i64)
+            + "|" + format("%d", self.size)
+            + "|" + self.checksum
+            + "|" + hex_encode(self.path);
+    }
+
+    public static fn parse(text: string) -> AppReleaseArtifact {
+        if (AppDiagText.fieldAt(text, 124, 0) != "A" || AppDiagText.fieldCount(text, 124) != 5) {
+            return AppReleaseArtifact.create(0, "");
+        }
+        var out = AppReleaseArtifact.create(
+            app_parse_i32_or(AppDiagText.fieldAt(text, 124, 1), 0),
+            hex_decode(AppDiagText.fieldAt(text, 124, 4)));
+        out.size = app_parse_i32_or(AppDiagText.fieldAt(text, 124, 2), 0) as i64;
+        out.checksum = AppDiagText.fieldAt(text, 124, 3);
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Release spec
+// ---------------------------------------------------------------------------
+
+public class AppReleaseSpec {
+    public app_id: string;
+    public version: AppVersion;
+    public channel: i32;
+    public platform: i32;
+    public arch: string;
+    public package_kind: i32;
+    public signing: AppSigningConfig;
+    private artifacts: Vec<AppReleaseArtifact>;
+
+    public static fn create(app_id: string, version: AppVersion, platform: i32) -> AppReleaseSpec {
+        return AppReleaseSpec {
+            app_id: app_id,
+            version: version.dup(),
+            channel: appReleaseChannelStable(),
+            platform: platform,
+            arch: "",
+            package_kind: Publish.publishPackageZip(),
+            signing: AppSigningConfig.unsigned(),
+            artifacts: Vec::<AppReleaseArtifact>.new()
+        };
+    }
+
+    public fn withChannel(mut self, channel: i32) -> AppReleaseSpec {
+        self.channel = channel;
+        return self;
+    }
+
+    public fn withArch(mut self, arch: string) -> AppReleaseSpec {
+        self.arch = arch;
+        return self;
+    }
+
+    public fn withPackageKind(mut self, kind: i32) -> AppReleaseSpec {
+        self.package_kind = kind;
+        return self;
+    }
+
+    public fn withSigning(mut self, signing: AppSigningConfig) -> AppReleaseSpec {
+        self.signing = signing.dup();
+        return self;
+    }
+
+    public fn addArtifact(mut self, artifact: AppReleaseArtifact) -> AppReleaseSpec {
+        self.artifacts.push(artifact.dup());
+        return self;
+    }
+
+    public fn addFile(mut self, kind: i32, path: string) -> Result<AppReleaseSpec, AppError> {
+        match (AppReleaseArtifact.ofFile(kind, path)) {
+            case Ok(artifact) => {
+                self.artifacts.push(artifact);
+                return Ok(self);
+            }
+            case Err(e) => { return Err(e); }
+        }
+    }
+
+    public fn artifactCount(&self) -> i32 { return self.artifacts.len as i32; }
+
+    public fn artifactAt(&self, index: i32) -> AppReleaseArtifact {
+        if (index < 0 || index >= self.artifactCount()) {
+            return AppReleaseArtifact.create(0, "");
+        }
+        return self.artifacts.get(index as i64).dup();
+    }
+
+    public fn dup(&self) -> AppReleaseSpec {
+        var out = AppReleaseSpec.create(self.app_id, self.version, self.platform);
+        out.channel = self.channel;
+        out.arch = self.arch;
+        out.package_kind = self.package_kind;
+        out.signing = self.signing.dup();
+        var i: i32 = 0;
+        while (i < self.artifactCount()) {
+            out.artifacts.push(self.artifacts.get(i as i64).dup());
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(&mut self) {
+        self.artifacts.destroy();
+    }
+
+    // One digest for the whole product. Artifact order must not matter - a
+    // build that emits the same files in a different order is the same build -
+    // so the per-artifact hashes are *summed* rather than concatenated in
+    // order. A sum is order-independent and, unlike xor, does not cancel a
+    // duplicated artifact.
+    public fn digest(&self) -> string {
+        var folded: i64 = 0;
+        var i: i32 = 0;
+        while (i < self.artifactCount()) {
+            folded = (folded + AppChecksum.fnv1a32(self.artifacts.get(i as i64).checksum)) & 4294967295;
+            i = i + 1;
+        }
+        return AppChecksum.of(self.app_id + "|" + self.version.toText() + "|"
+            + Publish.publishPlatformName(self.platform)
+            + "|" + self.arch
+            + "|" + AppChecksum.hex32(folded));
+    }
+
+    public fn verifyArtifacts(&self) -> Result<bool, AppError> {
+        var i: i32 = 0;
+        while (i < self.artifactCount()) {
+            let artifact = self.artifacts.get(i as i64);
+            if (!artifact.verify()) {
+                return Err(AppError.create(appDiagCodeUnhandled(),
+                    "artifact does not match the manifest: " + artifact.path));
+            }
+            i = i + 1;
+        }
+        return Ok(true);
+    }
+
+    // A store release cannot be unsigned, and a release build must not be
+    // signed with a debug identity. Both are checked here rather than in a
+    // checklist nobody runs.
+    public fn validateForChannel(&self) -> Result<bool, AppError> {
+        if (self.app_id.len == 0) {
+            return Err(AppError.create(appDiagCodeUnhandled(), "release has no application id"));
+        }
+        if (self.version.isZero()) {
+            return Err(AppError.create(appDiagCodeUnhandled(), "release version is unset"));
+        }
+        if (self.artifactCount() == 0) {
+            return Err(AppError.create(appDiagCodeUnhandled(), "release has no artifacts"));
+        }
+        if (self.channel == appReleaseChannelStable() && !self.signing.isUsableForStore()) {
+            return Err(AppError.create(appDiagCodeUnhandled(),
+                "stable release needs a release signing identity with a key reference"));
+        }
+        return Ok(true);
+    }
+
+    // `R|app_id|major|minor|patch|channel|platform|arch|package_kind|artifact_count`
+    // then the signing line (`S|...`), then one `A|...` line per artifact.
+    //
+    // The signing config is a line of its own rather than a field of the header:
+    // its own serialisation contains pipes, and inlining it would silently
+    // change the header's field count.
+    public fn serialize(&self) -> string {
+        var out = "R"
+            + "|" + hex_encode(self.app_id)
+            + "|" + format("%d", self.version.major as i64)
+            + "|" + format("%d", self.version.minor as i64)
+            + "|" + format("%d", self.version.patch as i64)
+            + "|" + format("%d", self.channel as i64)
+            + "|" + format("%d", self.platform as i64)
+            + "|" + hex_encode(self.arch)
+            + "|" + format("%d", self.package_kind as i64)
+            + "|" + format("%d", self.artifactCount() as i64);
+        out = out + "\n" + self.signing.serialize();
+        var i: i32 = 0;
+        while (i < self.artifactCount()) {
+            out = out + "\n" + self.artifacts.get(i as i64).serialize();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn parse(text: string) -> AppReleaseSpec {
+        let head = AppDiagText.lineAt(text, 0);
+        if (AppDiagText.fieldAt(head, 124, 0) != "R" || AppDiagText.fieldCount(head, 124) != 10) {
+            return AppReleaseSpec.create("", AppVersion.zero(), 0);
+        }
+        var out = AppReleaseSpec.create(
+            hex_decode(AppDiagText.fieldAt(head, 124, 1)),
+            AppVersion.create(
+                app_parse_i32_or(AppDiagText.fieldAt(head, 124, 2), 0),
+                app_parse_i32_or(AppDiagText.fieldAt(head, 124, 3), 0),
+                app_parse_i32_or(AppDiagText.fieldAt(head, 124, 4), 0)),
+            app_parse_i32_or(AppDiagText.fieldAt(head, 124, 6), 0));
+        out.channel = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 5), appReleaseChannelStable());
+        out.arch = hex_decode(AppDiagText.fieldAt(head, 124, 7));
+        out.package_kind = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 8), Publish.publishPackageZip());
+        out.signing = AppSigningConfig.parse(AppDiagText.lineAt(text, 1));
+        let declared = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 9), 0);
+        var i: i32 = 0;
+        while (i < declared) {
+            out.artifacts.push(AppReleaseArtifact.parse(AppDiagText.lineAt(text, i + 2)));
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Release manifest (the reproducible, checksummed product record)
+// ---------------------------------------------------------------------------
+
+public class AppReleaseManifest {
+    public static fn schema() -> string { return "release"; }
+    public static fn revision() -> i32 { return 1; }
+
+    public static fn encode(spec: AppReleaseSpec) -> string {
+        var payload = "ZYNR|1\n"
+            + "digest=" + spec.digest() + "\n"
+            + "app=" + hex_encode(spec.app_id) + "\n"
+            + "version=" + spec.version.toText() + "\n"
+            + "channel=" + appReleaseChannelName(spec.channel) + "\n"
+            + "platform=" + Publish.publishPlatformName(spec.platform) + "\n"
+            + "arch=" + hex_encode(spec.arch) + "\n"
+            + "package=" + Publish.publishPackageName(spec.package_kind) + "\n"
+            + "signing=" + appSigningName(spec.signing.kind) + "\n"
+            + "artifacts=" + format("%d", spec.artifactCount() as i64) + "\n";
+        var i: i32 = 0;
+        while (i < spec.artifactCount()) {
+            payload = payload + spec.artifactAt(i).serialize() + "\n";
+            i = i + 1;
+        }
+        return AppDocumentEnvelope.encode(AppReleaseManifest.schema(), AppReleaseManifest.revision(), payload);
+    }
+
+    public static fn decode(text: string) -> AppReleaseSpec {
+        let envelope = AppDocumentEnvelope.decode(text);
+        if (!envelope.isOk()) { return AppReleaseSpec.create("", AppVersion.zero(), 0); }
+        return AppReleaseManifest.parsePayload(envelope.payload);
+    }
+
+    // The manifest stores the platform and the package kind by *name* so the
+    // file stays readable, which means the reader needs the inverse of the
+    // naming functions. `Publish` does not export one, so it is derived here
+    // from `Publish.publishPlatformName` itself rather than from a second copy
+    // of the spelling - adding a platform to Publish cannot desynchronise this.
+    public static fn platformOfName(name: string) -> i32 {
+        var i: i32 = 0;
+        while (i < 8) {
+            let code = i + 1;
+            if (name == Publish.publishPlatformName(code)) { return code; }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    public static fn packageOfName(name: string) -> i32 {
+        var i: i32 = 0;
+        while (i < 8) {
+            let code = i;
+            if (name == Publish.publishPackageName(code)) { return code; }
+            i = i + 1;
+        }
+        return Publish.publishPackageZip();
+    }
+
+    // Reads the payload back. The header is 10 `key=value` lines, the first
+    // artifact line is line 10, and the `artifacts=` count is what bounds the
+    // loop - a truncated manifest yields fewer artifacts rather than a wrong
+    // one.
+    public static fn parsePayload(payload: string) -> AppReleaseSpec {
+        var out = AppReleaseSpec.create(
+            hex_decode(AppReleaseManifest.field(payload, 2)),
+            AppVersion.parse(AppReleaseManifest.field(payload, 3)),
+            AppReleaseManifest.platformOfName(AppReleaseManifest.field(payload, 5)));
+        out.arch = hex_decode(AppReleaseManifest.field(payload, 6));
+        out.channel = AppReleaseChannelOf(AppReleaseManifest.field(payload, 4));
+        out.package_kind = AppReleaseManifest.packageOfName(AppReleaseManifest.field(payload, 7));
+        var count = app_parse_i32_or(AppReleaseManifest.field(payload, 9), 0);
+        var i: i32 = 0;
+        while (i < count) {
+            out.artifacts.push(AppReleaseArtifact.parse(AppDiagText.lineAt(payload, i + 10)));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // `key=value` on line `line`, so the payload does not need a second parser.
+    private static fn field(payload: string, line: i32) -> string {
+        return AppDiagText.fieldAt(AppDiagText.lineAt(payload, line), 61, 1);
+    }
+
+    public static fn digestOf(text: string) -> string {
+        let envelope = AppDocumentEnvelope.decode(text);
+        if (!envelope.isOk()) { return ""; }
+        return AppReleaseManifest.field(envelope.payload, 1);
+    }
+
+    public static fn isValid(text: string) -> bool {
+        let envelope = AppDocumentEnvelope.decode(text);
+        return envelope.isOk();
+    }
+
+    // The install-time check: the manifest that shipped with the build must
+    // still describe the files on disk.
+    public static fn verifyAgainst(spec: AppReleaseSpec) -> Result<bool, AppError> {
+        return spec.verifyArtifacts();
+    }
+
+    public static fn write(path: string, spec: AppReleaseSpec) -> Result<bool, AppError> {
+        if (path.len == 0) {
+            return Err(AppError.create(appDiagCodeUnhandled(), "manifest path is empty"));
+        }
+        return AppCrashContext.write(path, AppReleaseManifest.encode(spec));
+    }
+
+    public static fn read(path: string) -> Result<AppReleaseSpec, AppError> {
+        match (AppCrashContext.read(path)) {
+            case Ok(text) => {
+                if (!AppReleaseManifest.isValid(text)) {
+                    return Err(AppError.create(appDiagCodeUnhandled(), "release manifest is corrupt: " + path));
+                }
+                return Ok(AppReleaseManifest.decode(text));
+            }
+            case Err(e) => { return Err(e); }
+        }
+    }
+}
+
+// The manifest stores the channel and the package kind by name, so the reader
+// needs the inverse of the name functions.
+public fn AppReleaseChannelOf(name: string) -> i32 {
+    if (name == "stable") { return appReleaseChannelStable(); }
+    if (name == "beta") { return appReleaseChannelBeta(); }
+    if (name == "dev") { return appReleaseChannelDev(); }
+    return appReleaseChannelStable();
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade plan
+// ---------------------------------------------------------------------------
+
+public class AppUpgradeStep {
+    public from_version: AppVersion;
+    public to_version: AppVersion;
+    public schema_from: i32;
+    public schema_to: i32;
+    public note: string;
+
+    public static fn create(from_version: AppVersion, to_version: AppVersion, schema_from: i32, schema_to: i32, note: string) -> AppUpgradeStep {
+        return AppUpgradeStep {
+            from_version: from_version.dup(), to_version: to_version.dup(),
+            schema_from: schema_from, schema_to: schema_to, note: note
+        };
+    }
+
+    public fn dup(&self) -> AppUpgradeStep {
+        return AppUpgradeStep.create(self.from_version, self.to_version, self.schema_from, self.schema_to, self.note);
+    }
+
+    public fn migratesData(&self) -> bool {
+        return self.schema_to > self.schema_from;
+    }
+
+    public fn summary(&self) -> string {
+        var out = self.from_version.toText() + " -> " + self.to_version.toText();
+        if (self.migratesData()) {
+            out = out + " (schema " + format("%d", self.schema_from as i64)
+                + " -> " + format("%d", self.schema_to as i64) + ")";
+        }
+        if (self.note.len > 0) { out = out + ": " + self.note; }
+        return out;
+    }
+
+    // `U|from|to|schema_from|schema_to|note`
+    public fn serialize(&self) -> string {
+        return "U|" + self.from_version.toText()
+            + "|" + self.to_version.toText()
+            + "|" + format("%d", self.schema_from as i64)
+            + "|" + format("%d", self.schema_to as i64)
+            + "|" + hex_encode(self.note);
+    }
+
+    public static fn parse(text: string) -> AppUpgradeStep {
+        if (AppDiagText.fieldAt(text, 124, 0) != "U" || AppDiagText.fieldCount(text, 124) != 6) {
+            return AppUpgradeStep.create(AppVersion.zero(), AppVersion.zero(), 0, 0, "");
+        }
+        return AppUpgradeStep.create(
+            AppVersion.parse(AppDiagText.fieldAt(text, 124, 1)),
+            AppVersion.parse(AppDiagText.fieldAt(text, 124, 2)),
+            app_parse_i32_or(AppDiagText.fieldAt(text, 124, 3), 0),
+            app_parse_i32_or(AppDiagText.fieldAt(text, 124, 4), 0),
+            hex_decode(AppDiagText.fieldAt(text, 124, 5)));
+    }
+}
+
+public class AppUpgradePlan {
+    private steps: Vec<AppUpgradeStep>;
+    public from_version: AppVersion;
+    public to_version: AppVersion;
+    public schema_from: i32;
+    public schema_to: i32;
+
+    public static fn empty() -> AppUpgradePlan {
+        return AppUpgradePlan {
+            steps: Vec::<AppUpgradeStep>.new(),
+            from_version: AppVersion.zero(),
+            to_version: AppVersion.zero(),
+            schema_from: 0,
+            schema_to: 0
+        };
+    }
+
+    public static fn between(from_version: AppVersion, to_version: AppVersion, schema_from: i32, schema_to: i32) -> AppUpgradePlan {
+        var out = AppUpgradePlan.empty();
+        out.from_version = from_version.dup();
+        out.to_version = to_version.dup();
+        out.schema_from = schema_from;
+        out.schema_to = schema_to;
+        return out;
+    }
+
+    public fn addStep(mut self, step: AppUpgradeStep) -> AppUpgradePlan {
+        self.steps.push(step.dup());
+        return self;
+    }
+
+    public fn stepCount(&self) -> i32 { return self.steps.len as i32; }
+
+    public fn stepAt(&self, index: i32) -> AppUpgradeStep {
+        if (index < 0 || index >= self.stepCount()) {
+            return AppUpgradeStep.create(AppVersion.zero(), AppVersion.zero(), 0, 0, "");
+        }
+        return self.steps.get(index as i64).dup();
+    }
+
+    public fn dup(&self) -> AppUpgradePlan {
+        var out = AppUpgradePlan.between(self.from_version, self.to_version, self.schema_from, self.schema_to);
+        var i: i32 = 0;
+        while (i < self.stepCount()) {
+            out.steps.push(self.steps.get(i as i64).dup());
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(&mut self) {
+        self.steps.destroy();
+    }
+
+    // A plan with no steps between two equal versions is a no-op, and a plan
+    // whose target is older is a downgrade. Both are legal, both need different
+    // handling, and neither should be inferred from a version string compare at
+    // the call site.
+    public fn isNoop(&self) -> bool {
+        return self.from_version.compare(self.to_version) == 0 && self.schema_to <= self.schema_from;
+    }
+
+    public fn isDowngrade(&self) -> bool {
+        return self.from_version.compare(self.to_version) > 0;
+    }
+
+    public fn requiresDataMigration(&self) -> bool {
+        return self.schema_to > self.schema_from;
+    }
+
+    // A plan must be a connected chain: each step starts where the previous one
+    // ended, and the last one lands on the target. An unconnected chain would
+    // apply half an upgrade and stop.
+    public fn isComplete(&self) -> bool {
+        if (self.stepCount() == 0) { return self.isNoop(); }
+        if (self.steps.get(0).from_version.compare(self.from_version) != 0) { return false; }
+        var i: i32 = 1;
+        while (i < self.stepCount()) {
+            let previous = self.steps.get(i - 1);
+            let current = self.steps.get(i);
+            if (previous.to_version.compare(current.from_version) != 0) { return false; }
+            i = i + 1;
+        }
+        return self.steps.get(self.stepCount() - 1).to_version.compare(self.to_version) == 0;
+    }
+
+    public fn summary(&self) -> string {
+        var out = "upgrade " + self.from_version.toText() + " -> " + self.to_version.toText()
+            + " steps=" + self.stepCount().toString()
+            + " noop=" + appDiagBoolText(self.isNoop())
+            + " downgrade=" + appDiagBoolText(self.isDowngrade())
+            + " data=" + appDiagBoolText(self.requiresDataMigration())
+            + " complete=" + appDiagBoolText(self.isComplete()) + "\n";
+        var i: i32 = 0;
+        while (i < self.stepCount()) {
+            out = out + "  " + self.stepAt(i).summary() + "\n";
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // `P|from|to|schema_from|schema_to|step_count` + step lines
+    public fn serialize(&self) -> string {
+        var out = "P|" + self.from_version.toText()
+            + "|" + self.to_version.toText()
+            + "|" + format("%d", self.schema_from as i64)
+            + "|" + format("%d", self.schema_to as i64)
+            + "|" + format("%d", self.stepCount() as i64);
+        var i: i32 = 0;
+        while (i < self.stepCount()) {
+            out = out + "\n" + self.steps.get(i as i64).serialize();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn parse(text: string) -> AppUpgradePlan {
+        let head = AppDiagText.lineAt(text, 0);
+        if (AppDiagText.fieldAt(head, 124, 0) != "P" || AppDiagText.fieldCount(head, 124) != 6) {
+            return AppUpgradePlan.empty();
+        }
+        var out = AppUpgradePlan.between(
+            AppVersion.parse(AppDiagText.fieldAt(head, 124, 1)),
+            AppVersion.parse(AppDiagText.fieldAt(head, 124, 2)),
+            app_parse_i32_or(AppDiagText.fieldAt(head, 124, 3), 0),
+            app_parse_i32_or(AppDiagText.fieldAt(head, 124, 4), 0));
+        let declared = app_parse_i32_or(AppDiagText.fieldAt(head, 124, 5), 0);
+        var i: i32 = 0;
+        while (i < declared) {
+            out.steps.push(AppUpgradeStep.parse(AppDiagText.lineAt(text, i + 1)));
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade state machine (crash-safe)
+// ---------------------------------------------------------------------------
+
+// The state lives in resources, so an upgrade interrupted by a crash is still
+// resumable on the next launch. The order matters: `stage` writes the new
+// version but leaves the old one running, `apply` switches over, `verify`
+// confirms, and only `verify` clears the rollback point.
+public class AppUpgradeState {
+    public static fn stateKey(owner: string) -> string { return "upgrade:" + owner + ":state"; }
+    public static fn planKey(owner: string) -> string { return "upgrade:" + owner + ":plan"; }
+    public static fn targetKey(owner: string) -> string { return "upgrade:" + owner + ":target"; }
+    public static fn rollbackKey(owner: string) -> string { return "upgrade:" + owner + ":rollback"; }
+    public static fn failureKey(owner: string) -> string { return "upgrade:" + owner + ":failure"; }
+
+    public static fn state(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppUpgradeState.stateKey(owner), appUpgradeIdle());
+    }
+
+    public static fn setState(world: AppWorld, owner: string, state: i32) -> AppWorld {
+        return world.setIntResource(AppUpgradeState.stateKey(owner), state);
+    }
+
+    public static fn target(world: AppWorld, owner: string) -> AppVersion {
+        return AppVersion.parse(world.stringResource(AppUpgradeState.targetKey(owner), ""));
+    }
+
+    public static fn rollbackPoint(world: AppWorld, owner: string) -> AppVersion {
+        return AppVersion.parse(world.stringResource(AppUpgradeState.rollbackKey(owner), ""));
+    }
+
+    public static fn failure(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppUpgradeState.failureKey(owner), "");
+    }
+
+    public static fn plan(world: AppWorld, owner: string) -> AppUpgradePlan {
+        let stored = world.stringResource(AppUpgradeState.planKey(owner), "");
+        if (stored.len == 0) { return AppUpgradePlan.empty(); }
+        return AppUpgradePlan.parse(stored);
+    }
+
+    // Staging records the plan and the version to fall back to. Refusing an
+    // incomplete plan here is what keeps a half-chain from ever being applied.
+    public static fn stage(world: AppWorld, owner: string, plan: AppUpgradePlan, current: AppVersion) -> Result<AppWorld, AppError> {
+        if (!plan.isComplete()) {
+            return Err(AppError.create(appDiagCodeUnhandled(), "upgrade plan is not a connected chain"));
+        }
+        var out = world.setStringResource(AppUpgradeState.planKey(owner), plan.serialize());
+        out = out.setStringResource(AppUpgradeState.targetKey(owner), plan.to_version.toText());
+        out = out.setStringResource(AppUpgradeState.rollbackKey(owner), current.toText());
+        out = out.setStringResource(AppUpgradeState.failureKey(owner), "");
+        return Ok(AppUpgradeState.setState(out, owner, appUpgradeStaged()));
+    }
+
+    public static fn apply(world: AppWorld, owner: string) -> Result<AppWorld, AppError> {
+        if (AppUpgradeState.state(world, owner) != appUpgradeStaged()) {
+            return Err(AppError.create(appDiagCodeUnhandled(),
+                "cannot apply: upgrade is " + appUpgradeStateName(AppUpgradeState.state(world, owner))));
+        }
+        return Ok(AppUpgradeState.setState(world, owner, appUpgradeApplied()));
+    }
+
+    public static fn verify(world: AppWorld, owner: string) -> Result<AppWorld, AppError> {
+        if (AppUpgradeState.state(world, owner) != appUpgradeApplied()) {
+            return Err(AppError.create(appDiagCodeUnhandled(),
+                "cannot verify: upgrade is " + appUpgradeStateName(AppUpgradeState.state(world, owner))));
+        }
+        var out = AppUpgradeState.setState(world, owner, appUpgradeVerified());
+        // The rollback point is only cleared once the new version is confirmed,
+        // because that is the first moment it is safe to forget the old one.
+        out = out.setStringResource(AppUpgradeState.rollbackKey(owner), "");
+        return Ok(out);
+    }
+
+    public static fn markFailed(world: AppWorld, owner: string, reason: string) -> AppWorld {
+        var out = AppUpgradeState.setState(world, owner, appUpgradeFailed());
+        return out.setStringResource(AppUpgradeState.failureKey(owner), reason);
+    }
+
+    // Reverts to the recorded rollback point. Legal from any non-idle state,
+    // including after a crash that left the upgrade `applied` but unverified.
+    public static fn rollback(world: AppWorld, owner: string) -> Result<AppWorld, AppError> {
+        let state = AppUpgradeState.state(world, owner);
+        if (state == appUpgradeIdle() || state == appUpgradeRolledBack()) {
+            return Err(AppError.create(appDiagCodeUnhandled(), "nothing to roll back"));
+        }
+        if (AppUpgradeState.rollbackPoint(world, owner).isZero()) {
+            return Err(AppError.create(appDiagCodeUnhandled(), "upgrade has no rollback point"));
+        }
+        var out = AppUpgradeState.setState(world, owner, appUpgradeRolledBack());
+        out = out.setStringResource(AppUpgradeState.targetKey(owner),
+            AppUpgradeState.rollbackPoint(out, owner).toText());
+        return Ok(out);
+    }
+
+    // Called at startup. An upgrade left `applied` by a crash is treated as
+    // unfinished, so the app runs the old version until verification completes.
+    public static fn recoverIfInterrupted(world: AppWorld, owner: string) -> AppWorld {
+        let state = AppUpgradeState.state(world, owner);
+        if (state == appUpgradeApplied()) {
+            var out = AppUpgradeState.setState(world, owner, appUpgradeStaged());
+            out = out.setStringResource(AppUpgradeState.failureKey(owner),
+                "upgrade was interrupted after apply; re-run verification or roll back");
+            return out;
+        }
+        return world;
+    }
+
+    public static fn summary(world: AppWorld, owner: string) -> string {
+        return "upgrade=" + appUpgradeStateName(AppUpgradeState.state(world, owner))
+            + " target=" + AppUpgradeState.target(world, owner).toText()
+            + " rollback=" + AppUpgradeState.rollbackPoint(world, owner).toText();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Release history (what actually ran, and what to fall back to)
+// ---------------------------------------------------------------------------
+
+public class AppReleaseHistory {
+    public static fn itemKey(owner: string) -> string { return "release:" + owner + ":item"; }
+    public static fn badKey(owner: string) -> string { return "release:" + owner + ":bad"; }
+
+    // Recorded at startup, after the version has been confirmed to run. A
+    // version that never reached `record` never became the last-good one, which
+    // is exactly the semantics a crash rollback needs.
+    public static fn record(world: AppWorld, owner: string, version: AppVersion, channel: i32, digest: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        return world.appendStringListResource(AppReleaseHistory.itemKey(owner),
+            version.toText() + "|" + appReleaseChannelName(channel) + "|" + digest
+                + "|" + format("%d", appDiagNow(world) as i64));
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        if (owner.len == 0) { return 0; }
+        return world.stringListResourceCount(AppReleaseHistory.itemKey(owner));
+    }
+
+    public static fn versionAt(world: AppWorld, owner: string, index: i32) -> AppVersion {
+        if (owner.len == 0 || index < 0) { return AppVersion.zero(); }
+        return AppVersion.parse(AppDiagText.fieldAt(
+            world.stringListResourceAt(AppReleaseHistory.itemKey(owner), index), 124, 0));
+    }
+
+    public static fn digestAt(world: AppWorld, owner: string, index: i32) -> string {
+        if (owner.len == 0 || index < 0) { return ""; }
+        return AppDiagText.fieldAt(
+            world.stringListResourceAt(AppReleaseHistory.itemKey(owner), index), 124, 2);
+    }
+
+    public static fn at(world: AppWorld, owner: string, index: i32) -> string {
+        if (owner.len == 0 || index < 0 || index >= AppReleaseHistory.count(world, owner)) { return ""; }
+        return world.stringListResourceAt(AppReleaseHistory.itemKey(owner), index);
+    }
+
+    // The most recent version that was recorded as running and has not since
+    // been marked bad.
+    public static fn lastGood(world: AppWorld, owner: string) -> AppVersion {
+        var i = AppReleaseHistory.count(world, owner) - 1;
+        while (i >= 0) {
+            let version = AppReleaseHistory.versionAt(world, owner, i);
+            if (!AppReleaseHistory.isBad(world, owner, version)) { return version; }
+            i = i - 1;
+        }
+        return AppVersion.zero();
+    }
+
+    public static fn isBad(world: AppWorld, owner: string, version: AppVersion) -> bool {
+        let list = world.stringResource(AppReleaseHistory.badKey(owner), "");
+        var i: i32 = 0;
+        while (i < AppCredentialRedactor.entryCount(list)) {
+            if (AppVersion.parse(AppCredentialRedactor.entryAt(list, i)).compare(version) == 0) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Marking a version bad is what turns "it crashed" into "roll back to the
+    // last one that did not".
+    public static fn markBad(world: AppWorld, owner: string, version: AppVersion, reason: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        var list = world.stringResource(AppReleaseHistory.badKey(owner), "");
+        list = AppCredentialRedactor.appendEntry(list, version.toText());
+        var out = world.setStringResource(AppReleaseHistory.badKey(owner), list);
+        return AppLog.errorLine(out, owner, "release", "version " + version.toText() + " marked bad: " + reason);
+    }
+
+    public static fn clearBad(world: AppWorld, owner: string) -> AppWorld {
+        return world.setStringResource(AppReleaseHistory.badKey(owner), "");
+    }
+
+    public static fn report(world: AppWorld, owner: string) -> string {
+        var out = "installed=" + AppReleaseHistory.count(world, owner).toString()
+            + " lastGood=" + AppReleaseHistory.lastGood(world, owner).toText() + "\n";
+        var i: i32 = 0;
+        while (i < AppReleaseHistory.count(world, owner)) {
+            var mark = "  ";
+            if (AppReleaseHistory.isBad(world, owner, AppReleaseHistory.versionAt(world, owner, i))) {
+                mark = "! ";
+            }
+            out = out + mark + AppReleaseHistory.at(world, owner, i) + "\n";
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn clear(world: AppWorld, owner: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        return AppRowStore.clearList(world, AppReleaseHistory.itemKey(owner));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Install verification
+// ---------------------------------------------------------------------------
+
+// The last step of ZC-19: an installed build proves it is the build it claims
+// to be. The manifest travels with the product, so this needs no network and no
+// build machine - only the files on disk.
+public class AppInstallVerification {
+    public static fn reportKey(owner: string) -> string { return "install:" + owner + ":report"; }
+
+    public static fn verify(manifest_path: string) -> Result<AppReleaseSpec, AppError> {
+        match (AppReleaseManifest.read(manifest_path)) {
+            case Ok(spec) => {
+                match (spec.verifyArtifacts()) {
+                    case Ok(_) => { return Ok(spec); }
+                    case Err(e) => { return Err(e); }
+                }
+            }
+            case Err(e) => { return Err(e); }
+        }
+    }
+
+    public static fn run(world: AppWorld, owner: string, manifest_path: string) -> AppWorld {
+        match (AppInstallVerification.verify(manifest_path)) {
+            case Ok(spec) => {
+                let text = "ok version=" + spec.version.toText() + " digest=" + spec.digest();
+                var out = world.setStringResource(AppInstallVerification.reportKey(owner), text);
+                return AppLog.info(out, owner, "install", text);
+            }
+            case Err(e) => {
+                var failed = world.setStringResource(AppInstallVerification.reportKey(owner), "failed: " + e.message);
+                var diag = AppDiagnostic.create(e.code, "installed build does not match its manifest");
+                diag = diag.withCategory(appDiagPersistence());
+                diag = diag.withOrigin(appOriginPlatform(), "install");
+                diag = diag.withDetail(e.message);
+                failed = AppDiagList.note(failed, owner, &diag);
+                return AppLog.errorLine(failed, owner, "install", e.message);
+            }
+        }
+    }
+
+    public static fn report(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppInstallVerification.reportKey(owner), "not run");
+    }
+
+    // Convenience for a release tool: build the spec from a list of files and
+    // immediately write the manifest next to them.
+    public static fn writeManifest(spec: AppReleaseSpec, path: string) -> Result<bool, AppError> {
+        match (spec.validateForChannel()) {
+            case Ok(_) => { }
+            case Err(e) => { return Err(e); }
+        }
+        return AppReleaseManifest.write(path, spec);
+    }
+}

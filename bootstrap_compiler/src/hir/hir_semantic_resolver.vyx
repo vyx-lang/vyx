@@ -1,0 +1,1827 @@
+module bootstrap.hir_semantic_resolver;
+
+/// HIR semantic resolver — closed-HIR wave 2 (`--hir-complete-resolve`).
+///
+/// Migrated (copy-adapted, not re-invented) from the legacy AST codegen
+/// (`codegen.vyx`), re-targeted at the stable-ID HIR model so MIR/LLVM no
+/// longer re-derives these semantics. Source provenance:
+///
+///   A) owner/env computation
+///      - class_generic_env            codegen.vyx L6112-6140
+///      - generic_env_for_call         codegen.vyx L13786-13803
+///      - generic_env_bind_type_ref    codegen.vyx L13902-13981 (text level:
+///        class-name binding, nested generic args, ptr/ref/mutref peeling,
+///        fn/cfn param+ret recursion)
+///      - generic_env_for_call_args    codegen.vyx L13983-14039 (explicit
+///        turbofish binding + per-arg type inference over the call's HIR
+///        argument exprs and the callee's param locals)
+///      - substitute_type_ref          codegen.vyx L4430-4495 (text level)
+///      - associated_type_ref_for_name codegen.vyx L4497-4542
+///      - resolve_method_owner_class_name  codegen.vyx L17067-17151
+///      - class_name_for_value_expr    codegen.vyx L6255-6395 (HIR exprs are
+///        fully typed, so the receiver TypeId replaces the AST branches)
+///   B) field/variant/assoc item resolution
+///      - index_decl_lookups           codegen.vyx L3623-3727 — rebuilt as
+///        FNV-1a open-addressing hash maps over the HIR item/function
+///        tables (built once per resolver, O(1) probes; replaces the
+///        original's string-keyed entry buffers and avoids any O(n^2)
+///        whole-table rescans)
+///      - find_class_decl              codegen.vyx L16990-17050
+///      - find_enum_variant_decl(_casefold) codegen.vyx L17480-17505
+///      - find_variant_owner_decl      codegen.vyx L17507-17519
+///      - enum_variant_index           codegen.vyx L17448-17460
+///      - find_field_decl(_by_name)    codegen.vyx L19995-20050 (inherited
+///        layout fields are already materialized into the HIR member chain
+///        by the builder, so no AST parent recursion is needed)
+///      - find_field_idx               codegen.vyx L19509-19527 (HIR keeps
+///        the ordinal on the item record: item_field_index)
+///      - find_method_decl_by_name     codegen.vyx L19480-19503 (the
+///        any-method legacy map)
+///      - find_assoc_const_decl        codegen.vyx L20052-20062
+///      - find_type_alias_decl / resolve_alias_type_ref codegen.vyx
+///        L18667-18711
+///
+/// Interface contract: every public entry point takes and returns HIR typed
+/// IDs (ItemId / FunctionId / TypeId / ExprId / GenericEnvId as i32) plus
+/// plain strings. No AST pointer crosses this module boundary. Structured
+/// generic envs use the hir_model genv/tlist pools (hir_unit_add_generic_env
+/// / genv_param_list / genv_arg_list / genv_owner_type).
+
+use bootstrap.ast;
+use bootstrap.policy;
+use bootstrap.hir_ids;
+use bootstrap.hir_type_table;
+use bootstrap.hir_model;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn strncmp(a: rawptr, b: rawptr, n: i64) -> i32;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// String helpers (migrated codegen.vyx L1773/L1785/L1921)
+// ────────────────────────────────────────────────────────────────────
+
+fn hsr_last_dot_segment(path: string) -> string {
+    if (path.len == 0) { return ""; }
+    var last: i32 = -1;
+    var i: i32 = 0;
+    while (i < path.len) {
+        if (path.charAt(i) == 46) { last = i; }
+        i = i + 1;
+    }
+    if (last < 0) { return path; }
+    if (last + 1 >= path.len) { return ""; }
+    return path.substring(last + 1, path.len as i32);
+}
+
+fn hsr_contains_dot(s: string) -> bool {
+    var i: i32 = 0;
+    while (i < s.len) {
+        if (s.charAt(i) == 46) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn hsr_lower_char(ch: i32) -> i32 {
+    if (ch >= 65 && ch <= 90) { return ch + 32; }
+    return ch;
+}
+
+fn hsr_eq_ignore_case(a: string, b: string) -> bool {
+    if (a.len != b.len) { return false; }
+    var i: i32 = 0;
+    while (i < a.len) {
+        if (hsr_lower_char(a.charAt(i)) != hsr_lower_char(b.charAt(i))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Mirror of hir_type_table's private primitive-name map so the resolver can
+/// intern arg type names without an AST type ref.
+fn hsr_primitive_kind_for_name(name: string) -> i32 {
+    if (name == "i32") { return ty_I32(); }
+    if (name == "i64") { return ty_I64(); }
+    if (name == "bool") { return ty_BOOL(); }
+    if (name == "char") { return ty_CHAR(); }
+    if (name == "str" || name == "string" || name == "__String") { return ty_STRING(); }
+    if (name == "rawptr") { return ty_RAWPTR(); }
+    if (name == "void") { return ty_VOID(); }
+    if (name == "f32") { return ty_F32(); }
+    if (name == "f64") { return ty_F64(); }
+    if (name == "i8") { return ty_I8(); }
+    if (name == "i16") { return ty_I16(); }
+    if (name == "u8") { return ty_U8(); }
+    if (name == "u16") { return ty_U16(); }
+    if (name == "u32") { return ty_U32(); }
+    if (name == "u64") { return ty_U64(); }
+    if (name == "isize") { return ty_ISIZE(); }
+    if (name == "usize") { return ty_USIZE(); }
+    return hir_type_unknown();
+}
+
+/// Interning helpers take the table as a parameter (the prevailing pattern
+/// in hir_builder) so growth inside `intern` lands on the live table.
+fn hsr_intern_named_type(types: HirTypeTable, kind: i32, text: string) -> i32 {
+    if (kind == ty_CLASS()) {
+        return types.intern_name(text);
+    }
+    return types.intern(kind, text, 0, 0);
+}
+
+fn hsr_primitive_text(types: HirTypeTable, kind: i32) -> string {
+    return types.primitive_name(kind);
+}
+
+/// CSV cell reader for the legacy generic param/arg strings stored on HIR
+/// function records ("T,U" / "i32,str"). Depth-aware for both `<>` and `()`
+/// so nested generic and fn-type texts survive splitting.
+fn hsr_csv_at(csv: string, want_idx: i32) -> string {
+    if (csv.len == 0) { return ""; }
+    var idx: i32 = 0;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    var depth: i32 = 0;
+    while (i <= csv.len) {
+        var at_sep: bool = false;
+        if (i == csv.len) { at_sep = true; }
+        else {
+            let ch = csv.charAt(i);
+            if (ch == 60 || ch == 40) { depth = depth + 1; }
+            if (ch == 62 || ch == 41) { depth = depth - 1; }
+            if (ch == 44 && depth == 0) { at_sep = true; }
+        }
+        if (at_sep) {
+            if (idx == want_idx) {
+                if (i <= start) { return ""; }
+                return csv.substring(start, i);
+            }
+            idx = idx + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn hsr_csv_count(csv: string) -> i32 {
+    var n: i32 = 0;
+    while (n < 64) {
+        if (hsr_csv_at(csv.clone(), n).len == 0) { return n; }
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Pointer-like type text peeling: "ptr<T>"/"ref<T>"/"mutref<T>" -> "T".
+/// Mirrors the kind-insensitive pointee recursion of
+/// generic_env_bind_type_ref (codegen.vyx L13953-13961).
+fn hsr_ptr_like_inner(text: string) -> string {
+    var prefix_len: i32 = 0;
+    if (text.len > 4
+        && text.charAt(0) == 112 && text.charAt(1) == 116 && text.charAt(2) == 114
+        && text.charAt(3) == 60) {
+        prefix_len = 4;
+    }
+    if (prefix_len == 0
+        && text.len > 4
+        && text.charAt(0) == 114 && text.charAt(1) == 101 && text.charAt(2) == 102
+        && text.charAt(3) == 60) {
+        prefix_len = 4;
+    }
+    if (prefix_len == 0
+        && text.len > 7
+        && text.charAt(0) == 109 && text.charAt(1) == 117 && text.charAt(2) == 116
+        && text.charAt(3) == 114 && text.charAt(4) == 101 && text.charAt(5) == 102
+        && text.charAt(6) == 60) {
+        prefix_len = 7;
+    }
+    if (prefix_len == 0) { return ""; }
+    if (text.charAt(text.len - 1) != 62) { return ""; }
+    return text.substring(prefix_len, (text.len - 1) as i32);
+}
+
+/// fn-type text decomposition: "fn(a,b)->r" / "cfn(a,b)->r".
+/// Returns the param CSV; ret text via hsr_fn_text_ret.
+fn hsr_fn_text_params(text: string) -> string {
+    var open: i32 = -1;
+    if (text.len > 3 && text.charAt(0) == 102 && text.charAt(1) == 110 && text.charAt(2) == 40) {
+        open = 2;
+    }
+    if (open < 0
+        && text.len > 4
+        && text.charAt(0) == 99 && text.charAt(1) == 102 && text.charAt(2) == 110
+        && text.charAt(3) == 40) {
+        open = 3;
+    }
+    if (open < 0) { return ""; }
+    var depth: i32 = 0;
+    var i: i32 = open;
+    while (i < text.len) {
+        let ch = text.charAt(i);
+        if (ch == 40 || ch == 60) { depth = depth + 1; }
+        if (ch == 41 || ch == 62) {
+            depth = depth - 1;
+            if (depth == 0 && ch == 41) {
+                return text.substring(open + 1, i);
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn hsr_fn_text_ret(text: string) -> string {
+    var depth: i32 = 0;
+    var i: i32 = 0;
+    while (i + 1 < text.len) {
+        let ch = text.charAt(i);
+        if (ch == 40 || ch == 60) { depth = depth + 1; }
+        if (ch == 41 || ch == 62) { depth = depth - 1; }
+        if (depth == 0 && ch == 45 && text.charAt(i + 1) == 62) {
+            if (i + 2 >= text.len) { return ""; }
+            return text.substring(i + 2, text.len as i32);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn hsr_text_is_fn_like(text: string) -> bool {
+    if (text.len > 3 && text.charAt(0) == 102 && text.charAt(1) == 110 && text.charAt(2) == 40) {
+        return true;
+    }
+    if (text.len > 4
+        && text.charAt(0) == 99 && text.charAt(1) == 102 && text.charAt(2) == 110
+        && text.charAt(3) == 40) {
+        return true;
+    }
+    return false;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// FNV-1a open-addressing hash map: string key -> i32 value.
+// Slot layout (24 bytes): 0 key ptr | 8 key len i64 | 16 value i32 | 20 spare.
+// Built once per index with capacity >= 2x entries; first-wins on duplicate
+// keys to mirror codegen's forward entry_lookup_value semantics.
+// ────────────────────────────────────────────────────────────────────
+
+fn hsr_map_slot_size() -> i32 { return 24; }
+
+fn hsr_hash(s: string) -> u64 {
+    var h: u64 = (-3750763034362895579) as u64;  // FNV-1a 64 offset basis
+    var i: i32 = 0;
+    while (i < s.len) {
+        h = h ^ (s.charAt(i) as u64);
+        h = h * (1099511628211 as u64);
+        i = i + 1;
+    }
+    return h;
+}
+
+fn hsr_map_new(cap: i32) -> rawptr {
+    if (cap <= 0) { return null; }
+    let bytes: i64 = (cap as i64) * (hsr_map_slot_size() as i64);
+    let buf = malloc(bytes as u64);
+    if (buf != null) { memset(buf, 0, bytes as u64); }
+    return buf;
+}
+
+fn hsr_map_slot(buf: rawptr, idx: i32) -> rawptr {
+    return ptr_offset(buf, (idx as i64) * (hsr_map_slot_size() as i64));
+}
+
+fn hsr_map_slot_key(slot: rawptr) -> string {
+    let ptr = ast_read_rawptr(slot);
+    let len = ast_read_i64(ptr_offset(slot, 8));
+    if (ptr == null || len <= 0) { return ""; }
+    return from_cstr_len(ptr, len);
+}
+
+fn hsr_map_dispose(buf: rawptr, cap: i32) {
+    if (buf == null || cap <= 0) { return; }
+    var idx: i32 = 0;
+    while (idx < cap) {
+        let slot = hsr_map_slot(buf, idx);
+        let key_ptr = ast_read_rawptr(slot);
+        if (key_ptr != null) { free(key_ptr); }
+        idx = idx + 1;
+    }
+    free(buf);
+}
+
+fn hsr_c_string_equals(ptr: rawptr, len: i64, value: string) -> bool {
+    if (ptr == null || len != value.len) { return false; }
+    if (len == 0) { return value.len == 0; }
+    return strncmp(ptr, value.c_str(), len) == 0;
+}
+
+/// Insert (first-wins). Capacity is sized 2x entries up front, so probing
+/// always terminates on an empty slot.
+fn hsr_map_put_first(buf: rawptr, cap: i32, key: string, value: i32) {
+    if (buf == null || cap <= 0 || key.len == 0) { return; }
+    var idx: i32 = (hsr_hash(key.clone()) % (cap as u64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = hsr_map_slot(buf, idx);
+        let ptr = ast_read_rawptr(slot);
+        if (ptr == null) {
+            ast_write_rawptr(slot, ast_dup_c_string(key.clone()));
+            ast_write_i64(ptr_offset(slot, 8), key.len);
+            ast_write_i32(ptr_offset(slot, 16), value);
+            return;
+        }
+        if (hsr_c_string_equals(ptr, ast_read_i64(ptr_offset(slot, 8)), key)) { return; }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+}
+
+fn hsr_map_get(buf: rawptr, cap: i32, key: string) -> i32 {
+    if (buf == null || cap <= 0 || key.len == 0) { return hir_id_invalid(); }
+    var idx: i32 = (hsr_hash(key.clone()) % (cap as u64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = hsr_map_slot(buf, idx);
+        let ptr = ast_read_rawptr(slot);
+        if (ptr == null) { return hir_id_invalid(); }
+        if (hsr_c_string_equals(ptr, ast_read_i64(ptr_offset(slot, 8)), key)) {
+            return ast_read_i32(ptr_offset(slot, 16));
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return hir_id_invalid();
+}
+
+fn hsr_pow2_at_least(want: i32) -> i32 {
+    var cap: i32 = 64;
+    while (cap < want) { cap = cap * 2; }
+    return cap;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Resolver
+// ────────────────────────────────────────────────────────────────────
+
+public class HirSemanticResolver {
+    public unit: HirUnit
+    public idx_built: bool
+    public idx_cap: i32
+    /// class/enum/interface name maps (exact full text > generic base >
+    /// '.'-qualified short segment) — find_class_decl L16990 priority order.
+    public class_exact_buf: rawptr
+    public class_base_buf: rawptr
+    public class_short_buf: rawptr
+    /// type alias name -> alias ItemId (find_type_alias_decl L18667).
+    public alias_buf: rawptr
+    /// variant name -> owner enum ItemId (find_variant_owner_decl L17507).
+    public variant_owner_buf: rawptr
+    /// field name -> first field ItemId (find_field_decl_by_name L20033).
+    public field_any_buf: rawptr
+    /// "ownerBase::methodBase" -> FunctionId (method symbol table; replaces
+    /// the ClassName_method suffix walk of codegen L17128-17149).
+    public method_owner_buf: rawptr
+    /// methodBase -> FunctionId (find_method_decl_by_name L19480 legacy lookup).
+    public method_any_buf: rawptr
+    /// top-level function name maps (exact > base).
+    public topfn_exact_buf: rawptr
+    public topfn_base_buf: rawptr
+    /// generic_env_bind accumulator: two parallel 64-slot raw buffers of
+    /// (c-string ptr, len) pairs. Raw storage sidesteps a host-codegen
+    /// defect with string-typed class fields passed to free functions.
+    public bind_names_buf: rawptr
+    public bind_args_buf: rawptr
+    public bind_count: i32
+    /// pass stats
+    public resolved_members: i32
+    public resolved_calls: i32
+    public genv_backfills: i32
+    public call_envs_bound: i32
+    public unresolved_members: i32
+    public unresolved_calls: i32
+    public print_summary: bool
+
+    public static fn create(h: HirUnit) -> HirSemanticResolver {
+        return HirSemanticResolver {
+            unit: h,
+            idx_built: false,
+            idx_cap: 0,
+            class_exact_buf: null,
+            class_base_buf: null,
+            class_short_buf: null,
+            alias_buf: null,
+            variant_owner_buf: null,
+            field_any_buf: null,
+            method_owner_buf: null,
+            method_any_buf: null,
+            topfn_exact_buf: null,
+            topfn_base_buf: null,
+            bind_names_buf: null,
+            bind_args_buf: null,
+            bind_count: 0,
+            resolved_members: 0,
+            resolved_calls: 0,
+            genv_backfills: 0,
+            call_envs_bound: 0,
+            unresolved_members: 0,
+            unresolved_calls: 0,
+            print_summary: true
+        };
+    }
+
+    public static fn create_silent(h: HirUnit) -> HirSemanticResolver {
+        let resolver = HirSemanticResolver.create(h);
+        resolver.print_summary = false;
+        return resolver;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // B) HIR symbol index — index_decl_lookups (codegen L3623) rebuilt
+    //    as hash maps over the flat item/function tables.
+    // ────────────────────────────────────────────────────────────────
+
+    public fn item_is_type_owner(self, item_id: i32) -> bool {
+        let k = self.unit.item_kind(item_id);
+        return k == hir_item_class()
+            || k == hir_item_enum()
+            || k == hir_item_interface();
+    }
+
+    public fn ensure_index(self) {
+        if (self.idx_built) { return; }
+        self.idx_built = true;
+        let entries = self.unit.item_count + self.unit.function_count + 8;
+        let cap = hsr_pow2_at_least(entries * 2);
+        self.idx_cap = cap;
+        self.class_exact_buf = hsr_map_new(cap);
+        self.class_base_buf = hsr_map_new(cap);
+        self.class_short_buf = hsr_map_new(cap);
+        self.alias_buf = hsr_map_new(cap);
+        self.variant_owner_buf = hsr_map_new(cap);
+        self.field_any_buf = hsr_map_new(cap);
+        self.method_owner_buf = hsr_map_new(cap);
+        self.method_any_buf = hsr_map_new(cap);
+        self.topfn_exact_buf = hsr_map_new(cap);
+        self.topfn_base_buf = hsr_map_new(cap);
+        var id: i32 = 1;
+        while (id <= self.unit.item_count) {
+            let kind = self.unit.item_kind(id);
+            let name = self.unit.item_name(id);
+            if (name.len > 0) {
+                if (kind == hir_item_class()
+                    || kind == hir_item_enum()
+                    || kind == hir_item_interface()) {
+                    hsr_map_put_first(self.class_exact_buf, cap, name.clone(), id);
+                    let base = policy_generic_call_base(name.clone());
+                    if (base.len > 0) {
+                        hsr_map_put_first(self.class_base_buf, cap, base.clone(), id);
+                        let short = hsr_last_dot_segment(base.clone());
+                        if (short.len > 0 && short != base) {
+                            hsr_map_put_first(self.class_short_buf, cap, short, id);
+                        }
+                    }
+                }
+                if (kind == hir_item_type_alias()) {
+                    hsr_map_put_first(self.alias_buf, cap, name.clone(), id);
+                }
+                if (kind == hir_item_variant()) {
+                    let owner = self.unit.item_owner(id);
+                    if (owner != hir_id_invalid()) {
+                        hsr_map_put_first(self.variant_owner_buf, cap, name.clone(), owner);
+                    }
+                }
+                if (kind == hir_item_field()) {
+                    hsr_map_put_first(self.field_any_buf, cap, name.clone(), id);
+                }
+                if (kind == hir_item_method()) {
+                    let fn_id = self.unit.item_function(id);
+                    if (fn_id != hir_id_invalid()) {
+                        let owner_item = self.unit.item_owner(id);
+                        let owner_name = self.unit.item_name(owner_item);
+                        let owner_base = policy_generic_call_base(owner_name.clone());
+                        let mbase = policy_generic_call_base(name.clone());
+                        if (owner_base.len > 0 && mbase.len > 0) {
+                            hsr_map_put_first(self.method_owner_buf,
+                                              cap,
+                                              owner_base + "::" + mbase,
+                                              fn_id);
+                        }
+                        if (mbase.len > 0) {
+                            hsr_map_put_first(self.method_any_buf, cap, mbase, fn_id);
+                        }
+                    }
+                }
+            }
+            id = id + 1;
+        }
+        var fn_id2: i32 = 1;
+        while (fn_id2 <= self.unit.function_count) {
+            let fname = self.unit.function_name(fn_id2);
+            if (fname.len > 0) {
+                let fbase = policy_generic_call_base(fname.clone());
+                let owner_text = self.unit.function_owner_type(fn_id2);
+                if (owner_text.len == 0) {
+                    hsr_map_put_first(self.topfn_exact_buf, cap, fname.clone(), fn_id2);
+                    if (fbase.len > 0) {
+                        hsr_map_put_first(self.topfn_base_buf, cap, fbase.clone(), fn_id2);
+                    }
+                } else {
+                    let obase = policy_generic_call_base(owner_text.clone());
+                    if (obase.len > 0 && fbase.len > 0) {
+                        hsr_map_put_first(self.method_owner_buf,
+                                          cap,
+                                          obase + "::" + fbase,
+                                          fn_id2);
+                        hsr_map_put_first(self.method_any_buf, cap, fbase, fn_id2);
+                    }
+                }
+            }
+            fn_id2 = fn_id2 + 1;
+        }
+    }
+
+    public fn bind_clear(self) {
+        var i: i32 = 0;
+        while (i < 64) {
+            if (self.bind_names_buf != null) {
+                let name_slot = ptr_offset(self.bind_names_buf, i * 16);
+                let name_ptr = ast_read_rawptr(name_slot);
+                if (name_ptr != null) { free(name_ptr); }
+                ast_write_rawptr(name_slot, null);
+                ast_write_i64(ptr_offset(name_slot, 8), 0);
+            }
+            if (self.bind_args_buf != null) {
+                let arg_slot = ptr_offset(self.bind_args_buf, i * 16);
+                let arg_ptr = ast_read_rawptr(arg_slot);
+                if (arg_ptr != null) { free(arg_ptr); }
+                ast_write_rawptr(arg_slot, null);
+                ast_write_i64(ptr_offset(arg_slot, 8), 0);
+            }
+            i = i + 1;
+        }
+        self.bind_count = 0;
+    }
+
+    public fn dispose(self) {
+        if (self.idx_cap > 0) {
+            hsr_map_dispose(self.class_exact_buf, self.idx_cap);
+            hsr_map_dispose(self.class_base_buf, self.idx_cap);
+            hsr_map_dispose(self.class_short_buf, self.idx_cap);
+            hsr_map_dispose(self.alias_buf, self.idx_cap);
+            hsr_map_dispose(self.variant_owner_buf, self.idx_cap);
+            hsr_map_dispose(self.field_any_buf, self.idx_cap);
+            hsr_map_dispose(self.method_owner_buf, self.idx_cap);
+            hsr_map_dispose(self.method_any_buf, self.idx_cap);
+            hsr_map_dispose(self.topfn_exact_buf, self.idx_cap);
+            hsr_map_dispose(self.topfn_base_buf, self.idx_cap);
+        }
+        self.class_exact_buf = null;
+        self.class_base_buf = null;
+        self.class_short_buf = null;
+        self.alias_buf = null;
+        self.variant_owner_buf = null;
+        self.field_any_buf = null;
+        self.method_owner_buf = null;
+        self.method_any_buf = null;
+        self.topfn_exact_buf = null;
+        self.topfn_base_buf = null;
+        self.idx_cap = 0;
+        self.idx_built = false;
+        self.bind_clear();
+        if (self.bind_names_buf != null) { free(self.bind_names_buf); }
+        if (self.bind_args_buf != null) { free(self.bind_args_buf); }
+        self.bind_names_buf = null;
+        self.bind_args_buf = null;
+    }
+
+    /// Migrated find_class_decl (codegen.vyx L16990): exact concrete
+    /// instance name first ("Vec::<i32>" items are materialized by the
+    /// builder), then the generic base, then the '.'-qualified short name.
+    public fn find_class_item(self, name: string) -> i32 {
+        if (name.len == 0) { return hir_id_invalid(); }
+        self.ensure_index();
+        let exact = hsr_map_get(self.class_exact_buf, self.idx_cap, name.clone());
+        if (exact != hir_id_invalid()) { return exact; }
+        let base = policy_generic_call_base(name.clone());
+        if (base.len > 0 && base != name) {
+            let by_base = hsr_map_get(self.class_exact_buf, self.idx_cap, base.clone());
+            if (by_base != hir_id_invalid()) { return by_base; }
+        }
+        let by_base_map = hsr_map_get(self.class_base_buf, self.idx_cap, base.clone());
+        if (by_base_map != hir_id_invalid()) { return by_base_map; }
+        if (hsr_contains_dot(base.clone())) {
+            let short = hsr_last_dot_segment(base.clone());
+            if (short.len > 0 && short != base) {
+                let by_short = hsr_map_get(self.class_exact_buf, self.idx_cap, short.clone());
+                if (by_short != hir_id_invalid()) { return by_short; }
+                return hsr_map_get(self.class_base_buf, self.idx_cap, short);
+            }
+        }
+        // Reverse short lookup: a short query may name a '.'-qualified item.
+        return hsr_map_get(self.class_short_buf, self.idx_cap, base);
+    }
+
+    public fn find_enum_item(self, name: string) -> i32 {
+        let item = self.find_class_item(name.clone());
+        if (item == hir_id_invalid()) { return hir_id_invalid(); }
+        if (self.unit.item_kind(item) != hir_item_enum()) { return hir_id_invalid(); }
+        return item;
+    }
+
+    /// Member-chain walk (owner-scoped, chain length = member count; same
+    /// shape as the original decl member walks).
+    public fn find_member_item_of_kind(self, owner_item: i32, want_kind: i32, name: string) -> i32 {
+        if (owner_item == hir_id_invalid() || name.len == 0) { return hir_id_invalid(); }
+        let name_base = policy_generic_call_base(name.clone());
+        var cur = self.unit.item_first_member(owner_item);
+        var guard: i32 = 0;
+        let guard_limit: i32 = self.unit.item_count + 2;
+        while (cur != hir_id_invalid() && guard < guard_limit) {
+            if (self.unit.item_kind(cur) == want_kind) {
+                let mname = self.unit.item_name(cur);
+                if (mname == name || policy_generic_call_base(mname.clone()) == name_base) {
+                    return cur;
+                }
+            }
+            cur = self.unit.item_next_sibling(cur);
+            guard = guard + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    /// Migrated find_field_decl (codegen.vyx L19995). Inherited layout
+    /// fields are already part of the HIR member chain.
+    public fn find_field_item(self, owner_item: i32, name: string) -> i32 {
+        return self.find_member_item_of_kind(owner_item, hir_item_field(), name);
+    }
+
+    /// Migrated find_field_idx (codegen.vyx L19509); the ordinal lives on
+    /// the item record (+1 biased, -1 when unset).
+    public fn field_index(self, field_item: i32) -> i32 {
+        return self.unit.item_field_index(field_item);
+    }
+
+    /// Migrated find_field_decl_by_name (codegen.vyx L20033).
+    public fn find_field_item_by_name(self, name: string) -> i32 {
+        if (name.len == 0) { return hir_id_invalid(); }
+        self.ensure_index();
+        return hsr_map_get(self.field_any_buf, self.idx_cap, name);
+    }
+
+    /// Migrated find_assoc_const_decl (codegen.vyx L20052); assoc consts
+    /// register as const items on the owner chain.
+    public fn find_assoc_const_item(self, owner_item: i32, name: string) -> i32 {
+        return self.find_member_item_of_kind(owner_item, hir_item_const(), name);
+    }
+
+    public fn find_method_item(self, owner_item: i32, name: string) -> i32 {
+        return self.find_member_item_of_kind(owner_item, hir_item_method(), name);
+    }
+
+    /// Migrated find_enum_variant_decl + _casefold (codegen.vyx L17480/17492).
+    public fn find_enum_variant_item(self, enum_item: i32, name: string) -> i32 {
+        let exact = self.find_member_item_of_kind(enum_item, hir_item_variant(), name.clone());
+        if (exact != hir_id_invalid()) { return exact; }
+        if (enum_item == hir_id_invalid() || name.len == 0) { return hir_id_invalid(); }
+        var cur = self.unit.item_first_member(enum_item);
+        var guard: i32 = 0;
+        let guard_limit: i32 = self.unit.item_count + 2;
+        while (cur != hir_id_invalid() && guard < guard_limit) {
+            if (self.unit.item_kind(cur) == hir_item_variant()
+                && hsr_eq_ignore_case(self.unit.item_name(cur), name.clone())) {
+                return cur;
+            }
+            cur = self.unit.item_next_sibling(cur);
+            guard = guard + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    /// Migrated enum_variant_index (codegen.vyx L17448): prefer the tag
+    /// stamped on the item record, fall back to the chain ordinal.
+    public fn enum_variant_tag(self, enum_item: i32, name: string) -> i32 {
+        let variant = self.find_enum_variant_item(enum_item, name.clone());
+        if (variant == hir_id_invalid()) { return -1; }
+        let stamped = self.unit.item_variant_tag(variant);
+        if (stamped >= 0) { return stamped; }
+        var ordinal: i32 = 0;
+        var cur = self.unit.item_first_member(enum_item);
+        var guard: i32 = 0;
+        let guard_limit: i32 = self.unit.item_count + 2;
+        while (cur != hir_id_invalid() && guard < guard_limit) {
+            if (self.unit.item_kind(cur) == hir_item_variant()) {
+                if (cur == variant) { return ordinal; }
+                ordinal = ordinal + 1;
+            }
+            cur = self.unit.item_next_sibling(cur);
+            guard = guard + 1;
+        }
+        return -1;
+    }
+
+    /// Migrated find_variant_owner_decl (codegen.vyx L17507).
+    public fn find_variant_owner_item(self, variant_name: string) -> i32 {
+        if (variant_name.len == 0) { return hir_id_invalid(); }
+        self.ensure_index();
+        return hsr_map_get(self.variant_owner_buf, self.idx_cap, variant_name);
+    }
+
+    /// Migrated find_type_alias_decl (codegen.vyx L18667).
+    public fn find_type_alias_item(self, name: string) -> i32 {
+        if (name.len == 0) { return hir_id_invalid(); }
+        self.ensure_index();
+        return hsr_map_get(self.alias_buf, self.idx_cap, name);
+    }
+
+    /// Migrated resolve_alias_type_ref (codegen.vyx L18691): chase alias
+    /// items by TypeId text, depth-capped. Use-aliases were already folded
+    /// by the builder, so only `type X = Y` items remain.
+    public fn resolve_alias_type(self, type_id: i32) -> i32 {
+        var cur = type_id;
+        var depth: i32 = 0;
+        while (cur != hir_id_invalid() && depth < 16) {
+            if (hir_type_table_kind(self.unit.types, cur) != ty_CLASS()) { return cur; }
+            let text = hir_type_table_text(self.unit.types, cur);
+            let alias_item = self.find_type_alias_item(text.clone());
+            if (alias_item == hir_id_invalid()) { return cur; }
+            let target = self.unit.item_type(alias_item);
+            if (target == hir_id_invalid() || target == cur) { return cur; }
+            cur = target;
+            depth = depth + 1;
+        }
+        return cur;
+    }
+
+    /// Migrated resolve_method_owner_class_name (codegen.vyx L17067),
+    /// ItemId flavor: direct member chain first, then the method symbol
+    /// table, then the any-method legacy lookup (find_method_decl_by_name
+    /// L19480). The defining owner is recovered from the method's
+    /// function record / item owner.
+    public fn resolve_method_owner_item(self, owner_item: i32, method_name: string) -> i32 {
+        if (method_name.len == 0) { return hir_id_invalid(); }
+        if (owner_item != hir_id_invalid()) {
+            if (self.find_method_item(owner_item, method_name.clone()) != hir_id_invalid()) {
+                return owner_item;
+            }
+        }
+        let fn_id = self.method_function_id(owner_item, method_name.clone());
+        if (fn_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let fn_item = self.unit.function_item(fn_id);
+        if (fn_item != hir_id_invalid()) {
+            let fn_owner = self.unit.item_owner(fn_item);
+            if (fn_owner != hir_id_invalid() && self.item_is_type_owner(fn_owner)) {
+                return fn_owner;
+            }
+        }
+        let owner_text = self.unit.function_owner_type(fn_id);
+        if (owner_text.len > 0) {
+            return self.find_class_item(owner_text);
+        }
+        return hir_id_invalid();
+    }
+
+    /// FunctionId for a method: member chain, then the
+    /// "ownerBase::methodBase" symbol map, then the any-method legacy lookup.
+    public fn method_function_id(self, owner_item: i32, method_name: string) -> i32 {
+        if (method_name.len == 0) { return hir_id_invalid(); }
+        let direct = self.find_method_item(owner_item, method_name.clone());
+        if (direct != hir_id_invalid()) {
+            let fn_id = self.unit.item_function(direct);
+            if (fn_id != hir_id_invalid()) { return fn_id; }
+        }
+        self.ensure_index();
+        let mbase = policy_generic_call_base(method_name.clone());
+        if (owner_item != hir_id_invalid()) {
+            let owner_base = policy_generic_call_base(self.unit.item_name(owner_item).clone());
+            if (owner_base.len > 0 && mbase.len > 0) {
+                let mapped = hsr_map_get(self.method_owner_buf,
+                                         self.idx_cap,
+                                         owner_base + "::" + mbase);
+                if (mapped != hir_id_invalid()) { return mapped; }
+            }
+        }
+        return hsr_map_get(self.method_any_buf, self.idx_cap, mbase);
+    }
+
+    /// Top-level (non-method) function lookup (exact then base map).
+    public fn find_top_function_id(self, name: string) -> i32 {
+        if (name.len == 0) { return hir_id_invalid(); }
+        self.ensure_index();
+        let exact = hsr_map_get(self.topfn_exact_buf, self.idx_cap, name.clone());
+        if (exact != hir_id_invalid()) { return exact; }
+        return hsr_map_get(self.topfn_base_buf,
+                           self.idx_cap,
+                           policy_generic_call_base(name.clone()));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // A) owner/env computation
+    // ────────────────────────────────────────────────────────────────
+
+    /// Migrated class_name_for_value_expr (codegen.vyx L6255). HIR exprs
+    /// carry canonical TypeIds, so the receiver's type text answers most
+    /// of the original's AST special cases.
+    public fn owner_type_text_for_expr(self, expr_id: i32) -> string {
+        if (expr_id == hir_id_invalid()) { return ""; }
+        let k = self.unit.expr_kind(expr_id);
+        if (k == ex_STRUCT_INIT()) {
+            let sn = self.unit.expr_name(expr_id);
+            if (sn.len > 0) { return sn; }
+        }
+        let ty = self.unit.expr_type(expr_id);
+        if (ty != hir_id_invalid()) {
+            let tk = hir_type_table_kind(self.unit.types, ty);
+            if (tk == ty_CLASS()) {
+                return hir_type_table_text(self.unit.types, ty);
+            }
+            if (tk == ty_STRING()) { return "str"; }
+            if (tk == ty_PTR() || tk == ty_REF() || tk == ty_MUTREF()) {
+                let elem = hir_type_table_elem(self.unit.types, ty);
+                if (elem != hir_id_invalid()
+                    && hir_type_table_kind(self.unit.types, elem) == ty_CLASS()) {
+                    return hir_type_table_text(self.unit.types, elem);
+                }
+            }
+        }
+        if (k == ex_IDENT()) {
+            // Static member access: the receiver ident itself names a type.
+            let n = self.unit.expr_name(expr_id);
+            if (n.len > 0 && self.find_class_item(n.clone()) != hir_id_invalid()) {
+                return n;
+            }
+        }
+        return "";
+    }
+
+    public fn owner_item_for_expr(self, expr_id: i32) -> i32 {
+        let text = self.owner_type_text_for_expr(expr_id);
+        if (text.len == 0) { return hir_id_invalid(); }
+        return self.find_class_item(text);
+    }
+
+    /// TypeId for a type name (intern; primitives map to their canonical
+    /// kinds the same way hir_type_table normalizes them).
+    public fn type_id_for_name(self, name: string) -> i32 {
+        return self.unit.types.intern_name(name);
+    }
+
+    /// Build a TypeId list (tlist pool chain) from CSV text. `mark_open`
+    /// marks every node's TypeId as structurally open (template formals).
+    public fn type_list_from_csv(self, csv: string, mark_open: bool) -> i32 {
+        if (csv.len == 0) { return hir_id_invalid(); }
+        var head: i32 = hir_id_invalid();
+        var tail: i32 = hir_id_invalid();
+        var i: i32 = 0;
+        while (i < 64) {
+            let part = hsr_csv_at(csv.clone(), i);
+            if (part.len == 0) { return head; }
+            let ty = self.type_id_for_name(part.clone());
+            if (mark_open) { self.unit.types.add_flags(ty, hir_type_flag_open()); }
+            let node = self.unit.add_type_list_node(ty);
+            if (head == hir_id_invalid()) { head = node; }
+            else { self.unit.set_type_list_next(tail, node); }
+            tail = node;
+            i = i + 1;
+        }
+        return head;
+    }
+
+    /// TypeId substitute: map interned params onto interned args, then rebuild
+    /// pointer and generic-class rows from substituted TypeIds. CSV is only a
+    /// serialization of those TypeId lists, not a second type model.
+    public fn substitute_type_id(self, type_id: i32, params_csv: string, args_csv: string) -> i32 {
+        if (type_id <= 0 || params_csv.len == 0) { return type_id; }
+        var pi: i32 = 0;
+        while (pi < 64) {
+            let p = hsr_csv_at(params_csv.clone(), pi);
+            if (p.len == 0) { pi = 64; }
+            else {
+                if (self.type_id_for_name(p.clone()) == type_id) {
+                    let a = hsr_csv_at(args_csv.clone(), pi);
+                    if (a.len > 0) { return self.type_id_for_name(a); }
+                    return type_id;
+                }
+                pi = pi + 1;
+            }
+        }
+        if (!self.unit.types.is_open(type_id)) { return type_id; }
+        let kind = hir_type_table_kind(self.unit.types, type_id);
+        let elem = hir_type_table_elem(self.unit.types, type_id);
+        if (kind == ty_PTR() || kind == ty_REF() || kind == ty_MUTREF()) {
+            let se = self.substitute_type_id(elem, params_csv.clone(), args_csv.clone());
+            if (se == elem) { return type_id; }
+            var prefix = "ptr";
+            if (kind == ty_REF()) { prefix = "ref"; }
+            if (kind == ty_MUTREF()) { prefix = "mutref"; }
+            return self.unit.types.intern(kind,
+                                          prefix + "<" + hir_type_table_text(self.unit.types, se) + ">",
+                                          se,
+                                          0);
+        }
+        if (kind == ty_CLASS()) {
+            let text = hir_type_table_text(self.unit.types, type_id);
+            let inner_args = policy_generic_call_args(text.clone());
+            if (inner_args.len == 0) { return type_id; }
+            let base = policy_generic_call_base(text.clone());
+            var out_args = "";
+            var changed: bool = false;
+            var gi: i32 = 0;
+            while (gi < 64) {
+                let part = policy_generic_arg_at(inner_args.clone(), gi);
+                if (part.len == 0) {
+                    if (!changed || out_args.len == 0) { return type_id; }
+                    return self.type_id_for_name(base + "::<" + out_args + ">");
+                }
+                let aid = self.type_id_for_name(part.clone());
+                let sid = self.substitute_type_id(aid, params_csv.clone(), args_csv.clone());
+                if (sid != aid) { changed = true; }
+                if (out_args.len > 0) { out_args = out_args + ","; }
+                out_args = out_args + hir_type_table_text(self.unit.types, sid);
+                gi = gi + 1;
+            }
+            if (!changed) { return type_id; }
+            return self.type_id_for_name(base + "::<" + out_args + ">");
+        }
+        let text2 = hir_type_table_text(self.unit.types, type_id);
+        let subst = self.subst_text_walk(text2.clone(), params_csv.clone(), args_csv.clone());
+        if (subst == text2) { return type_id; }
+        return self.type_id_for_name(subst);
+    }
+
+    /// Text dump of TypeId substitution. Nested generic spelling is interned
+    /// (`Wrap<i32>` and `Wrap::<i32>` share one TypeId) before mapping.
+    public fn substitute_type_text(self, text: string, params_csv: string, args_csv: string) -> string {
+        if (text.len == 0 || params_csv.len == 0) { return text; }
+        if (hsr_ptr_like_inner(text.clone()).len > 0
+            || hsr_text_is_fn_like(text.clone())
+            || (text.len > 0 && (text.charAt(0) == 91 || text.charAt(0) == 40))) {
+            return self.subst_text_walk(text, params_csv, args_csv);
+        }
+        let tid = self.type_id_for_name(text.clone());
+        let sid = self.substitute_type_id(tid, params_csv, args_csv);
+        return hir_type_table_text(self.unit.types, sid);
+    }
+
+    fn subst_text_walk(self, text: string, params_csv: string, args_csv: string) -> string {
+        if (text.len == 0 || params_csv.len == 0) { return text; }
+        var pi: i32 = 0;
+        while (pi < 64) {
+            let p = hsr_csv_at(params_csv.clone(), pi);
+            if (p.len == 0) { pi = 64; }
+            else {
+                if (p == text) {
+                    let a = hsr_csv_at(args_csv.clone(), pi);
+                    if (a.len > 0) { return a; }
+                    return text;
+                }
+                pi = pi + 1;
+            }
+        }
+        let ptr_inner = hsr_ptr_like_inner(text.clone());
+        if (ptr_inner.len > 0) {
+            let prefix_len = text.len - ptr_inner.len - 1;
+            let prefix = text.substring(0, prefix_len as i32);
+            return prefix
+                + self.substitute_type_text(ptr_inner.clone(), params_csv.clone(), args_csv.clone())
+                + ">";
+        }
+        if (hsr_text_is_fn_like(text.clone())) {
+            let fparams = hsr_fn_text_params(text.clone());
+            let fret = hsr_fn_text_ret(text.clone());
+            var out_params = "";
+            var fi: i32 = 0;
+            while (fi < 64) {
+                let part = hsr_csv_at(fparams.clone(), fi);
+                if (part.len == 0) { fi = 64; }
+                else {
+                    if (out_params.len > 0) { out_params = out_params + ","; }
+                    out_params = out_params
+                        + self.substitute_type_text(part.clone(), params_csv.clone(), args_csv.clone());
+                    fi = fi + 1;
+                }
+            }
+            var fn_prefix = "fn";
+            if (text.charAt(0) == 99) { fn_prefix = "cfn"; }
+            return fn_prefix + "(" + out_params + ")->"
+                + self.substitute_type_text(fret.clone(), params_csv.clone(), args_csv.clone());
+        }
+        let inner_args = policy_generic_call_args(text.clone());
+        if (inner_args.len == 0) { return text; }
+        let base = policy_generic_call_base(text.clone());
+        var out_args = "";
+        var gi: i32 = 0;
+        while (gi < 64) {
+            let part2 = policy_generic_arg_at(inner_args.clone(), gi);
+            if (part2.len == 0) {
+                if (out_args.len == 0) { return text; }
+                return base + "::<" + out_args + ">";
+            }
+            if (out_args.len > 0) { out_args = out_args + ","; }
+            out_args = out_args + self.substitute_type_text(part2.clone(),
+                                                            params_csv.clone(),
+                                                            args_csv.clone());
+            gi = gi + 1;
+        }
+        return base + "::<" + out_args + ">";
+    }
+
+    /// Migrated associated_type_ref_for_name (codegen.vyx L4497):
+    /// "Base.Member" / "Base::Member" -> the assoc type's TypeId, with the
+    /// base name substituted through the supplied env first. Assoc types
+    /// register as type_alias items on the owner's member chain.
+    public fn assoc_type_id_for_name(self, name: string, params_csv: string, args_csv: string) -> i32 {
+        if (name.len == 0) { return hir_id_invalid(); }
+        var sep: i32 = -1;
+        var sep_len: i32 = 1;
+        var i: i32 = 0;
+        while (i < name.len) {
+            let ch = name.charAt(i);
+            if (ch == 46) {
+                sep = i;
+                sep_len = 1;
+            } else {
+                if (ch == 58 && i + 1 < name.len && name.charAt(i + 1) == 58) {
+                    sep = i;
+                    sep_len = 2;
+                    i = i + 1;
+                }
+            }
+            i = i + 1;
+        }
+        if (sep <= 0 || sep + sep_len >= name.len) { return hir_id_invalid(); }
+        var base_name = name.substring(0, sep);
+        let member_name = name.substring(sep + sep_len, name.len as i32);
+        if (member_name.len == 0) { return hir_id_invalid(); }
+        var mi: i32 = 0;
+        while (mi < member_name.len) {
+            let mc = member_name.charAt(mi);
+            if (mc == 58 || mc == 60 || mc == 62) { return hir_id_invalid(); }
+            mi = mi + 1;
+        }
+        base_name = self.substitute_type_text(base_name.clone(), params_csv.clone(), args_csv.clone());
+        if (base_name.len == 0) { return hir_id_invalid(); }
+        let owner = self.find_class_item(policy_generic_call_base(base_name.clone()));
+        if (owner == hir_id_invalid()) { return hir_id_invalid(); }
+        let assoc = self.find_member_item_of_kind(owner, hir_item_type_alias(), member_name.clone());
+        if (assoc == hir_id_invalid()) { return hir_id_invalid(); }
+        return self.unit.item_type(assoc);
+    }
+
+    // ── generic env binding (codegen L13902 text level) ────────────
+
+    /// Bind slot layout (16 bytes): 0 c-string ptr | 8 len i64.
+    public fn bind_reset(self) {
+        if (self.bind_names_buf == null) {
+            self.bind_names_buf = malloc(1024);
+            self.bind_args_buf = malloc(1024);
+        }
+        self.bind_clear();
+    }
+
+    public fn bind_slot_text(self, buf: rawptr, idx: i32) -> string {
+        if (buf == null || idx < 0 || idx >= 64) { return ""; }
+        let slot = ptr_offset(buf, idx * 16);
+        let ptr = ast_read_rawptr(slot);
+        let len = ast_read_i64(ptr_offset(slot, 8));
+        if (ptr == null || len <= 0) { return ""; }
+        return from_cstr_len(ptr, len);
+    }
+
+    public fn bind_slot_write(self, buf: rawptr, idx: i32, value: string) {
+        if (buf == null || idx < 0 || idx >= 64) { return; }
+        let slot = ptr_offset(buf, idx * 16);
+        let old_ptr = ast_read_rawptr(slot);
+        if (old_ptr != null) { free(old_ptr); }
+        ast_write_rawptr(slot, ast_dup_c_string(value.clone()));
+        ast_write_i64(ptr_offset(slot, 8), value.len);
+    }
+
+    public fn bind_slot_index(self, name: string) -> i32 {
+        var found: i32 = -1;
+        var i: i32 = 0;
+        while (i < self.bind_count) {
+            if (found < 0 && self.bind_slot_text(self.bind_names_buf, i) == name) {
+                found = i;
+            }
+            i = i + 1;
+        }
+        return found;
+    }
+
+    public fn bind_lookup(self, name: string) -> string {
+        let slot = self.bind_slot_index(name.clone());
+        if (slot < 0) { return ""; }
+        return self.bind_slot_text(self.bind_args_buf, slot);
+    }
+
+    /// First-wins with the self-reference upgrade of codegen L13917-13925:
+    /// an existing binding T->T is replaced by a concrete T->actual.
+    public fn bind_add(self, name: string, value: string) {
+        if (name.len == 0 || value.len == 0) { return; }
+        let slot = self.bind_slot_index(name.clone());
+        if (slot >= 0) {
+            let existing = self.bind_slot_text(self.bind_args_buf, slot);
+            if (existing == name && value != name) {
+                self.bind_slot_write(self.bind_args_buf, slot, value.clone());
+            }
+            return;
+        }
+        if (value == name) { return; }
+        if (self.bind_count >= 64) { return; }
+        self.bind_slot_write(self.bind_names_buf, self.bind_count, name.clone());
+        self.bind_slot_write(self.bind_args_buf, self.bind_count, value.clone());
+        self.bind_count = self.bind_count + 1;
+    }
+
+    public fn generic_param_exists(self, params_csv: string, name: string) -> bool {
+        if (name.len == 0) { return false; }
+        var i: i32 = 0;
+        while (i < 64) {
+            let p = hsr_csv_at(params_csv.clone(), i);
+            if (p.len == 0) { return false; }
+            if (p == name) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn bind_type_id(self, params_csv: string, pattern_id: i32, actual_id: i32) {
+        if (pattern_id <= 0 || actual_id <= 0) { return; }
+        let pattern = hir_type_table_text(self.unit.types, pattern_id);
+        let actual = hir_type_table_text(self.unit.types, actual_id);
+        if (self.generic_param_exists(params_csv.clone(), pattern.clone())) {
+            if (actual != "void" && actual != "rawptr") {
+                self.bind_add(pattern.clone(), actual.clone());
+            }
+            return;
+        }
+        let pk = hir_type_table_kind(self.unit.types, pattern_id);
+        let ak = hir_type_table_kind(self.unit.types, actual_id);
+        if ((pk == ty_PTR() || pk == ty_REF() || pk == ty_MUTREF()) && pk == ak) {
+            self.bind_type_id(params_csv,
+                              hir_type_table_elem(self.unit.types, pattern_id),
+                              hir_type_table_elem(self.unit.types, actual_id));
+            return;
+        }
+        if (pk == ty_CLASS() && ak == ty_CLASS()) {
+            let p_base = policy_generic_call_base(pattern.clone());
+            let a_base = policy_generic_call_base(actual.clone());
+            if (p_base == a_base) {
+                let p_args = policy_generic_call_args(pattern.clone());
+                let a_args = policy_generic_call_args(actual.clone());
+                if (p_args.len > 0 && a_args.len > 0) {
+                    var gi: i32 = 0;
+                    while (gi < 64) {
+                        let pa = policy_generic_arg_at(p_args.clone(), gi);
+                        if (pa.len == 0) { return; }
+                        let aa = policy_generic_arg_at(a_args.clone(), gi);
+                        if (aa.len == 0) { return; }
+                        self.bind_type_id(params_csv.clone(),
+                                          self.type_id_for_name(pa),
+                                          self.type_id_for_name(aa));
+                        gi = gi + 1;
+                    }
+                    return;
+                }
+            }
+        }
+        self.bind_type_text(params_csv, pattern, actual);
+    }
+
+    public fn bind_type_text(self, params_csv: string, pattern: string, actual: string) {
+        if (pattern.len == 0 || actual.len == 0) { return; }
+        if (self.generic_param_exists(params_csv.clone(), pattern.clone())) {
+            if (actual != "void" && actual != "rawptr") {
+                self.bind_add(pattern.clone(), actual.clone());
+            }
+            return;
+        }
+        let p_inner = hsr_ptr_like_inner(pattern.clone());
+        if (p_inner.len > 0) {
+            let a_inner = hsr_ptr_like_inner(actual.clone());
+            if (a_inner.len > 0) {
+                self.bind_type_text(params_csv.clone(), p_inner, a_inner);
+            }
+            return;
+        }
+        if (hsr_text_is_fn_like(pattern.clone()) && hsr_text_is_fn_like(actual.clone())) {
+            let p_params = hsr_fn_text_params(pattern.clone());
+            let a_params = hsr_fn_text_params(actual.clone());
+            var fi: i32 = 0;
+            while (fi < 64) {
+                let pp = hsr_csv_at(p_params.clone(), fi);
+                if (pp.len == 0) { fi = 64; }
+                else {
+                    let aa = hsr_csv_at(a_params.clone(), fi);
+                    if (aa.len > 0) {
+                        self.bind_type_text(params_csv.clone(), pp, aa);
+                    }
+                    fi = fi + 1;
+                }
+            }
+            self.bind_type_text(params_csv.clone(),
+                                hsr_fn_text_ret(pattern.clone()),
+                                hsr_fn_text_ret(actual.clone()));
+            return;
+        }
+        let p_base = policy_generic_call_base(pattern.clone());
+        let a_base = policy_generic_call_base(actual.clone());
+        if (p_base == a_base) {
+            let p_args = policy_generic_call_args(pattern.clone());
+            let a_args = policy_generic_call_args(actual.clone());
+            if (p_args.len > 0 && a_args.len > 0) {
+                var gi: i32 = 0;
+                while (gi < 64) {
+                    let pa = policy_generic_arg_at(p_args.clone(), gi);
+                    if (pa.len == 0) { return; }
+                    let aa2 = policy_generic_arg_at(a_args.clone(), gi);
+                    if (aa2.len == 0) { return; }
+                    self.bind_type_text(params_csv.clone(), pa, aa2);
+                    gi = gi + 1;
+                }
+            }
+        }
+    }
+
+    /// Migrated class_generic_env (codegen.vyx L6112), structured flavor:
+    /// builds a genv row binding the class formals to the instance args of
+    /// `class_type_text` ("Vec::<i32>"). Formal names come from a member
+    /// function record of the class when available (the builder stamps
+    /// generic_params CSV on method instances), else positional T0..Tn.
+    public fn class_generic_env_id(self, class_type_text: string) -> i32 {
+        if (class_type_text.len == 0) { return hir_id_invalid(); }
+        let args_csv = policy_generic_call_args(class_type_text.clone());
+        if (args_csv.len == 0) { return hir_id_invalid(); }
+        let base = policy_generic_call_base(class_type_text.clone());
+        var params_csv = "";
+        var fn_id: i32 = 1;
+        while (fn_id <= self.unit.function_count && params_csv.len == 0) {
+            let fn_owner = self.unit.function_owner_type(fn_id);
+            if (fn_owner.len > 0
+                && (fn_owner == class_type_text
+                    || policy_generic_call_base(fn_owner.clone()) == base)) {
+                let cand = self.unit.function_generic_params(fn_id);
+                if (cand.len > 0) { params_csv = cand; }
+            }
+            fn_id = fn_id + 1;
+        }
+        if (params_csv.len == 0) {
+            let n = hsr_csv_count(args_csv.clone());
+            var synth = "";
+            var pi: i32 = 0;
+            while (pi < n) {
+                if (synth.len > 0) { synth = synth + ","; }
+                synth = synth + "T" + policy_i64_to_string(pi as i64);
+                pi = pi + 1;
+            }
+            params_csv = synth;
+        }
+        if (params_csv.len == 0) { return hir_id_invalid(); }
+        let param_head = self.type_list_from_csv(params_csv.clone(), true);
+        let arg_head = self.type_list_from_csv(args_csv.clone(), false);
+        if (param_head == hir_id_invalid() || arg_head == hir_id_invalid()) {
+            return hir_id_invalid();
+        }
+        let owner_ty = self.type_id_for_name(class_type_text.clone());
+        return self.unit.add_generic_env(param_head, arg_head, owner_ty);
+    }
+
+    /// Param locals of a function (flags bit 1), excluding the `self`
+    /// receiver (bit 32); returns the local id at `want_idx`, or the last
+    /// param when past the end (variadic re-binding, codegen L14015-14020).
+    public fn param_local_at(self, fn_id: i32, want_idx: i32) -> i32 {
+        var idx: i32 = 0;
+        var last: i32 = hir_id_invalid();
+        var cur = self.unit.function_first_local(fn_id);
+        var guard: i32 = 0;
+        let guard_limit: i32 = self.unit.local_count + 2;
+        while (cur != hir_id_invalid() && guard < guard_limit) {
+            let flags = self.unit.local_flags(cur);
+            if ((flags & hir_local_flag_param()) != 0
+                && (flags & hir_local_flag_self_receiver()) == 0) {
+                if (idx == want_idx) { return cur; }
+                last = cur;
+                idx = idx + 1;
+            }
+            cur = self.unit.local_next(cur);
+            guard = guard + 1;
+        }
+        return last;
+    }
+
+    /// Migrated generic_env_for_call (codegen.vyx L13786) + the inference
+    /// half of generic_env_for_call_args (L13983): explicit turbofish args
+    /// bind positionally; remaining params are inferred by binding each
+    /// callee param type text against the call argument's expr TypeId text.
+    /// Returns the structured genv id (reusing the target function's row
+    /// when it already has one).
+    public fn call_generic_env_id(self, call_expr_id: i32) -> i32 {
+        if (call_expr_id == hir_id_invalid()) { return hir_id_invalid(); }
+        if (self.unit.expr_target_kind(call_expr_id) != hir_target_function()) {
+            return hir_id_invalid();
+        }
+        let fn_id = self.unit.expr_target_id(call_expr_id);
+        if (fn_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let existing = self.unit.function_generic_env_id(fn_id);
+        if (existing != hir_id_invalid()) { return existing; }
+        let params_csv = self.unit.function_generic_params(fn_id);
+        if (params_csv.len == 0) { return hir_id_invalid(); }
+        var args_csv = self.unit.function_generic_args(fn_id);
+        var from_instance_record: bool = args_csv.len > 0;
+        if (args_csv.len == 0) {
+            // explicit turbofish on the callee name (L13786)
+            var callee_name = "";
+            let callee = self.unit.expr_lhs(call_expr_id);
+            if (callee != hir_id_invalid()) { callee_name = self.unit.expr_name(callee); }
+            if (callee_name.len == 0) { callee_name = self.unit.expr_name(call_expr_id); }
+            let explicit_args = policy_generic_call_args(callee_name.clone());
+            self.bind_reset();
+            var gi: i32 = 0;
+            while (gi < 64) {
+                let p = hsr_csv_at(params_csv.clone(), gi);
+                if (p.len == 0) { gi = 64; }
+                else {
+                    let a = hsr_csv_at(explicit_args.clone(), gi);
+                    if (a.len > 0) { self.bind_add(p, a); }
+                    gi = gi + 1;
+                }
+            }
+            // per-arg inference (L14006-14029) over HIR arg exprs
+            var arg_expr = self.unit.expr_first_arg(call_expr_id);
+            var arg_idx: i32 = 0;
+            var guard: i32 = 0;
+            let guard_limit: i32 = self.unit.expr_count + 2;
+            while (arg_expr != hir_id_invalid() && guard < guard_limit) {
+                let param_local = self.param_local_at(fn_id, arg_idx);
+                if (param_local != hir_id_invalid()) {
+                    let pty = self.unit.local_type(param_local);
+                    let aty = self.unit.expr_type(arg_expr);
+                    if (pty != hir_id_invalid() && aty != hir_id_invalid()) {
+                        self.bind_type_id(params_csv.clone(), pty, aty);
+                    }
+                }
+                arg_expr = self.unit.expr_next_arg(arg_expr);
+                arg_idx = arg_idx + 1;
+                guard = guard + 1;
+            }
+            // assemble in param order; all params must bind (L14031-14037)
+            var out_args = "";
+            var pi: i32 = 0;
+            while (pi < 64) {
+                let p2 = hsr_csv_at(params_csv.clone(), pi);
+                if (p2.len == 0) { pi = 64; }
+                else {
+                    let bound = self.bind_lookup(p2.clone());
+                    if (bound.len == 0) { return hir_id_invalid(); }
+                    if (out_args.len > 0) { out_args = out_args + ","; }
+                    out_args = out_args + bound;
+                    pi = pi + 1;
+                }
+            }
+            args_csv = out_args;
+        }
+        if (args_csv.len == 0) { return hir_id_invalid(); }
+        let param_head = self.type_list_from_csv(params_csv.clone(), true);
+        let arg_head = self.type_list_from_csv(args_csv.clone(), false);
+        if (param_head == hir_id_invalid() || arg_head == hir_id_invalid()) {
+            return hir_id_invalid();
+        }
+        var owner_ty: i32 = hir_id_invalid();
+        let owner_text = self.unit.function_owner_type(fn_id);
+        if (owner_text.len > 0) { owner_ty = self.type_id_for_name(owner_text.clone()); }
+        let env_id = self.unit.add_generic_env(param_head, arg_head, owner_ty);
+        if (from_instance_record) {
+            // The env mirrors the instance function's own CSV record, so it
+            // is the function's canonical structured env.
+            self.unit.set_function_generic_env_id(fn_id, env_id);
+        }
+        self.call_envs_bound = self.call_envs_bound + 1;
+        return env_id;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Backfill pass — completes expr sem/target the builder left open.
+    // ────────────────────────────────────────────────────────────────
+
+    public fn expr_needs_resolution(self, expr_id: i32) -> bool {
+        let sem = self.unit.expr_sem_kind(expr_id);
+        if (sem == expr_sem_NONE()) { return true; }
+        if (self.unit.expr_target_kind(expr_id) != hir_target_none()) { return false; }
+        // sem stamped but target missing: only member/method-ish sems are
+        // completable here; INDIRECT_FN legitimately has no target.
+        if (sem == expr_sem_FIELD()
+            || sem == expr_sem_METHOD()
+            || sem == expr_sem_VARIANT()
+            || sem == expr_sem_CONST()) {
+            return true;
+        }
+        return false;
+    }
+
+    public fn resolve_member_expr(self, expr_id: i32) -> bool {
+        let name = self.unit.expr_name(expr_id);
+        if (name.len == 0) { return false; }
+        let recv = self.unit.expr_lhs(expr_id);
+        let owner_item = self.owner_item_for_expr(recv);
+        let existing_sem = self.unit.expr_sem_kind(expr_id);
+        if (owner_item != hir_id_invalid()) {
+            if (existing_sem == expr_sem_NONE() || existing_sem == expr_sem_FIELD()) {
+                let field = self.find_field_item(owner_item, name.clone());
+                if (field != hir_id_invalid()) {
+                    self.unit.set_expr_semantic(expr_id,
+                                               expr_sem_FIELD(),
+                                               hir_target_field(),
+                                               field);
+                    return true;
+                }
+            }
+            if (existing_sem == expr_sem_NONE() || existing_sem == expr_sem_VARIANT()) {
+                if (self.unit.item_kind(owner_item) == hir_item_enum()) {
+                    let variant = self.find_enum_variant_item(owner_item, name.clone());
+                    if (variant != hir_id_invalid()) {
+                        self.unit.set_expr_semantic(expr_id,
+                                                   expr_sem_VARIANT(),
+                                                   hir_target_variant(),
+                                                   variant);
+                        return true;
+                    }
+                }
+            }
+            if (existing_sem == expr_sem_NONE() || existing_sem == expr_sem_CONST()) {
+                let assoc = self.find_assoc_const_item(owner_item, name.clone());
+                if (assoc != hir_id_invalid()) {
+                    self.unit.set_expr_semantic(expr_id,
+                                               expr_sem_CONST(),
+                                               hir_target_item(),
+                                               assoc);
+                    return true;
+                }
+            }
+            if (existing_sem == expr_sem_NONE() || existing_sem == expr_sem_METHOD()) {
+                var method_owner = owner_item;
+                var method_fn = self.method_function_id(method_owner, name.clone());
+                if (method_fn == hir_id_invalid()) {
+                    method_owner = self.resolve_method_owner_item(owner_item, name.clone());
+                    if (method_owner != hir_id_invalid()) {
+                        method_fn = self.method_function_id(method_owner, name.clone());
+                    }
+                }
+                if (method_fn != hir_id_invalid()) {
+                    self.unit.set_expr_semantic(expr_id,
+                                               expr_sem_METHOD(),
+                                               hir_target_function(),
+                                               method_fn);
+                    return true;
+                }
+            }
+        }
+        if (existing_sem == expr_sem_NONE() || existing_sem == expr_sem_VARIANT()) {
+            // Bare variant path (codegen find_variant_owner_decl L17507):
+            // the receiver did not name a type but the member is a known
+            // variant name across the enum items.
+            let owner_enum = self.find_variant_owner_item(name.clone());
+            if (owner_enum != hir_id_invalid()) {
+                let variant2 = self.find_enum_variant_item(owner_enum, name.clone());
+                if (variant2 != hir_id_invalid()) {
+                    self.unit.set_expr_semantic(expr_id,
+                                               expr_sem_VARIANT(),
+                                               hir_target_variant(),
+                                               variant2);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public fn call_sem_completable(self, sem: i32) -> bool {
+        return sem == expr_sem_DIRECT_FN()
+            || sem == expr_sem_METHOD()
+            || sem == expr_sem_VARIANT()
+            || sem == expr_sem_BUILTIN();
+    }
+
+    public fn resolve_call_expr(self, expr_id: i32) -> bool {
+        let callee = self.unit.expr_lhs(expr_id);
+        if (callee != hir_id_invalid()) {
+            let callee_sem = self.unit.expr_sem_kind(callee);
+            if (self.call_sem_completable(callee_sem)
+                && self.unit.expr_target_kind(callee) != hir_target_none()) {
+                self.unit.set_expr_semantic(expr_id,
+                                           callee_sem,
+                                           self.unit.expr_target_kind(callee),
+                                           self.unit.expr_target_id(callee));
+                return true;
+            }
+        }
+        let name = self.unit.expr_name(expr_id);
+        if (name.len > 0) {
+            let fn_id = self.find_top_function_id(name.clone());
+            if (fn_id != hir_id_invalid()) {
+                self.unit.set_expr_semantic(expr_id,
+                                           expr_sem_DIRECT_FN(),
+                                           hir_target_function(),
+                                           fn_id);
+                return true;
+            }
+            let base = policy_generic_call_base(name.clone());
+            let owner_enum = self.find_variant_owner_item(base.clone());
+            if (owner_enum != hir_id_invalid()) {
+                let variant = self.find_enum_variant_item(owner_enum, base.clone());
+                if (variant != hir_id_invalid()) {
+                    self.unit.set_expr_semantic(expr_id,
+                                               expr_sem_VARIANT(),
+                                               hir_target_variant(),
+                                               variant);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Structured genv gap-fill: function records carrying the legacy CSV
+    /// env but no genv row get one (mirrors the builder's
+    /// set_structured_generic_env for paths that predate it).
+    public fn backfill_function_genvs(self) {
+        var fn_id: i32 = 1;
+        while (fn_id <= self.unit.function_count) {
+            if (self.unit.function_generic_env_id(fn_id) == hir_id_invalid()) {
+                let params_csv = self.unit.function_generic_params(fn_id);
+                let args_csv = self.unit.function_generic_args(fn_id);
+                if (params_csv.len > 0 && args_csv.len > 0) {
+                    let param_head = self.type_list_from_csv(params_csv.clone(), true);
+                    let arg_head = self.type_list_from_csv(args_csv.clone(), false);
+                    if (param_head != hir_id_invalid() && arg_head != hir_id_invalid()) {
+                        var owner_ty: i32 = hir_id_invalid();
+                        let owner_text = self.unit.function_owner_type(fn_id);
+                        if (owner_text.len > 0) {
+                            owner_ty = self.type_id_for_name(owner_text.clone());
+                        }
+                        let env_id = self.unit.add_generic_env(param_head, arg_head, owner_ty);
+                        self.unit.set_function_generic_env_id(fn_id, env_id);
+                        self.unit.clear_function_generic_env_strings(fn_id);
+                        self.genv_backfills = self.genv_backfills + 1;
+                    }
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+    }
+
+    public fn run(self) -> i32 {
+        // Interface/partition HIR may contain function and type shells only.
+        // The only resolver work that remains for such a unit is structured
+        // generic-environment backfill; allocating ten full symbol indices
+        // and scanning two empty expression passes is pure overhead.
+        if (self.unit.expr_count == 0) {
+            self.backfill_function_genvs();
+            if (self.print_summary) {
+                print("[hir-resolve] members+0 calls+0 call_envs+0 genvs+"
+                      + policy_i64_to_string(self.genv_backfills as i64)
+                      + " unresolved_members=0 unresolved_calls=0");
+            }
+            return 0;
+        }
+        self.ensure_index();
+        // Pass 1: member exprs (callees) so calls can inherit their result.
+        var expr_id: i32 = 1;
+        while (expr_id <= self.unit.expr_count) {
+            if (self.unit.expr_kind(expr_id) == ex_MEMBER()
+                && self.expr_needs_resolution(expr_id)) {
+                if (self.resolve_member_expr(expr_id)) {
+                    self.resolved_members = self.resolved_members + 1;
+                } else {
+                    if (self.unit.expr_sem_kind(expr_id) == expr_sem_NONE()) {
+                        self.unresolved_members = self.unresolved_members + 1;
+                    }
+                }
+            }
+            expr_id = expr_id + 1;
+        }
+        // Pass 2: call exprs; bind call-site generic envs for resolved
+        // generic targets while we are here.
+        expr_id = 1;
+        while (expr_id <= self.unit.expr_count) {
+            if (self.unit.expr_kind(expr_id) == ex_CALL()) {
+                if (self.expr_needs_resolution(expr_id)) {
+                    if (self.resolve_call_expr(expr_id)) {
+                        self.resolved_calls = self.resolved_calls + 1;
+                    } else {
+                        if (self.unit.expr_sem_kind(expr_id) == expr_sem_NONE()) {
+                            self.unresolved_calls = self.unresolved_calls + 1;
+                        }
+                    }
+                }
+                if (self.unit.expr_target_kind(expr_id) == hir_target_function()) {
+                    self.call_generic_env_id(expr_id);
+                    // Calls resolved while their target was still an instance
+                    // shell (return type not yet backfilled) keep an unset
+                    // expr type; complete it from the final function table so
+                    // MIR never sees a void-typed call result.
+                    if (self.unit.expr_type(expr_id) == hir_id_invalid()) {
+                        let target_ret = self.unit.function_return_type(self.unit.expr_target_id(expr_id));
+                        if (target_ret != hir_id_invalid() && target_ret <= self.unit.types.count) {
+                            self.unit.set_expr_type(expr_id, target_ret);
+                        }
+                    }
+                }
+            }
+            expr_id = expr_id + 1;
+        }
+        self.backfill_function_genvs();
+        if (self.print_summary) {
+            print("[hir-resolve] members+" + policy_i64_to_string(self.resolved_members as i64)
+                  + " calls+" + policy_i64_to_string(self.resolved_calls as i64)
+                  + " call_envs+" + policy_i64_to_string(self.call_envs_bound as i64)
+                  + " genvs+" + policy_i64_to_string(self.genv_backfills as i64)
+                  + " unresolved_members=" + policy_i64_to_string(self.unresolved_members as i64)
+                  + " unresolved_calls=" + policy_i64_to_string(self.unresolved_calls as i64));
+        }
+        return self.unresolved_members + self.unresolved_calls;
+    }
+}
+
+// ── Typed-ID public API (no AST pointers cross this boundary) ──────────
+
+/// Run the completion pass over a finalized HIR unit. Returns the number
+/// of member/call exprs still lacking a semantic after the pass (callers
+/// treat this as informational; verify gates remain authoritative).
+public fn hir_semantic_resolve_unit(h: HirUnit) -> i32 {
+    // The `[hir-resolve]` summary is auditing evidence (VYX_PHASE_SUMMARY=1).
+    if (!policy_phase_summary_enabled()) {
+        return hir_semantic_resolve_unit_silent(h);
+    }
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.run();
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_semantic_resolve_unit_silent(h: HirUnit) -> i32 {
+    let resolver = HirSemanticResolver.create_silent(h);
+    let out = resolver.run();
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_class_item(h: HirUnit, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_class_item(name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_enum_item(h: HirUnit, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_enum_item(name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_field_item(h: HirUnit, owner_item: i32, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_field_item(owner_item, name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_field_index(h: HirUnit, field_item: i32) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.field_index(field_item);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_field_item_by_name(h: HirUnit, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_field_item_by_name(name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_assoc_const_item(h: HirUnit, owner_item: i32, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_assoc_const_item(owner_item, name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_method_item(h: HirUnit, owner_item: i32, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_method_item(owner_item, name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_method_function_id(h: HirUnit, owner_item: i32, method_name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.method_function_id(owner_item, method_name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_resolve_method_owner_item(h: HirUnit, owner_item: i32, method_name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.resolve_method_owner_item(owner_item, method_name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_enum_variant_item(h: HirUnit, enum_item: i32, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_enum_variant_item(enum_item, name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_enum_variant_tag(h: HirUnit, enum_item: i32, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.enum_variant_tag(enum_item, name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_variant_owner_item(h: HirUnit, variant_name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_variant_owner_item(variant_name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_type_alias_item(h: HirUnit, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_type_alias_item(name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_resolve_alias_type(h: HirUnit, type_id: i32) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.resolve_alias_type(type_id);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_assoc_type_id_for_name(h: HirUnit, name: string, params_csv: string, args_csv: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.assoc_type_id_for_name(name, params_csv, args_csv);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_owner_type_text_for_expr(h: HirUnit, expr_id: i32) -> string {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.owner_type_text_for_expr(expr_id);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_owner_item_for_expr(h: HirUnit, expr_id: i32) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.owner_item_for_expr(expr_id);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_type_id_for_name(h: HirUnit, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.type_id_for_name(name);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_class_generic_env_id(h: HirUnit, class_type_text: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.class_generic_env_id(class_type_text);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_call_generic_env_id(h: HirUnit, call_expr_id: i32) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.call_generic_env_id(call_expr_id);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_substitute_type_text(h: HirUnit, text: string, params_csv: string, args_csv: string) -> string {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.substitute_type_text(text, params_csv, args_csv);
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_resolver_find_top_function_id(h: HirUnit, name: string) -> i32 {
+    let resolver = HirSemanticResolver.create(h);
+    let out = resolver.find_top_function_id(name);
+    resolver.dispose();
+    return out;
+}

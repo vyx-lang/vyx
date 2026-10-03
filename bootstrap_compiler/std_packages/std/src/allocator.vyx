@@ -1,0 +1,331 @@
+module std.allocator;
+
+/// Vyx Standard Library: Allocator Interface
+/// Trait-based custom memory allocator API.
+
+extern "C" {
+    fn malloc(size: i64) -> rawptr;
+    fn realloc(ptr: rawptr, size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dest: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dest: rawptr, val: i32, n: i64) -> rawptr;
+    fn vyx_pointer_allocation_register(ptr: rawptr, size: i64) -> rawptr;
+    fn vyx_pointer_allocation_unregister(ptr: rawptr);
+    fn vyx_pointer_allocation_unregister_range(ptr: rawptr, size: i64);
+    fn vyx_pointer_allocation_realloc(old_ptr: rawptr, new_ptr: rawptr, size: i64) -> rawptr;
+}
+
+fn alloc_max_align() -> i64 { return 16; }
+fn alloc_header_size() -> i64 { return 8; }
+
+public fn allocator_align_forward(value: i64, align: i64) -> i64 {
+    if (align <= 1) { return value; }
+    let mask = align - 1;
+    return (value + mask) & (0 - align);
+}
+
+public fn allocator_next_capacity(current: i64, needed: i64) -> i64 {
+    var cap = current;
+    if (cap < 8) { cap = 8; }
+    while (cap < needed) {
+        if (cap > 4611686018427387903) { return needed; }
+        cap = cap * 2;
+    }
+    return cap;
+}
+
+public fn allocator_array_size(count: i64, elem_size: i64) -> i64 {
+    if (count <= 0 || elem_size <= 0) { return 0; }
+    if (count > 9223372036854775807 / elem_size) {
+        panic("allocator_array_size overflow");
+    }
+    return count * elem_size;
+}
+
+public fn allocator_copy_bytes(dst: rawptr, src: rawptr, n: i64) {
+    if (dst != null && src != null && n > 0) { memcpy(dst, src, n); }
+}
+
+public fn allocator_zero_bytes(dst: rawptr, n: i64) {
+    if (dst != null && n > 0) { memset(dst, 0, n); }
+}
+
+/// Base allocator trait — any custom allocator must implement these methods.
+trait Allocator {
+    type Error;
+
+    fn alloc(size: i64, align: i64) -> rawptr;
+    fn dealloc(ptr: rawptr, size: i64, align: i64);
+    fn realloc(ptr: rawptr, old_size: i64, new_size: i64, align: i64) -> rawptr;
+}
+
+/// Global allocator using C malloc/free.
+class GlobalAllocator : Allocator {
+    type Error = i32;
+
+    public static fn create() -> GlobalAllocator {
+        return GlobalAllocator {};
+    }
+
+    public fn alloc(size: i64, align: i64) -> rawptr {
+        var n = size;
+        if (n <= 0) { n = 1; }
+        var a = align;
+        if (a <= alloc_max_align()) {
+            return vyx_pointer_allocation_register(malloc(n), n);
+        }
+
+        let total = n + a + alloc_header_size();
+        let base = malloc(total);
+        if (base == null) { return null; }
+
+        let raw_addr = base as i64;
+        let aligned_addr = allocator_align_forward(raw_addr + alloc_header_size(), a);
+        let out = aligned_addr as rawptr;
+        let header = (aligned_addr - alloc_header_size()) as rawptr;
+        var saved = base;
+        memcpy(header, to_rawptr(&saved), alloc_header_size());
+        return vyx_pointer_allocation_register(out, n);
+    }
+
+    public fn allocZeroed(size: i64, align: i64) -> rawptr {
+        let ptr = self.alloc(size, align);
+        if (ptr != null && size > 0) { memset(ptr, 0, size); }
+        return ptr;
+    }
+
+    public fn allocArray(count: i64, elem_size: i64, align: i64) -> rawptr {
+        return self.alloc(allocator_array_size(count, elem_size), align);
+    }
+
+    public fn allocArrayZeroed(count: i64, elem_size: i64, align: i64) -> rawptr {
+        return self.allocZeroed(allocator_array_size(count, elem_size), align);
+    }
+
+    public fn dealloc(ptr: rawptr, size: i64, align: i64) {
+        if (ptr == null) { return; }
+        vyx_pointer_allocation_unregister(ptr);
+        if (align <= alloc_max_align()) {
+            free(ptr);
+            return;
+        }
+        var base: rawptr = null;
+        let header = ((ptr as i64) - alloc_header_size()) as rawptr;
+        memcpy(to_rawptr(&base), header, alloc_header_size());
+        if (base != null) { free(base); }
+    }
+
+    public fn realloc(ptr: rawptr, old_size: i64, new_size: i64, align: i64) -> rawptr {
+        if (ptr == null) { return self.alloc(new_size, align); }
+        if (new_size <= 0) {
+            self.dealloc(ptr, old_size, align);
+            return null;
+        }
+        if (align <= alloc_max_align()) {
+            let new_ptr = realloc(ptr, new_size);
+            return vyx_pointer_allocation_realloc(ptr, new_ptr, new_size);
+        }
+
+        let new_ptr = self.alloc(new_size, align);
+        if (new_ptr == null) { return null; }
+        var copy_size = old_size;
+        if (new_size < copy_size) { copy_size = new_size; }
+        allocator_copy_bytes(new_ptr, ptr, copy_size);
+        self.dealloc(ptr, old_size, align);
+        return new_ptr;
+    }
+
+    public fn grow(ptr: rawptr, old_cap: i64, needed_cap: i64, elem_size: i64, align: i64) -> rawptr {
+        let new_cap = allocator_next_capacity(old_cap, needed_cap);
+        return self.realloc(ptr,
+                            allocator_array_size(old_cap, elem_size),
+                            allocator_array_size(new_cap, elem_size),
+                            align);
+    }
+}
+
+/// Bump allocator — fast, no individual deallocation.
+class BumpAllocator : Allocator {
+    type Error = i32;
+
+    buf: rawptr;
+    offset: i64;
+    cap: i64;
+
+    public static fn create(capacity: i64) -> BumpAllocator {
+        let buf = malloc(capacity);
+        memset(buf, 0, capacity);
+        return BumpAllocator { buf: buf, offset: 0, cap: capacity };
+    }
+
+    public fn alloc(size: i64, align: i64) -> rawptr {
+        var aligned = self.offset;
+        if (align > 1) {
+            aligned = allocator_align_forward(aligned, align);
+        }
+        if (aligned + size > self.cap) {
+            return null;
+        }
+        let ptr = self.buf + aligned;
+        self.offset = aligned + size;
+        return vyx_pointer_allocation_register(ptr, size);
+    }
+
+    public fn dealloc(ptr: rawptr, size: i64, align: i64) {
+        // Bump allocator doesn't support individual deallocation
+    }
+
+    public fn realloc(ptr: rawptr, old_size: i64, new_size: i64, align: i64) -> rawptr {
+        if (ptr == null) { return self.alloc(new_size, align); }
+        let new_ptr = self.alloc(new_size, align);
+        if (new_ptr == null) { return null; }
+        var copy_size = old_size;
+        if (new_size < copy_size) { copy_size = new_size; }
+        allocator_copy_bytes(new_ptr, ptr, copy_size);
+        return new_ptr;
+    }
+
+    public fn allocZeroed(size: i64, align: i64) -> rawptr {
+        let ptr = self.alloc(size, align);
+        if (ptr != null && size > 0) { memset(ptr, 0, size); }
+        return ptr;
+    }
+
+    public fn allocArray(count: i64, elem_size: i64, align: i64) -> rawptr {
+        return self.alloc(allocator_array_size(count, elem_size), align);
+    }
+
+    public fn mark() -> i64 {
+        return self.offset;
+    }
+
+    public fn rewind(mark: i64) {
+        if (mark < 0) { return; }
+        if (mark > self.offset) { return; }
+        if (mark < self.offset && self.buf != null) {
+            vyx_pointer_allocation_unregister_range(self.buf + mark, self.offset - mark);
+        }
+        self.offset = mark;
+    }
+
+    public fn contains(ptr: rawptr) -> bool {
+        if (self.buf == null || ptr == null) { return false; }
+        let p = ptr as i64;
+        let b = self.buf as i64;
+        return p >= b && p < b + self.cap;
+    }
+
+    public fn reset() {
+        if (self.buf != null && self.offset > 0) {
+            vyx_pointer_allocation_unregister_range(self.buf, self.offset);
+        }
+        self.offset = 0;
+    }
+
+    public fn used() -> i64 {
+        return self.offset;
+    }
+
+    public fn remaining() -> i64 {
+        return self.cap - self.offset;
+    }
+
+    public fn destroy() {
+        if (self.buf != null) {
+            vyx_pointer_allocation_unregister_range(self.buf, self.cap);
+            free(self.buf);
+        }
+        self.buf = null;
+        self.offset = 0;
+        self.cap = 0;
+    }
+
+    /// SSS Drop — idempotent via `self.buf == null` sentinel.
+    public fn drop() { self.destroy(); }
+}
+
+/// Fixed-size block allocator for many same-sized short-lived objects.
+class FixedBlockAllocator : Allocator {
+    type Error = i32;
+
+    buf: rawptr;
+    free_list: rawptr;
+    block_size: i64;
+    block_count: i64;
+    used_count: i64;
+
+    public static fn create(block_size: i64, block_count: i64) -> FixedBlockAllocator {
+        var bs = block_size;
+        if (bs < 8) { bs = 8; }
+        var bc = block_count;
+        if (bc < 0) { bc = 0; }
+        let total = allocator_array_size(bc, bs);
+        let buf = malloc(total);
+        var free_head: rawptr = null;
+        if (buf != null && total > 0) {
+            var i: i64 = 0;
+            while (i < bc) {
+                let slot = buf + i * bs;
+                var next: rawptr = null;
+                if (i + 1 < bc) { next = buf + (i + 1) * bs; }
+                memcpy(slot, to_rawptr(&next), 8);
+                i = i + 1;
+            }
+            free_head = buf;
+        }
+        return FixedBlockAllocator {
+            buf: buf,
+            free_list: free_head,
+            block_size: bs,
+            block_count: bc,
+            used_count: 0
+        };
+    }
+
+    public fn alloc(size: i64, align: i64) -> rawptr {
+        if (size > self.block_size) { return null; }
+        if (align > 1 && ((self.block_size as i64) & (align - 1)) != 0) { return null; }
+        if (self.free_list == null) { return null; }
+        let out = self.free_list;
+        var next: rawptr = null;
+        memcpy(to_rawptr(&next), out, 8);
+        self.free_list = next;
+        self.used_count = self.used_count + 1;
+        return vyx_pointer_allocation_register(out, size);
+    }
+
+    public fn dealloc(ptr: rawptr, size: i64, align: i64) {
+        if (ptr == null) { return; }
+        vyx_pointer_allocation_unregister(ptr);
+        memcpy(ptr, to_rawptr(&self.free_list), 8);
+        self.free_list = ptr;
+        if (self.used_count > 0) { self.used_count = self.used_count - 1; }
+    }
+
+    public fn realloc(ptr: rawptr, old_size: i64, new_size: i64, align: i64) -> rawptr {
+        if (new_size <= self.block_size) {
+            return vyx_pointer_allocation_realloc(ptr, ptr, new_size);
+        }
+        return null;
+    }
+
+    public fn used() -> i64 { return self.used_count; }
+    public fn capacity() -> i64 { return self.block_count; }
+
+    public fn destroy() {
+        if (self.buf != null) {
+            vyx_pointer_allocation_unregister_range(
+                self.buf,
+                allocator_array_size(self.block_count, self.block_size)
+            );
+            free(self.buf);
+        }
+        self.buf = null;
+        self.free_list = null;
+        self.block_size = 0;
+        self.block_count = 0;
+        self.used_count = 0;
+    }
+
+    public fn drop() { self.destroy(); }
+}

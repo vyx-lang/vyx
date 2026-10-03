@@ -1,0 +1,2389 @@
+module bootstrap.effect;
+
+use std.string;
+use bootstrap.ast;
+use bootstrap.policy;
+use bootstrap.diag;
+use bootstrap.effect_manifest;
+use bootstrap.effect_attributes;
+use bootstrap.dci_dcib;
+
+// The last sealed manifest is published only after a unit has passed through
+// Effect collection.  The driver may export it with
+// VYX_EFFECT_MANIFEST_OUT or validate an incoming artifact with
+// VYX_EFFECT_MANIFEST_IN; ordinary builds keep it in-process.
+var g_effect_last_manifest: string = "";
+var g_effect_last_dci_export: string = "";
+var g_effect_manifest_module: string = "";
+var g_effect_incoming_manifest: string = "";
+var g_effect_dci_paths: string = "";
+var g_effect_dci_symbols: string = "";
+var g_effect_source_stamp: string = "";
+var g_effect_schema_text: string = "";
+
+/// MOSP's fact dimension starts as a deterministic, compiler-owned ledger.
+///
+/// An EffectFact records what an attribute says about one declaration.  The
+/// ledger deliberately stores normalized rows and handler registrations rather
+/// than executing source text.  This gives later handlers a stable input while
+/// keeping unknown attributes observable and semantically inert.
+public class EffectFact {
+    public subject: string
+    public attribute: string
+    public arguments: string
+    public phase: string
+    public scope: string
+    public status: string
+
+    public static fn create(subject: string,
+                            attribute: string,
+                            arguments: string,
+                            phase: string,
+                            scope: string,
+                            status: string) -> EffectFact {
+        return EffectFact {
+            subject: subject,
+            attribute: attribute,
+            arguments: arguments,
+            phase: phase,
+            scope: scope,
+            status: status
+        };
+    }
+
+    /// The key excludes derived status so status is not part of declaration
+    /// identity when a later phase inspects the fact.
+    public fn key(self) -> string {
+        return self.subject + effect_sep() + self.attribute + effect_sep() + self.arguments;
+    }
+
+    /// Stable row passed through the cross-module manifest boundary later.
+    public fn row(self) -> string {
+        return self.key() + effect_sep() + self.phase + effect_sep()
+            + self.scope + effect_sep() + self.status;
+    }
+}
+
+/// A normalized declaration handed to the effect planner.  This value is
+/// deliberately independent of the parser's attribute spelling: handlers see
+/// the canonical attribute name, argument string, declaration target and
+/// validation status only.
+public class EffectDecl {
+    public subject: string
+    public attribute: string
+    public arguments: string
+    public target: string
+    public phase: string
+    public scope: string
+    public status: string
+    public callback: string
+
+    public static fn create(subject: string,
+                            attribute: string,
+                            arguments: string,
+                            target: string,
+                            phase: string,
+                            scope: string,
+                            status: string,
+                            callback: string) -> EffectDecl {
+        return EffectDecl {
+            subject: subject,
+            attribute: attribute,
+            arguments: arguments,
+            target: target,
+            phase: phase,
+            scope: scope,
+            status: status,
+            callback: callback
+        };
+    }
+
+    public fn key(self) -> string {
+        return self.subject + effect_sep() + self.attribute + effect_sep()
+            + self.arguments + effect_sep() + self.target;
+    }
+}
+
+/// Value-level view used by diagnostics and future handlers.  The live Sema
+/// ledger is represented by the rawptr handle below because it must survive
+/// function boundaries and be freed by the executable-side allocator.
+public class EffectPlan {
+    public handle: rawptr
+
+    public static fn create() -> EffectPlan {
+        return EffectPlan { handle: effect_plan_alloc() };
+    }
+}
+
+public fn effect_plan_last_manifest() -> string { return g_effect_last_manifest; }
+public fn effect_plan_last_dci_export() -> string { return g_effect_last_dci_export; }
+public fn effect_plan_manifest_module() -> string { return g_effect_manifest_module; }
+public fn effect_plan_set_incoming_manifest(text: string) {
+    g_effect_incoming_manifest = text;
+}
+public fn effect_plan_incoming_manifest() -> string { return g_effect_incoming_manifest; }
+public fn effect_plan_set_dci_paths(paths: string) {
+    g_effect_dci_paths = paths;
+    g_effect_dci_symbols = "";
+}
+/// Bind the exact source content to the manifest source stamp.  A module name
+/// alone is not a freshness proof: editing a file at the same path must
+/// invalidate a consumer artifact.  The driver supplies the source text that
+/// it already loaded for parsing, so this adds no second source read.
+public fn effect_plan_set_source_stamp(source: string) {
+    g_effect_source_stamp = "source:" + source.len.toString() + ":"
+        + effect_hash(source).toString();
+}
+
+/// Set the validated package-owned schema table consumed by the next plan.
+/// The driver validates the text before calling this setter; plan clearing then
+/// registers the data-only handlers before collecting declaration attributes.
+public fn effect_plan_set_schema_text(text: string) {
+    g_effect_schema_text = text.clone();
+}
+
+/// Stable digest for the validated package schema table.  It is intentionally
+/// exposed as a value rather than a path so a manifest remains portable and a
+/// schema edit invalidates consumers even when the file name is unchanged.
+public fn effect_plan_schema_stamp() -> string {
+    return effect_hash(g_effect_schema_text).toString();
+}
+
+public fn effect_manifest_validate_text(text: string,
+                                        expected_target: string,
+                                        expected_abi: string,
+                                        expected_scope: string,
+                                        expected_source: string,
+                                        expected_compiler: string) -> i32 {
+    let manifest = effect_manifest_deserialize(text);
+    return manifest.validate(expected_target, expected_abi, expected_scope,
+                             expected_source, expected_compiler);
+}
+
+public fn effect_manifest_status_text(status: i32) -> string {
+    return effect_manifest_status_name(status);
+}
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn cJSON_Delete(item: rawptr);
+    fn cJSON_GetObjectItemCaseSensitive(object: rawptr, string: rawptr) -> rawptr;
+    fn cJSON_GetStringValue(item: rawptr) -> rawptr;
+    fn cJSON_GetArraySize(array: rawptr) -> i32;
+    fn cJSON_GetArrayItem(array: rawptr, index: i32) -> rawptr;
+    fn cJSON_IsObject(item: rawptr) -> i32;
+    fn cJSON_IsArray(item: rawptr) -> i32;
+    fn cJSON_IsString(item: rawptr) -> i32;
+}
+
+fn effect_sep() -> string {
+    var c: i32 = 31;
+    return from_cstr_len(to_rawptr(&c), 1);
+}
+
+fn effect_record_sep() -> i32 { return 30; }
+fn effect_state_size() -> i32 { return 224; }
+fn effect_slot_size() -> i32 { return 48; }
+fn effect_init_cap() -> i32 { return 64; }
+
+// State layout (malloc-backed, executable-side):
+//   0/8/12   fact table, capacity, count
+//   16/24/28 handler table, capacity, count
+//   32       commutative fingerprint
+//   40       attributes seen
+//   48       unregistered attributes
+//   56       malformed attributes
+//   64       rejected writes after freeze
+//   72       duplicate facts
+//   80       handler conflicts
+//   88       frozen (i32)
+//   96/104/108 result table, capacity, count
+//   112/120/124 diagnostic-obligation table, capacity, count
+//   128      rejected target obligations
+//   136      rejected argument obligations
+//   144      dispatched callbacks
+//   152      deterministic plan failures
+//   160      declaration records seen
+//   168      dependency cycle count
+//   176/184/188 edge/dependency table, capacity, count
+// Slot layout: key_ptr/key_len/hash/value_ptr/value_len/pad.
+
+fn effect_table_offset(which: i32) -> i32 {
+    if (which == 0) { return 0; }
+    if (which == 1) { return 16; }
+    if (which == 2) { return 96; }
+    if (which == 3) { return 112; }
+    if (which == 4) { return 176; }
+    return 0;
+}
+
+fn effect_table_buf(s: rawptr, which: i32) -> rawptr {
+    if (s == null) { return null; }
+    return ast_read_rawptr(ptr_offset(s, effect_table_offset(which)));
+}
+
+fn effect_table_cap(s: rawptr, which: i32) -> i32 {
+    if (s == null) { return 0; }
+    return ptr_read_i32(ptr_offset(s, effect_table_offset(which) + 8));
+}
+
+fn effect_table_count(s: rawptr, which: i32) -> i32 {
+    if (s == null) { return 0; }
+    return ptr_read_i32(ptr_offset(s, effect_table_offset(which) + 12));
+}
+
+fn effect_set_table(s: rawptr, which: i32, buf: rawptr, cap: i32, count: i32) {
+    if (s == null) { return; }
+    let off = effect_table_offset(which);
+    ast_write_rawptr(ptr_offset(s, off), buf);
+    ptr_write_i32(ptr_offset(s, off + 8), cap);
+    ptr_write_i32(ptr_offset(s, off + 12), count);
+}
+
+fn effect_set_table_count(s: rawptr, which: i32, count: i32) {
+    if (s == null) { return; }
+    ptr_write_i32(ptr_offset(s, effect_table_offset(which) + 12), count);
+}
+
+fn effect_is_frozen(s: rawptr) -> bool {
+    if (s == null) { return false; }
+    return ptr_read_i32(ptr_offset(s, 88)) != 0;
+}
+
+fn effect_hash(text: string) -> i64 {
+    var h: i64 = 1469598103934665603;
+    var i: i32 = 0;
+    while (i < text.len) {
+        h = (h ^ (text.charAt(i) as i64)) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn effect_dup(text: string) -> rawptr {
+    let p = malloc((text.len + 1) as u64);
+    if (p == null) { return null; }
+    if (text.len > 0) { memcpy(p, text.c_str(), text.len as u64); }
+    var nul: i32 = 0;
+    memcpy(ptr_offset(p, text.len as i32), to_rawptr(&nul), 1);
+    return p;
+}
+
+fn effect_table_alloc(cap: i32) -> rawptr {
+    let p = malloc((cap * effect_slot_size()) as u64);
+    if (p != null) { memset(p, 0, (cap * effect_slot_size()) as u64); }
+    return p;
+}
+
+fn effect_slot_key(slot: rawptr) -> rawptr {
+    if (slot == null) { return null; }
+    return ast_read_rawptr(slot);
+}
+
+fn effect_slot_value(slot: rawptr) -> rawptr {
+    if (slot == null) { return null; }
+    return ast_read_rawptr(ptr_offset(slot, 24));
+}
+
+fn effect_slot_matches(slot: rawptr, key: string, hash: i64) -> bool {
+    let kp = effect_slot_key(slot);
+    if (kp == null) { return false; }
+    let len = ptr_read_i64(ptr_offset(slot, 8));
+    if (ptr_read_i64(ptr_offset(slot, 16)) != hash || len != key.len) { return false; }
+    if (len == 0) { return true; }
+    return memcmp(kp, key.c_str(), len as u64) == 0;
+}
+
+fn effect_lookup(buf: rawptr, cap: i32, key: string, hash: i64) -> rawptr {
+    if (buf == null || cap <= 0 || key.len == 0) { return null; }
+    var idx = (hash & ((cap - 1) as i64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = ptr_offset(buf, idx * effect_slot_size());
+        if (effect_slot_key(slot) == null) { return null; }
+        if (effect_slot_matches(slot, key, hash)) { return slot; }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn effect_lookup_or_reserve(buf: rawptr, cap: i32, key: string, hash: i64) -> rawptr {
+    if (buf == null || cap <= 0 || key.len == 0) { return null; }
+    var idx = (hash & ((cap - 1) as i64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = ptr_offset(buf, idx * effect_slot_size());
+        if (effect_slot_key(slot) == null || effect_slot_matches(slot, key, hash)) { return slot; }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn effect_needs_grow(count: i32, cap: i32) -> bool {
+    return count * 10 >= cap * 6;
+}
+
+fn effect_parse_i32(text: string) -> i32 {
+    if (text.len == 0) { return 0; }
+    var sign: i32 = 1;
+    var i: i32 = 0;
+    if (text.charAt(0) == 45) { sign = -1; i = 1; }
+    var out: i32 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c < 48 || c > 57) { return 0; }
+        out = out * 10 + (c - 48);
+        i = i + 1;
+    }
+    return out * sign;
+}
+
+fn effect_table_dispose(buf: rawptr, cap: i32) {
+    if (buf == null) { return; }
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        let kp = effect_slot_key(slot);
+        let vp = effect_slot_value(slot);
+        if (kp != null) { free(kp); }
+        if (vp != null) { free(vp); }
+        i = i + 1;
+    }
+    free(buf);
+}
+
+fn effect_grow(s: rawptr, which: i32) {
+    let old = effect_table_buf(s, which);
+    let old_cap = effect_table_cap(s, which);
+    let next_cap = old_cap * 2;
+    let fresh = effect_table_alloc(next_cap);
+    if (fresh == null) { return; }
+    var i: i32 = 0;
+    while (i < old_cap) {
+        let src = ptr_offset(old, i * effect_slot_size());
+        let kp = effect_slot_key(src);
+        if (kp != null) {
+            let key = from_cstr_len(kp, ptr_read_i64(ptr_offset(src, 8)));
+            let hash = ptr_read_i64(ptr_offset(src, 16));
+            let dst = effect_lookup_or_reserve(fresh, next_cap, key, hash);
+            if (dst != null) {
+                ast_write_rawptr(dst, kp);
+                ptr_write_i64(ptr_offset(dst, 8), ptr_read_i64(ptr_offset(src, 8)));
+                ptr_write_i64(ptr_offset(dst, 16), hash);
+                ast_write_rawptr(ptr_offset(dst, 24), effect_slot_value(src));
+                ptr_write_i64(ptr_offset(dst, 32), ptr_read_i64(ptr_offset(src, 32)));
+            }
+        }
+        i = i + 1;
+    }
+    free(old);
+    effect_set_table(s, which, fresh, next_cap, effect_table_count(s, which));
+}
+
+fn effect_install(s: rawptr, which: i32, key: string, value: string) -> bool {
+    let buf = effect_table_buf(s, which);
+    let cap = effect_table_cap(s, which);
+    let hash = effect_hash(key);
+    let slot = effect_lookup_or_reserve(buf, cap, key, hash);
+    if (slot == null) { return false; }
+    if (effect_slot_key(slot) != null) { return false; }
+    let kp = effect_dup(key);
+    let vp = effect_dup(value);
+    if (kp == null || vp == null) {
+        if (kp != null) { free(kp); }
+        if (vp != null) { free(vp); }
+        return false;
+    }
+    ast_write_rawptr(slot, kp);
+    ptr_write_i64(ptr_offset(slot, 8), key.len);
+    ptr_write_i64(ptr_offset(slot, 16), hash);
+    ast_write_rawptr(ptr_offset(slot, 24), vp);
+    ptr_write_i64(ptr_offset(slot, 32), value.len);
+    let count = effect_table_count(s, which) + 1;
+    effect_set_table_count(s, which, count);
+    if (effect_needs_grow(count, cap)) { effect_grow(s, which); }
+    return true;
+}
+
+public fn effect_plan_alloc() -> rawptr {
+    let s = malloc(effect_state_size() as u64);
+    if (s == null) { return null; }
+    memset(s, 0, effect_state_size() as u64);
+    effect_set_table(s, 0, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    effect_set_table(s, 1, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    effect_set_table(s, 2, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    effect_set_table(s, 3, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    effect_set_table(s, 4, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    if (effect_table_buf(s, 0) == null || effect_table_buf(s, 1) == null
+        || effect_table_buf(s, 2) == null || effect_table_buf(s, 3) == null
+        || effect_table_buf(s, 4) == null) {
+        effect_plan_dispose(s);
+        return null;
+    }
+    effect_plan_register_builtin_handlers(s);
+    return s;
+}
+
+public fn effect_plan_dispose(s: rawptr) {
+    if (s == null) { return; }
+    effect_table_dispose(effect_table_buf(s, 0), effect_table_cap(s, 0));
+    effect_table_dispose(effect_table_buf(s, 1), effect_table_cap(s, 1));
+    effect_table_dispose(effect_table_buf(s, 2), effect_table_cap(s, 2));
+    effect_table_dispose(effect_table_buf(s, 3), effect_table_cap(s, 3));
+    effect_table_dispose(effect_table_buf(s, 4), effect_table_cap(s, 4));
+    free(s);
+}
+
+public fn effect_plan_clear(s: rawptr) {
+    if (s == null) { return; }
+    effect_table_dispose(effect_table_buf(s, 0), effect_table_cap(s, 0));
+    effect_table_dispose(effect_table_buf(s, 1), effect_table_cap(s, 1));
+    effect_table_dispose(effect_table_buf(s, 2), effect_table_cap(s, 2));
+    effect_table_dispose(effect_table_buf(s, 3), effect_table_cap(s, 3));
+    effect_table_dispose(effect_table_buf(s, 4), effect_table_cap(s, 4));
+    memset(s, 0, effect_state_size() as u64);
+    effect_set_table(s, 0, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    effect_set_table(s, 1, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    effect_set_table(s, 2, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    effect_set_table(s, 3, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    effect_set_table(s, 4, effect_table_alloc(effect_init_cap()), effect_init_cap(), 0);
+    if (effect_table_buf(s, 0) == null || effect_table_buf(s, 1) == null
+        || effect_table_buf(s, 2) == null || effect_table_buf(s, 3) == null
+        || effect_table_buf(s, 4) == null) {
+        ptr_write_i64(ptr_offset(s, 152), 1);
+        return;
+    }
+    effect_plan_register_builtin_handlers(s);
+    effect_plan_register_external_schemas(s);
+}
+
+fn effect_fingerprint_mix(seed: i64, value: i64) -> i64 {
+    let modulus: i64 = 2147483647;
+    var out = (seed * 1000003 + value + 97) % modulus;
+    if (out < 0) { out = out + modulus; }
+    return out;
+}
+
+fn effect_plan_fold_table(s: rawptr, which: i32, seed: i64) -> i64 {
+    if (s == null) { return seed; }
+    let buf = effect_table_buf(s, which);
+    let cap = effect_table_cap(s, which);
+    var out = seed;
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        let kp = effect_slot_key(slot);
+        if (kp != null) {
+            let key = from_cstr_len(kp, ptr_read_i64(ptr_offset(slot, 8)));
+            let value = from_cstr_len(effect_slot_value(slot),
+                                      ptr_read_i64(ptr_offset(slot, 32)));
+            out = effect_fingerprint_mix(out, effect_hash(key));
+            out = effect_fingerprint_mix(out, effect_hash(value));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn effect_plan_recompute_fingerprint(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    var out: i64 = 5381;
+    out = effect_fingerprint_mix(out, effect_table_count(s, 0) as i64);
+    out = effect_fingerprint_mix(out, effect_table_count(s, 1) as i64);
+    out = effect_fingerprint_mix(out, effect_table_count(s, 2) as i64);
+    out = effect_fingerprint_mix(out, effect_table_count(s, 3) as i64);
+    out = effect_plan_fold_table(s, 0, out);
+    out = effect_plan_fold_table(s, 1, out);
+    out = effect_plan_fold_table(s, 2, out);
+    out = effect_plan_fold_table(s, 3, out);
+    out = effect_plan_fold_table(s, 4, out);
+    return out;
+}
+
+public fn effect_plan_freeze(s: rawptr) {
+    if (s != null && !effect_is_frozen(s)) {
+        // The old fingerprint was only an XOR of fact keys.  Freeze now
+        // commits facts, handler schemas, results and obligations into one
+        // deterministic cache identity before any consumer can observe the
+        // sealed plan.
+        ptr_write_i64(ptr_offset(s, 32), effect_plan_recompute_fingerprint(s));
+        ptr_write_i32(ptr_offset(s, 88), 1);
+    }
+}
+
+public fn effect_plan_is_frozen(s: rawptr) -> bool { return effect_is_frozen(s); }
+public fn effect_plan_fact_count(s: rawptr) -> i32 { return effect_table_count(s, 0); }
+public fn effect_plan_handler_count(s: rawptr) -> i32 { return effect_table_count(s, 1); }
+public fn effect_plan_unregistered_count(s: rawptr) -> i64 { if (s == null) { return 0; } return ptr_read_i64(ptr_offset(s, 48)); }
+public fn effect_plan_malformed_count(s: rawptr) -> i64 { if (s == null) { return 0; } return ptr_read_i64(ptr_offset(s, 56)); }
+public fn effect_plan_rejected_count(s: rawptr) -> i64 { if (s == null) { return 0; } return ptr_read_i64(ptr_offset(s, 64)); }
+public fn effect_plan_duplicate_count(s: rawptr) -> i64 { if (s == null) { return 0; } return ptr_read_i64(ptr_offset(s, 72)); }
+public fn effect_plan_conflict_count(s: rawptr) -> i64 { if (s == null) { return 0; } return ptr_read_i64(ptr_offset(s, 80)); }
+public fn effect_plan_fingerprint(s: rawptr) -> i64 { if (s == null) { return 0; } return ptr_read_i64(ptr_offset(s, 32)); }
+public fn effect_plan_obligation_count(s: rawptr) -> i32 { return effect_table_count(s, 3); }
+public fn effect_plan_result_count(s: rawptr) -> i32 { return effect_table_count(s, 2); }
+public fn effect_plan_edge_count(s: rawptr) -> i32 { return effect_table_count(s, 4); }
+public fn effect_plan_rejected_target_count(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 128));
+}
+public fn effect_plan_rejected_argument_count(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 136));
+}
+public fn effect_plan_dispatched_count(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 144));
+}
+public fn effect_plan_failure_count(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 152));
+}
+public fn effect_plan_cycle_count(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 168));
+}
+public fn effect_plan_is_valid(s: rawptr) -> bool {
+    if (s == null) { return false; }
+    return effect_plan_malformed_count(s) == 0
+        && effect_plan_rejected_count(s) == 0
+        && effect_plan_conflict_count(s) == 0
+        && effect_plan_cycle_count(s) == 0
+        && effect_plan_failure_count(s) == 0
+        && effect_plan_obligation_count(s) == 0;
+}
+public fn effect_plan_decl_count(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 160));
+}
+
+/// Return the normalized row at a stable table index.  Empty or out-of-range
+/// indices return an empty string; callers never receive an owned pointer.
+public fn effect_plan_fact_at(s: rawptr, ordinal: i32) -> string {
+    if (s == null || ordinal < 0) { return ""; }
+    let buf = effect_table_buf(s, 0);
+    let cap = effect_table_cap(s, 0);
+    var seen: i32 = 0;
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            if (seen == ordinal) {
+                return from_cstr_len(effect_slot_value(slot), ptr_read_i64(ptr_offset(slot, 32)));
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Read a deterministic callback result by ordinal.  The result table is
+/// keyed by the canonical EffectDecl key and values are stable rows such as
+/// `planned|migrate.collect` or `opaque|unregistered`.
+public fn effect_plan_result_at(s: rawptr, ordinal: i32) -> string {
+    if (s == null || ordinal < 0) { return ""; }
+    let buf = effect_table_buf(s, 2);
+    let cap = effect_table_cap(s, 2);
+    var seen: i32 = 0;
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            if (seen == ordinal) {
+                return from_cstr_len(effect_slot_value(slot), ptr_read_i64(ptr_offset(slot, 32)));
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Read a deferred diagnostic obligation by ordinal.  Obligations are not
+/// printed during collection: a later owning phase can attach source spans
+/// and render them through the normal diagnostics engine.
+public fn effect_plan_obligation_at(s: rawptr, ordinal: i32) -> string {
+    if (s == null || ordinal < 0) { return ""; }
+    let buf = effect_table_buf(s, 3);
+    let cap = effect_table_cap(s, 3);
+    var seen: i32 = 0;
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            if (seen == ordinal) {
+                return from_cstr_len(effect_slot_value(slot), ptr_read_i64(ptr_offset(slot, 32)));
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Return a dependency edge as `source<US>target<US>kind`.  Edges are part of
+/// the sealed plan fingerprint and are therefore cache-visible facts rather
+/// than best-effort telemetry.
+public fn effect_plan_edge_at(s: rawptr, ordinal: i32) -> string {
+    let key = effect_plan_edge_key_at(s, ordinal);
+    if (key.len == 0) { return ""; }
+    let kind = effect_plan_edge_kind_at(s, ordinal);
+    return key + effect_sep() + kind;
+}
+
+/// Return the canonical source<US>target key for an edge.  Keeping key and
+/// value accessors separate avoids reparsing an internal separator string at
+/// the manifest publication boundary.
+public fn effect_plan_edge_key_at(s: rawptr, ordinal: i32) -> string {
+    if (s == null || ordinal < 0) { return ""; }
+    let buf = effect_table_buf(s, 4);
+    let cap = effect_table_cap(s, 4);
+    var seen: i32 = 0;
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            if (seen == ordinal) {
+                return from_cstr_len(effect_slot_key(slot),
+                                     ptr_read_i64(ptr_offset(slot, 8)));
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+public fn effect_plan_edge_kind_at(s: rawptr, ordinal: i32) -> string {
+    if (s == null || ordinal < 0) { return ""; }
+    let buf = effect_table_buf(s, 4);
+    let cap = effect_table_cap(s, 4);
+    var seen: i32 = 0;
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            if (seen == ordinal) {
+                let value = from_cstr_len(effect_slot_value(slot),
+                                          ptr_read_i64(ptr_offset(slot, 32)));
+                return effect_edge_value_kind(value);
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+public fn effect_plan_edge_digest_at(s: rawptr, ordinal: i32) -> string {
+    if (s == null || ordinal < 0) { return ""; }
+    let buf = effect_table_buf(s, 4);
+    let cap = effect_table_cap(s, 4);
+    var seen: i32 = 0;
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            if (seen == ordinal) {
+                let value = from_cstr_len(effect_slot_value(slot),
+                                          ptr_read_i64(ptr_offset(slot, 32)));
+                return effect_edge_value_digest(value);
+            }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Render deferred obligations at a caller-owned span.  Sema may call this
+/// after collection and before freezing; failures then contribute to the
+/// ordinary diagnostic count rather than disappearing in telemetry.
+public fn effect_plan_emit_obligations_at(s: rawptr, loc: rawptr) -> i32 {
+    if (s == null) { return 0; }
+    let count = effect_plan_obligation_count(s);
+    var emitted: i32 = 0;
+    var i: i32 = 0;
+    while (i < count) {
+        let row = effect_plan_obligation_at(s, i);
+        let split = row.indexOf(effect_sep());
+        if (split >= 0) {
+            let code = str_view_range(row, 0, split);
+            let message = str_view_range(row, split + 1, row.len);
+            if (diag_emit_at(diag_sev_ERROR(), diag_code_sema_generic(), loc,
+                             code + ": " + message)) {
+                emitted = emitted + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return emitted;
+}
+
+fn effect_schema_field(value: string, ordinal: i32) -> string {
+    if (ordinal < 0 || value.len == 0) { return ""; }
+    let sep = effect_sep();
+    var field: i32 = 0;
+    var start: i32 = 0;
+    while (true) {
+        let pos = effect_find_from(value, sep, start);
+        let end = if (pos < 0) { value.len; } else { pos; };
+        if (field == ordinal) { return str_view_range(value, start, end); }
+        if (pos < 0) { return ""; }
+        start = pos + sep.len;
+        field = field + 1;
+    }
+}
+
+fn effect_schema_targets(value: string) -> string { return effect_schema_field(value, 3); }
+fn effect_schema_policy(value: string) -> string { return effect_schema_field(value, 4); }
+fn effect_schema_callback(value: string) -> string { return effect_schema_field(value, 5); }
+
+fn effect_target_list_contains(list: string, target: string) -> bool {
+    if (list == "*") { return true; }
+    if (target.len == 0 || list.len == 0) { return false; }
+    let wrapped = "|" + list + "|";
+    return wrapped.indexOf("|" + target + "|") >= 0;
+}
+
+/// Register a versioned handler schema.  The schema is data only: callback is
+/// a compiler-owned name, never source text or executable code.  Capability
+/// is an audit label consumed by the compiler, never a permission to invoke
+/// arbitrary host code.
+public fn effect_plan_register_handler_schema_v2(s: rawptr,
+                                                 attribute: string,
+                                                 phase: string,
+                                                 scope: string,
+                                                 targets: string,
+                                                 arg_policy: string,
+                                                 callback: string,
+                                                 version: string,
+                                                 capability: string) -> bool {
+    if (s == null || effect_is_frozen(s) || attribute.len == 0
+        || phase.len == 0 || scope.len == 0 || targets.len == 0
+        || arg_policy.len == 0 || callback.len == 0 || version.len == 0
+        || capability.len == 0) {
+        if (s != null && effect_is_frozen(s)) {
+            ptr_write_i64(ptr_offset(s, 64), ptr_read_i64(ptr_offset(s, 64)) + 1);
+        }
+        return false;
+    }
+    let key = attribute;
+    let hash = effect_hash(key);
+    let prior = effect_lookup(effect_table_buf(s, 1), effect_table_cap(s, 1), key, hash);
+    let value = attribute + effect_sep() + phase + effect_sep() + scope
+        + effect_sep() + targets + effect_sep() + arg_policy + effect_sep() + callback
+        + effect_sep() + version + effect_sep() + capability;
+    if (prior != null) {
+        let old = from_cstr_len(effect_slot_value(prior), ptr_read_i64(ptr_offset(prior, 32)));
+        if (old != value) {
+            ptr_write_i64(ptr_offset(s, 80), ptr_read_i64(ptr_offset(s, 80)) + 1);
+            return false;
+        }
+        return true;
+    }
+    return effect_install(s, 1, key, value);
+}
+
+/// Register a schema with the built-in handler version and capability.  This
+/// preserves the original API while ensuring every live schema carries the
+/// same deterministic metadata as the v2 entry point.
+public fn effect_plan_register_handler_schema(s: rawptr,
+                                              attribute: string,
+                                              phase: string,
+                                              scope: string,
+                                              targets: string,
+                                              arg_policy: string,
+                                              callback: string) -> bool {
+    return effect_plan_register_handler_schema_v2(s, attribute, phase, scope,
+        targets, arg_policy, callback, "1", "compiler.core");
+}
+
+public fn effect_plan_handler_version(s: rawptr, attribute: string) -> string {
+    let value = effect_handler_value(s, attribute);
+    return effect_schema_field(value, 6);
+}
+
+public fn effect_plan_handler_capability(s: rawptr, attribute: string) -> string {
+    let value = effect_handler_value(s, attribute);
+    return effect_schema_field(value, 7);
+}
+
+/// Compatibility entry point for existing phase registration.  New users
+/// should provide an explicit target set, argument policy and callback name.
+public fn effect_plan_register_handler(s: rawptr,
+                                       attribute: string,
+                                       phase: string,
+                                       scope: string) -> bool {
+    return effect_plan_register_handler_schema(s, attribute, phase, scope,
+        "declaration|function|type|field|module|variant|variable|use",
+        "canonical", "record." + attribute);
+}
+
+fn effect_plan_register_builtin_handlers(s: rawptr) {
+    if (s == null) { return; }
+    effect_plan_register_handler_schema(s, "migrate", "migration", "declaration",
+        "declaration|function|type|field|module|variant", "canonical", "migrate.collect");
+    effect_plan_register_handler_schema(s, "reflect", "reflection", "declaration",
+        "declaration|function|type|field|module|variant", "canonical", "reflect.collect");
+    effect_plan_register_handler_schema(s, "Reflect", "reflection", "declaration",
+        "declaration|function|type|field|module|variant", "canonical", "reflect.collect");
+    effect_plan_register_handler_schema(s, "REFLECT", "reflection", "declaration",
+        "declaration|function|type|field|module|variant", "canonical", "reflect.collect");
+    effect_plan_register_handler_schema(s, "dci_import", "abi", "module",
+        "module|declaration|type|function", "canonical", "dci.import");
+    effect_plan_register_handler_schema(s, "dci_export", "abi", "module",
+        "module|declaration|type|function", "canonical", "dci.export");
+    // DCI producer-side lifecycle and exception obligations are data facts
+    // when they cross the Effect manifest boundary.  They deliberately use
+    // record callbacks: importing them must validate and fingerprint the
+    // graph, never authorize an extra lowering operation implicitly.
+    effect_plan_register_handler_schema(s, "dci.lifecycle", "abi", "module",
+        "module|declaration|type|function", "canonical", "record.dci.lifecycle");
+    effect_plan_register_handler_schema(s, "dci.exception", "abi", "module",
+        "module|declaration|type|function", "canonical", "record.dci.exception");
+    effect_plan_register_handler_schema(s, "derive", "declaration", "declaration",
+        "type|struct|class|enum", "canonical", "derive.expand");
+    effect_plan_register_handler_schema(s, "comptime", "evaluation", "expression",
+        "expression|declaration|function", "canonical", "comptime.evaluate");
+    effect_plan_register_handler_schema(s, "async", "lowering", "function",
+        "function", "none", "async.lower");
+    effect_plan_register_handler_schema(s, "task", "lowering", "function",
+        "function", "none", "task.lower");
+    effect_plan_register_handler_schema(s, "platform", "target", "declaration",
+        "declaration|module|function|type", "canonical", "platform.select");
+    // A reachability effect is consumed by HIR construction below. It makes
+    // the annotated function a code-generation root, so later DCE rounds keep
+    // the body even when no source call edge reaches it.
+    effect_plan_register_handler_schema(s, "retain", "lowering", "function",
+        "function", "none", "dce.retain");
+    // `myAttr` is the reference declarative extension handler.  It is kept in
+    // the compiler-owned registry so a real source attribute can exercise the
+    // same schema, argument validation, plan result and lowering authorization
+    // path as package supplied handlers.  The callback is deliberately a
+    // record handler: it can derive facts/markers, but it cannot execute source
+    // text or call arbitrary host code.
+    effect_plan_register_handler_schema_v2(s, "myAttr", "custom", "declaration",
+        "function|type|field|module", "named", "record.myAttr.validate",
+        "1", "effect.record");
+    // A source-level `effect name { ... }` declaration is a data-only
+    // compiler contract.  Registering its record handler lets the declaration
+    // cross a manifest boundary without authorizing executable lowering.
+    effect_plan_register_handler_schema_v2(s, "effect", "declaration", "unit",
+        "declaration|module", "canonical", "record.effect",
+        "1", "compiler.core");
+}
+
+fn effect_external_schema_row(attribute: string) -> string {
+    if (g_effect_schema_text.len == 0 || attribute.len == 0) { return ""; }
+    let count = effect_attribute_schema_row_count(g_effect_schema_text.clone());
+    var i: i32 = 0;
+    while (i < count) {
+        let row = effect_attribute_schema_row_at(g_effect_schema_text.clone(), i);
+        let schema_attribute = effect_attribute_schema_field(row, 1).clone();
+        if (schema_attribute == attribute) { return row; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn effect_plan_register_external_schemas(s: rawptr) {
+    if (s == null || g_effect_schema_text.len == 0) { return; }
+    let count = effect_attribute_schema_row_count(g_effect_schema_text.clone());
+    var i: i32 = 0;
+    while (i < count) {
+        let row = effect_attribute_schema_row_at(g_effect_schema_text.clone(), i);
+        if (effect_attribute_schema_row_valid(row)) {
+            let attribute = effect_attribute_schema_field(row, 1);
+            let version = effect_attribute_schema_field(row, 2);
+            let targets = effect_attribute_schema_field(row, 3);
+            let consequence = effect_attribute_schema_field(row, 5);
+            let callback = "record." + attribute;
+            let capability = "effect.declarative." + consequence;
+            if (!effect_plan_register_handler_schema_v2(s, attribute, "custom",
+                    "declaration", targets, "named", callback, version, capability)) {
+                effect_plan_add_obligation(s, "schema" + effect_sep() + attribute,
+                    "EFFECT-SCHEMA", "declarative schema conflicts with a compiler handler");
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn effect_handler_value(s: rawptr, attribute: string) -> string {
+    if (s == null || attribute.len == 0) { return ""; }
+    let slot = effect_lookup(effect_table_buf(s, 1), effect_table_cap(s, 1), attribute, effect_hash(attribute));
+    if (slot == null) { return ""; }
+    return from_cstr_len(effect_slot_value(slot), ptr_read_i64(ptr_offset(slot, 32)));
+}
+
+fn effect_builtin_phase(attribute: string) -> string {
+    if (attribute == "migrate") { return "migration"; }
+    if (attribute == "reflect") { return "reflection"; }
+    if (attribute == "dci_import" || attribute == "dci_export") { return "abi"; }
+    if (attribute == "derive") { return "declaration"; }
+    if (attribute == "comptime") { return "evaluation"; }
+    if (attribute == "async" || attribute == "task") { return "lowering"; }
+    if (attribute == "platform") { return "target"; }
+    return "custom";
+}
+
+fn effect_is_space(c: i32) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+fn effect_args_balanced(text: string) -> bool {
+    var quote: i32 = 0;
+    var escaped: bool = false;
+    var square: i32 = 0;
+    var curly: i32 = 0;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (quote != 0) {
+            if (escaped) { escaped = false; }
+            elif (c == 92) { escaped = true; }
+            elif (c == quote) { quote = 0; }
+        } else {
+            if (c == 34 || c == 39) { quote = c; }
+            elif (c == 91) { square = square + 1; }
+            elif (c == 93) {
+                square = square - 1;
+                if (square < 0) { return false; }
+            } elif (c == 123) { curly = curly + 1; }
+            elif (c == 125) {
+                curly = curly - 1;
+                if (curly < 0) { return false; }
+            }
+        }
+        i = i + 1;
+    }
+    return quote == 0 && !escaped && square == 0 && curly == 0;
+}
+
+/// Canonicalize argument spelling without evaluating it.  Whitespace outside
+/// quoted literals is removed, preserving order and escapes.  This makes the
+/// planner deterministic while keeping arbitrary custom values opaque.
+fn effect_canonical_args(text: string) -> string {
+    var out: string = "";
+    var quote: i32 = 0;
+    var escaped: bool = false;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (quote != 0) {
+            out = out + str_view_range(text, i, i + 1);
+            if (escaped) { escaped = false; }
+            elif (c == 92) { escaped = true; }
+            elif (c == quote) { quote = 0; }
+        } else {
+            if (c == 34 || c == 39) {
+                quote = c;
+                out = out + str_view_range(text, i, i + 1);
+            } elif (effect_is_space(c)) {
+                var next = i + 1;
+                while (next < text.len && effect_is_space(text.charAt(next))) { next = next + 1; }
+                if (out.len > 0 && next < text.len) {
+                    let prev = out.charAt(out.len - 1);
+                    let after = text.charAt(next);
+                    // Preserve a lexical separator between value tokens.  A
+                    // whitespace-only spelling change cannot turn `a b` into
+                    // a different identifier `ab`.
+                    if (effect_attr_name_char(prev) && effect_attr_name_char(after)) {
+                        out = out + " ";
+                    } elif ((prev == 34 || prev == 39) &&
+                            (after == 34 || after == 39 || effect_attr_name_char(after))) {
+                        out = out + " ";
+                    }
+                }
+                i = next - 1;
+            } else {
+                out = out + str_view_range(text, i, i + 1);
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn effect_decl_target(kind: i32) -> string {
+    if (kind == de_FN() || kind == de_EXTERN_FN() || kind == de_METHOD()) { return "function"; }
+    if (kind == de_CLASS() || kind == de_ENUM() || kind == de_TYPE_ALIAS()) { return "type"; }
+    if (kind == de_FIELD()) { return "field"; }
+    if (kind == de_MODULE()) { return "module"; }
+    if (kind == de_VARIANT()) { return "variant"; }
+    if (kind == de_CONST() || kind == de_GLOBAL_VAR()) { return "variable"; }
+    if (kind == de_USE()) { return "use"; }
+    return "declaration";
+}
+
+public fn effect_plan_add_obligation(s: rawptr, key: string, code: string, message: string) {
+    if (s == null || key.len == 0 || code.len == 0 || message.len == 0) { return; }
+    let full_key = key + effect_sep() + code;
+    let value = code + effect_sep() + message;
+    let prior = effect_lookup(effect_table_buf(s, 3), effect_table_cap(s, 3),
+                              full_key, effect_hash(full_key));
+    if (prior != null) { return; }
+    if (!effect_install(s, 3, full_key, value)) {
+        ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+    }
+}
+
+fn effect_edge_source(key: string) -> string {
+    let sep = effect_sep();
+    let pos = effect_find_from(key, sep, 0);
+    if (pos < 0) { return ""; }
+    return str_view_range(key, 0, pos);
+}
+
+fn effect_edge_target(key: string) -> string {
+    let sep = effect_sep();
+    let pos = effect_find_from(key, sep, 0);
+    if (pos < 0 || pos + sep.len >= key.len) { return ""; }
+    return str_view_range(key, pos + sep.len, key.len);
+}
+
+fn effect_edge_value_kind(value: string) -> string {
+    let sep = effect_sep();
+    let pos = effect_find_from(value, sep, 0);
+    if (pos < 0) { return value; }
+    return str_view_range(value, 0, pos);
+}
+
+fn effect_edge_value_digest(value: string) -> string {
+    let sep = effect_sep();
+    let pos = effect_find_from(value, sep, 0);
+    if (pos < 0 || pos + sep.len >= value.len) { return ""; }
+    return str_view_range(value, pos + sep.len, value.len);
+}
+
+// Select the lexicographically first outgoing edge.  Hash-table iteration is
+// deliberately not used as an ordering signal: this makes diagnostics stable
+// across insertion order and table growth.
+fn effect_edge_next_sorted(s: rawptr, source: string, path: string) -> string {
+    if (s == null || source.len == 0) { return ""; }
+    let buf = effect_table_buf(s, 4);
+    let cap = effect_table_cap(s, 4);
+    var best = "";
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            let key = from_cstr_len(effect_slot_key(slot), ptr_read_i64(ptr_offset(slot, 8)));
+            let edge_source = effect_edge_source(key);
+            let edge_target = effect_edge_target(key);
+            if (edge_source == source && edge_target.len > 0
+                && path.indexOf("|" + edge_target + "|") < 0
+                && (best.len == 0 || str_compare(edge_target, best) < 0)) {
+                best = edge_target;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn effect_edge_find_path(s: rawptr, current: string, want: string, path: string) -> string {
+    if (current == want) { return current; }
+    if (s == null) { return ""; }
+    let buf = effect_table_buf(s, 4);
+    let cap = effect_table_cap(s, 4);
+    var best = "";
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            let key = from_cstr_len(effect_slot_key(slot), ptr_read_i64(ptr_offset(slot, 8)));
+            let next = effect_edge_target(key);
+            if (effect_edge_source(key) == current && next.len > 0
+                && path.indexOf("|" + next + "|") < 0) {
+                let tail = effect_edge_find_path(s, next, want, path + next + "|");
+                if (tail.len > 0) {
+                    let candidate = current + " -> " + tail;
+                    if (best.len == 0 || str_compare(candidate, best) < 0) { best = candidate; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+/// Add a compiler-owned dependency edge.  A prospective edge is checked
+/// against the existing graph before insertion; a back edge records a stable
+/// EFFECT-CYCLE obligation and is rejected, so no cyclic plan can be sealed.
+public fn effect_plan_add_edge(s: rawptr,
+                               source: string,
+                               target: string,
+                               kind: string) -> bool {
+    return effect_plan_add_edge_with_digest(s, source, target, kind, "");
+}
+
+public fn effect_plan_add_edge_with_digest(s: rawptr,
+                                           source: string,
+                                           target: string,
+                                           kind: string,
+                                           digest: string) -> bool {
+    if (s == null) { return false; }
+    if (effect_is_frozen(s)) {
+        ptr_write_i64(ptr_offset(s, 64), ptr_read_i64(ptr_offset(s, 64)) + 1);
+        return false;
+    }
+    if (source.trim().len == 0 || target.trim().len == 0 || kind.trim().len == 0
+        || source.indexOf(effect_sep()) >= 0 || target.indexOf(effect_sep()) >= 0
+        || source.indexOf("->") >= 0 || target.indexOf("->") >= 0
+        || source.indexOf("|") >= 0 || target.indexOf("|") >= 0) {
+        effect_plan_add_obligation(s, "edge" + effect_sep() + source + effect_sep() + target,
+            "EFFECT-DEPENDENCY", "edge endpoint or kind is malformed");
+        ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+        return false;
+    }
+    if (digest.indexOf(effect_sep()) >= 0 || digest.indexOf("\n") >= 0 || digest.indexOf("\r") >= 0) {
+        effect_plan_add_obligation(s, "edge" + effect_sep() + source + effect_sep() + target,
+            "EFFECT-DEPENDENCY", "edge digest contains a reserved separator");
+        ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+        return false;
+    }
+    let from = source.trim();
+    let to = target.trim();
+    let edge_key = from + effect_sep() + to;
+    let hash = effect_hash(edge_key);
+    let prior = effect_lookup(effect_table_buf(s, 4), effect_table_cap(s, 4), edge_key, hash);
+    if (prior != null) {
+        let old_value = from_cstr_len(effect_slot_value(prior), ptr_read_i64(ptr_offset(prior, 32)));
+        let old_kind = effect_edge_value_kind(old_value);
+        let old_digest = effect_edge_value_digest(old_value);
+        let new_digest = digest.trim();
+        if (old_kind != kind.trim()
+            || (old_digest.len > 0 && new_digest.len > 0 && old_digest != new_digest)) {
+            ptr_write_i64(ptr_offset(s, 80), ptr_read_i64(ptr_offset(s, 80)) + 1);
+            return false;
+        }
+        return true;
+    }
+    let path = effect_edge_find_path(s, to, from, "|" + to + "|");
+    if (path.len > 0) {
+        effect_plan_add_obligation(s, "edge" + effect_sep() + edge_key,
+            "EFFECT-CYCLE", "dependency cycle: " + path + " -> " + to);
+        ptr_write_i64(ptr_offset(s, 168), ptr_read_i64(ptr_offset(s, 168)) + 1);
+        ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+        return false;
+    }
+    var edge_value = kind.trim();
+    if (digest.trim().len > 0) {
+        edge_value = edge_value + effect_sep() + digest.trim();
+    }
+    if (!effect_install(s, 4, edge_key, edge_value)) {
+        ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+        return false;
+    }
+    return true;
+}
+
+public fn effect_plan_add_dependency(s: rawptr,
+                                    source: string,
+                                    target: string,
+                                    kind: string) -> bool {
+    return effect_plan_add_edge(s, source, target, kind);
+}
+
+fn effect_plan_store_result(s: rawptr, key: string, value: string) {
+    if (s == null || key.len == 0 || value.len == 0) { return; }
+    let prior = effect_lookup(effect_table_buf(s, 2), effect_table_cap(s, 2),
+                              key, effect_hash(key));
+    if (prior != null) {
+        let old = from_cstr_len(effect_slot_value(prior), ptr_read_i64(ptr_offset(prior, 32)));
+        if (old != value) {
+            ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+        }
+        return;
+    }
+    if (!effect_install(s, 2, key, value)) {
+        ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+    }
+}
+
+// Return the value of one top-level named argument.  Arguments are already
+// balanced and canonicalized by the attribute normalizer, but values may still
+// contain quoted commas or nested lists.  The scanner therefore only treats a
+// comma outside quotes/brackets as the end of a value.
+fn effect_text_equal(a: string, b: string) -> bool {
+    if (a.len != b.len) { return false; }
+    var i: i32 = 0;
+    while (i < a.len) {
+        if (a.charAt(i) != b.charAt(i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn effect_named_arg_value(arguments: string, wanted: string) -> string {
+    if (arguments.len == 0 || wanted.len == 0) { return ""; }
+    var i: i32 = 0;
+    while (i < arguments.len) {
+        var token_start = i;
+        var quote: i32 = 0;
+        var escaped: bool = false;
+        var square: i32 = 0;
+        var curly: i32 = 0;
+        while (i < arguments.len) {
+            let c = arguments.charAt(i);
+            if (quote != 0) {
+                if (escaped) { escaped = false; }
+                elif (c == 92) { escaped = true; }
+                elif (c == quote) { quote = 0; }
+            } else {
+                if (c == 34 || c == 39) { quote = c; }
+                elif (c == 91) { square = square + 1; }
+                elif (c == 93) { square = square - 1; }
+                elif (c == 123) { curly = curly + 1; }
+                elif (c == 125) { curly = curly - 1; }
+                elif (c == 44 && square == 0 && curly == 0) { break; }
+            }
+            i = i + 1;
+        }
+        var token_end = i;
+        while (token_start < token_end && effect_is_space(arguments.charAt(token_start))) {
+            token_start = token_start + 1;
+        }
+        while (token_end > token_start && effect_is_space(arguments.charAt(token_end - 1))) {
+            token_end = token_end - 1;
+        }
+        var eq: i32 = -1;
+        var eq_scan: i32 = token_start;
+        while (eq_scan < token_end) {
+            if (arguments.charAt(eq_scan) == 61) { eq = eq_scan; break; }
+            eq_scan = eq_scan + 1;
+        }
+        if (eq > token_start) {
+            var key_start = token_start;
+            var key_end = eq;
+            while (key_end > key_start && effect_is_space(arguments.charAt(key_end - 1))) {
+                key_end = key_end - 1;
+            }
+            if (key_end - key_start == wanted.len) {
+                var key_same = true;
+                var key_i: i32 = 0;
+                while (key_i < wanted.len && key_same) {
+                    if (arguments.charAt(key_start + key_i) != wanted.charAt(key_i)) {
+                        key_same = false;
+                    }
+                    key_i = key_i + 1;
+                }
+                if (key_same) {
+                    var value_start = eq + 1;
+                    var value_end = token_end;
+                    while (value_start < value_end && effect_is_space(arguments.charAt(value_start))) {
+                        value_start = value_start + 1;
+                    }
+                    while (value_end > value_start && effect_is_space(arguments.charAt(value_end - 1))) {
+                        value_end = value_end - 1;
+                    }
+                    return str_view_range(arguments, value_start, value_end);
+                }
+            }
+        }
+        if (i < arguments.len && arguments.charAt(i) == 44) { i = i + 1; }
+    }
+    return "";
+}
+
+fn effect_named_arg_token_count(arguments: string) -> i32 {
+    if (arguments.trim().len == 0) { return 0; }
+    var count: i32 = 1;
+    var i: i32 = 0;
+    var quote: i32 = 0;
+    var escaped: bool = false;
+    var square: i32 = 0;
+    var curly: i32 = 0;
+    while (i < arguments.len) {
+        let c = arguments.charAt(i);
+        if (quote != 0) {
+            if (escaped) { escaped = false; }
+            elif (c == 92) { escaped = true; }
+            elif (c == quote) { quote = 0; }
+        } else {
+            if (c == 34 || c == 39) { quote = c; }
+            elif (c == 91) { square = square + 1; }
+            elif (c == 93) { square = square - 1; }
+            elif (c == 123) { curly = curly + 1; }
+            elif (c == 125) { curly = curly - 1; }
+            elif (c == 44 && square == 0 && curly == 0) { count = count + 1; }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn effect_strip_literal_quotes(value: string) -> string {
+    if (value.len >= 2
+        && ((value.charAt(0) == 34 && value.charAt(value.len - 1) == 34)
+            || (value.charAt(0) == 39 && value.charAt(value.len - 1) == 39))) {
+        return str_view_range(value, 1, value.len - 1);
+    }
+    return value;
+}
+
+fn effect_custom_myattr_args_valid(arguments: string) -> bool {
+    // Schema: level is required and is one of the two canonical enum values;
+    // retain is optional and defaults to false.  Unknown or duplicate keys are
+    // rejected so a typo cannot silently change the handler's meaning.
+    let level = effect_strip_literal_quotes(effect_named_arg_value(arguments, "level"));
+    let retain = effect_named_arg_value(arguments, "retain");
+    if (!effect_text_equal(level, "abi") && !effect_text_equal(level, "layout")) { return false; }
+    if (retain.len > 0 && !effect_text_equal(retain, "true") && !effect_text_equal(retain, "false")) { return false; }
+    let token_count = effect_named_arg_token_count(arguments);
+    var known_count: i32 = 0;
+    if (level.len > 0) { known_count = known_count + 1; }
+    if (retain.len > 0) { known_count = known_count + 1; }
+    return token_count == known_count;
+}
+
+fn effect_custom_handler_dispatch(s: rawptr, decl: EffectDecl) {
+    if (s == null || decl.callback != "record.myAttr.validate") { return; }
+    if (!effect_custom_myattr_args_valid(decl.arguments)) {
+        effect_plan_add_obligation(s, decl.key(), "EFFECT-ARGS",
+            "attribute 'myAttr' requires level=\"abi\"|\"layout\" and optional retain=bool");
+        ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+        return;
+    }
+    let level = effect_named_arg_value(decl.arguments, "level");
+    var retain = effect_named_arg_value(decl.arguments, "retain");
+    if (retain.len == 0) { retain = "false"; }
+    // `handled` is an authorization result, distinct from the initial
+    // `planned` dispatch marker.  Downstream lowering checks this exact row.
+    effect_plan_store_result(s, decl.key(), "handled" + effect_sep()
+        + decl.callback + effect_sep() + "level=" + level
+        + effect_sep() + "retain=" + retain);
+}
+
+fn effect_callback_supported(callback: string) -> bool {
+    if (callback == "migrate.collect" || callback == "reflect.collect"
+        || callback == "dci.import" || callback == "dci.export"
+        || callback == "derive.expand" || callback == "comptime.evaluate"
+        || callback == "async.lower" || callback == "task.lower"
+        || callback == "platform.select" || callback == "dce.retain") { return true; }
+    // A record callback emits a plan result only.  It cannot lower, execute
+    // source code, access the environment or mutate compiler options.
+    return callback.startsWith("record.") && callback.len > 7;
+}
+
+fn effect_find_from(hay: string, needle: string, start: i32) -> i32 {
+    if (needle.len == 0 || start < 0 || start > hay.len) { return -1; }
+    var i = start;
+    while (i + needle.len <= hay.len) {
+        var j: i32 = 0;
+        var same: bool = true;
+        while (j < needle.len && same) {
+            if (hay.charAt(i + j) != needle.charAt(j)) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn effect_attr_name_char(c: i32) -> bool {
+    return c == 95 || c == 46 || c == 58
+        || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+/// Parse one `@name(...)`, `@[name(...)]`, or `@[name]` token from attrs.
+/// The parser has already accepted the attribute grammar; malformed text is
+/// recorded instead of being guessed into a semantic effect.
+fn effect_parse_attr(text: string, start: i32) -> string {
+    var i = start;
+    if (i >= text.len || text.charAt(i) != 64) { return ""; }
+    i = i + 1;
+    var bracket = false;
+    if (i < text.len && text.charAt(i) == 91) { bracket = true; i = i + 1; }
+    let name_start = i;
+    while (i < text.len && effect_attr_name_char(text.charAt(i))) { i = i + 1; }
+    if (i == name_start) { return ""; }
+    let name = str_view_range(text, name_start, i);
+    var args = "";
+    if (i < text.len && text.charAt(i) == 40) {
+        let arg_start = i + 1;
+        var depth: i32 = 1;
+        var quote: i32 = 0;
+        var escaped: bool = false;
+        i = i + 1;
+        while (i < text.len && depth > 0) {
+            let c = text.charAt(i);
+            if (quote != 0) {
+                if (escaped) { escaped = false; }
+                elif (c == 92) { escaped = true; }
+                elif (c == quote) { quote = 0; }
+            } else {
+                if (c == 34 || c == 39) { quote = c; }
+                elif (c == 40) { depth = depth + 1; }
+                elif (c == 41) { depth = depth - 1; }
+            }
+            i = i + 1;
+        }
+        if (depth != 0 || quote != 0 || escaped) { return ""; }
+        args = str_view_range(text, arg_start, i - 1);
+    }
+    if (bracket) {
+        if (i >= text.len || text.charAt(i) != 93) { return ""; }
+        i = i + 1;
+    }
+    return "@" + name + "(" + args + ")" + effect_sep() + i.toString();
+}
+
+fn effect_plan_dispatch_decl(s: rawptr, decl: EffectDecl) {
+    if (s == null || decl.subject.len == 0 || decl.attribute.len == 0) { return; }
+    let key = decl.key();
+    if (decl.status == "registered") {
+        if (decl.callback == "record.myAttr.validate") {
+            // The custom handler writes its typed `handled` result below.  Do
+            // not first install a generic `planned` row: result rows are
+            // immutable once installed and a second write would be diagnosed
+            // as a dispatch conflict.
+            effect_custom_handler_dispatch(s, decl);
+        } else {
+            var state = "planned";
+            let external_schema = effect_external_schema_row(decl.attribute);
+            if (external_schema.len > 0) { state = "handled"; }
+            let value = state + effect_sep() + decl.callback + effect_sep()
+                + decl.phase + effect_sep() + decl.scope;
+            effect_plan_store_result(s, key, value);
+        }
+        // Every registered declaration has an explicit edge to the compiler
+        // handler that will consume its fact.  This is the smallest useful
+        // cross-declaration graph and gives manifests a real dependency
+        // boundary without inferring edges from names or source text.
+        effect_plan_add_edge(s, decl.subject,
+            "effect:" + decl.callback, "handler");
+        ptr_write_i64(ptr_offset(s, 144), ptr_read_i64(ptr_offset(s, 144)) + 1);
+        return;
+    }
+    if (decl.status == "unregistered") {
+        effect_plan_store_result(s, key, "opaque" + effect_sep() + "unregistered");
+        return;
+    }
+    let reason = "rejected" + effect_sep() + decl.status;
+    effect_plan_store_result(s, key, reason);
+    ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+}
+
+fn effect_apply_decl_result(s: rawptr, decl: EffectDecl, source_decl: rawptr) {
+    if (s == null || source_decl == null || decl.status != "registered") { return; }
+    var marker = "";
+    if (decl.callback == "dce.retain") { marker = "|effect:retain|"; }
+    elif (decl.callback == "reflect.collect") { marker = "|effect:reflect|"; }
+    elif (decl.callback == "migrate.collect") { marker = "|effect:migrate|"; }
+    // Async/task lowering consumes the same compiler-owned authorization
+    // boundary.  Keep the legacy marker spellings as compatibility inputs in
+    // HIR, but always stamp a validated Effect result so a source attribute is
+    // represented in the MOSP fact ledger before coroutine lowering runs.
+    elif (decl.callback == "async.lower" || decl.callback == "task.lower") {
+        marker = "|effect:async|";
+    }
+    elif (decl.callback == "platform.select") { marker = "|effect:platform|"; }
+    elif (decl.callback == "derive.expand") { marker = "|effect:derive|"; }
+    elif (decl.callback == "comptime.evaluate") { marker = "|effect:comptime|"; }
+    elif (decl.callback == "record.myAttr.validate"
+          && effect_text_equal(effect_named_arg_value(decl.arguments, "retain"), "true")) {
+        // Demonstrates a declarative custom handler feeding an existing
+        // lowering capability.  The marker is stamped only after the handler
+        // has produced and the planner has authorized a `handled` result.
+        marker = "|effect:retain|";
+    }
+    // Package-owned declarative schemas are data-only.  Their consequence is
+    // resolved from the validated schema row, and the marker is emitted only
+    // after the generic handler produced a handled plan result.
+    let external_schema = effect_external_schema_row(decl.attribute);
+    if (external_schema.len > 0) {
+        let consequence = effect_attribute_schema_field(external_schema, 5);
+        if (consequence == "retain") { marker = "|effect:retain|"; }
+        elif (consequence == "reflect") { marker = "|effect:reflect|"; }
+    }
+    // DCI contract selection is performed by the driver before HIR exists,
+    // but the authorization must still come from the sealed EffectPlan.  The
+    // marker is stamped on the declaration tree and checked by the driver
+    // before it binds the auto-discovered contract path.  Explicit
+    // `--dci` paths remain an independent, command-line contract.
+    elif (decl.callback == "dci.import") { marker = "|effect:dci_import|"; }
+    elif (decl.callback == "dci.export") { marker = "|effect:dci_export|"; }
+    if (marker.len == 0) { return; }
+    // The HIR boundary consumes a compiler-owned authorization marker, never
+    // the raw spelling of an attribute.  Confirm the result actually exists:
+    // failure to store a result must not authorize a lowering mutation.
+    let key = decl.key();
+    let slot = effect_lookup(effect_table_buf(s, 2), effect_table_cap(s, 2),
+                             key, effect_hash(key));
+    if (slot == null) { return; }
+    let result = from_cstr_len(effect_slot_value(slot), ptr_read_i64(ptr_offset(slot, 32)));
+    let result_state = effect_schema_field(result, 0);
+    if ((result_state != "planned" && result_state != "handled")
+        || effect_schema_field(result, 1) != decl.callback) { return; }
+    effect_stamp_decl_tree(source_decl, marker);
+}
+
+/// Stamp every declaration in a wrapper's member tree.  `@[dci_import]` is
+/// attached to the `extern "dci"` wrapper by the parser while the actual
+/// foreign classes/functions live below it; keeping the authorization on the
+/// complete tree makes the boundary inspectable by HIR/codegen consumers.
+fn effect_stamp_decl_tree(head: rawptr, marker: string) {
+    if (head == null || marker.len == 0) { return; }
+    // `next` links sibling top-level declarations and is intentionally not
+    // followed here: an attribute on one declaration must not authorize the
+    // following declaration chain.  Members are the owned declaration tree
+    // of the current wrapper/type and do inherit the authorization.
+    let meta = decl_get_meta(head);
+    if (meta.indexOf(marker) < 0) {
+        decl_set_meta(head, meta + marker);
+    }
+    let members = decl_get_members(head);
+    if (members != null) { effect_stamp_decl_tree(members, marker.clone()); }
+}
+
+fn effect_normalize_attrs(s: rawptr, subject: string, target: string, attrs: string,
+                         source_decl: rawptr) {
+    if (s == null) { return; }
+    if (effect_is_frozen(s)) {
+        ptr_write_i64(ptr_offset(s, 64), ptr_read_i64(ptr_offset(s, 64)) + 1);
+        return;
+    }
+    var i: i32 = 0;
+    while (i < attrs.len) {
+        if (attrs.charAt(i) != 64) { i = i + 1; continue; }
+        let parsed = effect_parse_attr(attrs, i);
+        if (parsed.len == 0) {
+            ptr_write_i64(ptr_offset(s, 56), ptr_read_i64(ptr_offset(s, 56)) + 1);
+            i = i + 1;
+            continue;
+        }
+        let sep_pos = parsed.indexOf(effect_sep());
+        if (sep_pos < 0) { return; }
+        let token = str_view_range(parsed, 0, sep_pos);
+        let next = effect_parse_i32(str_view_range(parsed, sep_pos + 1, parsed.len));
+        let open = token.indexOf("(");
+        if (open <= 1 || token.charAt(token.len - 1) != 41) {
+            ptr_write_i64(ptr_offset(s, 56), ptr_read_i64(ptr_offset(s, 56)) + 1);
+            i = i + 1;
+            continue;
+        }
+        let attr = str_view_range(token, 1, open);
+        let args = str_view_range(token, open + 1, token.len - 1);
+        // `@doc(...)` is parser transport for a documentation comment, not a
+        // MOSP attribute and must never enter the fact fingerprint.
+        if (attr == "doc") {
+            i = next;
+            continue;
+        }
+        var canonical_args = effect_canonical_args(args);
+        let args_ok = effect_args_balanced(args);
+        var phase = effect_builtin_phase(attr);
+        var scope = "declaration";
+        var targets = "";
+        var arg_policy = "opaque";
+        var callback = "opaque";
+        let handler = effect_handler_value(s, attr);
+        var status = "unregistered";
+        if (handler.len > 0) {
+            phase = effect_schema_field(handler, 1);
+            scope = effect_schema_field(handler, 2);
+            targets = effect_schema_targets(handler);
+            arg_policy = effect_schema_policy(handler);
+            callback = effect_schema_callback(handler);
+            if (!effect_target_list_contains(targets, target)) {
+                status = "rejected_target";
+                ptr_write_i64(ptr_offset(s, 128), ptr_read_i64(ptr_offset(s, 128)) + 1);
+            } elif (!args_ok) {
+                status = "rejected_args";
+                ptr_write_i64(ptr_offset(s, 136), ptr_read_i64(ptr_offset(s, 136)) + 1);
+            } elif (arg_policy == "none" && canonical_args.len > 0) {
+                status = "rejected_args";
+                ptr_write_i64(ptr_offset(s, 136), ptr_read_i64(ptr_offset(s, 136)) + 1);
+            } elif (arg_policy == "named" && canonical_args.len > 0
+                    && canonical_args.indexOf("=") < 0) {
+                status = "rejected_args";
+                ptr_write_i64(ptr_offset(s, 136), ptr_read_i64(ptr_offset(s, 136)) + 1);
+            } elif (!effect_callback_supported(callback)) {
+                status = "rejected_callback";
+            } else {
+                status = "registered";
+                let external_schema = effect_external_schema_row(attr);
+                if (external_schema.len > 0) {
+                    let schema_error = effect_attribute_schema_args_error(external_schema, canonical_args);
+                    if (schema_error.len > 0) {
+                        status = "rejected_args";
+                        ptr_write_i64(ptr_offset(s, 136), ptr_read_i64(ptr_offset(s, 136)) + 1);
+                    } else {
+                        canonical_args = effect_attribute_schema_args_normalize(external_schema, canonical_args);
+                    }
+                }
+            }
+        } else {
+            // A known spelling without a live handler is still unregistered;
+            // retaining the phase name must never silently authorize lowering.
+            ptr_write_i64(ptr_offset(s, 48), ptr_read_i64(ptr_offset(s, 48)) + 1);
+        }
+        let decl = EffectDecl.create(subject, attr, canonical_args, target,
+                                     phase, scope, status, callback);
+        let fact = EffectFact.create(subject, attr, canonical_args, phase, scope, status);
+        effect_plan_add_fact(s, fact);
+        if (status == "rejected_target") {
+            effect_plan_add_obligation(s, decl.key(), "EFFECT-TARGET",
+                "attribute '" + attr + "' is not valid on target '" + target + "'");
+        } elif (status == "rejected_args") {
+            effect_plan_add_obligation(s, decl.key(), "EFFECT-ARGS",
+                "attribute '" + attr + "' has invalid arguments");
+        } elif (status == "rejected_callback") {
+            effect_plan_add_obligation(s, decl.key(), "EFFECT-CALLBACK",
+                "attribute '" + attr + "' requests an unsupported compiler callback");
+        }
+        effect_plan_dispatch_decl(s, decl);
+        effect_apply_decl_result(s, decl, source_decl);
+        ptr_write_i64(ptr_offset(s, 40), ptr_read_i64(ptr_offset(s, 40)) + 1);
+        i = next;
+    }
+}
+
+fn effect_meta_attrs(meta: string) -> string {
+    let marker = "|attrs:";
+    let pos = meta.indexOf(marker);
+    if (pos < 0) { return ""; }
+    let start = pos + marker.len;
+    var end = start;
+    while (end < meta.len && meta.charAt(end) != 124) { end = end + 1; }
+    return str_view_range(meta, start, end);
+}
+
+// Exact attribute-name query used by the driver when a build-system command
+// already supplied a descriptor with `--dci`.  The build planner is allowed to
+// discover paths early for cache planning, but that must not turn a raw
+// `dci_import` spelling into an implicit authorization.  Keep this query
+// lexical and exact; substring tests would accept lookalike attributes.
+fn effect_attrs_have_attribute(attrs: string, wanted: string) -> bool {
+    if (attrs.len == 0 || wanted.len == 0) { return false; }
+    var i: i32 = 0;
+    while (i < attrs.len) {
+        if (attrs.charAt(i) != 64) { i = i + 1; continue; }
+        let parsed = effect_parse_attr(attrs, i);
+        if (parsed.len == 0) { i = i + 1; continue; }
+        let sep = parsed.indexOf(effect_sep());
+        if (sep < 0) { i = i + 1; continue; }
+        let token = str_view_range(parsed, 0, sep);
+        let open = token.indexOf("(");
+        if (open > 1 && token.charAt(token.len - 1) == 41
+            && str_view_range(token, 1, open) == wanted) {
+            return true;
+        }
+        i = effect_parse_i32(str_view_range(parsed, sep + 1, parsed.len));
+    }
+    return false;
+}
+
+fn effect_decl_tree_declares_attribute(head: rawptr, wanted: string) -> bool {
+    if (head == null || wanted.len == 0) { return false; }
+    var cur = head;
+    while (cur != null) {
+        if (effect_attrs_have_attribute(effect_meta_attrs(decl_get_meta(cur)), wanted)) {
+            return true;
+        }
+        if (effect_decl_tree_declares_attribute(decl_get_members(cur), wanted)) {
+            return true;
+        }
+        cur = decl_get_next(cur);
+    }
+    return false;
+}
+
+fn effect_decl_tree_has_marker(head: rawptr, marker: string) -> bool {
+    if (head == null || marker.len == 0) { return false; }
+    var cur = head;
+    while (cur != null) {
+        if (decl_get_meta(cur).indexOf(marker) >= 0) { return true; }
+        if (effect_decl_tree_has_marker(decl_get_members(cur), marker)) { return true; }
+        cur = decl_get_next(cur);
+    }
+    return false;
+}
+
+/// Return whether Sema's frozen EffectPlan authorized a DCI contract import
+/// on this source unit.  The driver uses this only for paths it discovered
+/// from source attributes; a direct `--dci` remains explicit and does not
+/// need a source marker.  Keep export out of this predicate: an export fact
+/// must never satisfy an import authorization check.
+public fn effect_unit_has_authorized_dci(unit: rawptr) -> bool {
+    if (unit == null) { return false; }
+    let decls = unit_get_decls(unit);
+    return effect_decl_tree_has_marker(decls, "|effect:dci_import|");
+}
+
+/// Return whether the unit contains an exact `dci_import` request.  This is
+/// separate from `effect_unit_has_authorized_dci`: the driver uses both facts
+/// to protect build-system supplied `--dci` paths without rejecting explicit
+/// descriptor use for inline/direct contracts that carry no source request.
+public fn effect_unit_declares_dci_import(unit: rawptr) -> bool {
+    if (unit == null) { return false; }
+    return effect_decl_tree_declares_attribute(unit_get_decls(unit), "dci_import");
+}
+
+public fn effect_plan_add_fact(s: rawptr, fact: EffectFact) -> bool {
+    if (s == null) { return false; }
+    if (effect_is_frozen(s)) {
+        ptr_write_i64(ptr_offset(s, 64), ptr_read_i64(ptr_offset(s, 64)) + 1);
+        return false;
+    }
+    if (fact.subject.len == 0 || fact.attribute.len == 0 || fact.phase.len == 0
+        || fact.scope.len == 0 || fact.status.len == 0) {
+        ptr_write_i64(ptr_offset(s, 56), ptr_read_i64(ptr_offset(s, 56)) + 1);
+        return false;
+    }
+    let key = fact.key();
+    let hash = effect_hash(key);
+    let slot = effect_lookup(effect_table_buf(s, 0), effect_table_cap(s, 0), key, hash);
+    if (slot != null) {
+        ptr_write_i64(ptr_offset(s, 72), ptr_read_i64(ptr_offset(s, 72)) + 1);
+        return true;
+    }
+    if (!effect_install(s, 0, key, fact.row())) { return false; }
+    ptr_write_i64(ptr_offset(s, 32), ptr_read_i64(ptr_offset(s, 32)) ^ hash);
+    return true;
+}
+
+fn effect_plan_collect_decl_scoped(s: rawptr, decl: rawptr, owner: string) {
+    if (s == null || decl == null) { return; }
+    let local_name = decl_get_name(decl);
+    let subject = if (owner.len == 0) { local_name }
+        else { owner + "." + local_name };
+    let attrs = effect_meta_attrs(decl_get_meta(decl));
+    ptr_write_i64(ptr_offset(s, 160), ptr_read_i64(ptr_offset(s, 160)) + 1);
+    if (attrs.len > 0) {
+        effect_normalize_attrs(s, subject,
+                               effect_decl_target(decl_get_kind(decl)), attrs, decl);
+    }
+    var member = decl_get_members(decl);
+    while (member != null) {
+        effect_plan_collect_decl_scoped(s, member, subject);
+        member = decl_get_next(member);
+    }
+}
+
+public fn effect_plan_collect_decl(s: rawptr, decl: rawptr) {
+    effect_plan_collect_decl_scoped(s, decl, "");
+}
+
+public fn effect_plan_collect_unit(s: rawptr, unit: rawptr) {
+    if (s == null || unit == null) { return; }
+    var decl = unit_get_decls(unit);
+    while (decl != null) {
+        effect_plan_collect_decl(s, decl);
+        decl = decl_get_next(decl);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct DCI obligation import
+// ---------------------------------------------------------------------------
+// The Python validator is useful for producer tooling, but a compiler must
+// enforce the same graph when a real --dci path is consumed.  These helpers
+// read the already parsed cJSON root, add lifecycle/exception facts to the
+// live EffectPlan, and only then add dependency edges.  That ordering lets a
+// cross-module edge refer to a fact declared by a later contract while still
+// rejecting dangling endpoints and shared_abi cleanup omissions.
+
+fn effect_dci_json_string(object: rawptr, key: string) -> string {
+    if (object == null || key.len == 0) { return ""; }
+    let item = cJSON_GetObjectItemCaseSensitive(object, key.c_str());
+    if (item == null || cJSON_IsString(item) == 0) { return ""; }
+    let raw = cJSON_GetStringValue(item);
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}
+
+fn effect_dci_json_object(object: rawptr, key: string) -> rawptr {
+    if (object == null || key.len == 0) { return null; }
+    let item = cJSON_GetObjectItemCaseSensitive(object, key.c_str());
+    if (item == null || cJSON_IsObject(item) == 0) { return null; }
+    return item;
+}
+
+fn effect_dci_json_array(object: rawptr, key: string) -> rawptr {
+    if (object == null || key.len == 0) { return null; }
+    let item = cJSON_GetObjectItemCaseSensitive(object, key.c_str());
+    if (item == null || cJSON_IsArray(item) == 0) { return null; }
+    return item;
+}
+
+fn effect_dci_fail(s: rawptr, path: string, code: string, message: string) {
+    effect_plan_add_obligation(s, "dci" + effect_sep() + path + effect_sep() + code,
+        code, message);
+}
+
+fn effect_dci_node(kind: string, subject: string) -> string {
+    if (kind == "exception") { return "dci:exception:" + subject; }
+    if (kind == "lifecycle") { return "dci:lifecycle:" + subject; }
+    return "";
+}
+
+fn effect_dci_edge_node(node: string) -> string {
+    if (node.startsWith("dci:exception:") || node.startsWith("dci:lifecycle:")) {
+        return node;
+    }
+    if (node.startsWith("exception:")) { return "dci:" + node; }
+    if (node.startsWith("lifecycle:")) { return "dci:" + node; }
+    return "";
+}
+
+fn effect_dci_symbol_add(symbol: string) {
+    let value = symbol.trim();
+    if (value.len == 0 || g_effect_dci_symbols.indexOf("\n" + value + "\n") >= 0) { return; }
+    g_effect_dci_symbols = g_effect_dci_symbols + "\n" + value + "\n";
+}
+
+fn effect_dci_symbol_known(symbol: string) -> bool {
+    return symbol.len > 0 && g_effect_dci_symbols.indexOf("\n" + symbol + "\n") >= 0;
+}
+
+fn effect_dci_collect_symbols(root: rawptr) {
+    let exports = effect_dci_json_object(root, "exports");
+    let symbols = effect_dci_json_array(exports, "symbols");
+    if (symbols == null) { return; }
+    var i: i32 = 0;
+    let n = cJSON_GetArraySize(symbols);
+    while (i < n) {
+        let item = cJSON_GetArrayItem(symbols, i);
+        let name = effect_dci_json_string(item, "name");
+        let link = effect_dci_json_string(item, "link_name");
+        let mangled = effect_dci_json_string(item, "mangled");
+        effect_dci_symbol_add(name);
+        effect_dci_symbol_add(link);
+        effect_dci_symbol_add(mangled);
+        i = i + 1;
+    }
+}
+
+fn effect_dci_fact_subject_exists(s: rawptr, subject: string) -> bool {
+    if (s == null || subject.len == 0) { return false; }
+    let buf = effect_table_buf(s, 0);
+    let cap = effect_table_cap(s, 0);
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            let key = from_cstr_len(effect_slot_key(slot), ptr_read_i64(ptr_offset(slot, 8)));
+            let sep = effect_sep();
+            let end = effect_find_from(key, sep, 0);
+            if (end >= 0 && str_view_range(key, 0, end) == subject) { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn effect_dci_edge_exists(s: rawptr, source: string, kind: string) -> bool {
+    if (s == null) { return false; }
+    let buf = effect_table_buf(s, 4);
+    let cap = effect_table_cap(s, 4);
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * effect_slot_size());
+        if (effect_slot_key(slot) != null) {
+            let key = from_cstr_len(effect_slot_key(slot), ptr_read_i64(ptr_offset(slot, 8)));
+            let value = from_cstr_len(effect_slot_value(slot), ptr_read_i64(ptr_offset(slot, 32)));
+            if (effect_edge_source(key) == source && effect_edge_value_kind(value) == kind) { return true; }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn effect_dci_check_contract_header(s: rawptr, root: rawptr, path: string) -> bool {
+    let profile = effect_dci_json_object(root, "profile");
+    let mode = effect_dci_json_string(profile, "obligation_mode");
+    let obligations_item = cJSON_GetObjectItemCaseSensitive(root, "obligations".c_str());
+    if (obligations_item == null) {
+        if (mode == "required") {
+            effect_dci_fail(s, path, "EFFECT-DCI-OBLIGATION", "profile requires an obligations graph");
+            return false;
+        }
+        return true;
+    }
+    if (cJSON_IsObject(obligations_item) == 0) {
+        effect_dci_fail(s, path, "EFFECT-DCI-OBLIGATION", "obligations must be an object");
+        return false;
+    }
+    let version = effect_dci_json_string(obligations_item, "version");
+    if (version != "1") {
+        effect_dci_fail(s, path, "EFFECT-DCI-OBLIGATION", "unsupported obligations version");
+        return false;
+    }
+    return true;
+}
+
+fn effect_dci_import_facts(s: rawptr, root: rawptr, path: string) {
+    let obligations = effect_dci_json_object(root, "obligations");
+    if (obligations == null) { return; }
+    let lifecycle = effect_dci_json_array(obligations, "lifecycle");
+    if (lifecycle != null) {
+        var i: i32 = 0;
+        let n = cJSON_GetArraySize(lifecycle);
+        while (i < n) {
+            let item = cJSON_GetArrayItem(lifecycle, i);
+            let subject = effect_dci_json_string(item, "subject");
+            let ownership = effect_dci_json_string(item, "ownership");
+            let unwind = effect_dci_json_string(item, "on_unwind");
+            let operations = effect_dci_json_array(item, "required_operations");
+            if (subject.len == 0 || ownership.len == 0 || unwind.len == 0
+                || operations == null || cJSON_GetArraySize(operations) <= 0) {
+                effect_dci_fail(s, path, "EFFECT-DCI-LIFECYCLE", "invalid lifecycle obligation");
+            } else {
+                let args = "subject=" + subject + ",ownership=" + ownership + ",on_unwind=" + unwind;
+                effect_plan_add_fact(s, EffectFact.create(effect_dci_node("lifecycle", subject),
+                    "dci.lifecycle", args, "abi", "module", "registered"));
+            }
+            i = i + 1;
+        }
+    }
+    let exceptions = effect_dci_json_array(obligations, "exceptions");
+    if (exceptions != null) {
+        var i: i32 = 0;
+        let n = cJSON_GetArraySize(exceptions);
+        while (i < n) {
+            let item = cJSON_GetArrayItem(exceptions, i);
+            let subject = effect_dci_json_string(item, "subject");
+            let boundary = effect_dci_json_string(item, "boundary");
+            let cleanup = effect_dci_json_string(item, "cleanup");
+            let abi = effect_dci_json_string(item, "abi");
+            if (subject.len == 0 || boundary.len == 0 || cleanup.len == 0
+                || (boundary == "shared_abi" && (abi.len == 0 || cleanup != "unwind"))) {
+                effect_dci_fail(s, path, "EFFECT-DCI-EXCEPTION", "invalid exception obligation");
+            } else {
+                let args = "subject=" + subject + ",boundary=" + boundary + ",cleanup=" + cleanup;
+                effect_plan_add_fact(s, EffectFact.create(effect_dci_node("exception", subject),
+                    "dci.exception", args, "abi", "module", "registered"));
+            }
+            i = i + 1;
+        }
+    }
+}
+
+fn effect_dci_import_edges(s: rawptr, root: rawptr, path: string) {
+    let obligations = effect_dci_json_object(root, "obligations");
+    let edges = effect_dci_json_array(obligations, "edges");
+    if (edges == null) { return; }
+    var i: i32 = 0;
+    let n = cJSON_GetArraySize(edges);
+    while (i < n) {
+        let item = cJSON_GetArrayItem(edges, i);
+        let source = effect_dci_edge_node(effect_dci_json_string(item, "from"));
+        let target = effect_dci_edge_node(effect_dci_json_string(item, "to"));
+        let kind = effect_dci_json_string(item, "kind");
+        if (source.len == 0 || target.len == 0 || kind.len == 0
+            || !effect_dci_fact_subject_exists(s, source)
+            || !effect_dci_fact_subject_exists(s, target)) {
+            effect_dci_fail(s, path, "EFFECT-DCI-EDGE", "edge has an unresolved endpoint or kind");
+        } elif (kind == "cleanup-before-propagate"
+                && (!source.startsWith("dci:exception:") || !target.startsWith("dci:lifecycle:"))) {
+            effect_dci_fail(s, path, "EFFECT-DCI-EDGE", "cleanup-before-propagate has invalid endpoint kinds");
+        } else {
+            let digest = effect_hash(path + effect_sep() + source + effect_sep() + target
+                                     + effect_sep() + kind).toString();
+            if (!effect_plan_add_edge_with_digest(s, source, target, kind, digest)) {
+                effect_dci_fail(s, path, "EFFECT-DCI-EDGE", "dependency edge was rejected");
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn effect_dci_validate_lifecycle_symbols(s: rawptr, root: rawptr, path: string) {
+    let obligations = effect_dci_json_object(root, "obligations");
+    let lifecycle = effect_dci_json_array(obligations, "lifecycle");
+    if (lifecycle == null) { return; }
+    var i: i32 = 0;
+    let n = cJSON_GetArraySize(lifecycle);
+    while (i < n) {
+        let item = cJSON_GetArrayItem(lifecycle, i);
+        let operations = effect_dci_json_array(item, "required_operations");
+        if (operations != null) {
+            var j: i32 = 0;
+            let m = cJSON_GetArraySize(operations);
+            while (j < m) {
+                let symbol = effect_dci_json_string(cJSON_GetArrayItem(operations, j), "symbol");
+                if (symbol.len == 0 || !effect_dci_symbol_known(symbol)) {
+                    effect_dci_fail(s, path, "EFFECT-DCI-SYMBOL", "lifecycle operation symbol is not exported");
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn effect_dci_validate_cleanup(s: rawptr, root: rawptr, path: string) {
+    let obligations = effect_dci_json_object(root, "obligations");
+    let exceptions = effect_dci_json_array(obligations, "exceptions");
+    if (exceptions == null) { return; }
+    var i: i32 = 0;
+    let n = cJSON_GetArraySize(exceptions);
+    while (i < n) {
+        let item = cJSON_GetArrayItem(exceptions, i);
+        let boundary = effect_dci_json_string(item, "boundary");
+        let subject = effect_dci_json_string(item, "subject");
+        if (boundary == "shared_abi"
+            && !effect_dci_edge_exists(s, effect_dci_node("exception", subject),
+                                       "cleanup-before-propagate")) {
+            effect_dci_fail(s, path, "EFFECT-DCI-CLEANUP", "shared_abi exception has no cleanup-before-propagate edge");
+        }
+        i = i + 1;
+    }
+}
+
+public fn effect_plan_import_dci_paths(s: rawptr) -> i32 {
+    if (s == null || g_effect_dci_paths.len == 0) { return 0; }
+    var errors: i32 = 0;
+    var i: i32 = 0;
+    let n = dci_path_list_count(g_effect_dci_paths.clone());
+    // Pass 1: collect all exported symbols before validating cross-module
+    // lifecycle operations.
+    while (i < n) {
+        let path = dci_path_list_at(g_effect_dci_paths.clone(), i);
+        let parsed = dci_parse_contract_path(path.clone());
+        if (parsed.root == null) { effect_dci_fail(s, path, "EFFECT-DCI-PARSE", parsed.message); errors = errors + 1; }
+        else { effect_dci_collect_symbols(parsed.root); cJSON_Delete(parsed.root); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        let path = dci_path_list_at(g_effect_dci_paths.clone(), i);
+        let parsed = dci_parse_contract_path(path.clone());
+        if (parsed.root == null) { i = i + 1; continue; }
+        if (!effect_dci_check_contract_header(s, parsed.root, path)) { errors = errors + 1; }
+        effect_dci_import_facts(s, parsed.root, path);
+        effect_dci_validate_lifecycle_symbols(s, parsed.root, path);
+        cJSON_Delete(parsed.root);
+        i = i + 1;
+    }
+    // Facts are now present for every producer, so cross-module edge endpoints
+    // can be checked before insertion and cycle detection sees one graph.
+    i = 0;
+    while (i < n) {
+        let path = dci_path_list_at(g_effect_dci_paths.clone(), i);
+        let parsed = dci_parse_contract_path(path.clone());
+        if (parsed.root != null) { effect_dci_import_edges(s, parsed.root, path); cJSON_Delete(parsed.root); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        let path = dci_path_list_at(g_effect_dci_paths.clone(), i);
+        let parsed = dci_parse_contract_path(path.clone());
+        if (parsed.root != null) { effect_dci_validate_cleanup(s, parsed.root, path); cJSON_Delete(parsed.root); }
+        i = i + 1;
+    }
+    return errors;
+}
+
+fn effect_manifest_tab_field(line: string, ordinal: i32) -> string {
+    if (ordinal < 0 || line.len == 0) { return ""; }
+    var field: i32 = 0;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= line.len) {
+        if (i == line.len || line.charAt(i) == 9) {
+            if (field == ordinal) { return str_view_range(line, start, i); }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn effect_manifest_tab_decoded_field(line: string, ordinal: i32) -> string {
+    return effect_manifest_decode_field(effect_manifest_tab_field(line, ordinal));
+}
+
+fn effect_manifest_import_status(flags: i32) -> string {
+    if ((flags & 4) != 0) { return "imported_rejected"; }
+    if ((flags & 2) != 0) { return "imported_unregistered"; }
+    if ((flags & 1) != 0) { return "imported_registered"; }
+    return "imported";
+}
+
+/// Merge a validated producer manifest into the current unit's fact ledger.
+/// The driver validates target/ABI/scope/source/compiler stamps before this
+/// hook is called.  Imported rows remain data: the consumer must still have a
+/// local handler schema for a registered attribute, otherwise the row becomes
+/// an explicit obligation instead of silently authorizing a lowering.
+public fn effect_plan_import_manifest(s: rawptr) -> i32 {
+    if (s == null || g_effect_incoming_manifest.len == 0) { return 0; }
+    let manifest = effect_manifest_deserialize(g_effect_incoming_manifest);
+    if (manifest.status() != effect_manifest_fresh()) { return -1; }
+    var imported: i32 = 0;
+    var i: i32 = 0;
+    while (i < manifest.record_count) {
+        let row = manifest.record_row(i);
+        if (row.len == 0 || !row.startsWith("R\t")) {
+            ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+            i = i + 1;
+            continue;
+        }
+        // R subject attribute args phase scope target abi flags dependency
+        if (effect_manifest_tab_field(row, 0) != "R"
+            || effect_manifest_tab_field(row, 7).len == 0) {
+            ptr_write_i64(ptr_offset(s, 56), ptr_read_i64(ptr_offset(s, 56)) + 1);
+            i = i + 1;
+            continue;
+        }
+        let subject = effect_manifest_tab_decoded_field(row, 1).clone();
+        let attribute = effect_manifest_tab_decoded_field(row, 2).clone();
+        let arguments = effect_manifest_tab_decoded_field(row, 3).clone();
+        let phase = effect_manifest_tab_decoded_field(row, 4).clone();
+        let scope = effect_manifest_tab_decoded_field(row, 5).clone();
+        let target = effect_manifest_tab_decoded_field(row, 6).clone();
+        let abi = effect_manifest_tab_decoded_field(row, 7).clone();
+        let flags = effect_parse_i32(effect_manifest_tab_field(row, 8));
+        if (subject.len == 0 || attribute.len == 0 || phase.len == 0
+            || scope.len == 0 || target != effect_manifest_target_vyx()
+            || abi != "vyx.aot.v1") {
+            ptr_write_i64(ptr_offset(s, 56), ptr_read_i64(ptr_offset(s, 56)) + 1);
+            i = i + 1;
+            continue;
+        }
+        let handler = effect_handler_value(s, attribute);
+        if ((flags & 1) != 0 && handler.len == 0) {
+            effect_plan_add_obligation(s, subject + effect_sep() + attribute,
+                "EFFECT-HANDLER",
+                "imported registered attribute has no consumer handler");
+        }
+        if (attribute == "myAttr" && !effect_custom_myattr_args_valid(arguments)) {
+            effect_plan_add_obligation(s, subject + effect_sep() + attribute,
+                "EFFECT-ARGS",
+                "imported myAttr requires level=abi|layout and optional retain=bool");
+            ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+        }
+        let status = effect_manifest_import_status(flags);
+        let fact = EffectFact.create(subject, attribute, arguments, phase, scope, status);
+        if (effect_plan_add_fact(s, fact)) {
+            imported = imported + 1;
+            let key = subject + effect_sep() + attribute + effect_sep()
+                + arguments + effect_sep() + "imported";
+            effect_plan_store_result(s, key, "imported" + effect_sep()
+                + attribute + effect_sep() + phase + effect_sep() + scope);
+        }
+        i = i + 1;
+    }
+    // DCI obligation graphs use the manifest dependency channel for typed
+    // edges.  Import them into the same live EffectPlan graph before freeze;
+    // this makes cross-module cycles and malformed edges fail through the
+    // compiler's normal EFFECT-CYCLE / EffectPlan obligation path instead of
+    // being checked by an unrelated sidecar parser.
+    var dependency_index: i32 = 0;
+    while (dependency_index < manifest.dependency_count) {
+        let dependency = manifest.dependency_row(dependency_index);
+        if (dependency.len == 0 || effect_manifest_tab_field(dependency, 0) != "D"
+            || effect_manifest_tab_field(dependency, 1).len == 0) {
+            ptr_write_i64(ptr_offset(s, 56), ptr_read_i64(ptr_offset(s, 56)) + 1);
+            dependency_index = dependency_index + 1;
+            continue;
+        }
+        let dep_key = effect_manifest_tab_decoded_field(dependency, 1);
+        let dep_value = effect_manifest_tab_decoded_field(dependency, 2);
+        if (dep_key.startsWith("edge:")) {
+            let edge = dep_key.substring(5, dep_key.len);
+            let arrow = edge.indexOf("->");
+            if (arrow <= 0 || arrow + 2 >= edge.len || dep_value.len == 0) {
+                effect_plan_add_obligation(s, "dependency" + effect_sep() + dep_key,
+                    "EFFECT-DEPENDENCY",
+                    "malformed imported Effect dependency edge");
+                ptr_write_i64(ptr_offset(s, 152), ptr_read_i64(ptr_offset(s, 152)) + 1);
+            } else {
+                let source = edge.substring(0, arrow);
+                let target = edge.substring(arrow + 2, edge.len);
+                effect_plan_add_edge_with_digest(s, source, target, dep_value,
+                                                 effect_manifest_tab_decoded_field(dependency, 3));
+            }
+        }
+        dependency_index = dependency_index + 1;
+    }
+    return imported;
+}
+
+fn effect_manifest_find_module(unit: rawptr) -> string {
+    if (unit == null) { return "<unit>"; }
+    var decl = unit_get_decls(unit);
+    while (decl != null) {
+        if (decl_get_kind(decl) == de_MODULE()) {
+            let name = decl_get_name(decl);
+            if (name.len > 0) { return name; }
+        }
+        decl = decl_get_next(decl);
+    }
+    return "<unit>";
+}
+
+fn effect_dci_paths_stamp() -> string {
+    let count = dci_path_list_count(g_effect_dci_paths.clone());
+    if (count <= 0) { return ""; }
+    var folded: i64 = 5381;
+    var selected: string = "";
+    var emitted: i32 = 0;
+    // Contract discovery order is an input detail of the driver, not a fact.
+    // Select paths lexicographically before folding path identity and bytes so
+    // equivalent multi-contract invocations receive the same freshness stamp.
+    while (emitted < count) {
+        var path = "";
+        var i: i32 = 0;
+        while (i < count) {
+            let candidate = dci_path_list_at(g_effect_dci_paths.clone(), i);
+            if (!dci_path_list_contains(selected.clone(), candidate.clone())
+                && (path.len == 0 || str_compare(candidate, path) < 0)) {
+                path = candidate;
+            }
+            i = i + 1;
+        }
+        if (path.len == 0) { break; }
+        selected = dci_path_list_append(selected, path.clone());
+        let content = dci_contract_content_stamp(path);
+        folded = effect_fingerprint_mix(folded, effect_hash(path + "=" + content));
+        emitted = emitted + 1;
+    }
+    return "dci-set:" + emitted.toString() + ":" + folded.toString();
+}
+
+/// Seal a cross-module manifest snapshot from the normalized fact ledger.
+/// This is intentionally a data boundary: it carries facts and handler
+/// metadata, never executable callbacks or parser source.  The driver can
+/// persist the returned envelope after Sema has disposed its live plan.
+public fn effect_plan_publish_manifest(s: rawptr, unit: rawptr) {
+    if (s == null) {
+        g_effect_last_manifest = "";
+        g_effect_last_dci_export = "";
+        g_effect_manifest_module = "";
+        return;
+    }
+    let module_name = effect_manifest_find_module(unit);
+    g_effect_manifest_module = module_name;
+    var source_stamp = g_effect_source_stamp;
+    if (source_stamp.len == 0) { source_stamp = module_name + "@unit"; }
+    let dci_stamp = effect_dci_paths_stamp();
+    if (dci_stamp.len > 0) { source_stamp = source_stamp + "|" + dci_stamp; }
+    let compiler_stamp = "bootstrap.effect.v1";
+    let target = effect_manifest_target_vyx();
+    let abi = "vyx.aot.v1";
+    var manifest = EffectManifest.create(target, abi,
+                                         effect_manifest_scope_unit(), module_name,
+                                         source_stamp, compiler_stamp);
+    var i: i32 = 0;
+    let n = effect_plan_fact_count(s);
+    while (i < n) {
+        let row = effect_plan_fact_at(s, i).clone();
+        if (row.len > 0) {
+            let subject = effect_schema_field(row, 0).clone();
+            let attribute = effect_schema_field(row, 1).clone();
+            let arguments = effect_schema_field(row, 2).clone();
+            let phase = effect_schema_field(row, 3).clone();
+            let scope = effect_schema_field(row, 4).clone();
+            let status = effect_schema_field(row, 5).clone();
+            var flags: i32 = 0;
+            if (status == "registered" || status == "imported_registered") { flags = 1; }
+            elif (status == "unregistered" || status == "imported_unregistered") { flags = 2; }
+            elif (status.startsWith("rejected") || status == "imported_rejected") { flags = 4; }
+            manifest.add_record(subject, attribute, arguments, phase, scope,
+                                target, abi, flags, "");
+        }
+        i = i + 1;
+    }
+    manifest.add_dependency("handlers", "schema.v1",
+                            effect_plan_fold_table(s, 1, 5381).toString());
+    manifest.add_dependency("schema", "effect.schemas.v1",
+                            effect_plan_schema_stamp());
+    manifest.add_dependency("plan", "facts",
+                            effect_plan_fingerprint(s).toString());
+    var edge_index: i32 = 0;
+    let edge_count = effect_plan_edge_count(s);
+    while (edge_index < edge_count) {
+        let edge_key = effect_plan_edge_key_at(s, edge_index).clone();
+        if (edge_key.len > 0) {
+            let edge_source = effect_edge_source(edge_key).clone();
+            let edge_target = effect_edge_target(edge_key).clone();
+            let kind = effect_plan_edge_kind_at(s, edge_index).clone();
+            var digest = effect_plan_edge_digest_at(s, edge_index).clone();
+            if (digest.len == 0) {
+                digest = effect_hash(edge_key + effect_sep() + kind).toString();
+            }
+            manifest.add_edge(edge_source, edge_target, kind, digest);
+        }
+        edge_index = edge_index + 1;
+    }
+    manifest.seal();
+    g_effect_last_manifest = manifest.serialize();
+}
+
+/// Publish the explicitly selected DCI export facts as a sidecar artifact.
+/// This is intentionally a data-only boundary: it records declarations that
+/// passed the dci_export schema and were stamped by the sealed EffectPlan.
+/// It does not synthesize a foreign ABI contract or execute user code.  The
+/// driver writes this artifact only when `VYX_DCI_EXPORT_OUT` is supplied.
+public fn effect_plan_publish_dci_export(s: rawptr, unit: rawptr) {
+    if (s == null) {
+        g_effect_last_dci_export = "";
+        return;
+    }
+    let module_name = effect_manifest_find_module(unit);
+    var out = "H\tMOSP-DCI-EXPORT\t1\t"
+        + effect_manifest_encode_field(module_name) + "\t"
+        + effect_plan_fingerprint(s).toString() + "\n";
+    var selected: i32 = 0;
+    var export_rows = "";
+    var i: i32 = 0;
+    let n = effect_plan_fact_count(s);
+    while (i < n) {
+        let row = effect_plan_fact_at(s, i).clone();
+        if (row.len > 0
+            && effect_schema_field(row, 1) == "dci_export") {
+            let subject = effect_schema_field(row, 0).clone();
+            let args = effect_schema_field(row, 2).clone();
+            let phase = effect_schema_field(row, 3).clone();
+            let scope = effect_schema_field(row, 4).clone();
+            let status = effect_schema_field(row, 5).clone();
+            export_rows = export_rows + "R\t" + effect_manifest_encode_field(subject) + "\t"
+                + "dci_export\t" + effect_manifest_encode_field(args) + "\t"
+                + effect_manifest_encode_field(phase) + "\t"
+                + effect_manifest_encode_field(scope) + "\t"
+                + effect_manifest_encode_field(status) + "\n";
+            selected = selected + 1;
+        }
+        i = i + 1;
+    }
+    if (selected == 0) {
+        g_effect_last_dci_export = "";
+        return;
+    }
+    g_effect_last_dci_export = out + effect_manifest_sorted_lines(export_rows);
+}
+
+public fn effect_plan_dump_stats(s: rawptr) {
+    if (s == null || !policy_phase_summary_enabled()) { return; }
+    if (ptr_read_i64(ptr_offset(s, 40)) == 0) { return; }
+    print("[MOSP effect] facts=" + policy_i64_to_string(effect_plan_fact_count(s) as i64)
+          + " handlers=" + policy_i64_to_string(effect_plan_handler_count(s) as i64)
+          + " decls=" + policy_i64_to_string(effect_plan_decl_count(s))
+          + " results=" + policy_i64_to_string(effect_table_count(s, 2) as i64)
+          + " obligations=" + policy_i64_to_string(effect_plan_obligation_count(s) as i64)
+          + " edges=" + policy_i64_to_string(effect_plan_edge_count(s) as i64)
+          + " cycles=" + policy_i64_to_string(effect_plan_cycle_count(s))
+          + " dispatched=" + policy_i64_to_string(effect_plan_dispatched_count(s))
+          + " failures=" + policy_i64_to_string(effect_plan_failure_count(s))
+          + " unregistered=" + policy_i64_to_string(effect_plan_unregistered_count(s))
+          + " malformed=" + policy_i64_to_string(effect_plan_malformed_count(s))
+          + " bad_target=" + policy_i64_to_string(effect_plan_rejected_target_count(s))
+          + " bad_args=" + policy_i64_to_string(effect_plan_rejected_argument_count(s))
+          + " fingerprint=" + policy_i64_to_string(effect_plan_fingerprint(s)));
+}

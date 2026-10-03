@@ -1,0 +1,928 @@
+module bootstrap.dci_binder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_ids;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+
+extern "C" {
+    fn cJSON_Parse(value: rawptr) -> rawptr;
+    fn cJSON_Delete(item: rawptr);
+    fn cJSON_GetObjectItemCaseSensitive(object: rawptr, string: rawptr) -> rawptr;
+    fn cJSON_GetArraySize(array: rawptr) -> i32;
+    fn cJSON_GetArrayItem(array: rawptr, index: i32) -> rawptr;
+    fn cJSON_GetStringValue(item: rawptr) -> rawptr;
+    fn cJSON_IsTrue(item: rawptr) -> i32;
+    fn cJSON_IsString(item: rawptr) -> i32;
+    fn cJSON_IsArray(item: rawptr) -> i32;
+    fn cJSON_IsObject(item: rawptr) -> i32;
+}
+
+fn dci_binder_string_contains(hay: string, needle: string) -> bool {
+    if (needle.len == 0) { return true; }
+    if (hay.len < needle.len) { return false; }
+    var i: i64 = 0;
+    while (i + needle.len <= hay.len) {
+        var j: i64 = 0;
+        var same: bool = true;
+        while (j < needle.len && same) {
+            if (hay.charAt((i + j) as i32) != needle.charAt(j as i32)) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+class HirDciLifecycleBinder {
+    public unit: HirUnit
+    public root: rawptr
+    public errors: i32
+    public bound_drops: i32
+    public rewritten_moves: i32
+    public rewritten_copies: i32
+    public moved_from_locals: string
+    public op_domains: string
+
+    public static fn create(h: HirUnit) -> HirDciLifecycleBinder {
+        return HirDciLifecycleBinder {
+            unit: h,
+            root: null,
+            errors: 0,
+            bound_drops: 0,
+            rewritten_moves: 0,
+            rewritten_copies: 0,
+            moved_from_locals: "",
+            op_domains: ""
+        };
+    }
+
+    fn record_error(self, message: string) {
+        self.errors = self.errors + 1;
+        diag_emit_codegen("DCI lifecycle: " + message);
+        diag_emit_help_at(diag_code_codegen_failure(),
+                            null,
+                            "fix the DCI lifecycle contract, or match the extern type's create/drop symbols");
+    }
+
+    fn json_item(self, object: rawptr, key: string) -> rawptr {
+        if (object == null || key.len == 0) { return null; }
+        return cJSON_GetObjectItemCaseSensitive(object, key.c_str());
+    }
+
+    fn json_string(self, object: rawptr, key: string) -> string {
+        let item = self.json_item(object, key);
+        if (item == null || cJSON_IsString(item) == 0) { return ""; }
+        let raw = cJSON_GetStringValue(item);
+        if (raw == null) { return ""; }
+        return from_cstr(raw);
+    }
+
+    fn json_bool(self, object: rawptr, key: string) -> bool {
+        let item = self.json_item(object, key);
+        return item != null && cJSON_IsTrue(item) != 0;
+    }
+
+    fn type_ids_exact(self, lhs: i32, rhs: i32) -> bool {
+        if (lhs == hir_id_invalid() || rhs == hir_id_invalid()) { return false; }
+        if (lhs == rhs) { return true; }
+        let lhs_text = hir_type_table_text(self.unit.types, lhs);
+        let rhs_text = hir_type_table_text(self.unit.types, rhs);
+        return lhs_text.len > 0 && lhs_text == rhs_text;
+    }
+
+    fn exact_type_id(self, type_name: string) -> i32 {
+        if (type_name.len == 0) { return hir_id_invalid(); }
+        var type_id: i32 = 1;
+        while (type_id <= self.unit.types.count) {
+            if (hir_type_table_record(self.unit.types, type_id) != null
+                && hir_type_table_text(self.unit.types, type_id) == type_name) {
+                return type_id;
+            }
+            type_id = type_id + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    fn function_param_at(self, function_id: i32, wanted: i32) -> i32 {
+        var local_id = self.unit.function_first_local(function_id);
+        var index: i32 = 0;
+        while (local_id != hir_id_invalid()) {
+            if ((self.unit.local_flags(local_id) & hir_local_flag_param()) != 0) {
+                if (index == wanted) { return local_id; }
+                index = index + 1;
+            }
+            local_id = self.unit.local_next(local_id);
+        }
+        return hir_id_invalid();
+    }
+
+    fn function_param_count(self, function_id: i32) -> i32 {
+        var out: i32 = 0;
+        var local_id = self.unit.function_first_local(function_id);
+        while (local_id != hir_id_invalid()) {
+            if ((self.unit.local_flags(local_id) & hir_local_flag_param()) != 0) {
+                out = out + 1;
+            }
+            local_id = self.unit.local_next(local_id);
+        }
+        return out;
+    }
+
+    fn descriptor_symbol(self, symbol_name: string) -> rawptr {
+        let exports = self.json_item(self.root, "exports");
+        let symbols = self.json_item(exports, "symbols");
+        if (symbols == null || cJSON_IsArray(symbols) == 0) { return null; }
+        var found: rawptr = null;
+        var symbol = dci_cjson_child(symbols);
+        while (symbol != null) {
+            if (cJSON_IsObject(symbol) != 0
+                && (self.json_string(symbol, "name") == symbol_name
+                    || self.json_string(symbol, "semantic_id") == symbol_name
+                    || self.json_string(symbol, "link_name") == symbol_name
+                    || self.json_string(symbol, "mangled") == symbol_name)) {
+                if (found != null
+                    && self.json_string(found, "link_name") != self.json_string(symbol, "link_name")) {
+                    self.record_error("lifecycle operation symbol reference `" + symbol_name
+                                      + "` is ambiguous");
+                    return null;
+                }
+                found = symbol;
+            }
+            symbol = dci_cjson_next(symbol);
+        }
+        return found;
+    }
+
+    fn foreign_function(self, symbol_name: string) -> i32 {
+        var found = hir_id_invalid();
+        var function_id: i32 = 1;
+        while (function_id <= self.unit.function_count) {
+            if (self.unit.function_record(function_id) != null
+                && self.unit.function_name(function_id) == symbol_name
+                && (self.unit.function_flags(function_id) & hir_function_flag_foreign_dci()) != 0) {
+                if (found != hir_id_invalid()) {
+                    self.record_error("lifecycle symbol `" + symbol_name
+                                      + "` matches more than one extern \"dci\" declaration");
+                    return hir_id_invalid();
+                }
+                found = function_id;
+            }
+            function_id = function_id + 1;
+        }
+        if (found == hir_id_invalid()) {
+            self.record_error("lifecycle symbol `" + symbol_name
+                              + "` has no exact extern \"dci\" declaration");
+        }
+        return found;
+    }
+
+    fn descriptor_type_ref_matches(self,
+                                   type_ref: rawptr,
+                                   type_name: string,
+                                   reference: string) -> bool {
+        if (type_ref == null || cJSON_IsObject(type_ref) == 0) { return false; }
+        return self.json_string(type_ref, "name") == type_name
+            && self.json_string(type_ref, "reference") == reference;
+    }
+
+    fn validate_descriptor_symbol(self,
+                                  symbol: rawptr,
+                                  operation_name: string,
+                                  type_name: string) -> bool {
+        if (symbol == null || cJSON_IsObject(symbol) == 0) { return false; }
+        if (self.json_string(symbol, "kind") != "function") {
+            self.record_error("lifecycle operation `" + operation_name + "` must reference a function symbol");
+            return false;
+        }
+        let params = self.json_item(symbol, "params");
+        let ret = self.json_item(symbol, "return");
+        if (operation_name == "create") {
+            if (ret == null || cJSON_IsObject(ret) == 0
+                || !self.descriptor_type_ref_matches(self.json_item(ret, "type"), type_name, "value")
+                || self.json_string(ret, "ownership") != "owned") {
+                self.record_error("lifecycle create symbol for `" + type_name
+                                  + "` must return an owned value of the exact type");
+                return false;
+            }
+            return true;
+        }
+        if (params == null || cJSON_IsArray(params) == 0 || cJSON_GetArraySize(params) != 1) {
+            self.record_error("lifecycle `" + operation_name + "` symbol for `" + type_name
+                              + "` must have exactly one parameter");
+            return false;
+        }
+        let param = cJSON_GetArrayItem(params, 0);
+        var expected_reference = "pointer";
+        var expected_ownership = "borrow";
+        if (operation_name == "move" || operation_name == "destroy"
+            || operation_name == "release") {
+            expected_ownership = "move";
+        }
+        if (param == null || cJSON_IsObject(param) == 0
+            || !self.descriptor_type_ref_matches(self.json_item(param, "type"),
+                                                 type_name,
+                                                 expected_reference)
+            || self.json_string(param, "ownership") != expected_ownership) {
+            self.record_error("lifecycle `" + operation_name + "` symbol for `" + type_name
+                              + "` has an unsupported parameter ownership/type contract");
+            return false;
+        }
+        if (operation_name == "destroy" || operation_name == "release") {
+            if (ret != null && cJSON_IsObject(ret) != 0) {
+                self.record_error("lifecycle `" + operation_name + "` symbol for `" + type_name
+                                  + "` must return void");
+                return false;
+            }
+            return true;
+        }
+        if (ret == null || cJSON_IsObject(ret) == 0
+            || !self.descriptor_type_ref_matches(self.json_item(ret, "type"), type_name, "value")
+            || self.json_string(ret, "ownership") != "owned") {
+            self.record_error("lifecycle `" + operation_name + "` symbol for `" + type_name
+                              + "` must return an owned value of the exact type");
+            return false;
+        }
+        return true;
+    }
+
+    fn validate_hir_operation_function(self,
+                                       function_id: i32,
+                                       operation_name: string,
+                                       type_id: i32,
+                                       type_name: string) -> bool {
+        if (function_id == hir_id_invalid()) { return false; }
+        if (operation_name == "create") {
+            if (!self.type_ids_exact(self.unit.function_return_type(function_id), type_id)) {
+                self.record_error("extern DCI create declaration for `" + type_name
+                                  + "` must return the exact lifecycle type");
+                return false;
+            }
+            return true;
+        }
+        if (self.function_param_count(function_id) != 1) {
+            self.record_error("extern DCI `" + operation_name + "` declaration for `" + type_name
+                              + "` must have exactly one source parameter");
+            return false;
+        }
+        let param_local = self.function_param_at(function_id, 0);
+        let param_type = self.unit.local_type(param_local);
+        if (hir_type_table_kind(self.unit.types, param_type) != ty_PTR()
+            || !self.type_ids_exact(hir_type_table_elem(self.unit.types, param_type), type_id)) {
+            self.record_error("extern DCI `" + operation_name + "` declaration for `" + type_name
+                              + "` must take an exact *T parameter");
+            return false;
+        }
+        if (operation_name == "copy" || operation_name == "move"
+            || operation_name == "retain") {
+            if (!self.type_ids_exact(self.unit.function_return_type(function_id), type_id)) {
+                self.record_error("extern DCI `" + operation_name + "` declaration for `" + type_name
+                                  + "` must return the exact lifecycle type");
+                return false;
+            }
+            return true;
+        }
+        if (hir_type_table_kind(self.unit.types,
+                                self.unit.function_return_type(function_id)) != ty_VOID()) {
+            self.record_error("extern DCI `" + operation_name + "` declaration for `" + type_name
+                              + "` must return void");
+            return false;
+        }
+        return true;
+    }
+
+    fn operation_function(self,
+                          operations: rawptr,
+                          operation_name: string,
+                          type_id: i32,
+                          type_name: string) -> i32 {
+        let operation = self.json_item(operations, operation_name);
+        if (operation == null || cJSON_IsObject(operation) == 0) {
+            self.record_error("lifecycle for `" + type_name + "` requires operation `"
+                              + operation_name + "`");
+            return hir_id_invalid();
+        }
+        let symbol_name = self.json_string(operation, "symbol");
+        if (symbol_name.len == 0
+            || self.json_item(operation, "dispatch_table") != null
+            || self.json_item(operation, "intrinsic") != null) {
+            self.record_error("lifecycle operation `" + operation_name + "` for `" + type_name
+                              + "` requires the unsupported dispatch/intrinsic shape; Direct MVP requires symbol");
+            return hir_id_invalid();
+        }
+        if (self.json_string(operation, "availability") != "required"
+            || !self.json_bool(operation, "no_unwind")) {
+            self.record_error("lifecycle operation `" + operation_name + "` for `" + type_name
+                              + "` must be required and no_unwind");
+            return hir_id_invalid();
+        }
+        let symbol = self.descriptor_symbol(symbol_name);
+        if (symbol == null) {
+            self.record_error("lifecycle operation `" + operation_name + "` references unknown symbol `"
+                              + symbol_name + "`");
+            return hir_id_invalid();
+        }
+        if (!self.validate_descriptor_symbol(symbol, operation_name, type_name)) {
+            return hir_id_invalid();
+        }
+        let binding_name = self.json_string(symbol, "name");
+        if (binding_name.len == 0) {
+            self.record_error("lifecycle operation `" + operation_name
+                              + "` has no Converter binding name");
+            return hir_id_invalid();
+        }
+        let function_id = self.foreign_function(binding_name);
+        if (!self.validate_hir_operation_function(function_id,
+                                                  operation_name,
+                                                  type_id,
+                                                  type_name)) {
+            return hir_id_invalid();
+        }
+        return function_id;
+    }
+
+    fn type_has_value_local(self, type_id: i32) -> bool {
+        var local_id: i32 = 1;
+        while (local_id <= self.unit.local_count) {
+            if (self.unit.local_record(local_id) != null
+                && self.type_ids_exact(self.unit.local_type(local_id), type_id)
+                && (self.unit.local_flags(local_id) & hir_local_flag_param()) == 0) {
+                return true;
+            }
+            local_id = local_id + 1;
+        }
+        return false;
+    }
+
+    fn bind_local_drops(self, type_id: i32, type_name: string, destroy_fn: i32) {
+        var local_id: i32 = 1;
+        while (local_id <= self.unit.local_count) {
+            if (self.unit.local_record(local_id) != null
+                && self.type_ids_exact(self.unit.local_type(local_id), type_id)
+                && (self.unit.local_flags(local_id) & hir_local_flag_param()) == 0) {
+                if ((self.unit.local_flags(local_id) & hir_local_flag_capture()) != 0) {
+                    self.record_error("automatic DCI lifecycle for captured `" + type_name
+                                      + "` locals is not supported by the Direct MVP");
+                } else {
+                    let existing = self.unit.local_drop_function(local_id);
+                    if (existing != hir_id_invalid() && existing != destroy_fn) {
+                        self.record_error("local `" + self.unit.local_name(local_id)
+                                          + "` already has a different drop contract");
+                    } else {
+                        self.unit.set_local_flags(local_id,
+                                                  self.unit.local_flags(local_id)
+                                                  | hir_local_flag_auto_drop());
+                        self.unit.set_local_drop_function(local_id, destroy_fn);
+                        self.bound_drops = self.bound_drops + 1;
+                    }
+                }
+            }
+            local_id = local_id + 1;
+        }
+    }
+
+    fn copy_expr_location(self, dst: i32, src: i32) {
+        if (dst == hir_id_invalid() || src == hir_id_invalid()) { return; }
+        self.unit.set_expr_loc(dst,
+                               self.unit.expr_loc_line(src),
+                               self.unit.expr_loc_col(src),
+                               self.unit.expr_loc_end_line(src),
+                               self.unit.expr_loc_end_col(src));
+    }
+
+    fn rewrite_local_transfer(self,
+                              stmt_id: i32,
+                              init_expr_id: i32,
+                              type_id: i32,
+                              op_fn: i32,
+                              kind: string) {
+        let param_local = self.function_param_at(op_fn, 0);
+        if (param_local == hir_id_invalid()) { return; }
+        let pointer_type = self.unit.local_type(param_local);
+        let function_id = self.unit.stmt_function(stmt_id);
+        let owner_item = self.unit.expr_owner_item(init_expr_id);
+        let addr_expr = self.unit.add_expr(function_id,
+                                          ex_ADDR_OF(),
+                                          "",
+                                          "",
+                                          0,
+                                          pointer_type,
+                                          expr_sem_NONE(),
+                                          hir_target_none(),
+                                          hir_id_invalid(),
+                                          0,
+                                          0);
+        let call_expr = self.unit.add_expr(function_id,
+                                          ex_CALL(),
+                                          self.unit.function_name(op_fn),
+                                          "",
+                                          0,
+                                          type_id,
+                                          expr_sem_DIRECT_FN(),
+                                          hir_target_function(),
+                                          op_fn,
+                                          0,
+                                          0);
+        if (addr_expr == hir_id_invalid() || call_expr == hir_id_invalid()) {
+            self.record_error("cannot allocate HIR expressions for automatic DCI " + kind);
+            return;
+        }
+        self.unit.set_expr_lhs(addr_expr, init_expr_id);
+        self.unit.set_expr_first_arg(call_expr, addr_expr);
+        self.unit.set_expr_owner_item(addr_expr, owner_item);
+        self.unit.set_expr_owner_item(call_expr, owner_item);
+        self.copy_expr_location(addr_expr, init_expr_id);
+        self.copy_expr_location(call_expr, init_expr_id);
+        self.unit.set_stmt_expr(stmt_id, call_expr);
+        if (kind == "copy") {
+            self.rewritten_copies = self.rewritten_copies + 1;
+        } else {
+            self.rewritten_moves = self.rewritten_moves + 1;
+        }
+    }
+
+    fn mark_moved_from(self, local_id: i32) {
+        if (local_id == hir_id_invalid()) { return; }
+        let key = "#" + policy_i64_to_string(local_id as i64) + "#";
+        if (!dci_binder_string_contains(self.moved_from_locals, key)) {
+            self.moved_from_locals = self.moved_from_locals + key;
+        }
+    }
+
+    fn is_moved_from(self, local_id: i32) -> bool {
+        if (local_id == hir_id_invalid()) { return false; }
+        let key = "#" + policy_i64_to_string(local_id as i64) + "#";
+        return dci_binder_string_contains(self.moved_from_locals, key);
+    }
+
+    fn expr_mentions_local(self, expr_id: i32, local_id: i32, depth: i32) -> bool {
+        if (expr_id == hir_id_invalid() || local_id == hir_id_invalid() || depth > 64) {
+            return false;
+        }
+        let kind = self.unit.expr_kind(expr_id);
+        if (kind == ex_ADDR_OF()) { return false; }
+        if (kind == ex_IDENT()
+            && self.unit.expr_target_kind(expr_id) == hir_target_local()
+            && self.unit.expr_target_id(expr_id) == local_id) {
+            return true;
+        }
+        if (self.expr_mentions_local(self.unit.expr_lhs(expr_id), local_id, depth + 1)) {
+            return true;
+        }
+        if (self.expr_mentions_local(self.unit.expr_rhs(expr_id), local_id, depth + 1)) {
+            return true;
+        }
+        if (self.expr_mentions_local(self.unit.expr_aux(expr_id), local_id, depth + 1)) {
+            return true;
+        }
+        var arg = self.unit.expr_first_arg(expr_id);
+        var guard: i32 = 0;
+        while (arg != hir_id_invalid() && guard < 64) {
+            if (self.expr_mentions_local(arg, local_id, depth + 1)) { return true; }
+            arg = self.unit.expr_next_arg(arg);
+            guard = guard + 1;
+        }
+        return false;
+    }
+
+    fn local_has_later_ident_use(self, function_id: i32, local_id: i32, after_stmt_id: i32) -> bool {
+        if (function_id == hir_id_invalid() || local_id == hir_id_invalid()) { return false; }
+        var stmt_id: i32 = 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            if (stmt_id > after_stmt_id
+                && self.unit.stmt_function(stmt_id) == function_id) {
+                if (self.expr_mentions_local(self.unit.stmt_expr(stmt_id), local_id, 0)
+                    || self.expr_mentions_local(self.unit.stmt_cond(stmt_id), local_id, 0)
+                    || self.expr_mentions_local(self.unit.stmt_aux(stmt_id), local_id, 0)) {
+                    return true;
+                }
+            }
+            stmt_id = stmt_id + 1;
+        }
+        return false;
+    }
+
+    fn bind_local_transfers(self,
+                            type_id: i32,
+                            type_name: string,
+                            move_semantics: string,
+                            move_fn: i32,
+                            copy_semantics: string,
+                            copy_fn: i32,
+                            moved_from_state: string) {
+        var stmt_id: i32 = 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            let stmt_kind = self.unit.stmt_kind(stmt_id);
+            if (stmt_kind == hir_stmt_let() || stmt_kind == hir_stmt_var()) {
+                let local_id = self.unit.stmt_local(stmt_id);
+                let init_expr = self.unit.stmt_expr(stmt_id);
+                if (local_id != hir_id_invalid()
+                    && self.type_ids_exact(self.unit.local_type(local_id), type_id)
+                    && init_expr != hir_id_invalid()
+                    && self.unit.expr_kind(init_expr) == ex_IDENT()
+                    && self.unit.expr_target_kind(init_expr) == hir_target_local()
+                    && self.type_ids_exact(self.unit.expr_type(init_expr), type_id)) {
+                    let src_local = self.unit.expr_target_id(init_expr);
+                    let function_id = self.unit.stmt_function(stmt_id);
+                    if (self.is_moved_from(src_local) && moved_from_state == "destructible_only") {
+                        self.record_error("use of moved-from `" + type_name
+                                          + "` local `" + self.unit.local_name(src_local)
+                                          + "` is forbidden by destructible_only");
+                    } else {
+                        let later = self.local_has_later_ident_use(function_id, src_local, stmt_id);
+                        // A `zeroed` moved-from state makes the source a
+                        // well-defined zero value after the move, so later
+                        // reads of the source are legal and must not demote
+                        // the move to a copy -- observing that zeroing is
+                        // exactly how a consumer verifies the descriptor's
+                        // move contract.  Only an unspecified ("valid")
+                        // moved-from state has to fall back to the copy
+                        // operation when the source is used again.
+                        if (later && moved_from_state != "zeroed") {
+                            if (copy_semantics == "operation") {
+                                self.rewrite_local_transfer(stmt_id, init_expr, type_id, copy_fn, "copy");
+                            } else {
+                                self.record_error("`" + self.unit.local_name(src_local)
+                                                  + "` of type `" + type_name
+                                                  + "` is still used after this initialization; copy is forbidden by its DCI contract");
+                            }
+                        } else if (move_semantics == "operation") {
+                            self.rewrite_local_transfer(stmt_id, init_expr, type_id, move_fn, "move");
+                            self.mark_moved_from(src_local);
+                        } else if (copy_semantics == "operation") {
+                            self.rewrite_local_transfer(stmt_id, init_expr, type_id, copy_fn, "copy");
+                        } else {
+                            self.record_error("bare local-to-local initialization of `" + type_name
+                                              + "` is forbidden by its DCI move/copy contract");
+                        }
+                    }
+                }
+            }
+            stmt_id = stmt_id + 1;
+        }
+    }
+
+    fn bind_layout(self, layout: rawptr) {
+        if (layout == null || cJSON_IsObject(layout) == 0) { return; }
+        let type_name = self.json_string(layout, "type_name");
+        let type_id = self.exact_type_id(type_name);
+        if (type_id == hir_id_invalid()) { return; }
+        let lifecycle = self.json_item(layout, "lifecycle");
+        if (lifecycle == null) { return; }
+        if (cJSON_IsObject(lifecycle) == 0) {
+            self.record_error("lifecycle for `" + type_name + "` must be an object");
+            return;
+        }
+        let ownership_model = self.json_string(lifecycle, "ownership_model");
+        let copy_semantics = self.json_string(lifecycle, "copy_semantics");
+        let move_semantics = self.json_string(lifecycle, "move_semantics");
+        let destruction = self.json_string(lifecycle, "destruction");
+        let moved_from_state = self.json_string(lifecycle, "moved_from_state");
+        let allocator_domain = self.json_string(lifecycle, "allocator_domain");
+        let operations = self.json_item(lifecycle, "operations");
+
+        if (destruction == "external") {
+            if ((ownership_model != "external" && ownership_model != "manual"
+                 && ownership_model != "borrowed")
+                || copy_semantics != "forbidden" || move_semantics != "forbidden") {
+                self.record_error("external lifecycle for `" + type_name
+                                  + "` has an unsupported ownership/copy/move combination");
+            } else if (self.type_has_value_local(type_id)) {
+                self.record_error("externally-owned DCI type `" + type_name
+                                  + "` cannot be materialized as an owned Vyx local");
+            }
+            return;
+        }
+
+        if (destruction == "trivial" || destruction == "none") {
+            if (ownership_model != "value" || copy_semantics != "trivial"
+                || move_semantics != "trivial") {
+                self.record_error("trivial lifecycle for `" + type_name
+                                  + "` requires value ownership and trivial copy/move");
+            }
+            return;
+        }
+
+        if (destruction == "release") {
+            if (allocator_domain.len == 0) {
+                self.record_error("shared lifecycle for `" + type_name
+                                  + "` requires a non-empty allocator_domain");
+                return;
+            }
+            self.bind_shared_layout(type_id,
+                                    type_name,
+                                    ownership_model,
+                                    copy_semantics,
+                                    move_semantics,
+                                    moved_from_state,
+                                    operations);
+            return;
+        }
+
+        if (destruction != "operation") {
+            self.record_error("unsupported DCI destruction contract `" + destruction
+                              + "` for `" + type_name + "`");
+            return;
+        }
+        if (allocator_domain.len == 0) {
+            self.record_error("operation-driven lifecycle for `" + type_name
+                              + "` requires a non-empty allocator_domain");
+            return;
+        }
+        if (ownership_model != "unique" && ownership_model != "linear") {
+            self.record_error("operation-driven destruction for `" + type_name
+                              + "` currently requires unique or linear ownership");
+            return;
+        }
+        if (copy_semantics != "operation" && copy_semantics != "forbidden") {
+            self.record_error("unsupported DCI copy contract `" + copy_semantics
+                              + "` for operation-owned `" + type_name + "`");
+            return;
+        }
+        if (move_semantics != "operation" && move_semantics != "forbidden") {
+            self.record_error("unsupported DCI move contract `" + move_semantics
+                              + "` for operation-owned `" + type_name + "`");
+            return;
+        }
+        if (moved_from_state != "valid"
+            && moved_from_state != "zeroed"
+            && moved_from_state != "destructible_only") {
+            self.record_error("unsupported moved_from_state `" + moved_from_state
+                              + "` for `" + type_name + "`");
+            return;
+        }
+        if (operations == null || cJSON_IsObject(operations) == 0) {
+            self.record_error("operation-driven lifecycle for `" + type_name
+                              + "` requires an operations object");
+            return;
+        }
+
+        let create_ref = self.json_item(operations, "create");
+        if (create_ref != null) {
+            self.operation_function(operations, "create", type_id, type_name);
+        }
+        var copy_fn = hir_id_invalid();
+        if (copy_semantics == "operation") {
+            copy_fn = self.operation_function(operations, "copy", type_id, type_name);
+        }
+        var move_fn = hir_id_invalid();
+        if (move_semantics == "operation") {
+            move_fn = self.operation_function(operations, "move", type_id, type_name);
+        }
+        let destroy_fn = self.operation_function(operations, "destroy", type_id, type_name);
+        if (destroy_fn == hir_id_invalid()
+            || (move_semantics == "operation" && move_fn == hir_id_invalid())
+            || (copy_semantics == "operation" && copy_fn == hir_id_invalid())) {
+            return;
+        }
+        self.bind_local_drops(type_id, type_name, destroy_fn);
+        self.bind_local_transfers(type_id,
+                                 type_name,
+                                 move_semantics,
+                                 move_fn,
+                                 copy_semantics,
+                                 copy_fn,
+                                 moved_from_state);
+    }
+
+    // Shared (reference-counted) ownership materialization (SPEC 7 / 16). A
+    // `shared` type with `copy_semantics = retain` and `destruction = release`
+    // balances its refcount through automatic release at scope exit: every live
+    // shared local decrements once through the declared release operation. retain
+    // is validated as an explicit copy-producing operation (the host writes
+    // `retain(&value)` just like the Direct copy contract) rather than being
+    // auto-inserted, which would require full liveness analysis. Missing
+    // `lifecycle_binding` or `declaration` never reaches this path, so existing
+    // host-declared lifetimes are not taken over.
+    fn bind_shared_layout(self,
+                          type_id: i32,
+                          type_name: string,
+                          ownership_model: string,
+                          copy_semantics: string,
+                          move_semantics: string,
+                          moved_from_state: string,
+                          operations: rawptr) {
+        if (ownership_model != "shared") {
+            self.record_error("release-driven destruction for `" + type_name
+                              + "` currently requires shared ownership");
+            return;
+        }
+        if (copy_semantics != "retain" && copy_semantics != "forbidden") {
+            self.record_error("unsupported DCI copy contract `" + copy_semantics
+                              + "` for shared `" + type_name + "`");
+            return;
+        }
+        if (move_semantics != "operation" && move_semantics != "trivial"
+            && move_semantics != "forbidden") {
+            self.record_error("unsupported DCI move contract `" + move_semantics
+                              + "` for shared `" + type_name + "`");
+            return;
+        }
+        if (moved_from_state != "valid"
+            && moved_from_state != "zeroed"
+            && moved_from_state != "destructible_only") {
+            self.record_error("unsupported moved_from_state `" + moved_from_state
+                              + "` for shared `" + type_name + "`");
+            return;
+        }
+        if (operations == null || cJSON_IsObject(operations) == 0) {
+            self.record_error("shared lifecycle for `" + type_name
+                              + "` requires an operations object");
+            return;
+        }
+        let create_ref = self.json_item(operations, "create");
+        if (create_ref != null) {
+            self.operation_function(operations, "create", type_id, type_name);
+        }
+        if (copy_semantics == "retain") {
+            self.operation_function(operations, "retain", type_id, type_name);
+        }
+        var move_fn = hir_id_invalid();
+        if (move_semantics == "operation") {
+            move_fn = self.operation_function(operations, "move", type_id, type_name);
+        }
+        let release_fn = self.operation_function(operations, "release", type_id, type_name);
+        if (release_fn == hir_id_invalid()
+            || (move_semantics == "operation" && move_fn == hir_id_invalid())) {
+            return;
+        }
+        self.bind_local_drops(type_id, type_name, release_fn);
+        self.bind_local_transfers(type_id,
+                                 type_name,
+                                 move_semantics,
+                                 move_fn,
+                                 copy_semantics,
+                                 hir_id_invalid(),
+                                 moved_from_state);
+    }
+
+    fn domain_for_symbol(self, symbol: string) -> string {
+        if (symbol.len == 0 || self.op_domains.len == 0) { return ""; }
+        let key = "[" + symbol + "]=";
+        var i: i32 = 0;
+        while (i + key.len <= self.op_domains.len) {
+            var same: bool = true;
+            var j: i32 = 0;
+            while (j < key.len && same) {
+                if (self.op_domains.charAt(i + j) != key.charAt(j)) { same = false; }
+                j = j + 1;
+            }
+            if (same) {
+                let start = i + key.len;
+                var end = start;
+                while (end < self.op_domains.len && self.op_domains.charAt(end) != 59) {
+                    end = end + 1;
+                }
+                return self.op_domains.substring(start, end);
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    fn register_symbol_domain(self, symbol: string, domain: string, type_name: string) {
+        if (symbol.len == 0 || domain.len == 0) { return; }
+        let existing = self.domain_for_symbol(symbol);
+        if (existing.len > 0) {
+            if (existing != domain) {
+                self.record_error("allocator_domain mismatch for symbol `" + symbol
+                                  + "`: `" + existing + "` vs `" + domain
+                                  + "` (type `" + type_name + "`)");
+            }
+            return;
+        }
+        self.op_domains = self.op_domains + "[" + symbol + "]=" + domain + ";";
+    }
+
+    fn register_operation_domain(self,
+                                 operations: rawptr,
+                                 op_name: string,
+                                 domain: string,
+                                 type_name: string) {
+        let operation = self.json_item(operations, op_name);
+        if (operation == null || cJSON_IsObject(operation) == 0) { return; }
+        self.register_symbol_domain(self.json_string(operation, "symbol"), domain, type_name);
+    }
+
+    fn check_layout_allocator_domain(self, layout: rawptr) {
+        if (layout == null || cJSON_IsObject(layout) == 0) { return; }
+        let type_name = self.json_string(layout, "type_name");
+        let lifecycle = self.json_item(layout, "lifecycle");
+        if (lifecycle == null || cJSON_IsObject(lifecycle) == 0) { return; }
+        let destruction = self.json_string(lifecycle, "destruction");
+        if (destruction != "operation" && destruction != "release") { return; }
+        let domain = self.json_string(lifecycle, "allocator_domain");
+        if (domain.len == 0) {
+            self.record_error("operation-driven lifecycle for `" + type_name
+                              + "` requires a non-empty allocator_domain");
+            return;
+        }
+        let operations = self.json_item(lifecycle, "operations");
+        if (operations == null || cJSON_IsObject(operations) == 0) { return; }
+        self.register_operation_domain(operations, "create", domain, type_name);
+        self.register_operation_domain(operations, "copy", domain, type_name);
+        self.register_operation_domain(operations, "move", domain, type_name);
+        self.register_operation_domain(operations, "destroy", domain, type_name);
+        self.register_operation_domain(operations, "retain", domain, type_name);
+        self.register_operation_domain(operations, "release", domain, type_name);
+    }
+
+    fn release_descriptor(self, take_ownership: bool) {
+        if (self.root == null) { return; }
+        if (take_ownership) { cJSON_Delete(self.root); }
+        self.root = null;
+    }
+
+    fn bind_descriptor_root(self, descriptor_root: rawptr, take_ownership: bool) -> i32 {
+        if (descriptor_root == null) { return 0; }
+        self.root = descriptor_root;
+        if (self.root == null || cJSON_IsObject(self.root) == 0) {
+            self.record_error("invalid DCI descriptor");
+            self.release_descriptor(take_ownership);
+            return self.errors;
+        }
+        let profile = self.json_item(self.root, "profile");
+        let lifecycle_binding = self.json_string(profile, "lifecycle_binding");
+        dci_dcib_index_contract_root(self.root);
+        if (lifecycle_binding.len == 0 || lifecycle_binding == "declaration") {
+            dci_ids_note_declaration_noop();
+            self.release_descriptor(take_ownership);
+            return 0;
+        }
+        if (lifecycle_binding != "automatic") {
+            self.record_error("unsupported DCI lifecycle_binding `" + lifecycle_binding + "`");
+            self.release_descriptor(take_ownership);
+            return self.errors;
+        }
+        let exports = self.json_item(self.root, "exports");
+        let layouts = self.json_item(exports, "layouts");
+        if (layouts != null && cJSON_IsArray(layouts) != 0) {
+            var layout = dci_cjson_child(layouts);
+            while (layout != null) {
+                self.check_layout_allocator_domain(layout);
+                self.bind_layout(layout);
+                layout = dci_cjson_next(layout);
+            }
+        }
+        self.release_descriptor(take_ownership);
+        return self.errors;
+    }
+
+    public fn bind_root(self, descriptor_root: rawptr) -> i32 {
+        return self.bind_descriptor_root(descriptor_root, true);
+    }
+
+    public fn bind_root_borrowed(self, descriptor_root: rawptr) -> i32 {
+        return self.bind_descriptor_root(descriptor_root, false);
+    }
+
+    public fn bind(self, descriptor_text: string) -> i32 {
+        if (descriptor_text.len == 0) { return 0; }
+        let parsed = cJSON_Parse(descriptor_text.c_str());
+        if (parsed == null) {
+            self.record_error("invalid DCI descriptor JSON");
+            return self.errors;
+        }
+        return self.bind_root(parsed);
+    }
+}
+
+public fn dci_binder_bind_contract(h: HirUnit, descriptor_text: string) -> i32 {
+    let binder = HirDciLifecycleBinder.create(h);
+    return binder.bind(descriptor_text);
+}
+
+public fn dci_binder_bind_root(h: HirUnit, descriptor_root: rawptr) -> i32 {
+    let binder = HirDciLifecycleBinder.create(h);
+    return binder.bind_root(descriptor_root);
+}
+
+public fn dci_binder_bind_root_borrowed(h: HirUnit, descriptor_root: rawptr) -> i32 {
+    let binder = HirDciLifecycleBinder.create(h);
+    return binder.bind_root_borrowed(descriptor_root);
+}
+
+public fn dci_binder_bind_paths(h: HirUnit, paths: string) -> i32 {
+    let n = dci_path_list_count(paths.clone());
+    if (n <= 0) { return 0; }
+    var binder = HirDciLifecycleBinder.create(h);
+    var i: i32 = 0;
+    while (i < n) {
+        let path = dci_path_list_at(paths.clone(), i);
+        let parsed = dci_parse_contract_path(path.clone());
+        if (parsed.root == null) {
+            var detail = parsed.message;
+            if (detail.len == 0) { detail = "unknown DCI error"; }
+            binder.record_error("invalid DCI ABI contract `" + path + "`: " + detail);
+        } else {
+            binder.bind_root(parsed.root);
+        }
+        i = i + 1;
+    }
+    return binder.errors;
+}

@@ -1,0 +1,837 @@
+module Zyn.App;
+
+use std.collections;
+use std.fs;
+use FileSystem = Zyn.Platform.Platform.FileSystem;
+use AppPaths = Zyn.Platform.Platform.AppPaths;
+
+// ---------------------------------------------------------------------------
+// ZC-13 persistence
+//
+// Three things an application's data layer must get right, and none of them is
+// "call writeFile":
+//
+//   1. an interrupted write must not destroy the previous good file. So a save
+//      is never an in-place write: it lands in a sibling `.tmp`, the previous
+//      file is moved aside to `.bak`, and only then is the temp promoted. A
+//      crash at any point leaves either the old file or the new one, plus the
+//      evidence needed to finish the job on the next launch.
+//
+//   2. a file that parses but is wrong must be detectable. Every document
+//      carries a version and a checksum, so a truncated or bit-rotted file is
+//      reported as corrupt instead of being fed to the migration chain.
+//
+//   3. a schema change must be a *sequence* of named steps. `AppSchema` holds
+//      the chain; the step bodies live in the application behind
+//      `AppMigrationRunner`, which is why Zyn never learns what a business
+//      table looks like.
+//
+// The database is an adapter, not a built-in: `AppDatabaseAdapter` is the
+// boundary, and `AppNullDatabase` is the headless default so a test can run a
+// screen that expects SQLite without linking SQLite.
+// ---------------------------------------------------------------------------
+
+public fn appStoreOk() -> i32 { return 0; }
+public fn appStoreNotFound() -> i32 { return 1; }
+public fn appStoreCorrupt() -> i32 { return 2; }
+public fn appStoreReadOnly() -> i32 { return 3; }
+public fn appStoreIOError() -> i32 { return 4; }
+public fn appStoreMigrated() -> i32 { return 5; }
+
+public fn appDocumentOk() -> i32 { return 0; }
+public fn appDocumentMissing() -> i32 { return 1; }
+public fn appDocumentCorrupt() -> i32 { return 2; }
+public fn appDocumentWrongSchema() -> i32 { return 3; }
+public fn appDocumentNewerVersion() -> i32 { return 4; }
+
+// ---------------------------------------------------------------------------
+// Checksum
+// ---------------------------------------------------------------------------
+
+// FNV-1a 32. Not a cryptographic hash - the job is "did these bytes survive",
+// and a 32-bit non-crypto hash catches truncation, partial writes and the
+// common single-byte corruptions that a save/load path actually sees.
+public class AppChecksum {
+    public static fn fnv1a32(text: string) -> i64 {
+        var hash: i64 = 2166136261;
+        var i: i32 = 0;
+        let len = text.len as i32;
+        while (i < len) {
+            let byte = text.charAt(i as i64) & 255;
+            hash = (hash ^ byte) & 4294967295;
+            hash = (hash * 16777619) & 4294967295;
+            i = i + 1;
+        }
+        return hash;
+    }
+
+    public static fn hex32(value: i64) -> string {
+        let digits = "0123456789abcdef";
+        var out = "";
+        var shift: i32 = 28;
+        while (shift >= 0) {
+            let nibble = ((value >> shift) & 15) as i32;
+            out = out + digits.substring(nibble as i64, (nibble + 1) as i64);
+            shift = shift - 4;
+        }
+        return out;
+    }
+
+    public static fn of(text: string) -> string {
+        return AppChecksum.hex32(AppChecksum.fnv1a32(text));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Document envelope
+// ---------------------------------------------------------------------------
+
+// `ZYND|1|<schema>|<version>|<checksum>|<length>\n<payload>`.
+//
+// The header is one line of pipe-separated fields so that a corrupt file can
+// still be diagnosed: the reader can say *which* field was wrong rather than
+// just "invalid".
+public class AppDocumentEnvelope {
+    public schema: string;
+    public version: i32;
+    public payload: string;
+    public status: i32;
+    public error_message: string;
+
+    public static fn blank() -> AppDocumentEnvelope {
+        return AppDocumentEnvelope {
+            schema: "", version: 0, payload: "",
+            status: appDocumentMissing(), error_message: ""
+        };
+    }
+
+    public static fn encode(schema: string, version: i32, payload: string) -> string {
+        let checksum = AppChecksum.of(payload);
+        return "ZYND|1|" + schema + "|" + format("%d", version as i64) + "|"
+            + checksum + "|" + format("%d", payload.len as i64) + "\n" + payload;
+    }
+
+    // Tolerant decode: every failure mode is named. A payload whose declared
+    // length does not match its actual length is corrupt even if the checksum
+    // happens to agree, because a mismatched length means the reader and the
+    // writer disagree about where the payload ends.
+    public static fn decode(text: string) -> AppDocumentEnvelope {
+        let newline = AppDocumentEnvelope.indexOf(text, 10, 0);
+        if (newline < 0) {
+            return AppDocumentEnvelope.markFailed(appDocumentCorrupt(), "missing header terminator");
+        }
+        let header = text.substring(0, newline as i64);
+        let payload = text.substring((newline + 1) as i64, text.len as i64);
+        if (AppDocumentEnvelope.fieldCount(header) < 6) {
+            return AppDocumentEnvelope.markFailed(appDocumentCorrupt(), "header has too few fields");
+        }
+        if (AppDocumentEnvelope.fieldAt(header, 0) != "ZYND") {
+            return AppDocumentEnvelope.markFailed(appDocumentCorrupt(), "bad magic: " + AppDocumentEnvelope.fieldAt(header, 0));
+        }
+        if (AppDocumentEnvelope.fieldAt(header, 1) != "1") {
+            return AppDocumentEnvelope.markFailed(
+                appDocumentCorrupt(),
+                "unsupported envelope revision: " + AppDocumentEnvelope.fieldAt(header, 1));
+        }
+        let schema = AppDocumentEnvelope.fieldAt(header, 2);
+        let version = app_parse_i32_or(AppDocumentEnvelope.fieldAt(header, 3), -1);
+        if (version < 0) {
+            return AppDocumentEnvelope.markFailed(appDocumentCorrupt(), "bad version field: " + AppDocumentEnvelope.fieldAt(header, 3));
+        }
+        let declared_checksum = AppDocumentEnvelope.fieldAt(header, 4);
+        let declared_length = app_parse_i32_or(AppDocumentEnvelope.fieldAt(header, 5), -1);
+        if (declared_length != (payload.len as i32)) {
+            return AppDocumentEnvelope.markFailed(
+                appDocumentCorrupt(),
+                "length mismatch: header " + format("%d", declared_length as i64)
+                    + ", actual " + format("%d", payload.len as i64));
+        }
+        let actual_checksum = AppChecksum.of(payload);
+        if (actual_checksum != declared_checksum) {
+            return AppDocumentEnvelope.markFailed(
+                appDocumentCorrupt(),
+                "checksum mismatch: header " + declared_checksum + ", actual " + actual_checksum);
+        }
+        return AppDocumentEnvelope {
+            schema: schema, version: version, payload: payload,
+            status: appDocumentOk(), error_message: ""
+        };
+    }
+
+    public fn isOk(&self) -> bool {
+        return self.status == appDocumentOk();
+    }
+
+    public static fn markFailed(status: i32, message: string) -> AppDocumentEnvelope {
+        return AppDocumentEnvelope {
+            schema: "", version: 0, payload: "",
+            status: status, error_message: message
+        };
+    }
+
+    public static fn indexOf(text: string, target: i32, from: i32) -> i32 {
+        var i = from;
+        while (i < (text.len as i32)) {
+            if (text.charAt(i as i64) == target) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public static fn fieldCount(header: string) -> i32 {
+        var count: i32 = 1;
+        var i: i32 = 0;
+        while (i < (header.len as i32)) {
+            if (header.charAt(i as i64) == 124) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    // The nth pipe-separated field of the header. Extracting by index instead of
+    // splitting into a `Vec<string>` keeps the decode path allocation free and
+    // avoids handing a collection across a function boundary.
+    public static fn fieldAt(header: string, index: i32) -> string {
+        var current: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        let len = header.len as i32;
+        while (i <= len) {
+            var at_end = i == len;
+            var code: i32 = 0;
+            if (!at_end) { code = header.charAt(i as i64); }
+            if (at_end || code == 124) {
+                if (current == index) { return header.substring(start as i64, i as i64); }
+                current = current + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Application store
+// ---------------------------------------------------------------------------
+
+// One private directory per application, everything else relative to it. The
+// path is resolved from the platform preference directory so the framework does
+// not have to know where a given OS keeps user data.
+public class AppStore {
+    public static fn rootKey(owner: string) -> string { return "store:" + owner + ":root"; }
+    public static fn statusKey(owner: string) -> string { return "store:" + owner + ":status"; }
+    public static fn lastErrorKey(owner: string) -> string { return "store:" + owner + ":last_error"; }
+    public static fn writeCountKey(owner: string) -> string { return "store:" + owner + ":writes"; }
+    public static fn lastPathKey(owner: string) -> string { return "store:" + owner + ":last_path"; }
+
+    public static fn declare(world: AppWorld, owner: string, org: string, app: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        let root = AppPaths.prefPath(org, app);
+        var out = world.setStringResource(AppStore.rootKey(owner), root);
+        out = out.setIntResource(AppStore.statusKey(owner), appStoreOk());
+        out = out.setStringResource(AppStore.lastErrorKey(owner), "");
+        out = out.setIntResource(AppStore.writeCountKey(owner), 0);
+        return out;
+    }
+
+    public static fn setRoot(world: AppWorld, owner: string, path: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        return world.setStringResource(AppStore.rootKey(owner), path);
+    }
+
+    public static fn root(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppStore.rootKey(owner), "");
+    }
+
+    public static fn status(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppStore.statusKey(owner), appStoreOk());
+    }
+
+    public static fn lastError(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppStore.lastErrorKey(owner), "");
+    }
+
+    public static fn writeCount(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppStore.writeCountKey(owner), 0);
+    }
+
+    public static fn lastPath(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppStore.lastPathKey(owner), "");
+    }
+
+    public static fn pathFor(world: AppWorld, owner: string, relative: string) -> string {
+        let root = AppStore.root(world, owner);
+        if (root.len == 0) { return relative; }
+        if (relative.len == 0) { return root; }
+        return FileSystem.joinPath(root, relative);
+    }
+
+    public static fn exists(world: AppWorld, owner: string, relative: string) -> bool {
+        return FileSystem.exists(AppStore.pathFor(world, owner, relative));
+    }
+
+    // Read is non-throwing: a missing or unreadable file yields the empty string
+    // and sets the status, which is what a UI needs in order to show "could not
+    // load, retry" instead of aborting the frame.
+    public static fn readText(world: AppWorld, owner: string, relative: string) -> string {
+        let path = AppStore.pathFor(world, owner, relative);
+        if (!FileSystem.exists(path)) {
+            return "";
+        }
+        match (FileSystem.readText(path)) {
+            case Ok(text) => { return text; }
+            case Err(_) => { return ""; }
+        }
+    }
+
+    // Reads and reports, so a caller that needs to distinguish "absent" from
+    // "unreadable" does not have to guess.
+    public static fn readTextChecked(world: AppWorld, owner: string, relative: string) -> AppWorld {
+        let path = AppStore.pathFor(world, owner, relative);
+        if (!FileSystem.exists(path)) {
+            var missing = world.setIntResource(AppStore.statusKey(owner), appStoreNotFound());
+            missing = missing.setStringResource(AppStore.lastErrorKey(owner), "not found: " + relative);
+            return missing;
+        }
+        match (FileSystem.readText(path)) {
+            case Ok(text) => {
+                var ok = world.setIntResource(AppStore.statusKey(owner), appStoreOk());
+                ok = ok.setStringResource(AppStore.lastErrorKey(owner), "");
+                return ok;
+            }
+            case Err(e) => {
+                var failed = world.setIntResource(AppStore.statusKey(owner), appStoreIOError());
+                failed = failed.setStringResource(AppStore.lastErrorKey(owner), e.message);
+                return failed;
+            }
+        }
+    }
+
+    // The atomic save. Order matters:
+    //   1. write the temp file completely;
+    //   2. move the current file aside to `.bak`;
+    //   3. promote the temp to the real name.
+    // A crash after 1 leaves the old file intact; after 2 the recovery pass
+    // promotes `.bak`; after 3 the write is done and `.bak` is the backup.
+    public static fn writeTextAtomic(world: AppWorld, owner: string, relative: string, content: string) -> AppWorld {
+        let path = AppStore.pathFor(world, owner, relative);
+        if (path.len == 0) {
+            return AppStore.markFailed(world, owner, appStoreIOError(), "no store root for " + owner);
+        }
+        AppStore.ensureParent(path);
+        let temp_path = path + ".tmp";
+        let backup_path = path + ".bak";
+        if (writeFile(temp_path, content) != 0) {
+            return AppStore.markFailed(world, owner, appStoreReadOnly(), "cannot write temp: " + temp_path);
+        }
+        if (FileSystem.exists(path)) {
+            if (FileSystem.exists(backup_path)) { deleteFile(backup_path); }
+            if (renameFile(path, backup_path) != 0) {
+                // The old file could not be moved aside; do not destroy it.
+                deleteFile(temp_path);
+                return AppStore.markFailed(world, owner, appStoreIOError(), "cannot rotate backup: " + path);
+            }
+        }
+        if (renameFile(temp_path, path) != 0) {
+            return AppStore.markFailed(world, owner, appStoreIOError(), "cannot promote temp: " + path);
+        }
+        var out = world.setIntResource(AppStore.statusKey(owner), appStoreOk());
+        out = out.setStringResource(AppStore.lastErrorKey(owner), "");
+        out = out.setStringResource(AppStore.lastPathKey(owner), relative);
+        out = out.incrementIntResource(AppStore.writeCountKey(owner), 1);
+        return out;
+    }
+
+    public static fn markFailed(world: AppWorld, owner: string, status: i32, message: string) -> AppWorld {
+        var out = world.setIntResource(AppStore.statusKey(owner), status);
+        out = out.setStringResource(AppStore.lastErrorKey(owner), message);
+        return out;
+    }
+
+    public static fn remove(world: AppWorld, owner: string, relative: string) -> AppWorld {
+        let path = AppStore.pathFor(world, owner, relative);
+        if (!FileSystem.exists(path)) { return world; }
+        if (deleteFile(path) != 0) {
+            return AppStore.markFailed(world, owner, appStoreIOError(), "cannot remove: " + path);
+        }
+        return world.setIntResource(AppStore.statusKey(owner), appStoreOk());
+    }
+
+    public static fn hasBackup(world: AppWorld, owner: string, relative: string) -> bool {
+        return FileSystem.exists(AppStore.pathFor(world, owner, relative) + ".bak");
+    }
+
+    // Roll back to the previous contents. This is the escape hatch the roadmap
+    // asks for: a migration that produced garbage can be undone without a
+    // reinstall.
+    public static fn restoreBackup(world: AppWorld, owner: string, relative: string) -> AppWorld {
+        let path = AppStore.pathFor(world, owner, relative);
+        let backup_path = path + ".bak";
+        if (!FileSystem.exists(backup_path)) {
+            return AppStore.markFailed(world, owner, appStoreNotFound(), "no backup for " + relative);
+        }
+        if (FileSystem.exists(path)) { deleteFile(path); }
+        if (renameFile(backup_path, path) != 0) {
+            return AppStore.markFailed(world, owner, appStoreIOError(), "cannot restore backup: " + path);
+        }
+        return world.setIntResource(AppStore.statusKey(owner), appStoreOk());
+    }
+
+    // The recovery pass. Run it once at startup, before anything reads a file.
+    // It finishes a write that was interrupted between "old moved aside" and
+    // "temp promoted", and it refuses to promote a temp that is empty (which is
+    // what a write interrupted before the first flush looks like).
+    public static fn recoverIfInterrupted(world: AppWorld, owner: string, relative: string) -> AppWorld {
+        let path = AppStore.pathFor(world, owner, relative);
+        let temp_path = path + ".tmp";
+        let backup_path = path + ".bak";
+        let has_temp = FileSystem.exists(temp_path);
+        let has_backup = FileSystem.exists(backup_path);
+        let has_live = FileSystem.exists(path);
+        if (!has_temp && !has_backup) { return world; }
+        if (has_live) {
+            // The live file is present, so the interrupted operation was either
+            // a completed rotate or a temp that never got promoted. Drop the
+            // temp: the live file is the newer of the two by construction.
+            if (has_temp) { deleteFile(temp_path); }
+            return world;
+        }
+        if (has_temp && AppStore.nonEmpty(temp_path)) {
+            if (renameFile(temp_path, path) == 0) {
+                return world.setIntResource(AppStore.statusKey(owner), appStoreOk());
+            }
+        }
+        if (has_backup) {
+            if (renameFile(backup_path, path) == 0) {
+                var out = world.setIntResource(AppStore.statusKey(owner), appStoreOk());
+                out = out.setStringResource(AppStore.lastErrorKey(owner), "recovered from backup: " + relative);
+                return out;
+            }
+        }
+        return AppStore.markFailed(world, owner, appStoreIOError(), "recovery failed for " + relative);
+    }
+
+    public static fn nonEmpty(path: string) -> bool {
+        match (FileSystem.size(path)) {
+            case Ok(size) => { return size > 0; }
+            case Err(_) => { return false; }
+        }
+    }
+
+    // Create the directory a file lives in, so `data/state.json` does not need
+    // the caller to have pre-created `data`.
+    public static fn ensureParent(path: string) -> i32 {
+        var slash: i32 = -1;
+        var i: i32 = 0;
+        while (i < (path.len as i32)) {
+            let code = path.charAt(i as i64);
+            if (code == 47 || code == 92) { slash = i; }
+            i = i + 1;
+        }
+        if (slash <= 0) { return 0; }
+        let parent = path.substring(0, slash as i64);
+        if (parent.len == 0) { return 0; }
+        if (FileSystem.isDir(parent)) { return 0; }
+        return makeDir(parent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema and migrations
+// ---------------------------------------------------------------------------
+
+// A schema is a name, a current version, and an ordered list of steps. Steps are
+// `from -> to` so the chain can be validated up front: a gap in the sequence is
+// a bug in the application's registration, and it is much better to find it
+// when the schema is declared than at the moment a user's data needs it.
+public class AppSchema {
+    public static fn versionKey(schema_id: string) -> string { return "schema:" + schema_id + ":version"; }
+    public static fn storedKey(schema_id: string) -> string { return "schema:" + schema_id + ":stored"; }
+    public static fn fromListKey(schema_id: string) -> string { return "schema:" + schema_id + ":from"; }
+    public static fn toListKey(schema_id: string) -> string { return "schema:" + schema_id + ":to"; }
+    public static fn nameListKey(schema_id: string) -> string { return "schema:" + schema_id + ":name"; }
+
+    public static fn declare(world: AppWorld, schema_id: string, current_version: i32) -> AppWorld {
+        if (schema_id.len == 0) { return world; }
+        var out = world.setIntResource(AppSchema.versionKey(schema_id), current_version);
+        out = AppRowStore.clearList(out, AppSchema.fromListKey(schema_id));
+        out = AppRowStore.clearList(out, AppSchema.toListKey(schema_id));
+        out = AppRowStore.clearList(out, AppSchema.nameListKey(schema_id));
+        return out;
+    }
+
+    public static fn addMigration(world: AppWorld, schema_id: string, from_version: i32, to_version: i32, name: string) -> AppWorld {
+        if (schema_id.len == 0) { return world; }
+        var out = world.appendStringListResource(AppSchema.fromListKey(schema_id), format("%d", from_version as i64));
+        out = out.appendStringListResource(AppSchema.toListKey(schema_id), format("%d", to_version as i64));
+        out = out.appendStringListResource(AppSchema.nameListKey(schema_id), name);
+        return out;
+    }
+
+    public static fn currentVersion(world: AppWorld, schema_id: string) -> i32 {
+        return world.intResource(AppSchema.versionKey(schema_id), 0);
+    }
+
+    public static fn storedVersion(world: AppWorld, schema_id: string) -> i32 {
+        return world.intResource(AppSchema.storedKey(schema_id), 0);
+    }
+
+    public static fn setStoredVersion(world: AppWorld, schema_id: string, version: i32) -> AppWorld {
+        return world.setIntResource(AppSchema.storedKey(schema_id), version);
+    }
+
+    public static fn migrationCount(world: AppWorld, schema_id: string) -> i32 {
+        return world.stringListResourceCount(AppSchema.fromListKey(schema_id));
+    }
+
+    public static fn migrationFrom(world: AppWorld, schema_id: string, index: i32) -> i32 {
+        return app_parse_i32_or(world.stringListResourceAt(AppSchema.fromListKey(schema_id), index), -1);
+    }
+
+    public static fn migrationTo(world: AppWorld, schema_id: string, index: i32) -> i32 {
+        return app_parse_i32_or(world.stringListResourceAt(AppSchema.toListKey(schema_id), index), -1);
+    }
+
+    public static fn migrationName(world: AppWorld, schema_id: string, index: i32) -> string {
+        return world.stringListResourceAt(AppSchema.nameListKey(schema_id), index);
+    }
+
+    // The index of the step that starts at `version`, or -1 when the chain has
+    // a gap.
+    public static fn stepFrom(world: AppWorld, schema_id: string, version: i32) -> i32 {
+        let count = AppSchema.migrationCount(world, schema_id);
+        var i: i32 = 0;
+        while (i < count) {
+            if (AppSchema.migrationFrom(world, schema_id, i) == version) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public static fn needsMigration(world: AppWorld, schema_id: string) -> bool {
+        return AppSchema.storedVersion(world, schema_id) < AppSchema.currentVersion(world, schema_id);
+    }
+
+    // Counts the steps needed to get from the stored version to the current one.
+    // A gap stops the count and is reported by `chainIsComplete`.
+    public static fn pendingSteps(world: AppWorld, schema_id: string) -> i32 {
+        var version = AppSchema.storedVersion(world, schema_id);
+        let target = AppSchema.currentVersion(world, schema_id);
+        var steps: i32 = 0;
+        var guard: i32 = 0;
+        while (version < target && guard < 4096) {
+            let index = AppSchema.stepFrom(world, schema_id, version);
+            if (index < 0) { return -1; }
+            version = AppSchema.migrationTo(world, schema_id, index);
+            steps = steps + 1;
+            guard = guard + 1;
+        }
+        return steps;
+    }
+
+    public static fn chainIsComplete(world: AppWorld, schema_id: string) -> bool {
+        return AppSchema.pendingSteps(world, schema_id) >= 0;
+    }
+
+    // Applies the chain, one step at a time, through the injected runner. Each
+    // step's result is committed to the stored version only after the runner
+    // returns non-empty, so a failed step leaves the data at the last good
+    // version rather than half-migrated.
+    public static fn migrate(
+        world: AppWorld,
+        schema_id: string,
+        payload: string,
+        runner: dyn AppMigrationRunner
+    ) -> AppWorld {
+        var version = AppSchema.storedVersion(world, schema_id);
+        let target = AppSchema.currentVersion(world, schema_id);
+        if (version >= target) {
+            var done = world.setStringResource(AppSchema.payloadKey(schema_id), payload);
+            return done.setIntResource(AppSchema.statusKey(schema_id), appDocumentOk());
+        }
+        var current_payload = payload;
+        var guard: i32 = 0;
+        while (version < target && guard < 4096) {
+            let index = AppSchema.stepFrom(world, schema_id, version);
+            if (index < 0) {
+                return AppSchema.migrateFail(world, schema_id, "no migration from version " + format("%d", version as i64));
+            }
+            let to_version = AppSchema.migrationTo(world, schema_id, index);
+            let migrated = runner.migrate(schema_id, version, to_version, current_payload);
+            if (migrated.len == 0) {
+                return AppSchema.migrateFail(
+                    world, schema_id,
+                    "migration " + AppSchema.migrationName(world, schema_id, index) + " produced no data");
+            }
+            current_payload = migrated;
+            version = to_version;
+            guard = guard + 1;
+        }
+        var out = world.setStringResource(AppSchema.payloadKey(schema_id), current_payload);
+        out = out.setIntResource(AppSchema.storedKey(schema_id), version);
+        out = out.setIntResource(AppSchema.statusKey(schema_id), appDocumentOk());
+        out = out.setStringResource(AppSchema.errorKey(schema_id), "");
+        return out;
+    }
+
+    public static fn payloadKey(schema_id: string) -> string { return "schema:" + schema_id + ":payload"; }
+    public static fn statusKey(schema_id: string) -> string { return "schema:" + schema_id + ":status"; }
+    public static fn errorKey(schema_id: string) -> string { return "schema:" + schema_id + ":error"; }
+
+    public static fn payload(world: AppWorld, schema_id: string) -> string {
+        return world.stringResource(AppSchema.payloadKey(schema_id), "");
+    }
+
+    public static fn status(world: AppWorld, schema_id: string) -> i32 {
+        return world.intResource(AppSchema.statusKey(schema_id), appDocumentOk());
+    }
+
+    public static fn errorText(world: AppWorld, schema_id: string) -> string {
+        return world.stringResource(AppSchema.errorKey(schema_id), "");
+    }
+
+    public static fn migrateFail(world: AppWorld, schema_id: string, message: string) -> AppWorld {
+        var out = world.setIntResource(AppSchema.statusKey(schema_id), appStoreCorrupt());
+        out = out.setStringResource(AppSchema.errorKey(schema_id), message);
+        return out;
+    }
+}
+
+// The application supplies the step bodies. Keeping the payload a string means
+// the framework never has to know whether it is JSON, CSV or a binary blob.
+public interface AppMigrationRunner {
+    fn migrate(&self, schema_id: string, from_version: i32, to_version: i32, payload: string) -> string;
+}
+
+// The headless default: identity. A test that does not care about migrations
+// gets a runner that refuses to pretend a step happened, so a missing migration
+// shows up as a failure rather than as silently unchanged data.
+public class AppIdentityMigrationRunner : AppMigrationRunner {
+    public static fn create() -> AppIdentityMigrationRunner {
+        return AppIdentityMigrationRunner {};
+    }
+
+    public fn migrate(&self, schema_id: string, from_version: i32, to_version: i32, payload: string) -> string {
+        if (from_version == to_version) { return payload; }
+        return "";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Document store
+// ---------------------------------------------------------------------------
+
+// The document store is the happy path: declare a document, hand it a payload,
+// save it, load it, and let the schema chain run on the way in.
+public class AppDocumentStore {
+    public static fn payloadKey(owner: string, doc_id: string) -> string {
+        return "doc:" + owner + ":" + doc_id + ":payload";
+    }
+
+    public static fn versionKey(owner: string, doc_id: string) -> string {
+        return "doc:" + owner + ":" + doc_id + ":version";
+    }
+
+    public static fn dirtyKey(owner: string, doc_id: string) -> string {
+        return "doc:" + owner + ":" + doc_id + ":dirty";
+    }
+
+    public static fn statusKey(owner: string, doc_id: string) -> string {
+        return "doc:" + owner + ":" + doc_id + ":status";
+    }
+
+    public static fn errorKey(owner: string, doc_id: string) -> string {
+        return "doc:" + owner + ":" + doc_id + ":error";
+    }
+
+    public static fn schemaKey(owner: string, doc_id: string) -> string {
+        return "doc:" + owner + ":" + doc_id + ":schema";
+    }
+
+    public static fn declare(world: AppWorld, owner: string, doc_id: string, schema_id: string, payload: string) -> AppWorld {
+        if (owner.len == 0 || doc_id.len == 0) { return world; }
+        var out = world.setStringResource(AppDocumentStore.payloadKey(owner, doc_id), payload);
+        out = out.setStringResource(AppDocumentStore.schemaKey(owner, doc_id), schema_id);
+        out = out.setIntResource(AppDocumentStore.versionKey(owner, doc_id), AppSchema.currentVersion(world, schema_id));
+        out = out.setBoolResource(AppDocumentStore.dirtyKey(owner, doc_id), false);
+        out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), appDocumentOk());
+        out = out.setStringResource(AppDocumentStore.errorKey(owner, doc_id), "");
+        return out;
+    }
+
+    public static fn payload(world: AppWorld, owner: string, doc_id: string) -> string {
+        return world.stringResource(AppDocumentStore.payloadKey(owner, doc_id), "");
+    }
+
+    public static fn schemaId(world: AppWorld, owner: string, doc_id: string) -> string {
+        return world.stringResource(AppDocumentStore.schemaKey(owner, doc_id), "");
+    }
+
+    public static fn version(world: AppWorld, owner: string, doc_id: string) -> i32 {
+        return world.intResource(AppDocumentStore.versionKey(owner, doc_id), 0);
+    }
+
+    public static fn isDirty(world: AppWorld, owner: string, doc_id: string) -> bool {
+        return world.boolResource(AppDocumentStore.dirtyKey(owner, doc_id), false);
+    }
+
+    public static fn status(world: AppWorld, owner: string, doc_id: string) -> i32 {
+        return world.intResource(AppDocumentStore.statusKey(owner, doc_id), appDocumentOk());
+    }
+
+    public static fn errorText(world: AppWorld, owner: string, doc_id: string) -> string {
+        return world.stringResource(AppDocumentStore.errorKey(owner, doc_id), "");
+    }
+
+    // A payload change marks the document dirty; the save clears it. This is
+    // what the window-lifecycle work (ZC-15) reads to decide whether closing a
+    // window needs a confirmation.
+    public static fn setPayload(world: AppWorld, owner: string, doc_id: string, payload: string) -> AppWorld {
+        var out = world.setStringResource(AppDocumentStore.payloadKey(owner, doc_id), payload);
+        out = out.setBoolResource(AppDocumentStore.dirtyKey(owner, doc_id), true);
+        return out;
+    }
+
+    public static fn markClean(world: AppWorld, owner: string, doc_id: string) -> AppWorld {
+        return world.setBoolResource(AppDocumentStore.dirtyKey(owner, doc_id), false);
+    }
+
+    // Save: envelope the payload, write it atomically, clear the dirty flag.
+    public static fn save(world: AppWorld, owner: string, doc_id: string, relative: string) -> AppWorld {
+        let schema_id = AppDocumentStore.schemaId(world, owner, doc_id);
+        let payload = AppDocumentStore.payload(world, owner, doc_id);
+        let version = AppDocumentStore.version(world, owner, doc_id);
+        let encoded = AppDocumentEnvelope.encode(schema_id, version, payload);
+        var out = AppStore.writeTextAtomic(world, owner, relative, encoded);
+        if (AppStore.status(out, owner) != appStoreOk()) {
+            var failed = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), AppStore.status(out, owner));
+            failed = failed.setStringResource(AppDocumentStore.errorKey(owner, doc_id), AppStore.lastError(out, owner));
+            return failed;
+        }
+        out = out.setBoolResource(AppDocumentStore.dirtyKey(owner, doc_id), false);
+        out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), appDocumentOk());
+        out = out.setStringResource(AppDocumentStore.errorKey(owner, doc_id), "");
+        return out;
+    }
+
+    // Load: recover first, read, decode, check the schema, run the chain, adopt
+    // the payload. Every failure leaves the previous in-memory payload alone so
+    // that a corrupt file cannot blank the user's document.
+    public static fn load(
+        world: AppWorld,
+        owner: string,
+        doc_id: string,
+        relative: string,
+        runner: dyn AppMigrationRunner
+    ) -> AppWorld {
+        var out = AppStore.recoverIfInterrupted(world, owner, relative);
+        let text = AppStore.readText(out, owner, relative);
+        if (text.len == 0) {
+            out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), appDocumentMissing());
+            out = out.setStringResource(AppDocumentStore.errorKey(owner, doc_id), "no file at " + relative);
+            return out;
+        }
+        let envelope = AppDocumentEnvelope.decode(text);
+        if (!envelope.isOk()) {
+            out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), envelope.status);
+            out = out.setStringResource(AppDocumentStore.errorKey(owner, doc_id), envelope.error_message);
+            return out;
+        }
+        let schema_id = AppDocumentStore.schemaId(out, owner, doc_id);
+        if (schema_id.len > 0 && envelope.schema != schema_id) {
+            out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), appDocumentWrongSchema());
+            out = out.setStringResource(
+                AppDocumentStore.errorKey(owner, doc_id),
+                "document is " + envelope.schema + ", expected " + schema_id);
+            return out;
+        }
+        if (envelope.version > AppSchema.currentVersion(out, schema_id)) {
+            out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), appDocumentNewerVersion());
+            out = out.setStringResource(
+                AppDocumentStore.errorKey(owner, doc_id),
+                "document version " + format("%d", envelope.version as i64)
+                    + " is newer than this build (" + format("%d", AppSchema.currentVersion(out, schema_id) as i64) + ")");
+            return out;
+        }
+        out = out.setIntResource(AppDocumentStore.versionKey(owner, doc_id), envelope.version);
+        if (envelope.version < AppSchema.currentVersion(out, schema_id)) {
+            out = AppSchema.setStoredVersion(out, schema_id, envelope.version);
+            out = AppSchema.migrate(out, schema_id, envelope.payload, runner);
+            if (AppSchema.status(out, schema_id) != appDocumentOk()) {
+                out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), AppSchema.status(out, schema_id));
+                out = out.setStringResource(AppDocumentStore.errorKey(owner, doc_id), AppSchema.errorText(out, schema_id));
+                return out;
+            }
+            out = out.setStringResource(AppDocumentStore.payloadKey(owner, doc_id), AppSchema.payload(out, schema_id));
+            out = out.setIntResource(AppDocumentStore.versionKey(owner, doc_id), AppSchema.currentVersion(out, schema_id));
+            out = out.setBoolResource(AppDocumentStore.dirtyKey(owner, doc_id), true);
+            out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), appStoreMigrated());
+            return out;
+        }
+        out = out.setStringResource(AppDocumentStore.payloadKey(owner, doc_id), envelope.payload);
+        out = out.setIntResource(AppDocumentStore.statusKey(owner, doc_id), appDocumentOk());
+        out = out.setStringResource(AppDocumentStore.errorKey(owner, doc_id), "");
+        return out;
+    }
+
+    // Convenience: encode without touching the disk, which is what a test wants
+    // when it asserts on the on-disk format.
+    public static fn encodePayload(world: AppWorld, owner: string, doc_id: string) -> string {
+        let schema_id = AppDocumentStore.schemaId(world, owner, doc_id);
+        return AppDocumentEnvelope.encode(
+            schema_id,
+            AppDocumentStore.version(world, owner, doc_id),
+            AppDocumentStore.payload(world, owner, doc_id));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Database adapter
+// ---------------------------------------------------------------------------
+
+// Zyn does not ship a database and does not know what a table is. It ships the
+// boundary: an adapter that an application implements over whatever it likes,
+// plus a null adapter so a screen that expects a database still runs headless.
+public interface AppDatabaseAdapter {
+    fn open(&mut self, path: string) -> i32;
+    fn close(&mut self) -> i32;
+    fn execute(&mut self, statement: string) -> i32;
+    fn query(&mut self, statement: string) -> string;
+    fn isOpen(&self) -> bool;
+}
+
+public class AppNullDatabase : AppDatabaseAdapter {
+    public open_flag: bool;
+    public statement_count: i32;
+
+    public static fn create() -> AppNullDatabase {
+        return AppNullDatabase { open_flag: false, statement_count: 0 };
+    }
+
+    public fn open(&mut self, path: string) -> i32 {
+        self.open_flag = true;
+        return 0;
+    }
+
+    public fn close(&mut self) -> i32 {
+        self.open_flag = false;
+        return 0;
+    }
+
+    public fn execute(&mut self, statement: string) -> i32 {
+        if (!self.open_flag) { return 1; }
+        self.statement_count = self.statement_count + 1;
+        return 0;
+    }
+
+    public fn query(&mut self, statement: string) -> string {
+        if (!self.open_flag) { return ""; }
+        self.statement_count = self.statement_count + 1;
+        return "";
+    }
+
+    public fn isOpen(&self) -> bool {
+        return self.open_flag;
+    }
+}

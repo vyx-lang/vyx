@@ -1,0 +1,435 @@
+module std.hash;
+
+/// Vyx Standard Library — Hash
+/// Hashable trait + hash functions for built-in types.
+
+// `impl Eq for string { fn operator_eq(other: string) -> bool { ... } }`
+// below uses `str_equals` from std.string — structural compare rather
+// than the default pointer-equality lowering.
+use std.string;
+
+// P4-D.3: re-export `Clone` via transitive import so downstream modules
+// that already `use std.hash;` (std/dict.vyx, std/btree.vyx, ...) keep
+// seeing the trait + primitive impls without having to add a second
+// `use std.clone;`. The Clone contract itself lives in std/clone.vyx.
+use std.clone;
+
+extern "C" {
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+}
+
+// ============================================================
+// Hashable + Eq traits — all types used as Dict/HashSet/HashMap keys
+// must implement both.  Convention mirrors Rust's `Hash + Eq` and
+// Swift's `Hashable` protocol: structural equality and a stable hash
+// that agrees with it (i.e. `a.operator_eq(b)` ⇒ `a.hash() == b.hash()`).
+//
+// Compiler note (2026-04-23): primitives now satisfy both traits via
+// `impl Trait for <primitive>` blocks (see bottom of this file).  The
+// trait-bound checker consults `primitiveMethodImpls_` + the nominal
+// satisfaction set; method dispatch on `x: T where T: Hashable` routes
+// through `<PrimitiveName>.hash` when T is bound to a primitive.
+//
+// @[derive] audit (2026-04-23, phase 8b follow-up, commit 5ab0dbe): no
+// stdlib class was swept to `@[derive(Hashable, Eq, Clone)]` because every
+// stdlib class with a hand-written `operator_eq` / `hash` / `clone`
+// relies on a rawptr-indirect heap buffer — Vec, Dict, Set, HashSet,
+// Stack, Queue, Deque, List, Ref, Json — and needs content-based
+// (dereffed) semantics.  `@[derive]` emits field-shallow methods, which
+// would hash / compare the rawptr bit pattern and produce distinct
+// hashes for value-equal containers (semantic regression for Dict
+// keys).  Pair / Tuple3 / Tuple4 use a custom `eq` (memcmp over
+// `sizeof::<A>()`) rather than `operator_eq` and intentionally have no
+// generic `A: Eq` bound, so auto-derive does not apply either.  Plain
+// DTOs (ErrorContext, SemVer, ...) have no hand-written trait methods
+// in the first place.  Future stdlib additions with only primitive
+// fields SHOULD prefer `@[derive(Hashable, Eq, Clone, Copy)]` over
+// hand-written impls.
+// ============================================================
+
+trait Hashable {
+    fn hash() -> i64;
+}
+
+/// Structural equality, paired with `Hashable`.  Convention: use the
+/// `operator_eq` method name so `==` on a user type automatically
+/// satisfies this trait (see `Vec<T>.operator_eq` in std/vec.vyx for
+/// the canonical example).
+trait Eq {
+    fn operator_eq(other: Self) -> bool;
+}
+
+/// NOTE (2026-04-24, P4-D.3): the `Clone` trait definition moved to
+/// `std/clone.vyx` (module `std.clone`) so the deep-copy-vs-refcount-
+/// bump contract can be documented in one place without sharing a file
+/// with the unrelated `Hashable`/`Eq`/`Ord` plumbing. Callers get it
+/// transitively via `use std.hash;` (this file pulls in std.clone
+/// below) or directly via `use std.clone;`. Primitive impls (i32/i64/
+/// f32/f64/bool/char/string) live in std/clone.vyx alongside the trait.
+
+/// Marker trait — no methods.  Signals that a type is bitwise-copyable
+/// in the Rust sense: assignment / parameter passing already produces
+/// an independent value, so `clone()` would be redundant.
+///
+/// Ownership matches `std.clone`: assignment is move-by-default
+/// (`var b = a` transfers `a`; later use of `a` is V-MOVE-001).
+/// `Copy` does not currently suppress that diagnostic — it remains
+/// informational, with no Sema-level `T: Copy` enforcement. Use
+/// `a.clone()` when a second owned value is required.
+///
+/// Primitives (i8..i64, u8..u64, f32/f64, bool, char, rawptr) are
+/// Copy.  `string` is NOT Copy — it's a fat pointer {ptr, len, cap,
+/// owned} with owning semantics; sharing the pointer across two
+/// "copies" would double-free on drop.
+trait Copy {}
+
+/// Drop trait — owning containers and resources that need cleanup at
+/// end-of-life implement `fn drop()` so the compiler can emit automatic
+/// finalisation at scope exit (SSS memory model, 2026-04-24).
+///
+/// Semantics:
+///   * `drop()` releases ONLY the type's own heap resources (backing
+///     buffer / file handle / socket). It does NOT recurse into
+///     contained elements — those have their own Drop if they own
+///     anything. This mirrors the existing `destroy()` contract of Vec
+///     / Dict / HashMap / String (see `Vec.destroy` comment).
+///   * `drop()` MUST be idempotent. Concretely: after the first call
+///     the primary resource handle is nulled out, and subsequent calls
+///     are no-ops. This is the only property that makes shallow-struct
+///     aliasing (`var a = v; var b = a;`) safe under auto-drop — both
+///     a.drop() and b.drop() can fire, and only the first does work.
+///   * CodeGen wires auto-drop at scope exit for any local whose type
+///     has a registered `TypeName.drop` method (see
+///     `CodeGen::emitBlock` — the Drop-aware tail of block emission).
+///     Top-level function locals were already dropped at function exit;
+///     block-scope locals are now dropped too.
+///
+/// Transition: the pre-SSS std library had hand-written `destroy()`
+/// methods on every owning class. Those remain as explicit-call aliases
+/// (user code that already calls `.destroy()` keeps compiling) — the
+/// new `fn drop()` wrappers dispatch straight through. Prefer `drop()`
+/// in new code; the `destroy()` name is likely to retire once all call
+/// sites migrate.
+trait Drop {
+    fn drop();
+}
+
+/// Total-ordering trait.  Mirrors Rust's `Ord` / Swift's `Comparable` /
+/// C's `strcmp` convention: `compare(other)` returns a signed i32 where
+/// negative = self < other, zero = equal, positive = self > other.
+///
+/// Agreement with `Eq` is recommended but not compiler-enforced: types
+/// that implement both should ensure
+///   `a.compare(b) == 0`  ⇔  `a.operator_eq(b) == true`.
+///
+/// Float semantics (updated 2026-04-23, pragmatic total-order choice
+/// — Option B / Swift-Comparable / Java-Double.compare flavour):
+///   -inf < finite negatives < ±0 < finite positives < +inf < NaN
+/// Concretely: the `compare` body isNan-checks both operands first;
+/// two NaNs compare equal (`0`), a NaN on the left beats any non-NaN
+/// (`+1`), a NaN on the right is beaten (`-1`).  Non-NaN values fall
+/// through to IEEE `<`/`>`, which orders ±inf naturally and treats
+/// +0.0 == -0.0.  This gives a deterministic *total* order so that
+/// `sort::<f64>(v)`, `min/max`, and ordered containers keyed on f64
+/// all "just work" even when NaN is present — NaN sinks to the end.
+///
+/// Deviations from strict IEEE that callers should know:
+///   * NaN.compare(NaN) == 0   (IEEE `NaN == NaN` is false)
+///   * NaN.compare(x)   == +1  for every non-NaN x
+///   * +0.0 and -0.0 compare equal (bit-exact ordering NOT provided —
+///     use `totalOrder`-style helper on top if you need that)
+/// Eq for f32/f64 is kept consistent with this total order, so
+/// `a.compare(b) == 0` ⇔ `a.operator_eq(b) == true`.  If you need the
+/// raw IEEE predicate (NaN != NaN), use the `==` / `!=` operators
+/// directly instead of the trait methods.
+trait Ord {
+    fn compare(other: Self) -> i32;
+}
+
+// ============================================================
+// Hash functions for built-in types
+// ============================================================
+
+/// splitmix64 — high-quality integer hash (used by Java SplittableRandom)
+@[inline]
+@[hot]
+public fn hash_i64(val: i64) -> i64 {
+    var h = val;
+    h = h ^ (h >> 30);
+    h = h * -4658895280553007687;
+    h = h ^ (h >> 27);
+    h = h * -7723592293110705685;
+    h = h ^ (h >> 31);
+    return h;
+}
+
+@[inline]
+public fn hash_i32(val: i32) -> i64 {
+    return hash_i64(val as i64);
+}
+
+/// FNV-1a 64-bit — fast non-cryptographic string hash
+public fn hash_string(s: string) -> i64 {
+    var hash: i64 = -3750763034362895579;
+    var i: i64 = 0;
+    while (i < s.len) {
+        var b: i64 = 0;
+        unsafe { memcpy(to_rawptr(&b), s.ptr + i, 1); }
+        b = b & 255;
+        hash = hash ^ b;
+        hash = hash * 1099511628211;
+        i = i + 1;
+    }
+    return hash;
+}
+
+/// Fast structural string hash for Hashable dispatch.  The public
+/// `hash_string`/`fnv1a` API stays FNV-1a; Dict only needs a stable hash
+/// that agrees with string equality, so it can mix 8-byte chunks.
+@[inline]
+@[hot]
+public fn hash_string_key(s: string) -> i64 {
+    return hash_bytes_key(s.ptr, s.len);
+}
+
+/// Universal hash — works on any i64-boxed value
+/// For integers: splitmix64
+/// For pointers/strings: treated as integer (hash the pointer value)
+public fn hash_any(val: i64) -> i64 {
+    return hash_i64(val);
+}
+
+/// FNV-1a on raw bytes
+public fn hash_bytes(data: rawptr, len: i64) -> i64 {
+    var hash: i64 = -3750763034362895579;
+    var i: i64 = 0;
+    while (i < len) {
+        var b: i64 = 0;
+        unsafe { memcpy(to_rawptr(&b), data + i, 1); }
+        b = b & 255;
+        hash = hash ^ b;
+        hash = hash * 1099511628211;
+        i = i + 1;
+    }
+    return hash;
+}
+
+/// Chunked byte hash used by string Hashable.  Reads full 8-byte groups
+/// and folds the short tail into one final word to avoid per-byte FNV work
+/// in container hot paths.  splitmix64 mixing is inlined directly per
+/// chunk to drop the call-per-8-bytes overhead and let LLVM unroll / CSE
+/// across iterations.  Hash output is bit-identical to the previous
+/// `hash_i64(hash ^ chunk)` formulation, so Dict layouts stay stable.
+@[inline]
+@[hot]
+public fn hash_bytes_key(data: rawptr, len: i64) -> i64 {
+    var h = len ^ -7046029254386353131;
+    h = h ^ (h >> 30);
+    h = h * -4658895280553007687;
+    h = h ^ (h >> 27);
+    h = h * -7723592293110705685;
+    h = h ^ (h >> 31);
+    var i: i64 = 0;
+    while (i + 8 <= len) {
+        var chunk: i64 = 0;
+        unsafe { memcpy(to_rawptr(&chunk), data + i, 8); }
+        h = h ^ chunk;
+        h = h ^ (h >> 30);
+        h = h * -4658895280553007687;
+        h = h ^ (h >> 27);
+        h = h * -7723592293110705685;
+        h = h ^ (h >> 31);
+        i = i + 8;
+    }
+    var tail: i64 = 0;
+    var shift: i64 = 0;
+    while (i < len) {
+        var b: i64 = 0;
+        unsafe { memcpy(to_rawptr(&b), data + i, 1); }
+        tail = tail | ((b & 255) << shift);
+        shift = shift + 8;
+        i = i + 1;
+    }
+    if (shift > 0) {
+        h = h ^ tail;
+        h = h ^ (h >> 30);
+        h = h * -4658895280553007687;
+        h = h ^ (h >> 27);
+        h = h * -7723592293110705685;
+        h = h ^ (h >> 31);
+    }
+    return h;
+}
+
+// ============================================================
+// Legacy API (backward compatible)
+// ============================================================
+
+public fn fnv1a(input: string) -> i64 { return hash_string(input); }
+public fn fnv1a_32(input: string) -> i32 {
+    var hash: i32 = 2166136261 as i32;
+    var i: i64 = 0;
+    while (i < input.len) {
+        var b: i32 = 0;
+        unsafe { memcpy(to_rawptr(&b), input.ptr + i, 1); }
+        b = b & 255;
+        hash = hash ^ b;
+        hash = hash * 16777619;
+        i = i + 1;
+    }
+    return hash;
+}
+public fn fnv1a_bytes(data: rawptr, len: i32) -> i64 { return hash_bytes(data, len as i64); }
+
+// ============================================================
+// Primitive-type trait impls (2026-04-23).
+//
+// `impl <Trait> for <primitive>` blocks.  The compiler parses the target
+// keyword (i32 / i64 / bool / char / string), registers the method in
+// `primitiveMethodImpls_[(typeName, methodName)]`, and marks the
+// primitive as nominally satisfying the trait.  Method dispatch on
+//   `fn f<T>(x: T) -> i64 where T: Hashable { return x.hash(); }`
+// instantiated at T=i32 routes through `i32.hash`.
+//
+// Coherence policy (for now): one impl per (trait, primitive) pair;
+// the first impl wins, duplicates are silently overwritten.  Orphan
+// checking is deferred.
+// ============================================================
+
+impl Hashable for i32  { fn hash() -> i64 { return hash_i32(self); } }
+impl Hashable for i64  { fn hash() -> i64 { return hash_i64(self); } }
+impl Hashable for string { fn hash() -> i64 { return hash_string_key(self); } }
+impl Hashable for bool { fn hash() -> i64 { if (self) { return hash_i64(1); } return hash_i64(0); } }
+impl Hashable for char { fn hash() -> i64 { return hash_i64(self as i64); } }
+
+impl Eq for i32    { fn operator_eq(other: i32) -> bool { return self == other; } }
+impl Eq for i64    { fn operator_eq(other: i64) -> bool { return self == other; } }
+impl Eq for bool   { fn operator_eq(other: bool) -> bool { return self == other; } }
+impl Eq for char   { fn operator_eq(other: char) -> bool { return self == other; } }
+// Float Eq — total-order-consistent (matches `impl Ord for f32/f64` below,
+// NOT raw IEEE).  In particular: NaN.operator_eq(NaN) == true, and
+// NaN.operator_eq(anything_else) == false.  For strict IEEE semantics
+// (NaN != NaN) use the `==`/`!=` operators directly.  +0.0 and -0.0
+// compare equal, matching the Ord impl.
+impl Eq for f32 {
+    fn operator_eq(other: f32) -> bool {
+        let self_is_nan: bool = (self != self);
+        let other_is_nan: bool = (other != other);
+        if (self_is_nan && other_is_nan) { return true; }
+        if (self_is_nan || other_is_nan) { return false; }
+        return self == other;
+    }
+}
+impl Eq for f64 {
+    fn operator_eq(other: f64) -> bool {
+        let self_is_nan: bool = (self != self);
+        let other_is_nan: bool = (other != other);
+        if (self_is_nan && other_is_nan) { return true; }
+        if (self_is_nan || other_is_nan) { return false; }
+        return self == other;
+    }
+}
+// NOTE: string equality currently relies on the existing stdlib helper
+// `str_equals(a, b)` (std/string.vyx) rather than `a == b`, because the
+// compiler's `==` for Class{name="string"} lowers to a pointer compare.
+impl Eq for string { fn operator_eq(other: string) -> bool { return str_equals(self, other); } }
+
+// Ord impls — signed-compare convention (-1 / 0 / 1).
+// Same dispatch plumbing as Hashable/Eq: each block registers the method
+// under `primitiveMethodImpls_[(typeName, "compare")]` and records
+// `primitiveTraitSatisfied_[(typeName, "Ord")]`, so generic bodies with
+// `where T: Ord` dispatch `x.compare(y)` through here when T binds to a
+// primitive.
+impl Ord for i32 {
+    fn compare(other: i32) -> i32 {
+        if (self < other) { return -1; }
+        if (self > other) { return 1; }
+        return 0;
+    }
+}
+impl Ord for i64 {
+    fn compare(other: i64) -> i32 {
+        if (self < other) { return -1; }
+        if (self > other) { return 1; }
+        return 0;
+    }
+}
+// Float: pragmatic total order — see the `trait Ord` doc at the top of
+// this file.  NaN-NaN detection relies on IEEE's `x != x` idiom, which
+// is the one context where `!=` is `true` for bit-equal operands.  With
+// both sides non-NaN we fall through to the ordinary IEEE compare, so
+// ±inf and finite values order naturally and +0.0 / -0.0 are equal.
+impl Ord for f32 {
+    fn compare(other: f32) -> i32 {
+        let self_is_nan: bool = (self != self);
+        let other_is_nan: bool = (other != other);
+        if (self_is_nan && other_is_nan) { return 0; }
+        if (self_is_nan) { return 1; }
+        if (other_is_nan) { return -1; }
+        if (self < other) { return -1; }
+        if (self > other) { return 1; }
+        return 0;
+    }
+}
+impl Ord for f64 {
+    fn compare(other: f64) -> i32 {
+        let self_is_nan: bool = (self != self);
+        let other_is_nan: bool = (other != other);
+        if (self_is_nan && other_is_nan) { return 0; }
+        if (self_is_nan) { return 1; }
+        if (other_is_nan) { return -1; }
+        if (self < other) { return -1; }
+        if (self > other) { return 1; }
+        return 0;
+    }
+}
+// bool: `false < true` (matches Rust's derive, C's promoted-int compare).
+impl Ord for bool {
+    fn compare(other: bool) -> i32 {
+        if (self == other) { return 0; }
+        if (self) { return 1; }
+        return -1;
+    }
+}
+// char: compare by codepoint.  `char` is 32-bit Unicode in Vyx; widening
+// to i64 avoids the signed/unsigned ambiguity that would appear if we
+// compared two i32s directly (not applicable here since char is unsigned,
+// but the explicit cast documents intent).
+impl Ord for char {
+    fn compare(other: char) -> i32 {
+        let a: i64 = self as i64;
+        let b: i64 = other as i64;
+        if (a < b) { return -1; }
+        if (a > b) { return 1; }
+        return 0;
+    }
+}
+// string: delegate to the free `str_compare` helper (std/string.vyx).
+// We can't open-code `self.len` / `self.ptr` field access here because
+// primitive-impl method bodies currently pass `self` by value, but the
+// string struct-field load expects a pointer operand (LLVM verifier
+// rejects `load i64, %__String %self.len`).  `str_compare` takes
+// `a: string` as a normal parameter which codegen already handles
+// correctly — same delegation strategy as
+// `impl Hashable for string { return hash_string(self); }` above.
+impl Ord for string {
+    fn compare(other: string) -> i32 { return str_compare(self, other); }
+}
+
+// ============================================================
+// Copy marker impls — primitives are bitwise-copyable by definition.
+// Empty impl bodies register nominal satisfaction of the Copy trait
+// so generic bounds `where T: Copy` succeed when T binds to any of
+// these.  No methods → no dispatch plumbing needed.
+//
+// `string` is intentionally omitted (fat pointer with owning buffer;
+// see trait-level doc above).
+// ============================================================
+impl Copy for i32  {}
+impl Copy for i64  {}
+impl Copy for f32  {}
+impl Copy for f64  {}
+impl Copy for bool {}
+impl Copy for char {}
+
+// Clone impls moved to std/clone.vyx (P4-D.3).

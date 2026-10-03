@@ -1,0 +1,769 @@
+module bootstrap.hir_ownership_resolver;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+
+extern "C" {
+    fn vyx_bootstrap_now_ms() -> i64;
+    fn getenv(name: rawptr) -> rawptr;
+}
+
+// --- temporary HirOwnershipResolver profile accumulators -------------------
+var g_hor_n_range: i64 = 0;
+var g_hor_n_fdt: i64 = 0;
+var g_hor_n_fdt_hit: i64 = 0;
+var g_hor_n_psdf: i64 = 0;
+var g_hor_n_psfrds: i64 = 0;
+var g_hor_n_psfrds_hit: i64 = 0;
+var g_hor_ms_l1: i64 = 0;
+var g_hor_ms_l2: i64 = 0;
+var g_hor_ms_l3: i64 = 0;
+var g_hor_ms_fdt: i64 = 0;
+var g_hor_ms_psdf: i64 = 0;
+var g_hor_ms_psfrds: i64 = 0;
+var g_hor_ms_create: i64 = 0;
+var g_hor_ms_clear: i64 = 0;
+var g_hor_it_fdt_locals: i64 = 0;
+var g_hor_it_fdt_funcs: i64 = 0;
+var g_hor_it_psdf: i64 = 0;
+var g_hor_it_psfrds_stmts: i64 = 0;
+
+fn hor_prof_dump() {
+    let gh_env = getenv("VYX_HOR_PROF".c_str());
+    if (gh_env == null) { return; }
+    if (from_cstr(gh_env).trim() == "0") { return; }
+    print("[hor-prof] range=" + policy_i64_to_string(g_hor_n_range)
+          + " l1=" + policy_i64_to_string(g_hor_ms_l1)
+          + " l2=" + policy_i64_to_string(g_hor_ms_l2)
+          + " l3=" + policy_i64_to_string(g_hor_ms_l3)
+          + " fdt_ms=" + policy_i64_to_string(g_hor_ms_fdt)
+          + " fdt_n=" + policy_i64_to_string(g_hor_n_fdt)
+          + " fdt_hit=" + policy_i64_to_string(g_hor_n_fdt_hit)
+          + " fdt_loc=" + policy_i64_to_string(g_hor_it_fdt_locals)
+          + " fdt_fn=" + policy_i64_to_string(g_hor_it_fdt_funcs)
+          + " psdf_ms=" + policy_i64_to_string(g_hor_ms_psdf)
+          + " psdf_n=" + policy_i64_to_string(g_hor_n_psdf)
+          + " psdf_it=" + policy_i64_to_string(g_hor_it_psdf)
+          + " psfrds_ms=" + policy_i64_to_string(g_hor_ms_psfrds)
+          + " psfrds_n=" + policy_i64_to_string(g_hor_n_psfrds)
+          + " psfrds_hit=" + policy_i64_to_string(g_hor_n_psfrds_hit)
+          + " psfrds_st=" + policy_i64_to_string(g_hor_it_psfrds_stmts)
+          + " create_ms=" + policy_i64_to_string(g_hor_ms_create)
+          + " clear_ms=" + policy_i64_to_string(g_hor_ms_clear));
+}
+
+// Equivalence key of `type_ids_match`: two type ids match when their
+// `policy_generic_call_base` texts are equal (`lt == rt` implies the same base,
+// so base equality is the whole relation).  Hashing that key lets the hot
+// full-table scans reject non-matches with an integer compare.
+fn hor_type_base_hash(text: string) -> i32 {
+    if (text.len == 0) { return 0; }
+    var h: i64 = 5381;
+    var i: i32 = 0;
+    while (i < text.len) {
+        h = (h * 131) + (text.charAt(i) as i64) + 1;
+        i = i + 1;
+    }
+    var out: i32 = ((h & 2147483647) as i32);
+    if (out == 0) { out = 1; }
+    return out;
+}
+
+public class HirOwnershipResolver {
+    public unit: HirUnit
+    public drop_function_cache: rawptr
+    public drop_function_cache_cap: i32
+    public primitive_str_return_cache: rawptr
+    public primitive_str_return_cache_cap: i32
+    public type_base_hash_cache: rawptr
+    public type_base_hash_cap: i32
+    public categorized_exprs: i32
+    public marked_call_args: i32
+    public marked_return_moves: i32
+    public bound_drop_exprs: i32
+    public errors: i32
+    public print_summary: bool
+
+    public static fn alloc_i32_cache(count: i32, initial: i32) -> rawptr {
+        if (count <= 0) { return null; }
+        let bytes = ((count as i64) * 4) as u64;
+        let buf = malloc(bytes);
+        if (buf == null) { return null; }
+        var i: i32 = 0;
+        while (i < count) {
+            ast_write_i32(ptr_offset(buf, (i as i64) * 4), initial);
+            i = i + 1;
+        }
+        return buf;
+    }
+
+    public fn dispose(self) {
+        if (self.drop_function_cache != null) {
+            free(self.drop_function_cache);
+            self.drop_function_cache = null;
+        }
+        self.drop_function_cache_cap = 0;
+        if (self.primitive_str_return_cache != null) {
+            free(self.primitive_str_return_cache);
+            self.primitive_str_return_cache = null;
+        }
+        self.primitive_str_return_cache_cap = 0;
+        if (self.type_base_hash_cache != null) {
+            free(self.type_base_hash_cache);
+            self.type_base_hash_cache = null;
+        }
+        self.type_base_hash_cap = 0;
+    }
+
+    public static fn create(h: HirUnit) -> HirOwnershipResolver {
+        let cap: i32 = h.types.count;
+        return HirOwnershipResolver {
+            unit: h,
+            drop_function_cache: HirOwnershipResolver.alloc_i32_cache(cap, -1),
+            drop_function_cache_cap: cap,
+            primitive_str_return_cache: HirOwnershipResolver.alloc_i32_cache(h.function_count, -1),
+            primitive_str_return_cache_cap: h.function_count,
+            type_base_hash_cache: null,
+            type_base_hash_cap: 0,
+            categorized_exprs: 0,
+            marked_call_args: 0,
+            marked_return_moves: 0,
+            bound_drop_exprs: 0,
+            errors: 0,
+            print_summary: true
+        };
+    }
+
+    public static fn create_silent(h: HirUnit) -> HirOwnershipResolver {
+        let gh_t0 = vyx_bootstrap_now_ms();
+        let cap: i32 = h.types.count;
+        let gh_out = HirOwnershipResolver {
+            unit: h,
+            drop_function_cache: HirOwnershipResolver.alloc_i32_cache(cap, -1),
+            drop_function_cache_cap: cap,
+            primitive_str_return_cache: HirOwnershipResolver.alloc_i32_cache(h.function_count, -1),
+            primitive_str_return_cache_cap: h.function_count,
+            type_base_hash_cache: null,
+            type_base_hash_cap: 0,
+            categorized_exprs: 0,
+            marked_call_args: 0,
+            marked_return_moves: 0,
+            bound_drop_exprs: 0,
+            errors: 0,
+            print_summary: false
+        };
+        g_hor_ms_create = g_hor_ms_create + (vyx_bootstrap_now_ms() - gh_t0);
+        return gh_out;
+    }
+
+    public fn record_error(self, msg: string) {
+        self.errors = self.errors + 1;
+        diag_emit(diag_sev_ERROR(), diag_code_v_move_001(), 1, 1, msg);
+        diag_emit_help_at(diag_code_v_move_001(),
+                            null,
+                            "copy the value, rebind it, or stop using it after the move");
+    }
+
+    public fn id_text(self, value: i32) -> string {
+        return policy_i64_to_string(value as i64);
+    }
+
+    public fn type_text(self, type_id: i32) -> string {
+        if (type_id < 1 || type_id > self.unit.types.count) { return ""; }
+        if (hir_type_table_record(self.unit.types, type_id) == null) { return ""; }
+        return hir_type_table_text(self.unit.types, type_id);
+    }
+
+    public fn type_kind(self, type_id: i32) -> i32 {
+        if (type_id < 1 || type_id > self.unit.types.count) { return hir_type_unknown(); }
+        if (hir_type_table_record(self.unit.types, type_id) == null) { return hir_type_unknown(); }
+        return hir_type_table_kind(self.unit.types, type_id);
+    }
+
+    public fn type_id_can_have_drop_function(self, type_id: i32) -> bool {
+        let k = self.type_kind(type_id);
+        if (k == ty_CLASS()) { return true; }
+        return false;
+    }
+
+    // Primitive strings are not classes: their ownership tag selects whether
+    // `str_drop` releases storage.  The exact global `str_drop(str) -> void`
+    // function is therefore part of the primitive ABI, not a name heuristic.
+    public fn primitive_str_drop_function(self) -> i32 {
+        let gh_t0 = vyx_bootstrap_now_ms();
+        g_hor_n_psdf = g_hor_n_psdf + 1;
+        var fn_id: i32 = 1;
+        var gh_res: i32 = hir_id_invalid();
+        while (fn_id <= self.unit.function_count) {
+            g_hor_it_psdf = g_hor_it_psdf + 1;
+            if (self.unit.function_record(fn_id) != null
+                && self.unit.function_name(fn_id) == "str_drop"
+                && self.unit.function_owner_type(fn_id).len == 0
+                && self.type_kind(self.unit.function_return_type(fn_id)) == ty_VOID()) {
+                let param = self.function_param_local_at(fn_id, 0);
+                if (param != hir_id_invalid()
+                    && self.type_kind(self.unit.local_type(param)) == ty_STRING()
+                    && self.function_param_local_at(fn_id, 1) == hir_id_invalid()) {
+                    gh_res = fn_id;
+                    break;
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        g_hor_ms_psdf = g_hor_ms_psdf + (vyx_bootstrap_now_ms() - gh_t0);
+        return gh_res;
+    }
+
+    public fn cached_drop_function(self, type_id: i32) -> i32 {
+        if (type_id < 1 || type_id > self.drop_function_cache_cap) { return -1; }
+        if (self.drop_function_cache == null) { return -1; }
+        return ast_read_i32(ptr_offset(self.drop_function_cache, ((type_id as i64) - 1) * 4));
+    }
+
+    public fn remember_drop_function(self, type_id: i32, drop_fn: i32) -> i32 {
+        if (type_id >= 1 && type_id <= self.drop_function_cache_cap && self.drop_function_cache != null) {
+            ast_write_i32(ptr_offset(self.drop_function_cache, ((type_id as i64) - 1) * 4), drop_fn);
+        }
+        return drop_fn;
+    }
+
+    // Memoised `hor_type_base_hash(policy_generic_call_base(type_text(t)))`.
+    // 0 means "not computed yet"; 1 means "no base (empty type text)", which the
+    // caller must treat as unknown so it never fast-rejects on it.
+    public fn type_base_hash(self, type_id: i32) -> i32 {
+        if (type_id < 1) { return 1; }
+        if (self.type_base_hash_cache == null || type_id > self.type_base_hash_cap) {
+            let newcap: i32 = self.unit.types.count + 512;
+            let buf = HirOwnershipResolver.alloc_i32_cache(newcap, 0);
+            if (buf == null) { return 1; }
+            if (self.type_base_hash_cache != null) {
+                var ci: i32 = 0;
+                while (ci < self.type_base_hash_cap) {
+                    ast_write_i32(ptr_offset(buf, (ci as i64) * 4),
+                                  ast_read_i32(ptr_offset(self.type_base_hash_cache, (ci as i64) * 4)));
+                    ci = ci + 1;
+                }
+                free(self.type_base_hash_cache);
+            }
+            self.type_base_hash_cache = buf;
+            self.type_base_hash_cap = newcap;
+        }
+        if (type_id > self.type_base_hash_cap) { return 1; }
+        let cached = ast_read_i32(ptr_offset(self.type_base_hash_cache, ((type_id as i64) - 1) * 4));
+        if (cached != 0) { return cached; }
+        let text = self.type_text(type_id);
+        var h: i32 = 1;
+        if (text.len > 0) {
+            let base = policy_generic_call_base(text.clone());
+            h = hor_type_base_hash(base);
+            if (h == 0) { h = 1; }
+        }
+        ast_write_i32(ptr_offset(self.type_base_hash_cache, ((type_id as i64) - 1) * 4), h);
+        return h;
+    }
+
+    public fn type_ids_match(self, lhs: i32, rhs: i32) -> bool {
+        if (lhs == hir_id_invalid() || rhs == hir_id_invalid()) { return false; }
+        if (lhs == rhs) { return true; }
+        let hl = self.type_base_hash(lhs);
+        let hr = self.type_base_hash(rhs);
+        if (hl != 1 && hr != 1 && hl != hr) { return false; }
+        let lt = self.type_text(lhs);
+        let rt = self.type_text(rhs);
+        if (lt.len == 0 || rt.len == 0) { return false; }
+        if (lt == rt) { return true; }
+        return policy_generic_call_base(lt.clone()) == policy_generic_call_base(rt.clone());
+    }
+
+    public fn function_needs_closed_body(self, fn_id: i32) -> bool {
+        if (fn_id < 1 || fn_id > self.unit.function_count) { return false; }
+        if (self.unit.function_record(fn_id) == null) { return false; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) { return true; }
+        if ((hir_unit_function_flags(self.unit, fn_id) & hir_function_flag_codegen_root()) != 0) { return true; }
+        return false;
+    }
+
+    public fn function_param_local_at(self, fn_id: i32, param_index: i32) -> i32 {
+        if (fn_id < 1 || fn_id > self.unit.function_count) { return hir_id_invalid(); }
+        var cur = self.unit.function_first_local(fn_id);
+        var seen: i32 = 0;
+        var guard: i32 = 0;
+        while (cur != hir_id_invalid() && guard <= self.unit.local_count) {
+            if ((self.unit.local_flags(cur) & hir_local_flag_param()) != 0) {
+                if (seen == param_index) { return cur; }
+                seen = seen + 1;
+            }
+            cur = self.unit.local_next(cur);
+            guard = guard + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    public fn expr_function_target(self, expr_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid()) { return hir_id_invalid(); }
+        if (self.unit.expr_target_kind(expr_id) == hir_target_function()) {
+            return self.unit.expr_target_id(expr_id);
+        }
+        let callee_id = self.unit.expr_lhs(expr_id);
+        if (callee_id != hir_id_invalid()
+            && self.unit.expr_target_kind(callee_id) == hir_target_function()) {
+            return self.unit.expr_target_id(callee_id);
+        }
+        return hir_id_invalid();
+    }
+
+    public fn call_receiver_expr(self, call_expr_id: i32) -> i32 {
+        if (call_expr_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let callee_id = self.unit.expr_lhs(call_expr_id);
+        if (callee_id == hir_id_invalid()) { return hir_id_invalid(); }
+        if (self.unit.expr_kind(callee_id) != ex_MEMBER()) { return hir_id_invalid(); }
+        return self.unit.expr_lhs(callee_id);
+    }
+
+    public fn call_has_receiver_param(self, target_fn: i32, receiver_expr: i32) -> bool {
+        if (target_fn == hir_id_invalid() || receiver_expr == hir_id_invalid()) { return false; }
+        let first_param = self.function_param_local_at(target_fn, 0);
+        if (first_param == hir_id_invalid()) { return false; }
+        if ((self.unit.local_flags(first_param) & hir_local_flag_self_receiver()) != 0) { return true; }
+        if (self.unit.local_name(first_param) == "self") { return true; }
+        return self.type_ids_match(self.unit.local_type(first_param), self.unit.expr_type(receiver_expr));
+    }
+
+    public fn find_drop_function_for_type(self, type_id: i32) -> i32 {
+        if (type_id == hir_id_invalid()) { return hir_id_invalid(); }
+        if (!self.type_id_can_have_drop_function(type_id)) { return hir_id_invalid(); }
+        let cached = self.cached_drop_function(type_id);
+        if (cached != -1) { return cached; }
+        let gh_t0 = vyx_bootstrap_now_ms();
+        g_hor_n_fdt = g_hor_n_fdt + 1;
+        var gh_out: i32 = hir_id_invalid();
+        var local_id: i32 = 1;
+        while (local_id <= self.unit.local_count) {
+            g_hor_it_fdt_locals = g_hor_it_fdt_locals + 1;
+            if (self.unit.local_record(local_id) != null
+                && self.type_ids_match(self.unit.local_type(local_id), type_id)) {
+                let local_drop = self.unit.local_drop_function(local_id);
+                if (local_drop != hir_id_invalid()) {
+                    gh_out = self.remember_drop_function(type_id, local_drop);
+                    break;
+                }
+            }
+            local_id = local_id + 1;
+        }
+        if (local_id <= self.unit.local_count) {
+            g_hor_ms_fdt = g_hor_ms_fdt + (vyx_bootstrap_now_ms() - gh_t0);
+            return gh_out;
+        }
+        let type_name = self.type_text(type_id);
+        let type_base = policy_generic_call_base(type_name.clone());
+        if (type_base.len == 0) {
+            gh_out = self.remember_drop_function(type_id, hir_id_invalid());
+            g_hor_ms_fdt = g_hor_ms_fdt + (vyx_bootstrap_now_ms() - gh_t0);
+            return gh_out;
+        }
+        var fn_id: i32 = 1;
+        var gh_found = false;
+        while (fn_id <= self.unit.function_count) {
+            g_hor_it_fdt_funcs = g_hor_it_fdt_funcs + 1;
+            if (self.unit.function_record(fn_id) != null
+                && policy_generic_call_base(self.unit.function_name(fn_id).clone()) == "drop") {
+                let owner_text = self.unit.function_owner_type(fn_id);
+                if (owner_text.len > 0
+                    && policy_generic_call_base(owner_text.clone()) == type_base) {
+                    gh_out = self.remember_drop_function(type_id, fn_id);
+                    gh_found = true;
+                    break;
+                }
+                let first_param = self.function_param_local_at(fn_id, 0);
+                if (first_param != hir_id_invalid()
+                    && self.type_ids_match(self.unit.local_type(first_param), type_id)) {
+                    gh_out = self.remember_drop_function(type_id, fn_id);
+                    gh_found = true;
+                    break;
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        if (!gh_found) {
+            gh_out = self.remember_drop_function(type_id, hir_id_invalid());
+        }
+        g_hor_ms_fdt = g_hor_ms_fdt + (vyx_bootstrap_now_ms() - gh_t0);
+        return gh_out;
+    }
+
+    public fn value_category_for_expr(self, expr_id: i32) -> i32 {
+        let kind = self.unit.expr_kind(expr_id);
+        let sem = self.unit.expr_sem_kind(expr_id);
+        if (kind == ex_IDENT()) {
+            if (sem == expr_sem_LOCAL()) { return hir_value_cat_place(); }
+            if (sem == expr_sem_GLOBAL()) { return hir_value_cat_place(); }
+            if (sem == expr_sem_FIELD()) { return hir_value_cat_place(); }
+            return hir_value_cat_value();
+        }
+        if (kind == ex_MEMBER()) {
+            if (sem == expr_sem_FIELD()) { return hir_value_cat_place(); }
+            if (sem == expr_sem_GLOBAL()) { return hir_value_cat_place(); }
+            return hir_value_cat_value();
+        }
+        if (kind == ex_INDEX()) { return hir_value_cat_place(); }
+        if (kind == ex_DEREF()) { return hir_value_cat_place(); }
+        if (kind == ex_FAIL()) { return hir_value_cat_value(); }
+        if (kind == ex_IF_EXPR()) { return hir_value_cat_value(); }
+        return hir_value_cat_value();
+    }
+
+    public fn mark_expr_borrowed(self, expr_id: i32) {
+        if (expr_id == hir_id_invalid()) { return; }
+        let flags = self.unit.expr_move_drop_flags(expr_id);
+        self.unit.set_expr_move_drop_flags(expr_id,
+                                          flags | hir_move_drop_flag_borrow_arg());
+        self.marked_call_args = self.marked_call_args + 1;
+    }
+
+    public fn mark_expr_moved(self, expr_id: i32, drop_fn: i32) {
+        if (expr_id == hir_id_invalid()) { return; }
+        var flags = self.unit.expr_move_drop_flags(expr_id);
+        flags = flags | hir_move_drop_flag_move_arg();
+        if (drop_fn != hir_id_invalid()) {
+            flags = flags | hir_move_drop_flag_has_drop();
+            self.unit.set_expr_drop_function(expr_id, drop_fn);
+        }
+        self.unit.set_expr_move_drop_flags(expr_id, flags);
+    }
+
+    public fn drop_function_for_expr(self, expr_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let existing = self.unit.expr_drop_function(expr_id);
+        if (existing != hir_id_invalid()) { return existing; }
+        if (self.type_kind(self.unit.expr_type(expr_id)) == ty_STRING()) {
+            return self.primitive_str_drop_function_for_expr(expr_id);
+        }
+        return self.find_drop_function_for_type(self.unit.expr_type(expr_id));
+    }
+
+    // A primitive `str` is a tagged view, not an unconditionally owning
+    // object. Attaching str_drop to every expression therefore frees parser
+    // slices, parameters and field reads that only borrow their bytes. The
+    // owner bit is runtime data, so the HIR layer must establish ownership
+    // positively before it emits any move/drop metadata.
+    //
+    // This deliberately accepts only local values already registered with
+    // auto-drop glue or calls whose implementation/return flow proves a
+    // distinct result. Unknown calls, fields and casts of borrowed values
+    // remain non-owning.
+    public fn primitive_str_known_owned_call(self, expr_id: i32) -> bool {
+        if (expr_id == hir_id_invalid() || self.unit.expr_kind(expr_id) != ex_CALL()) {
+            return false;
+        }
+        let callee = self.unit.expr_lhs(expr_id);
+        if (callee == hir_id_invalid()) { return false; }
+        let callee_kind = self.unit.expr_kind(callee);
+        if (callee_kind != ex_IDENT() && callee_kind != ex_MEMBER()) { return false; }
+        let name = policy_generic_call_base(self.unit.expr_name(callee).clone());
+        if (name == "clone") { return true; }
+        return self.primitive_str_function_returns_drop_safe_value(
+            self.expr_function_target(expr_id), 1);
+    }
+
+    public fn primitive_str_expr_is_drop_safe(self, expr_id: i32, depth: i32) -> bool {
+        if (expr_id == hir_id_invalid() || depth > 32
+            || self.type_kind(self.unit.expr_type(expr_id)) != ty_STRING()) {
+            return false;
+        }
+        let kind = self.unit.expr_kind(expr_id);
+        if (kind == ex_FSTRING()) { return true; }
+        if (kind == ex_BIN() && self.unit.expr_op(expr_id) == tk_PLUS()) { return true; }
+        if (kind == ex_IDENT() && self.unit.expr_target_kind(expr_id) == hir_target_local()) {
+            let local_id = self.unit.expr_target_id(expr_id);
+            return local_id != hir_id_invalid()
+                && (self.unit.local_flags(local_id) & hir_local_flag_auto_drop()) != 0
+                && self.unit.local_drop_function(local_id) == self.primitive_str_drop_function();
+        }
+        if (kind == ex_CAST()) {
+            return self.primitive_str_expr_is_drop_safe(self.unit.expr_lhs(expr_id), depth + 1);
+        }
+        if (kind == ex_IF_EXPR()) {
+            return self.primitive_str_expr_is_drop_safe(self.unit.expr_lhs(expr_id), depth + 1)
+                && self.primitive_str_expr_is_drop_safe(self.unit.expr_rhs(expr_id), depth + 1)
+                && self.primitive_str_expr_is_drop_safe(self.unit.expr_aux(expr_id), depth + 1);
+        }
+        if (kind == ex_TERNARY()) {
+            return self.primitive_str_expr_is_drop_safe(self.unit.expr_rhs(expr_id), depth + 1)
+                && self.primitive_str_expr_is_drop_safe(self.unit.expr_aux(expr_id), depth + 1);
+        }
+        if (kind != ex_CALL()) { return false; }
+        if (self.primitive_str_known_owned_call(expr_id)) { return true; }
+        return self.primitive_str_function_returns_drop_safe_value(self.expr_function_target(expr_id), depth + 1);
+    }
+
+    public fn primitive_str_function_returns_drop_safe_value(self, fn_id: i32, depth: i32) -> bool {
+        if (fn_id < 1 || fn_id > self.primitive_str_return_cache_cap || depth > 32
+            || self.unit.function_record(fn_id) == null
+            || self.type_kind(self.unit.function_return_type(fn_id)) != ty_STRING()
+            || self.unit.function_body(fn_id) == hir_id_invalid()) {
+            return false;
+        }
+        let cached = ast_read_i32(ptr_offset(self.primitive_str_return_cache, ((fn_id as i64) - 1) * 4));
+        if (cached == 0 || cached == 1) {
+            g_hor_n_psfrds_hit = g_hor_n_psfrds_hit + 1;
+            return cached == 1;
+        }
+        let gh_t0 = vyx_bootstrap_now_ms();
+        g_hor_n_psfrds = g_hor_n_psfrds + 1;
+        // A recursive result flow cannot establish fresh ownership without a
+        // concrete base case already cached by an outer analysis round.
+        if (cached == -2) { return false; }
+        ast_write_i32(ptr_offset(self.primitive_str_return_cache, ((fn_id as i64) - 1) * 4), -2);
+        var saw_return = false;
+        var safe = true;
+        var stmt_id: i32 = 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            g_hor_it_psfrds_stmts = g_hor_it_psfrds_stmts + 1;
+            if (self.unit.stmt_function(stmt_id) == fn_id
+                && self.unit.stmt_kind(stmt_id) == hir_stmt_return()) {
+                saw_return = true;
+                if (!self.primitive_str_expr_is_drop_safe(self.unit.stmt_expr(stmt_id), depth + 1)) {
+                    safe = false;
+                    break;
+                }
+            }
+            stmt_id = stmt_id + 1;
+        }
+        if (!saw_return) { safe = false; }
+        if (safe) {
+            ast_write_i32(ptr_offset(self.primitive_str_return_cache, ((fn_id as i64) - 1) * 4), 1);
+        } else {
+            ast_write_i32(ptr_offset(self.primitive_str_return_cache, ((fn_id as i64) - 1) * 4), 0);
+        }
+        g_hor_ms_psfrds = g_hor_ms_psfrds + (vyx_bootstrap_now_ms() - gh_t0);
+        return safe;
+    }
+
+    public fn clear_primitive_str_return_cache(self) {
+        if (self.primitive_str_return_cache == null) { return; }
+        let gh_t0 = vyx_bootstrap_now_ms();
+        var i: i32 = 0;
+        while (i < self.primitive_str_return_cache_cap) {
+            ast_write_i32(ptr_offset(self.primitive_str_return_cache, (i as i64) * 4), -1);
+            i = i + 1;
+        }
+        g_hor_ms_clear = g_hor_ms_clear + (vyx_bootstrap_now_ms() - gh_t0);
+    }
+
+    public fn primitive_str_auto_drop_local_for_expr(self, expr_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid() || self.unit.expr_kind(expr_id) != ex_IDENT()) {
+            return hir_id_invalid();
+        }
+        if (self.unit.expr_target_kind(expr_id) != hir_target_local()) {
+            return hir_id_invalid();
+        }
+        let local_id = self.unit.expr_target_id(expr_id);
+        if (local_id == hir_id_invalid()
+            || (self.unit.local_flags(local_id) & hir_local_flag_auto_drop()) == 0) {
+            return hir_id_invalid();
+        }
+        return self.unit.local_drop_function(local_id);
+    }
+
+    public fn primitive_str_drop_function_for_expr(self, expr_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid()
+            || self.type_kind(self.unit.expr_type(expr_id)) != ty_STRING()) {
+            return hir_id_invalid();
+        }
+        let local_drop = self.primitive_str_auto_drop_local_for_expr(expr_id);
+        if (local_drop != hir_id_invalid()) { return local_drop; }
+        if (self.primitive_str_expr_is_drop_safe(expr_id, 0)) {
+            return self.primitive_str_drop_function();
+        }
+        return hir_id_invalid();
+    }
+
+    public fn mark_expr_result_moved(self, expr_id: i32) {
+        if (expr_id == hir_id_invalid()) { return; }
+        let drop_fn = self.drop_function_for_expr(expr_id);
+        if (drop_fn == hir_id_invalid()) { return; }
+        self.mark_expr_moved(expr_id, drop_fn);
+        self.marked_return_moves = self.marked_return_moves + 1;
+
+        let kind = self.unit.expr_kind(expr_id);
+        if (kind == ex_CAST()) {
+            self.mark_expr_result_moved(self.unit.expr_lhs(expr_id));
+            return;
+        }
+        if (kind == ex_IF_EXPR()) {
+            self.mark_expr_result_moved(self.unit.expr_lhs(expr_id));
+            self.mark_expr_result_moved(self.unit.expr_rhs(expr_id));
+            self.mark_expr_result_moved(self.unit.expr_aux(expr_id));
+            return;
+        }
+        if (kind == ex_TERNARY()) {
+            self.mark_expr_result_moved(self.unit.expr_rhs(expr_id));
+            self.mark_expr_result_moved(self.unit.expr_aux(expr_id));
+            return;
+        }
+    }
+
+    public fn mark_stmt_ownership(self, stmt_id: i32) {
+        if (stmt_id == hir_id_invalid()) { return; }
+        let fn_id = self.unit.stmt_function(stmt_id);
+        if (!self.function_needs_closed_body(fn_id)) { return; }
+        if (self.unit.stmt_kind(stmt_id) == hir_stmt_return()) {
+            self.mark_expr_result_moved(self.unit.stmt_expr(stmt_id));
+        }
+    }
+
+    public fn mark_call_argument_for_param(self, arg_expr: i32, param_local: i32) {
+        if (arg_expr == hir_id_invalid() || param_local == hir_id_invalid()) { return; }
+        let param_flags = self.unit.local_flags(param_local);
+        let drop_fn = self.unit.local_drop_function(param_local);
+        if ((param_flags & hir_local_flag_move_arg()) != 0) {
+            self.mark_expr_moved(arg_expr, drop_fn);
+            self.marked_call_args = self.marked_call_args + 1;
+            return;
+        }
+        self.mark_expr_borrowed(arg_expr);
+    }
+
+    public fn mark_call_ownership(self, call_expr_id: i32) {
+        let target_fn = self.expr_function_target(call_expr_id);
+        if (target_fn == hir_id_invalid()) { return; }
+        let receiver = self.call_receiver_expr(call_expr_id);
+        var param_index: i32 = 0;
+        if (self.call_has_receiver_param(target_fn, receiver)) {
+            self.mark_call_argument_for_param(receiver, self.function_param_local_at(target_fn, 0));
+            param_index = 1;
+        }
+        var arg = self.unit.expr_first_arg(call_expr_id);
+        var guard: i32 = 0;
+        while (arg != hir_id_invalid() && guard <= self.unit.expr_count) {
+            self.mark_call_argument_for_param(arg, self.function_param_local_at(target_fn, param_index));
+            arg = self.unit.expr_next_arg(arg);
+            param_index = param_index + 1;
+            guard = guard + 1;
+        }
+    }
+
+    public fn resolve_expr(self, expr_id: i32) {
+        if (expr_id == hir_id_invalid()) { return; }
+        let category = self.value_category_for_expr(expr_id);
+        self.unit.set_expr_value_category(expr_id, category);
+        self.categorized_exprs = self.categorized_exprs + 1;
+        if (category == hir_value_cat_place()) {
+            self.unit.set_expr_move_drop_flags(expr_id,
+                                              self.unit.expr_move_drop_flags(expr_id)
+                                              | hir_move_drop_flag_read_place());
+        }
+        if (self.unit.expr_kind(expr_id) == ex_CALL()) {
+            self.mark_call_ownership(expr_id);
+        }
+        let drop_fn = self.drop_function_for_expr(expr_id);
+        if (drop_fn != hir_id_invalid()) {
+            self.unit.set_expr_drop_function(expr_id, drop_fn);
+            self.unit.set_expr_move_drop_flags(expr_id,
+                                              self.unit.expr_move_drop_flags(expr_id)
+                                              | hir_move_drop_flag_has_drop());
+            self.bound_drop_exprs = self.bound_drop_exprs + 1;
+        }
+    }
+
+    public fn validate_expr(self, expr_id: i32) {
+        let fn_id = self.unit.expr_function(expr_id);
+        if (!self.function_needs_closed_body(fn_id)) { return; }
+        let cat = self.unit.expr_value_category(expr_id);
+        if (cat != hir_value_cat_place() && cat != hir_value_cat_value()) {
+            self.record_error("expr " + self.id_text(expr_id)
+                              + " in function " + self.id_text(fn_id)
+                              + " has no value category");
+        }
+        let drop_fn = self.unit.expr_drop_function(expr_id);
+        if (drop_fn != hir_id_invalid()
+            && (drop_fn < 1
+                || drop_fn > self.unit.function_count
+                || self.unit.function_record(drop_fn) == null)) {
+            self.record_error("expr " + self.id_text(expr_id)
+                              + " references invalid drop function "
+                              + self.id_text(drop_fn));
+        }
+    }
+
+    public fn run_range(self, expr_start: i32, stmt_start: i32) -> i32 {
+        // Local lifetime ownership is established only by HirUnitBuilder's
+        // source-level escape proof.  This resolver may classify expression
+        // temporaries, but an initializer-only HIR scan cannot prove that a
+        // local is safe to destroy: later assignments, calls, borrows,
+        // captures and returns may turn it into an alias.  Never promote an
+        // unmarked local here.
+        self.clear_primitive_str_return_cache();
+        g_hor_n_range = g_hor_n_range + 1;
+        let gh_t0 = vyx_bootstrap_now_ms();
+        var expr_id: i32 = expr_start + 1;
+        while (expr_id <= self.unit.expr_count) {
+            if (self.unit.expr_record(expr_id) != null) {
+                self.resolve_expr(expr_id);
+            }
+            expr_id = expr_id + 1;
+        }
+        let gh_t1 = vyx_bootstrap_now_ms();
+        g_hor_ms_l1 = g_hor_ms_l1 + (gh_t1 - gh_t0);
+        var stmt_id: i32 = stmt_start + 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            if (self.unit.stmt_record(stmt_id) != null) {
+                self.mark_stmt_ownership(stmt_id);
+            }
+            stmt_id = stmt_id + 1;
+        }
+        let gh_t2 = vyx_bootstrap_now_ms();
+        g_hor_ms_l2 = g_hor_ms_l2 + (gh_t2 - gh_t1);
+        expr_id = expr_start + 1;
+        while (expr_id <= self.unit.expr_count) {
+            if (self.unit.expr_record(expr_id) != null) {
+                self.validate_expr(expr_id);
+            }
+            expr_id = expr_id + 1;
+        }
+        g_hor_ms_l3 = g_hor_ms_l3 + (vyx_bootstrap_now_ms() - gh_t2);
+        if ((g_hor_n_range % 256) == 0) { hor_prof_dump(); }
+        if (self.print_summary) {
+            print("[hir-ownership] exprs=" + policy_i64_to_string(self.categorized_exprs as i64)
+                  + " call_args=" + policy_i64_to_string(self.marked_call_args as i64)
+                  + " return_moves=" + policy_i64_to_string(self.marked_return_moves as i64)
+                  + " drop_exprs=" + policy_i64_to_string(self.bound_drop_exprs as i64)
+                  + " errors=" + policy_i64_to_string(self.errors as i64));
+        }
+        return self.errors;
+    }
+
+    public fn run(self) -> i32 {
+        return self.run_range(0, 0);
+    }
+}
+
+public fn hir_ownership_resolve_unit(h: HirUnit) -> i32 {
+    // The `[hir-ownership]` summary is auditing evidence (VYX_PHASE_SUMMARY=1).
+    if (!policy_phase_summary_enabled()) {
+        return hir_ownership_resolve_unit_silent(h);
+    }
+    let resolver = HirOwnershipResolver.create(h);
+    let out = resolver.run();
+    resolver.dispose();
+    return out;
+}
+
+public fn hir_ownership_resolve_unit_range_silent(h: HirUnit, expr_start: i32, stmt_start: i32) -> i32 {
+    let resolver = HirOwnershipResolver.create_silent(h);
+    let out = resolver.run_range(expr_start, stmt_start);
+    resolver.dispose();
+    return out;
+}
+
+
+public fn hir_ownership_resolve_unit_silent(h: HirUnit) -> i32 {
+    let resolver = HirOwnershipResolver.create_silent(h);
+    let out = resolver.run();
+    resolver.dispose();
+    return out;
+}

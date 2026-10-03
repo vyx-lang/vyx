@@ -1,0 +1,1771 @@
+module bootstrap.policy;
+
+use std.string;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn getenv(name: rawptr) -> rawptr;
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn strlen(s: rawptr) -> u64;
+    fn strstr(haystack: rawptr, needle: rawptr) -> rawptr;
+    fn vyx_string_contains(hay: rawptr, hay_len: u64, needle: rawptr, needle_len: u64) -> i32;
+    fn vyx_rt_normalize_target_triple(triple: rawptr,
+                                      triple_len: u64,
+                                      buf: rawptr,
+                                      cap: u64) -> u64;
+    fn vyx_rt_default_target_triple(buf: rawptr, cap: u64) -> u64;
+    fn vyx_rt_validate_target_triple(triple: rawptr,
+                                     triple_len: u64,
+                                     buf: rawptr,
+                                     cap: u64) -> u64;
+    fn vyx_alloc_string_len(len: i64) -> rawptr;
+    fn vyx_dup_bytes_raw(s: rawptr, len: i64) -> rawptr;
+    fn vyx_intern_bytes(s: rawptr, len: i64) -> rawptr;
+    fn vyx_intern_concat2(a: rawptr, alen: i64, b: rawptr, blen: i64) -> rawptr;
+    fn vyx_intern_concat3(a: rawptr, alen: i64, b: rawptr, blen: i64, c: rawptr, clen: i64) -> rawptr;
+    fn vyx_intern_concat4(a: rawptr, alen: i64, b: rawptr, blen: i64, c: rawptr, clen: i64, d: rawptr, dlen: i64) -> rawptr;
+}
+
+fn policy_intern_str_view(p: rawptr) -> string {
+    if (p == null) { return ""; }
+    return from_cstr_view_len(p, strlen(p) as i64);
+}
+
+fn policy_env_raw(name: string) -> string {
+    let p = getenv(name.c_str());
+    if (p == null) { return ""; }
+    return from_cstr_view_len(p, strlen(p) as i64);
+}
+
+// ── Phase-summary gate ──────────────────────────────────────────────
+// `[S3 solver]`, `[hir-facts]`, `[hir-resolve]`, `[hir-ownership]`,
+// `[hir2-verify]` and `[llvm-cgu]` are auditing evidence for compiler
+// development, not build output.  They stay silent unless the caller opts
+// in, so a normal build shows progress and diagnostics only.  Set
+// VYX_PHASE_SUMMARY=1 to get them back.
+var g_policy_phase_summary_on: i32 = -1;
+
+public fn policy_phase_summary_enabled() -> bool {
+    if (g_policy_phase_summary_on < 0) {
+        let v = policy_env_raw("VYX_PHASE_SUMMARY").trim();
+        if (v.len > 0 && v != "0" && v != "false" && v != "FALSE") {
+            g_policy_phase_summary_on = 1;
+        } else {
+            g_policy_phase_summary_on = 0;
+        }
+    }
+    return g_policy_phase_summary_on == 1;
+}
+
+// ── CGU phase-split gate ────────────────────────────────────────────
+// The per-function codegen path is split into explicit phases (materialise /
+// optimise / lower / release) so the lowering stage can later move off the
+// materialisation thread.  Timing those phases costs two clock reads per
+// function per phase, so the counters only advance for a developer who sets
+// VYX_CGU_PHASES=1.  The summary is printed by the streaming driver under
+// the `[llvm-cgu] phases` tag.
+var g_policy_cgu_phases_on: i32 = -1;
+
+public fn policy_cgu_phases_enabled() -> bool {
+    if (g_policy_cgu_phases_on < 0) {
+        let v = policy_env_raw("VYX_CGU_PHASES").trim();
+        if (v.len > 0 && v != "0" && v != "false" && v != "FALSE") {
+            g_policy_cgu_phases_on = 1;
+        } else {
+            g_policy_cgu_phases_on = 0;
+        }
+    }
+    return g_policy_cgu_phases_on == 1;
+}
+
+// ── retained collect bodies ───────────────────────────────────────────
+// The multi-CGU path materialises every function body twice: once in the
+// collect walk that feeds the partition, once in the emit walk that lowers it.
+// Keeping the collect walk's bodies in the arena lets the emit walk reuse them
+// and skip the second materialisation entirely -- measured on
+// tests/projects/industrial_mir_stress: codegen 945ms -> 710ms, body build
+// 672ms -> 384ms.
+//
+// It is OFF by default.  Two reasons, both blocking rather than stylistic:
+//   1. The arena then grows monotonically instead of being rewound per
+//      function, and `MirUnit` is a *value* type holding owning raw pointers
+//      (`block_buf` and friends, reallocated on growth).  Every `self.m =
+//      builder.unit` copy is a dangling pointer waiting to happen, and the
+//      current code is not audited for that.  Small projects survive because
+//      they rarely grow past the high-water mark; large ones would not.
+//   2. It cannot be validated at scale right now: self-hosting crashes with an
+//      access violation while compiling `src/core/main.vyx`, with or without
+//      this flag, so there is no large workload to compare against.
+var g_policy_cgu_retain_on: i32 = -1;
+
+public fn policy_cgu_retain_enabled() -> bool {
+    if (g_policy_cgu_retain_on < 0) {
+        let v = policy_env_raw("VYX_CGU_RETAIN").trim();
+        if (v == "1" || v == "true" || v == "TRUE") {
+            g_policy_cgu_retain_on = 1;
+        } else {
+            g_policy_cgu_retain_on = 0;
+        }
+    }
+    return g_policy_cgu_retain_on == 1;
+}
+
+// ── dyn-materialization probe gate ──────────────────────────────────
+// `[dyn-probe]` traces why a `dyn` interface implementation could not be
+// resolved (candidate list + first failing match step).  It is an
+// investigation aid, far too verbose for a normal run, so it needs its own
+// switch rather than riding on VYX_PHASE_SUMMARY.
+var g_policy_dyn_probe_on: i32 = -1;
+
+public fn policy_dyn_probe_enabled() -> bool {
+    if (g_policy_dyn_probe_on < 0) {
+        let v = policy_env_raw("VYX_DYN_PROBE").trim();
+        if (v.len > 0 && v != "0" && v != "false" && v != "FALSE") {
+            g_policy_dyn_probe_on = 1;
+        } else {
+            g_policy_dyn_probe_on = 0;
+        }
+    }
+    return g_policy_dyn_probe_on == 1;
+}
+
+public fn intern_cat2(a: string, b: string) -> string {
+    return policy_intern_str_view(vyx_intern_concat2(a.c_str(), a.len, b.c_str(), b.len));
+}
+
+public fn intern_cat3(a: string, b: string, c: string) -> string {
+    return policy_intern_str_view(vyx_intern_concat3(a.c_str(), a.len, b.c_str(), b.len, c.c_str(), c.len));
+}
+
+public fn intern_cat4(a: string, b: string, c: string, d: string) -> string {
+    return policy_intern_str_view(vyx_intern_concat4(a.c_str(), a.len, b.c_str(), b.len, c.c_str(), c.len, d.c_str(), d.len));
+}
+
+public fn intern_pipe_eq(name: string) -> string {
+    return intern_cat3("|", name, "=");
+}
+
+public fn intern_dot(a: string, b: string) -> string {
+    return intern_cat3(a, ".", b);
+}
+
+public fn intern_view(s: string) -> string {
+    return intern_cat2("", s);
+}
+
+public fn str_view_range(s: string, start: i64, end: i64) -> string {
+    if (s.len <= 0) { return ""; }
+    var lo = start;
+    var hi = end;
+    if (lo < 0) { lo = 0; }
+    if (hi > s.len) { hi = s.len; }
+    if (lo >= hi) { return ""; }
+    return from_cstr_view_len(policy_ptr_offset(s.c_str(), lo as i32), hi - lo);
+}
+
+fn policy_ptr_offset(ptr: rawptr, offset: i32) -> rawptr {
+    return (ptr as i64 + offset as i64) as rawptr;
+}
+
+fn policy_write_rawptr(addr: rawptr, value: rawptr) {
+    var v: rawptr = value;
+    memcpy(addr, to_rawptr(&v), 8);
+}
+
+fn policy_read_rawptr(addr: rawptr) -> rawptr {
+    var v: rawptr = null;
+    memcpy(to_rawptr(&v), addr, 8);
+    return v;
+}
+
+fn policy_write_i64(addr: rawptr, value: i64) {
+    var v: i64 = value;
+    memcpy(addr, to_rawptr(&v), 8);
+}
+
+fn policy_read_i64(addr: rawptr) -> i64 {
+    var v: i64 = 0;
+    memcpy(to_rawptr(&v), addr, 8);
+    return v;
+}
+
+fn policy_slice_len(ptr: rawptr, len: i64) -> i64 {
+    if (ptr == null) { return 0; }
+    if (len < 0) { return strlen(ptr) as i64; }
+    return len;
+}
+
+fn policy_empty_raw() -> rawptr {
+    let out = malloc(1);
+    if (out != null) { memcpy(out, "".c_str(), 1); }
+    return out;
+}
+
+fn policy_dup_slice(ptr: rawptr, len: i64) -> rawptr {
+    let n = policy_slice_len(ptr, len);
+    if (ptr == null || n <= 0) { return policy_empty_raw(); }
+    let out = malloc((n + 1) as u64);
+    if (out == null) { return null; }
+    memcpy(out, ptr, n as u64);
+    memcpy(out + n, "".c_str(), 1);
+    return out;
+}
+
+public fn policy_slice_to_string(ptr: rawptr, len: i64) -> string {
+    let n = policy_slice_len(ptr, len);
+    if (ptr == null || n <= 0) { return ""; }
+    return from_cstr_len(ptr, n);
+}
+
+fn policy_target_contains(target: string, needle: string) -> bool {
+    if (target.len == 0 || needle.len == 0) { return false; }
+    return vyx_string_contains(target.c_str(), target.len as u64, needle.c_str(), needle.len as u64) != 0;
+}
+
+fn policy_target_segment(target: string, index: i32) -> string {
+    if (target.len == 0 || index < 0) { return ""; }
+    var segment_index: i32 = 0;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= target.len) {
+        if (i == target.len || target.charAt(i) == 45) {
+            if (segment_index == index) { return target.substring(start, i); }
+            segment_index = segment_index + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Normalize an LLVM target while keeping complete raw triples first-class.
+/// LLVM itself owns token interpretation, including vendor-less
+/// `arch-os[-env]` inputs, so policy cannot drift from the linked LLVM.
+public fn policy_target_canonical_triple(target: string) -> string {
+    var structured = target.trim();
+    if (structured.len == 0) { return ""; }
+    if (structured == "x64_windows") { structured = "x86_64-windows-msvc"; }
+    if (structured == "x64_linux") { structured = "x86_64-linux-gnu"; }
+    if (structured == "arm64_linux") { structured = "aarch64-linux-gnu"; }
+    if (structured == "arm64_android") { structured = "aarch64-linux-android23"; }
+    let required = vyx_rt_normalize_target_triple(structured.c_str(),
+                                                   structured.len as u64,
+                                                   null,
+                                                   0);
+    if (required == 0) { return ""; }
+    let buf = malloc(required + 1);
+    if (buf == null) { return structured; }
+    let written = vyx_rt_normalize_target_triple(structured.c_str(),
+                                                  structured.len as u64,
+                                                  buf,
+                                                  required + 1);
+    var out: string = "";
+    if (written > 0) { out = from_cstr_len(buf, written as i64); }
+    free(buf);
+    return out;
+}
+
+/// Return an LLVM TargetRegistry diagnostic, or an empty string when the
+/// canonical triple is backed by a target compiled into this LLVM SDK.
+public fn policy_target_validation_error(target: string) -> string {
+    let triple = policy_target_canonical_triple(target);
+    if (triple.len == 0) { return "empty target triple"; }
+    let required = vyx_rt_validate_target_triple(triple.c_str(),
+                                                  triple.len as u64,
+                                                  null,
+                                                  0);
+    if (required == 0) { return ""; }
+    let buf = malloc(required + 1);
+    if (buf == null) { return "LLVM target lookup failed"; }
+    let written = vyx_rt_validate_target_triple(triple.c_str(),
+                                                 triple.len as u64,
+                                                 buf,
+                                                 required + 1);
+    var out = "LLVM target lookup failed";
+    if (written > 0) { out = from_cstr_len(buf, written as i64); }
+    free(buf);
+    return out;
+}
+
+/// Return the platform selected by an alias or raw target triple.
+/// Android is checked before Linux because Android triples contain `linux`.
+public fn policy_target_platform_name(target: string) -> string {
+    let t = policy_target_canonical_triple(target).trim();
+    if (t.len == 0) { return ""; }
+    if (t == "android" || policy_target_contains(t.clone(), "android")) {
+        return "android";
+    }
+    if (t == "windows" || t == "win32" || t == "msvc"
+        || policy_target_contains(t.clone(), "windows")
+        || policy_target_contains(t.clone(), "mingw")
+        || policy_target_contains(t.clone(), "msvc")) {
+        return "windows";
+    }
+    if (t == "macos" || t == "darwin" || t == "apple"
+        || policy_target_contains(t.clone(), "darwin")
+        || policy_target_contains(t.clone(), "apple")) {
+        return "macos";
+    }
+    if (t == "linux" || policy_target_contains(t.clone(), "linux")) {
+        return "linux";
+    }
+    // LLVM triples normally spell the OS in the third component. Two-part
+    // triples such as `wasm32-wasi` use the second component instead.
+    let os = policy_target_segment(t.clone(), 2);
+    if (os.len > 0) { return os; }
+    let short_os = policy_target_segment(t.clone(), 1);
+    if (short_os.len > 0) { return short_os; }
+    return t;
+}
+
+/// Return the stable architecture spelling used by target aliases.
+public fn policy_target_arch_name(target: string) -> string {
+    let t = policy_target_canonical_triple(target).trim();
+    if (t.startsWith("x86_64") || t.startsWith("amd64") || t == "x64") {
+        return "x64";
+    }
+    if (t.startsWith("aarch64") || t.startsWith("arm64")) {
+        return "arm64";
+    }
+    if (t.startsWith("i386") || t.startsWith("i486")
+        || t.startsWith("i586") || t.startsWith("i686") || t == "x86") {
+        return "x86";
+    }
+    if (t.startsWith("arm")) { return "arm"; }
+    // Preserve LLVM's architecture token for targets outside the convenience
+    // aliases, e.g. `riscv64`, `wasm32`, or `powerpc64le`.
+    return policy_target_segment(t, 0);
+}
+
+/// Return the stable toolchain spelling used by manifest suffixes and the
+/// conventional `libs/<os>/<arch>/<toolchain>` search tree.  This is a
+/// linker/toolchain identity rather than the source language frontend name.
+public fn policy_target_compiler_name(target: string) -> string {
+    let t = policy_target_canonical_triple(target).trim();
+    if (t.len == 0) { return ""; }
+    if (policy_target_contains(t.clone(), "android")) { return "ndk"; }
+    if (policy_target_contains(t.clone(), "msvc")) { return "msvc"; }
+    if (policy_target_contains(t.clone(), "mingw")) { return "mingw"; }
+    if (policy_target_contains(t.clone(), "musl")) { return "musl"; }
+    if (policy_target_contains(t.clone(), "gnu")) { return "gnu"; }
+    if (policy_target_contains(t.clone(), "darwin")
+        || policy_target_contains(t.clone(), "apple")) {
+        return "clang";
+    }
+    if (policy_target_contains(t.clone(), "wasi")) { return "wasi"; }
+    // Preserve an unknown environment token so custom LLVM triples can still
+    // select an explicit manifest branch without compiler changes.
+    var last: string = "";
+    var index: i32 = 0;
+    while (index < 8) {
+        let segment = policy_target_segment(t.clone(), index);
+        if (segment.len == 0) { break; }
+        last = segment;
+        index = index + 1;
+    }
+    return last;
+}
+
+/// Resolve the command-line target or the normalized build host when no
+/// explicit cross target was requested.
+public fn policy_effective_target_triple() -> string {
+    let requested = policy_cli_target_triple();
+    if (requested.len > 0) { return requested; }
+    return policy_host_target_triple();
+}
+
+fn policy_cli_is_manifest_build() -> bool {
+    if (argCount() < 2 || getArg(1) != "build") { return false; }
+    var i: i32 = 2;
+    while (i < argCount()) {
+        if (getArg(i).startsWith("--src=")) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn policy_cli_option_value(long_name: string, legacy_name: string) -> string {
+    let argc = argCount();
+    var i: i32 = 1;
+    while (i < argc) {
+        let a = getArg(i);
+        if (a == "--") { return ""; }
+        if ((a == long_name || (legacy_name.len > 0 && a == legacy_name)) && i + 1 < argc) {
+            return getArg(i + 1);
+        }
+        let long_prefix = long_name + "=";
+        if (a.startsWith(long_prefix)) { return a.substring(long_prefix.len, a.len); }
+        if (legacy_name.len > 0) {
+            let legacy_prefix = legacy_name + "=";
+            if (a.startsWith(legacy_prefix)) { return a.substring(legacy_prefix.len, a.len); }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Manifest target selected by `vyxc build --target <name>`. Direct compiler
+/// invocations retain the historical `--target <triple>` compatibility form.
+public fn policy_cli_requested_build_target() -> string {
+    if (!policy_cli_is_manifest_build()) { return ""; }
+    return policy_cli_option_value("--target", "");
+}
+
+/// Backend target selected by the canonical `--triplet` option. Outside a
+/// manifest build, the historical `--target/-target` spelling remains an
+/// accepted alias so direct compiler integrations do not break.
+public fn policy_cli_requested_triplet() -> string {
+    let explicit = policy_cli_option_value("--triplet", "");
+    if (explicit.len > 0) { return explicit; }
+    if (policy_cli_is_manifest_build()) { return ""; }
+    return policy_cli_option_value("--target", "-target");
+}
+
+/// Compatibility accessor used throughout the backend. It now always means
+/// the LLVM/backend triplet, never a manifest target name.
+public fn policy_cli_requested_target() -> string {
+    return policy_cli_requested_triplet();
+}
+
+/// Find and canonicalize the command-line target for backend consumption.
+public fn policy_cli_target_triple() -> string {
+    return policy_target_canonical_triple(policy_cli_requested_triplet());
+}
+
+/// Return LLVM's normalized build-host triple when no explicit target exists.
+public fn policy_host_target_triple() -> string {
+    let required = vyx_rt_default_target_triple(null, 0);
+    if (required == 0) { return ""; }
+    let buf = malloc(required + 1);
+    if (buf == null) { return ""; }
+    let written = vyx_rt_default_target_triple(buf, required + 1);
+    var out: string = "";
+    if (written > 0) { out = from_cstr_len(buf, written as i64); }
+    free(buf);
+    return out;
+}
+
+@[borrow_args]
+fn policy_raw_eq(ptr: rawptr, len: i64, lit: string) -> bool {
+    if (ptr == null) { return false; }
+    if (len != lit.len) { return false; }
+    if (len == 0) { return true; }
+    return memcmp(ptr, lit.c_str(), len as u64) == 0;
+}
+
+public fn policy_primitive_type_kind_raw(s: rawptr, len: i64) -> i32 {
+    if (s == null || len <= 0) { return 0; }
+    if (len == 2) {
+        if (policy_raw_eq(s, len, "i8")) { return 1; }
+        if (policy_raw_eq(s, len, "u8")) { return 5; }
+        return 0;
+    }
+    if (len == 3) {
+        if (policy_raw_eq(s, len, "str")) { return 13; }
+        if (policy_raw_eq(s, len, "i16")) { return 2; }
+        if (policy_raw_eq(s, len, "i32")) { return 3; }
+        if (policy_raw_eq(s, len, "i64")) { return 4; }
+        if (policy_raw_eq(s, len, "u16")) { return 6; }
+        if (policy_raw_eq(s, len, "u32")) { return 7; }
+        if (policy_raw_eq(s, len, "u64")) { return 8; }
+        if (policy_raw_eq(s, len, "f32")) { return 16; }
+        if (policy_raw_eq(s, len, "f64")) { return 17; }
+        return 0;
+    }
+    if (len == 4) {
+        if (policy_raw_eq(s, len, "bool")) { return 11; }
+        if (policy_raw_eq(s, len, "char")) { return 12; }
+        if (policy_raw_eq(s, len, "void")) { return 15; }
+        return 0;
+    }
+    if (len == 5) {
+        if (policy_raw_eq(s, len, "isize")) { return 9; }
+        if (policy_raw_eq(s, len, "usize")) { return 10; }
+        return 0;
+    }
+    if (len == 6) {
+        if (policy_raw_eq(s, len, "string")) { return 13; }
+        if (policy_raw_eq(s, len, "rawptr")) { return 14; }
+        return 0;
+    }
+    return 0;
+}
+
+@[borrow_args]
+public fn policy_primitive_type_kind(s: string) -> i32 {
+    return policy_primitive_type_kind_raw(s.c_str(), s.len);
+}
+
+@[borrow_args]
+public fn policy_keyword_kind(s: string) -> i32 {
+    let len = s.len;
+    if (len <= 0) { return 5; }
+    if (len == 2) {
+        if (s == "fn") { return 6; }
+        if (s == "if") { return 20; }
+        if (s == "as") { return 47; }
+        if (s == "i8") { return 61; }
+        if (s == "u8") { return 65; }
+        if (s == "is") { return 79; }
+        if (s == "in") { return 80; }
+        return 5;
+    }
+    if (len == 3) {
+        if (s == "let") { return 7; }
+        if (s == "var") { return 8; }
+        if (s == "use") { return 17; }
+        if (s == "for") { return 24; }
+        if (s == "mut") { return 37; }
+        if (s == "new") { return 5; }
+        if (s == "asm") { return 60; }
+        if (s == "i16") { return 62; }
+        if (s == "i32") { return 63; }
+        if (s == "i64") { return 64; }
+        if (s == "u16") { return 66; }
+        if (s == "u32") { return 67; }
+        if (s == "u64") { return 68; }
+        if (s == "f32") { return 69; }
+        if (s == "f64") { return 70; }
+        return 5;
+    }
+    if (len == 4) {
+        if (s == "true") { return 4; }
+        if (s == "enum") { return 12; }
+        if (s == "impl") { return 14; }
+        if (s == "elif") { return 21; }
+        if (s == "else") { return 22; }
+        if (s == "case") { return 27; }
+        if (s == "null") { return 35; }
+        if (s == "self") { return 36; }
+        if (s == "task") { return 45; }
+        if (s == "fail") { return 46; }
+        if (s == "type") { return 50; }
+        if (s == "when") { return 77; }
+        if (s == "bool") { return 71; }
+        if (s == "char") { return 72; }
+        if (s == "void") { return 76; }
+        return 5;
+    }
+    if (len == 5) {
+        if (s == "false") { return 4; }
+        if (s == "class") { return 10; }
+        if (s == "error") { return 13; }
+        if (s == "while") { return 23; }
+        if (s == "match") { return 26; }
+        if (s == "break") { return 30; }
+        if (s == "yield") { return 32; }
+        if (s == "async") { return 43; }
+        if (s == "await") { return 44; }
+        if (s == "const") { return 49; }
+        if (s == "defer") { return 52; }
+        if (s == "bench") { return 55; }
+        if (s == "trait") { return 11; }
+        if (s == "where") { return 57; }
+        if (s == "macro") { return 78; }
+        if (s == "isize") { return 73; }
+        if (s == "usize") { return 74; }
+        return 5;
+    }
+    if (len == 6) {
+        if (s == "struct") { return 9; }
+        if (s == "import") { return 15; }
+        if (s == "module") { return 16; }
+        if (s == "export") { return 18; }
+        if (s == "extern") { return 19; }
+        if (s == "return") { return 29; }
+        if (s == "public") { return 38; }
+        if (s == "static") { return 48; }
+        if (s == "unsafe") { return 59; }
+        if (s == "rawptr") { return 75; }
+        return 5;
+    }
+    if (len == 7) {
+        if (s == "default") { return 28; }
+        if (s == "private") { return 39; }
+        if (s == "newtype") { return 51; }
+        if (s == "concept") { return 56; }
+        if (s == "foreach") { return 25; }
+        return 5;
+    }
+    if (len == 8) {
+        if (s == "continue") { return 31; }
+        if (s == "internal") { return 40; }
+        if (s == "override") { return 42; }
+        if (s == "comptime") { return 54; }
+        if (s == "protocol") { return 11; }
+        if (s == "requires") { return 58; }
+        if (s == "volatile") { return 138; }
+        return 5;
+    }
+    if (len == 9) {
+        if (s == "interface") { return 11; }
+        if (s == "protected") { return 41; }
+        return 5;
+    }
+    if (len == 13) {
+        if (s == "static_assert") { return 53; }
+    }
+    return 5;
+}
+
+public fn policy_keyword_kind_raw(s: rawptr, len: i64) -> i32 {
+    return policy_keyword_kind(policy_slice_to_string(s, len));
+}
+
+@[borrow_args]
+public fn policy_string_method_kind(name: string) -> i32 {
+    let len = name.len;
+    if (len <= 0) { return 0; }
+    if (len == 3) {
+        if (name == "len") { return 9; }
+        if (name == "ptr") { return 15; }
+        return 0;
+    }
+    if (len == 4) {
+        if (name == "size") { return 9; }
+        if (name == "trim") { return 5; }
+        return 0;
+    }
+    if (len == 5) {
+        if (name == "c_str") { return 1; }
+        if (name == "clone") { return 2; }
+        if (name == "count") { return 9; }
+        if (name == "equal") { return 0; }
+        return 0;
+    }
+    if (len == 6) {
+        if (name == "charAt") { return 3; }
+        if (name == "substr") { return 4; }
+        if (name == "equals") { return 12; }
+        if (name == "repeat") { return 17; }
+        return 0;
+    }
+    if (len == 7) {
+        if (name == "toUpper") { return 6; }
+        if (name == "toLower") { return 7; }
+        if (name == "replace") { return 8; }
+        if (name == "isEmpty") { return 11; }
+        if (name == "char_at") { return 3; }
+        return 0;
+    }
+    if (len == 8) {
+        if (name == "toString") { return 16; }
+        if (name == "contains") { return 10; }
+        if (name == "is_empty") { return 11; }
+        if (name == "endsWith") { return 14; }
+        if (name == "to_upper") { return 6; }
+        if (name == "to_lower") { return 7; }
+        return 0;
+    }
+    if (len == 9) {
+        if (name == "substring") { return 4; }
+        if (name == "ends_with") { return 14; }
+        return 0;
+    }
+    if (len == 10) {
+        if (name == "startsWith") { return 13; }
+        if (name == "charCodeAt") { return 3; }
+        if (name == "operator==") { return 12; }
+        return 0;
+    }
+    if (len == 11) {
+        if (name == "starts_with") { return 13; }
+        if (name == "operator_eq") { return 12; }
+        return 0;
+    }
+    if (len == 12) {
+        if (name == "char_code_at") { return 3; }
+    }
+    return 0;
+}
+
+public fn policy_string_method_kind_raw(s: rawptr, len: i64) -> i32 {
+    return policy_string_method_kind(policy_slice_to_string(s, len));
+}
+
+// Built-in pointer methods on `*T` / `&T` / `&mut T` / rawptr receivers.
+// Kind values (shared by sema signature resolution and MIR/LLVM lowering):
+//   1 = offset(idx)            element-scaled step
+//   2 = add(idx)               same as offset
+//   3 = sub(idx)               element-scaled backward step
+//   4 = byte_offset(bytes)     unscaled byte step
+//   5 = byte_add(bytes)        unscaled byte step forward
+//   6 = byte_sub(bytes)        unscaled byte step backward
+//   7 = offset_from(other)     element count between two pointers
+//   8 = byte_offset_from(o)    byte distance between two pointers
+public fn policy_pointer_method_kind(name: string) -> i32 {
+    if (name == "offset") { return 1; }
+    if (name == "add") { return 2; }
+    if (name == "sub") { return 3; }
+    if (name == "byte_offset") { return 4; }
+    if (name == "byte_add") { return 5; }
+    if (name == "byte_sub") { return 6; }
+    if (name == "offset_from") { return 7; }
+    if (name == "byte_offset_from") { return 8; }
+    return 0;
+}
+
+@[borrow_args]
+fn policy_generic_turbofish_start(name: string) -> i64 {
+    let n = name.len;
+    var i: i64 = 0;
+    while (i + 2 < n) {
+        if (name.charAt(i as i32) == 58
+            && name.charAt((i + 1) as i32) == 58
+            && name.charAt((i + 2) as i32) == 60) {
+            var depth: i32 = 0;
+            var j: i64 = i + 2;
+            while (j < n) {
+                let ch = name.charAt(j as i32);
+                if (ch == 60) {
+                    depth = depth + 1;
+                } else if (ch == 62
+                           && !(j > 0 && name.charAt((j - 1) as i32) == 45)) {
+                    depth = depth - 1;
+                    if (depth < 0) { return -1; }
+                    if (depth == 0) {
+                        if (j == n - 1) { return i; }
+                        return -1;
+                    }
+                }
+                j = j + 1;
+            }
+            return -1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i + 1 < n) {
+        if (name.charAt(i as i32) == 58
+            && name.charAt((i + 1) as i32) == 60) {
+            var depth2: i32 = 0;
+            var j2: i64 = i + 1;
+            while (j2 < n) {
+                let ch2 = name.charAt(j2 as i32);
+                if (ch2 == 60) {
+                    depth2 = depth2 + 1;
+                } else if (ch2 == 62
+                           && !(j2 > 0 && name.charAt((j2 - 1) as i32) == 45)) {
+                    depth2 = depth2 - 1;
+                    if (depth2 < 0) { return -1; }
+                    if (depth2 == 0) {
+                        if (j2 == n - 1) { return i; }
+                        return -1;
+                    }
+                }
+                j2 = j2 + 1;
+            }
+            return -1;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+@[borrow_args]
+public fn policy_generic_plain_angle_start(name: string) -> i64 {
+    let n = name.len;
+    if (n < 3) { return -1; }
+    if (name.charAt((n - 1) as i32) != 62) { return -1; }
+    var start: i64 = -1;
+    var depth: i32 = 0;
+    var i: i64 = 0;
+    while (i < n) {
+        let ch = name.charAt(i as i32);
+        if (ch == 60) {
+            if (depth == 0 && start < 0) { start = i; }
+            depth = depth + 1;
+        } else if (ch == 62
+                   && !(i > 0 && name.charAt((i - 1) as i32) == 45)) {
+            depth = depth - 1;
+            if (depth < 0) { return -1; }
+            if (depth == 0 && i != n - 1) { return -1; }
+        }
+        i = i + 1;
+    }
+    if (depth != 0) { return -1; }
+    return start;
+}
+
+@[borrow_args]
+fn policy_generic_start(name: string) -> i64 {
+    let tf = policy_generic_turbofish_start(name);
+    if (tf >= 0) { return tf; }
+    return policy_generic_plain_angle_start(name);
+}
+
+@[borrow_args]
+public fn policy_generic_call_base(name: string) -> string {
+    let p = policy_generic_start(name);
+    if (p < 0) { return name; }
+    return name.substring(0, p as i32);
+}
+
+@[borrow_args]
+public fn policy_versioned_call_name(name: string) -> string {
+    var angle_depth: i32 = 0;
+    var i: i32 = 0;
+    while (i < name.len) {
+        let ch = name.charAt(i);
+        if (ch == 60) {
+            angle_depth = angle_depth + 1;
+        } else if (ch == 62 && angle_depth > 0) {
+            angle_depth = angle_depth - 1;
+        } else if (ch == 64 && angle_depth == 0) {
+            return name.substring(0, i);
+        }
+        i = i + 1;
+    }
+    return name;
+}
+
+@[borrow_args]
+public fn policy_versioned_generic_call_base(name: string) -> string {
+    return policy_generic_call_base(policy_versioned_call_name(name));
+}
+
+@[borrow_args]
+public fn policy_versioned_generic_call_args(name: string) -> string {
+    return policy_generic_call_args(policy_versioned_call_name(name));
+}
+
+@[borrow_args]
+public fn policy_generic_call_args(name: string) -> string {
+    let n = name.len;
+    let tf = policy_generic_turbofish_start(name);
+    if (tf >= 0) {
+        if (tf + 1 < n && name.charAt((tf + 1) as i32) == 60) {
+            if (n <= tf + 3) { return ""; }
+            return name.substring((tf + 2) as i32, (n - 1) as i32);
+        }
+        if (n <= tf + 4) { return ""; }
+        return name.substring((tf + 3) as i32, (n - 1) as i32);
+    }
+    let plain = policy_generic_plain_angle_start(name);
+    if (plain >= 0) {
+        if (n <= plain + 2) { return ""; }
+        return name.substring((plain + 1) as i32, (n - 1) as i32);
+    }
+    return "";
+}
+
+@[borrow_args]
+public fn policy_generic_call_has_args(name: string) -> i32 {
+    let n = name.len;
+    let tf = policy_generic_turbofish_start(name);
+    if (tf >= 0) {
+        if (tf + 1 < n && name.charAt((tf + 1) as i32) == 60) {
+            if (n > tf + 3) { return 1; }
+            return 0;
+        }
+        if (n > tf + 4) { return 1; }
+        return 0;
+    }
+    let plain = policy_generic_plain_angle_start(name);
+    if (plain >= 0) {
+        if (n > plain + 2) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+@[borrow_args]
+public fn policy_generic_call_base_equals(name: string, lit: string) -> i32 {
+    let base = policy_generic_call_base(name);
+    if (base == lit) { return 1; }
+    return 0;
+}
+
+public fn policy_generic_call_base_raw(s: rawptr, len: i64) -> rawptr {
+    let text = policy_slice_to_string(s, len);
+    let out = policy_generic_call_base(text);
+    return policy_dup_slice(out.c_str(), out.len);
+}
+
+public fn policy_generic_call_args_raw(s: rawptr, len: i64) -> rawptr {
+    let text = policy_slice_to_string(s, len);
+    let out = policy_generic_call_args(text);
+    return policy_dup_slice(out.c_str(), out.len);
+}
+
+public fn policy_generic_call_has_args_raw(s: rawptr) -> i32 {
+    return policy_generic_call_has_args(policy_slice_to_string(s, -1));
+}
+
+public fn policy_generic_call_base_equals_raw(s: rawptr, lit: rawptr, lit_len: i64) -> i32 {
+    return policy_generic_call_base_equals(policy_slice_to_string(s, -1),
+                                           policy_slice_to_string(lit, lit_len));
+}
+
+@[borrow_args]
+fn policy_last_segment(name: string) -> string {
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i < name.len) {
+        if (name.charAt(i) == 46) { start = i + 1; }
+        i = i + 1;
+    }
+    if (start == 0) { return name; }
+    return name.substring(start, name.len as i32);
+}
+
+/// Exact spelling, no last-segment fold. Use when both names are already
+/// canonical / fully qualified. Last-segment `policy_type_name_equal` is
+/// a WP-ESC bootstrap concession and must not be the DCI hot path.
+@[borrow_args]
+public fn policy_type_name_equal_qualified(a: string, b: string) -> bool {
+    if (a.len <= 0 || b.len <= 0) { return false; }
+    return a == b;
+}
+
+@[borrow_args]
+public fn policy_type_name_equal(a: string, b: string) -> bool {
+    // WP-ESC concession: last dotted segment (and generic base) may match
+    // across namespaces. Self-host still compares `Vec` to `std.collections.Vec`.
+    // New call sites that have a structured id must not use this.
+    if (a.len <= 0 || b.len <= 0) { return false; }
+    if (policy_type_name_equal_qualified(a, b)) { return true; }
+    let an = policy_last_segment(a);
+    let bn = policy_last_segment(b);
+    if (an == bn) { return true; }
+    let ab = policy_generic_call_base(an);
+    if (ab.len == 0) { return false; }
+    let bb = policy_generic_call_base(bn);
+    if (ab != bb) { return false; }
+    return policy_generic_call_args(an) == policy_generic_call_args(bn);
+}
+
+public fn policy_type_name_equal_raw(a: rawptr, a_len: i64, b: rawptr, b_len: i64) -> i32 {
+    if (policy_type_name_equal(policy_slice_to_string(a, a_len),
+                               policy_slice_to_string(b, b_len))) {
+        return 1;
+    }
+    return 0;
+}
+
+@[borrow_args]
+public fn policy_duplicate_flat_helper_allowed(name: string) -> bool {
+    if (name.len < 4) { return false; }
+    let first = name.charAt(0);
+    if (first >= 65 && first <= 90) { return false; }
+    if (first == 97) { return name == "argCount"; }
+    if (first == 102) {
+        return name == "free"
+            || name == "from_cstr"
+            || name == "from_cstr_len"
+            || name == "from_cstr_view_len"
+            || name == "from_raw_string_parts"
+            || name == "fileSize";
+    }
+    if (first == 103) {
+        return name == "getArg"
+            || name == "generic_call_base"
+            || name == "generic_call_args";
+    }
+    if (first == 105) { return name == "int_to_string"; }
+    if (first == 109) {
+        return name == "malloc" || name == "memcpy"
+            || name == "memcmp" || name == "memset";
+    }
+    if (first == 112) {
+        return name == "ptr_offset"
+            || name == "ptr_read_u8"
+            || name == "ptr_read_i32"
+            || name == "ptr_read_i64"
+            || name == "ptr_write_i32"
+            || name == "ptr_write_i64";
+    }
+    if (first == 114) { return name == "readFile"; }
+    if (first == 115) {
+        return name == "strlen" || name == "snprintf"
+            || name == "strncmp" || name == "strstr"
+            || name == "str_length" || name == "string_contains"
+            || name == "system";
+    }
+    if (first == 116) { return name == "to_rawptr"; }
+    if (first == 118) {
+        return name == "vyx_string_len"
+            || name == "vyx_string_equals"
+            || name == "vyx_string_compare"
+            || name == "vyx_string_equals_len"
+            || name == "vyx_string_contains"
+            || name == "vyx_string_index_of"
+            || name == "vyx_string_starts_with"
+            || name == "vyx_string_ends_with"
+            || name == "vyx_note_string_len"
+            || name == "vyx_alloc_string_len"
+            || name == "vyx_dup_bytes_raw"
+            || name == "vyx_string_char_at"
+            || name == "vyx_string_substring"
+            || name == "vyx_string_substring_len"
+            || name == "vyx_string_trim"
+            || name == "vyx_string_clone"
+            || name == "vyx_string_to_upper"
+            || name == "vyx_string_to_lower"
+            || name == "vyx_string_replace"
+            || name == "vyx_string_concat"
+            || name == "vyx_string_concat3"
+            || name == "vyx_string_concat4"
+            || name == "vyx_concat";
+    }
+    return false;
+}
+
+@[borrow_args]
+fn policy_mangle_hex_nibble(value: i32) -> i32 {
+    if (value <= 0) { return 0; }
+    if (value >= 15) { return 15; }
+    return value;
+}
+
+@[borrow_args]
+fn policy_mangle_hi_nibble(value: i32) -> i32 {
+    var n = value;
+    if (n <= 0) { return 0; }
+    var hi: i32 = 0;
+    while (n >= 16 && hi < 15) {
+        n = n - 16;
+        hi = hi + 1;
+    }
+    return policy_mangle_hex_nibble(hi);
+}
+
+@[borrow_args]
+fn policy_mangle_lo_nibble(value: i32) -> i32 {
+    var n = value;
+    if (n <= 0) { return 0; }
+    while (n >= 16) {
+        n = n - 16;
+    }
+    return policy_mangle_hex_nibble(n);
+}
+
+@[borrow_args]
+public fn policy_mangle_part(s: string) -> string {
+    let hex = "0123456789ABCDEF";
+    var out_len: i32 = 0;
+    var i: i32 = 0;
+    while (i < s.len) {
+        let c = s.charAt(i);
+        let is_digit = c >= 48 && c <= 57;
+        let is_upper = c >= 65 && c <= 90;
+        let is_lower = c >= 97 && c <= 122;
+        if (is_digit || is_upper || is_lower) {
+            out_len = out_len + 1;
+        } else {
+            out_len = out_len + 3;
+        }
+        i = i + 1;
+    }
+    if (out_len <= 0) { return ""; }
+    let buf = vyx_alloc_string_len(out_len as i64);
+    if (buf == null) { return ""; }
+    var out_i: i32 = 0;
+    i = 0;
+    while (i < s.len) {
+        let c = s.charAt(i);
+        let is_digit = c >= 48 && c <= 57;
+        let is_upper = c >= 65 && c <= 90;
+        let is_lower = c >= 97 && c <= 122;
+        if (is_digit || is_upper || is_lower) {
+            memcpy(policy_ptr_offset(buf, out_i), s.c_str() + i, 1);
+            out_i = out_i + 1;
+        } else {
+            let hi = policy_mangle_hi_nibble(c);
+            let lo = policy_mangle_lo_nibble(c);
+            memcpy(policy_ptr_offset(buf, out_i), "_".c_str(), 1);
+            memcpy(policy_ptr_offset(buf, out_i + 1), hex.c_str() + hi, 1);
+            memcpy(policy_ptr_offset(buf, out_i + 2), hex.c_str() + lo, 1);
+            out_i = out_i + 3;
+        }
+        i = i + 1;
+    }
+    memcpy(policy_ptr_offset(buf, out_i), "".c_str(), 1);
+    return from_cstr_len(buf, out_len as i64);
+}
+
+public fn policy_mangle_part_raw(s: rawptr, len: i64) -> rawptr {
+    let out = policy_mangle_part(policy_slice_to_string(s, len));
+    return policy_dup_slice(out.c_str(), out.len);
+}
+
+public fn policy_operator_legacy_method_name(name: string) -> string {
+    if (name == "operator+") { return "operator_add"; }
+    if (name == "operator-") { return "operator_sub"; }
+    if (name == "operator*") { return "operator_mul"; }
+    if (name == "operator/") { return "operator_div"; }
+    if (name == "operator%") { return "operator_mod"; }
+    if (name == "operator==") { return "operator_eq"; }
+    if (name == "operator!=") { return "operator_ne"; }
+    if (name == "operator<") { return "operator_lt"; }
+    if (name == "operator>") { return "operator_gt"; }
+    if (name == "operator<=") { return "operator_le"; }
+    if (name == "operator>=") { return "operator_ge"; }
+    if (name == "operator&") { return "operator_band"; }
+    if (name == "operator|") { return "operator_bor"; }
+    if (name == "operator^") { return "operator_bxor"; }
+    if (name == "operator<<") { return "operator_shl"; }
+    if (name == "operator>>") { return "operator_shr"; }
+    if (name == "operator[]") { return "operator_index"; }
+    if (name == "operator=") { return "operator_assign"; }
+    if (name == "operator+=") { return "operator_add_assign"; }
+    if (name == "operator-=") { return "operator_sub_assign"; }
+    if (name == "operator*=") { return "operator_mul_assign"; }
+    if (name == "operator/=") { return "operator_div_assign"; }
+    if (name == "operator%=") { return "operator_mod_assign"; }
+    if (name == "operator&=") { return "operator_band_assign"; }
+    if (name == "operator|=") { return "operator_bor_assign"; }
+    if (name == "operator^=") { return "operator_bxor_assign"; }
+    if (name == "operator<<=") { return "operator_shl_assign"; }
+    if (name == "operator>>=") { return "operator_shr_assign"; }
+    if (name == "operator++") { return "operator_inc"; }
+    if (name == "operator--") { return "operator_dec"; }
+    if (name == "operator!") { return "operator_not"; }
+    if (name == "operator~") { return "operator_bnot"; }
+    return "";
+}
+
+public fn policy_operator_symbol_method_name(name: string) -> string {
+    if (name == "operator_add") { return "operator+"; }
+    if (name == "operator_sub") { return "operator-"; }
+    if (name == "operator_mul") { return "operator*"; }
+    if (name == "operator_div") { return "operator/"; }
+    if (name == "operator_mod") { return "operator%"; }
+    if (name == "operator_eq") { return "operator=="; }
+    if (name == "operator_ne") { return "operator!="; }
+    if (name == "operator_lt") { return "operator<"; }
+    if (name == "operator_gt") { return "operator>"; }
+    if (name == "operator_le") { return "operator<="; }
+    if (name == "operator_ge") { return "operator>="; }
+    if (name == "operator_band") { return "operator&"; }
+    if (name == "operator_bor") { return "operator|"; }
+    if (name == "operator_bxor") { return "operator^"; }
+    if (name == "operator_shl") { return "operator<<"; }
+    if (name == "operator_shr") { return "operator>>"; }
+    if (name == "operator_index") { return "operator[]"; }
+    if (name == "operator_assign") { return "operator="; }
+    if (name == "operator_add_assign") { return "operator+="; }
+    if (name == "operator_sub_assign") { return "operator-="; }
+    if (name == "operator_mul_assign") { return "operator*="; }
+    if (name == "operator_div_assign") { return "operator/="; }
+    if (name == "operator_mod_assign") { return "operator%="; }
+    if (name == "operator_band_assign") { return "operator&="; }
+    if (name == "operator_bor_assign") { return "operator|="; }
+    if (name == "operator_bxor_assign") { return "operator^="; }
+    if (name == "operator_shl_assign") { return "operator<<="; }
+    if (name == "operator_shr_assign") { return "operator>>="; }
+    if (name == "operator_inc") { return "operator++"; }
+    if (name == "operator_dec") { return "operator--"; }
+    if (name == "operator_not") { return "operator!"; }
+    if (name == "operator_bnot") { return "operator~"; }
+    return "";
+}
+
+@[borrow_args]
+public fn policy_generic_param_at(params: string, want_idx: i32) -> string {
+    if (params.len <= 0 || want_idx < 0) { return ""; }
+    var start: i32 = 0;
+    var idx: i32 = 0;
+    var i: i32 = 0;
+    while (i <= params.len) {
+        if (i == params.len || params.charAt(i) == 44 || params.charAt(i) == 124) {
+            if (idx == want_idx) { return params.substring(start, i); }
+            idx = idx + 1;
+            if (i < params.len && params.charAt(i) == 124) { return ""; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+@[borrow_args]
+public fn policy_generic_arg_at(args: string, want_idx: i32) -> string {
+    if (args.len <= 0 || want_idx < 0) { return ""; }
+    var start: i32 = 0;
+    var idx: i32 = 0;
+    var angle_depth: i32 = 0;
+    var paren_depth: i32 = 0;
+    var i: i32 = 0;
+    while (i <= args.len) {
+        if (i == args.len || (args.charAt(i) == 44 && angle_depth == 0 && paren_depth == 0)) {
+            if (idx == want_idx) { return args.substring(start, i); }
+            idx = idx + 1;
+            start = i + 1;
+        } else if (args.charAt(i) == 60) {
+            angle_depth = angle_depth + 1;
+        } else if (args.charAt(i) == 62
+                   && !(i > 0 && args.charAt(i - 1) == 45)) {
+            angle_depth = angle_depth - 1;
+            if (angle_depth < 0) { angle_depth = 0; }
+        } else if (args.charAt(i) == 40) {
+            paren_depth = paren_depth + 1;
+        } else if (args.charAt(i) == 41) {
+            paren_depth = paren_depth - 1;
+            if (paren_depth < 0) { paren_depth = 0; }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+public fn policy_generic_param_at_raw(s: rawptr, s_len: i64, want_idx: i32) -> rawptr {
+    let out = policy_generic_param_at(policy_slice_to_string(s, s_len), want_idx);
+    return policy_dup_slice(out.c_str(), out.len);
+}
+
+public fn policy_generic_arg_at_raw(s: rawptr, s_len: i64, want_idx: i32) -> rawptr {
+    let out = policy_generic_arg_at(policy_slice_to_string(s, s_len), want_idx);
+    return policy_dup_slice(out.c_str(), out.len);
+}
+
+@[borrow_args]
+public fn policy_env_get(env: string, name: string) -> string {
+    if (env.len == 0 || name.len == 0) { return ""; }
+    var found = "";
+    var i: i32 = 0;
+    while (i < env.len) {
+        if (env.charAt(i) != 124) {
+            i = i + 1;
+        } else {
+            let key_start = i + 1;
+            var eq = key_start;
+            while (eq < env.len && env.charAt(eq) != 61 && env.charAt(eq) != 124) {
+                eq = eq + 1;
+            }
+            if (eq < env.len && env.charAt(eq) == 61) {
+                var val_end = eq + 1;
+                while (val_end < env.len && env.charAt(val_end) != 124) {
+                    val_end = val_end + 1;
+                }
+                if (env.substring(key_start, eq) == name) {
+                    found = env.substring(eq + 1, val_end);
+                }
+                i = val_end;
+            } else {
+                i = eq;
+            }
+        }
+    }
+    return found;
+}
+
+public fn policy_env_get_raw(env: rawptr, name: rawptr) -> rawptr {
+    let out = policy_env_get(policy_slice_to_string(env, -1),
+                             policy_slice_to_string(name, -1));
+    return policy_dup_slice(out.c_str(), out.len);
+}
+
+@[borrow_args]
+public fn policy_i64_to_string(value: i64) -> string {
+    if (value == 0) { return "0"; }
+    let digits = "0123456789";
+    var n = value;
+    var negative = false;
+    if (n < 0) {
+        negative = true;
+    } else {
+        n = 0 - n;
+    }
+    var out = "";
+    while (n < 0) {
+        let d = (0 - (n % 10)) as i32;
+        out = digits.substring(d, d + 1) + out;
+        n = n / 10;
+    }
+    if (negative) { return "-" + out; }
+    return out;
+}
+
+@[borrow_args]
+public fn policy_env_set_i64(env: string, name: string, value: i64) -> string {
+    return env + "|" + name + "=" + policy_i64_to_string(value) + "|";
+}
+
+public fn policy_env_set_i64_raw(env: rawptr, name: rawptr, value: i64) -> rawptr {
+    let out = policy_env_set_i64(policy_slice_to_string(env, -1),
+                                 policy_slice_to_string(name, -1),
+                                 value);
+    return policy_dup_slice(out.c_str(), out.len);
+}
+
+@[borrow_args]
+public fn policy_env_set_text(env: string, name: string, value: string) -> string {
+    return env + "|" + name + "=" + value + "|";
+}
+
+public fn policy_env_set_text_raw(env: rawptr, name: rawptr, value: rawptr) -> rawptr {
+    let out = policy_env_set_text(policy_slice_to_string(env, -1),
+                                  policy_slice_to_string(name, -1),
+                                  policy_slice_to_string(value, -1));
+    return policy_dup_slice(out.c_str(), out.len);
+}
+
+@[borrow_args]
+public fn policy_member_lookup_key(class_name: string, member_name: string) -> string {
+    return class_name + "#" + member_name;
+}
+
+@[borrow_args]
+public fn policy_function_spec_lookup_key(name: string, args: string) -> string {
+    return name + "#<" + args + ">";
+}
+
+@[borrow_args]
+public fn policy_function_ordinal_lookup_key(name: string, d: rawptr) -> string {
+    return name + "#@" + policy_i64_to_string(d as i64);
+}
+
+fn policy_entry_slot(buf: rawptr, idx: i32) -> rawptr {
+    return policy_ptr_offset(buf, idx * 32);
+}
+
+fn policy_entry_key(slot: rawptr) -> rawptr {
+    return policy_read_rawptr(slot);
+}
+
+fn policy_entry_key_len(slot: rawptr) -> i64 {
+    return policy_read_i64(policy_ptr_offset(slot, 8));
+}
+
+fn policy_entry_ptr(slot: rawptr, offset: i32) -> rawptr {
+    return policy_read_rawptr(policy_ptr_offset(slot, offset));
+}
+
+public fn policy_entry_clear(slot: rawptr) {
+    if (slot == null) { return; }
+    let key = policy_entry_key(slot);
+    if (key != null) { free(key); }
+    var zero: i32 = 0;
+    memcpy(slot, to_rawptr(&zero), 4);
+    memcpy(policy_ptr_offset(slot, 4), to_rawptr(&zero), 4);
+    memcpy(policy_ptr_offset(slot, 8), to_rawptr(&zero), 4);
+    memcpy(policy_ptr_offset(slot, 12), to_rawptr(&zero), 4);
+    memcpy(policy_ptr_offset(slot, 16), to_rawptr(&zero), 4);
+    memcpy(policy_ptr_offset(slot, 20), to_rawptr(&zero), 4);
+    memcpy(policy_ptr_offset(slot, 24), to_rawptr(&zero), 4);
+    memcpy(policy_ptr_offset(slot, 28), to_rawptr(&zero), 4);
+}
+
+fn policy_entry_key_matches(key: rawptr, key_len: i64, want: rawptr, want_len: i64) -> bool {
+    if (key == null || want == null || key_len != want_len) { return false; }
+    if (want_len == 0) { return true; }
+    return memcmp(key, want, want_len as u64) == 0;
+}
+
+public fn policy_entry_write(slot: rawptr, name: rawptr, name_len: i64, value: rawptr, extra: rawptr) {
+    if (slot == null) { return; }
+    var len = name_len;
+    if (len < 0 || name == null) { len = 0; }
+    let key = policy_dup_slice(name, len);
+    policy_entry_clear(slot);
+    policy_write_rawptr(slot, key);
+    policy_write_i64(policy_ptr_offset(slot, 8), len);
+    policy_write_rawptr(policy_ptr_offset(slot, 16), value);
+    policy_write_rawptr(policy_ptr_offset(slot, 24), extra);
+}
+
+fn policy_entry_lookup_index(buf: rawptr, count: i32, name: rawptr, name_len: i64, reverse: i32) -> i32 {
+    if (buf == null || name == null || count <= 0 || name_len < 0) { return -1; }
+    if (reverse != 0) {
+        var i: i32 = count - 1;
+        while (i >= 0) {
+            let slot = policy_entry_slot(buf, i);
+            if (policy_entry_key_matches(policy_entry_key(slot),
+                                         policy_entry_key_len(slot),
+                                         name,
+                                         name_len)) {
+                return i;
+            }
+            i = i - 1;
+        }
+        return -1;
+    }
+    var j: i32 = 0;
+    while (j < count) {
+        let slot2 = policy_entry_slot(buf, j);
+        if (policy_entry_key_matches(policy_entry_key(slot2),
+                                     policy_entry_key_len(slot2),
+                                     name,
+                                     name_len)) {
+            return j;
+        }
+        j = j + 1;
+    }
+    return -1;
+}
+
+public fn policy_entry_lookup_value(buf: rawptr, count: i32, name: rawptr, name_len: i64, reverse: i32) -> rawptr {
+    let idx = policy_entry_lookup_index(buf, count, name, name_len, reverse);
+    if (idx < 0) { return null; }
+    return policy_entry_ptr(policy_entry_slot(buf, idx), 16);
+}
+
+public fn policy_entry_lookup_extra(buf: rawptr, count: i32, name: rawptr, name_len: i64, reverse: i32) -> rawptr {
+    let idx = policy_entry_lookup_index(buf, count, name, name_len, reverse);
+    if (idx < 0) { return null; }
+    return policy_entry_ptr(policy_entry_slot(buf, idx), 24);
+}
+
+public fn policy_entry_lookup_value_member_key(buf: rawptr,
+                                               count: i32,
+                                               class_name: rawptr,
+                                               class_len: i64,
+                                               member_name: rawptr,
+                                               member_len: i64,
+                                               reverse: i32) -> rawptr {
+    let key = policy_member_lookup_key(policy_slice_to_string(class_name, class_len),
+                                       policy_slice_to_string(member_name, member_len));
+    return policy_entry_lookup_value(buf, count, key.c_str(), key.len, reverse);
+}
+
+public fn policy_entry_lookup_value_function_spec_key(buf: rawptr,
+                                                      count: i32,
+                                                      name: rawptr,
+                                                      name_len: i64,
+                                                      args: rawptr,
+                                                      args_len: i64,
+                                                      reverse: i32) -> rawptr {
+    let key = policy_function_spec_lookup_key(policy_slice_to_string(name, name_len),
+                                             policy_slice_to_string(args, args_len));
+    return policy_entry_lookup_value(buf, count, key.c_str(), key.len, reverse);
+}
+
+public fn policy_entry_lookup_value_function_ordinal_key(buf: rawptr,
+                                                         count: i32,
+                                                         name: rawptr,
+                                                         name_len: i64,
+                                                         d: rawptr,
+                                                         reverse: i32) -> rawptr {
+    let key = policy_function_ordinal_lookup_key(policy_slice_to_string(name, name_len), d);
+    return policy_entry_lookup_value(buf, count, key.c_str(), key.len, reverse);
+}
+
+public fn policy_entry_has_later_name(buf: rawptr, limit: i32, start_idx: i32, name: rawptr, name_len: i64) -> i32 {
+    if (buf == null || name == null || limit <= 0 || name_len < 0) { return 0; }
+    var i: i32 = start_idx + 1;
+    while (i < limit) {
+        let slot = policy_entry_slot(buf, i);
+        if (policy_entry_key_matches(policy_entry_key(slot),
+                                     policy_entry_key_len(slot),
+                                     name,
+                                     name_len)) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+public fn policy_entry_name_occurrence_count(buf: rawptr, limit: i32, name: rawptr, name_len: i64) -> i32 {
+    if (buf == null || name == null || limit <= 0 || name_len < 0) { return 0; }
+    var out: i32 = 0;
+    var i: i32 = 0;
+    while (i < limit) {
+        let slot = policy_entry_slot(buf, i);
+        if (policy_entry_key_matches(policy_entry_key(slot),
+                                     policy_entry_key_len(slot),
+                                     name,
+                                     name_len)) {
+            out = out + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+public fn policy_entry_lookup_value_nth(buf: rawptr, count: i32, name: rawptr, name_len: i64, nth: i32) -> rawptr {
+    if (buf == null || name == null || count <= 0 || name_len < 0 || nth < 0) { return null; }
+    var seen: i32 = 0;
+    var i: i32 = 0;
+    while (i < count) {
+        let slot = policy_entry_slot(buf, i);
+        if (policy_entry_key_matches(policy_entry_key(slot),
+                                     policy_entry_key_len(slot),
+                                     name,
+                                     name_len)) {
+            if (seen == nth) { return policy_entry_ptr(slot, 16); }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+public fn policy_entry_lookup_extra_nth(buf: rawptr, count: i32, name: rawptr, name_len: i64, nth: i32) -> rawptr {
+    if (buf == null || name == null || count <= 0 || name_len < 0 || nth < 0) { return null; }
+    var seen: i32 = 0;
+    var i: i32 = 0;
+    while (i < count) {
+        let slot = policy_entry_slot(buf, i);
+        if (policy_entry_key_matches(policy_entry_key(slot),
+                                     policy_entry_key_len(slot),
+                                     name,
+                                     name_len)) {
+            if (seen == nth) { return policy_entry_ptr(slot, 24); }
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+public fn policy_string_multiset_new() -> rawptr {
+    let h = malloc(8);
+    if (h != null) { policy_write_rawptr(h, null); }
+    return h;
+}
+
+fn policy_string_set_node_next(node: rawptr) -> rawptr {
+    return policy_read_rawptr(policy_ptr_offset(node, 24));
+}
+
+fn policy_string_set_node_matches(node: rawptr, name: rawptr, name_len: i64) -> bool {
+    if (node == null) { return false; }
+    return policy_entry_key_matches(policy_read_rawptr(node),
+                                    policy_read_i64(policy_ptr_offset(node, 8)),
+                                    name,
+                                    name_len);
+}
+
+public fn policy_string_multiset_count(h: rawptr, name: rawptr, name_len: i64) -> i32 {
+    if (h == null || name == null) { return 0; }
+    let n = policy_slice_len(name, name_len);
+    var node = policy_read_rawptr(h);
+    while (node != null) {
+        if (policy_string_set_node_matches(node, name, n)) {
+            return policy_read_i64(policy_ptr_offset(node, 16)) as i32;
+        }
+        node = policy_string_set_node_next(node);
+    }
+    return 0;
+}
+
+public fn policy_string_multiset_add(h: rawptr, name: rawptr, name_len: i64) {
+    if (h == null || name == null) { return; }
+    let n = policy_slice_len(name, name_len);
+    var node = policy_read_rawptr(h);
+    while (node != null) {
+        if (policy_string_set_node_matches(node, name, n)) {
+            let old = policy_read_i64(policy_ptr_offset(node, 16));
+            policy_write_i64(policy_ptr_offset(node, 16), old + 1);
+            return;
+        }
+        node = policy_string_set_node_next(node);
+    }
+    let fresh = malloc(32);
+    if (fresh == null) { return; }
+    policy_write_rawptr(fresh, policy_dup_slice(name, n));
+    policy_write_i64(policy_ptr_offset(fresh, 8), n);
+    policy_write_i64(policy_ptr_offset(fresh, 16), 1);
+    policy_write_rawptr(policy_ptr_offset(fresh, 24), policy_read_rawptr(h));
+    policy_write_rawptr(h, fresh);
+}
+
+public fn policy_string_set_contains(h: rawptr, name: rawptr, name_len: i64) -> i32 {
+    if (policy_string_multiset_count(h, name, name_len) > 0) { return 1; }
+    return 0;
+}
+
+public fn policy_string_set_add(h: rawptr, name: rawptr, name_len: i64) {
+    policy_string_multiset_add(h, name, name_len);
+}
+
+public fn policy_string_set_free(h: rawptr) {
+    if (h == null) { return; }
+    var node = policy_read_rawptr(h);
+    while (node != null) {
+        let next = policy_string_set_node_next(node);
+        let key = policy_read_rawptr(node);
+        if (key != null) { free(key); }
+        free(node);
+        node = next;
+    }
+    free(h);
+}
+
+/// Total number of unique entries in the multiset/set. Used by callers
+/// running fixed-point worklist algorithms on top of the set.
+public fn policy_string_multiset_count_total(h: rawptr) -> i64 {
+    if (h == null) { return 0; }
+    var n: i64 = 0;
+    var node = policy_read_rawptr(h);
+    while (node != null) {
+        n = n + 1;
+        node = policy_string_set_node_next(node);
+    }
+    return n;
+}
+
+public fn policy_strip_quoted_string(text: string) -> string {
+    let clean = text.trim();
+    if (clean.len >= 2) {
+        let first = clean.charAt(0);
+        let last = clean.charAt((clean.len - 1) as i32);
+        if ((first == 34 && last == 34) || (first == 39 && last == 39)) {
+            return clean.substring(1, (clean.len - 1) as i32);
+        }
+    }
+    return clean;
+}
+
+public fn policy_meta_attribute_value(meta: string, attr: string) -> string {
+    if (meta.len == 0 || attr.len == 0) { return ""; }
+    var pattern = "@[" + attr + "(";
+    var pos = meta.indexOf(pattern);
+    if (pos < 0) {
+        pattern = "@" + attr + "(";
+        pos = meta.indexOf(pattern);
+    }
+    if (pos < 0) { return ""; }
+    let start = (pos + pattern.len) as i32;
+    var i = start;
+    var depth: i32 = 1;
+    while (i < meta.len) {
+        let ch = meta.charAt(i);
+        if (ch == 40) {
+            depth = depth + 1;
+        } elif (ch == 41) {
+            depth = depth - 1;
+            if (depth == 0) { return meta.substring(start, i).trim(); }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+public fn policy_named_argument_value(arguments: string, name: string) -> string {
+    if (arguments.len == 0 || name.len == 0) { return ""; }
+    var start: i32 = 0;
+    var depth: i32 = 0;
+    var quote: i32 = 0;
+    var i: i32 = 0;
+    while (i <= arguments.len) {
+        var ch: i32 = 44;
+        if (i < arguments.len) { ch = arguments.charAt(i); }
+        if (quote != 0) {
+            if (ch == quote && (i == 0 || arguments.charAt(i - 1) != 92)) {
+                quote = 0;
+            }
+        } else if (ch == 34 || ch == 39) {
+            quote = ch;
+        } else if (ch == 40 || ch == 91 || ch == 123 || ch == 60) {
+            depth = depth + 1;
+        } else if (ch == 41 || ch == 93 || ch == 125 || ch == 62) {
+            if (depth > 0) { depth = depth - 1; }
+        } else if (ch == 44 && depth == 0) {
+            let part = arguments.substring(start, i).trim();
+            var eq: i32 = -1;
+            var j: i32 = 0;
+            while (j < part.len && eq < 0) {
+                if (part.charAt(j) == 61) { eq = j; }
+                j = j + 1;
+            }
+            if (eq > 0 && part.substring(0, eq).trim() == name) {
+                return part.substring(eq + 1, part.len).trim();
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+public fn policy_module_identity(base: string, version: string, variant: string) -> string {
+    if (base.len == 0) { return ""; }
+    let clean_version = policy_strip_quoted_string(version);
+    let clean_variant = policy_strip_quoted_string(variant);
+    if (clean_version.len == 0) { return base; }
+    var out = base + "@" + clean_version;
+    if (clean_variant.len > 0) { out = out + "[\"" + clean_variant + "\"]"; }
+    return out;
+}
+
+public fn policy_module_identity_from_meta(base: string, meta: string) -> string {
+    let version = policy_meta_attribute_value(meta, "version");
+    let variant = policy_meta_attribute_value(meta, "variant");
+    return policy_module_identity(base, version, variant);
+}
+
+public fn policy_module_selector_index(identity: string) -> i32 {
+    var i: i32 = 0;
+    while (i < identity.len) {
+        if (identity.charAt(i) == 64) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+public fn policy_module_base(identity: string) -> string {
+    let at = policy_module_selector_index(identity);
+    if (at < 0) { return identity; }
+    return identity.substring(0, at);
+}
+
+public fn policy_module_version(identity: string) -> string {
+    let at = policy_module_selector_index(identity);
+    if (at < 0 || at + 1 >= identity.len) { return ""; }
+    var end = at + 1;
+    while (end < identity.len && identity.charAt(end) != 91) {
+        end = end + 1;
+    }
+    return identity.substring(at + 1, end);
+}
+
+public fn policy_module_variant(identity: string) -> string {
+    let at = policy_module_selector_index(identity);
+    if (at < 0) { return ""; }
+    var open: i32 = at + 1;
+    while (open < identity.len && identity.charAt(open) != 91) {
+        open = open + 1;
+    }
+    if (open >= identity.len) { return ""; }
+    var close = open + 1;
+    while (close < identity.len && identity.charAt(close) != 93) {
+        close = close + 1;
+    }
+    if (close >= identity.len) { return ""; }
+    return policy_strip_quoted_string(identity.substring(open + 1, close));
+}
+
+fn policy_semver_component(version: string, want: i32) -> i64 {
+    var component: i32 = 0;
+    var value: i64 = 0;
+    var seen_digit = false;
+    var i: i32 = 0;
+    while (i <= version.len) {
+        var ch: i32 = 46;
+        if (i < version.len) { ch = version.charAt(i); }
+        if (ch >= 48 && ch <= 57) {
+            if (component == want) {
+                value = value * 10 + ((ch - 48) as i64);
+                seen_digit = true;
+            }
+        } else if (ch == 46) {
+            if (component == want) {
+                if (seen_digit) { return value; }
+                return 0;
+            }
+            component = component + 1;
+        } else if (component == want) {
+            if (seen_digit) { return value; }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return value;
+}
+
+public fn policy_semver_compare(a: string, b: string) -> i32 {
+    var component: i32 = 0;
+    while (component < 8) {
+        let av = policy_semver_component(a, component);
+        let bv = policy_semver_component(b, component);
+        if (av < bv) { return -1; }
+        if (av > bv) { return 1; }
+        component = component + 1;
+    }
+    return 0;
+}

@@ -1,0 +1,1135 @@
+module std.string;
+
+use std.clone;
+use std.core;
+use std.defaults;
+
+/// Vyx Standard Library: String Module
+///
+/// `str` is the borrowed UTF-8 slice type.
+/// `String` is the owned stdlib text type with SSO.
+/// The lowercase `string` spelling is accepted by the compiler as a
+/// deprecated compatibility name for `str`; it is not an alias to `String`.
+
+extern "C" {
+    fn strlen(s: rawptr) -> i64;
+    fn strcmp(a: rawptr, b: rawptr) -> i32;
+    fn strncmp(a: rawptr, b: rawptr, n: i64) -> i32;
+    fn strstr(haystack: rawptr, needle: rawptr) -> rawptr;
+    fn atoi(s: rawptr) -> i32;
+    fn atof(s: rawptr) -> f64;
+    fn malloc(size: i64) -> rawptr;
+    fn realloc(ptr: rawptr, size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn vyx_forget_string_len(ptr: rawptr);
+    fn vyx_free_runtime_string(ptr: rawptr);
+    fn vyx_free_pooled_string(ptr: rawptr);
+    fn vyx_int_decimal_len_abi(v: i64) -> i64;
+    fn vyx_int_to_string_into_abi(v: i64, out: rawptr) -> i64;
+    fn vyx_uint_decimal_len_abi(v: u64) -> i64;
+    fn vyx_uint_to_string_into_abi(v: u64, out: rawptr) -> i64;
+    fn memcpy(dest: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dest: rawptr, val: i32, n: i64) -> rawptr;
+}
+
+// --- Free functions for string type ---
+
+@[inline]
+public fn str_length(s: str) -> i64 { return s.len; }
+@[inline]
+public fn str_is_empty(s: str) -> bool { return s.len == 0; }
+
+/// Length-first / pointer-identity / memcmp short-circuit ladder.  The
+/// `a.len == 0` branch saves an `strncmp("", "", 0)` libc call; the
+/// `a.ptr == b.ptr` branch catches same-string-literal / interned-key
+/// compares on the Dict probe path.
+@[inline]
+@[hot]
+public fn str_equals(a: str, b: str) -> bool {
+    if (a.len != b.len) { return false; }
+    if (a.len == 0) { return true; }
+    let ap = a.c_str();
+    let bp = b.c_str();
+    if (ap == bp) { return true; }
+    return strncmp(ap, bp, a.len) == 0;
+}
+
+/// Lexicographic total-order compare.  Returns -1 / 0 / 1 per the C
+/// `strcmp` convention.  Shared helper for compiler internals; `impl Ord
+/// for string` open-codes the same order on `self.ptr` / `self.len`.
+public fn str_compare(a: str, b: str) -> i32 {
+    var n: i64 = a.len;
+    if (b.len < n) { n = b.len; }
+    let r: i32 = strncmp(a.c_str(), b.c_str(), n);
+    if (r != 0) {
+        if (r < 0) { return -1; }
+        return 1;
+    }
+    if (a.len < b.len) { return -1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+public fn str_to_int(s: str) -> i32 { return atoi(s.c_str()); }
+public fn str_to_float(s: str) -> f64 { return atof(s.c_str()); }
+
+/// Deep-copy a string into a freshly-allocated heap buffer.  Used by
+/// `impl Clone for string` (`clone_str_dup`); `str.clone()` is also
+/// intercepted by the LLVM lowerer.
+@[inline]
+public fn str_dup(s: str) -> str {
+    return from_cstr_len(s.c_str(), s.len);
+}
+
+@[inline]
+public fn str_from_parts(ptr: rawptr, len: i64, cap: i64, owned: i64) -> str {
+    if (ptr == null || len < 0 || cap < 0) { return ""; }
+    return from_raw_string_parts(ptr, len, cap, owned);
+}
+
+@[inline]
+public fn str_drop(s: str) {
+    if (s.owned == str_malloc_flag() && s.c_str() != null) {
+        vyx_forget_string_len(s.c_str());
+        free(s.c_str());
+    } else if (s.owned == str_runtime_flag() && s.c_str() != null) {
+        vyx_free_runtime_string(s.c_str());
+    } else if (s.owned == str_pooled_flag() && s.c_str() != null) {
+        vyx_free_pooled_string(s.c_str());
+    }
+}
+
+@[inline]
+public fn str_concat(a: str, b: str) -> str {
+    let total = a.len + b.len;
+    if (total == 0) { return ""; }
+    let buf = malloc(total + 1);
+    if (buf == null) { return ""; }
+    if (a.len > 0) { memcpy(buf, a.c_str(), a.len); }
+    if (b.len > 0) { memcpy(buf + a.len, b.c_str(), b.len); }
+    memset(buf + total, 0, 1);
+    return from_raw_string_parts(buf, total, total + 1, str_malloc_flag());
+}
+
+public fn str_append_assign(base: string, suffix: str) -> string {
+    if (suffix.len <= 0) { return base; }
+
+    let total = base.len + suffix.len;
+    let needed = total + 1;
+    var src = suffix.c_str();
+    var tmp: rawptr = null;
+    if (src == base.c_str() && suffix.len > 0) {
+        tmp = malloc(suffix.len + 1);
+        if (tmp == null) { return str_concat(base, suffix); }
+        memcpy(tmp, suffix.c_str(), suffix.len);
+        memset(tmp + suffix.len, 0, 1);
+        src = tmp;
+    }
+
+    if (base.owned == str_malloc_flag()
+        && base.cap >= needed
+        && base.ptr != null) {
+        memcpy(base.ptr + base.len, src, suffix.len);
+        memset(base.ptr + total, 0, 1);
+        if (tmp != null) { free(tmp); }
+        return from_raw_string_parts(base.ptr, total, base.cap, base.owned);
+    }
+
+    var new_cap = needed * 2;
+    if (new_cap < 64) { new_cap = 64; }
+    let buf = malloc(new_cap);
+    if (buf == null) {
+        if (tmp != null) { free(tmp); }
+        return "";
+    }
+    if (base.len > 0) { memcpy(buf, base.c_str(), base.len); }
+    memcpy(buf + base.len, src, suffix.len);
+    memset(buf + total, 0, 1);
+    if (tmp != null) { free(tmp); }
+    str_drop(base);
+    return from_raw_string_parts(buf, total, new_cap, str_malloc_flag());
+}
+
+/// Bounds-checked single-byte fetch.  Returns -1 on out-of-range index.
+/// Body dispatches through `s.char_at(idx)` so the bootstrap codegen
+/// lowers it to `GEP + load i8 + zext` instead of a `memcpy(1)` call.
+@[inline]
+@[hot]
+public fn str_char_at(s: str, idx: i64) -> i32 {
+    if (idx < 0 || idx >= s.len) { return -1; }
+    return s.char_at(idx as i32);
+}
+
+/// Unchecked single-byte fetch.  Caller must guarantee `0 <= idx < s.len`.
+@[inline]
+@[hot]
+public fn str_byte_at_unchecked(s: str, idx: i64) -> i32 {
+    return s.char_at(idx as i32);
+}
+
+public fn str_substring(s: str, start: i64, end_idx: i64) -> str {
+    var st = start;
+    if (st < 0) { st = 0; }
+    if (st >= s.len) { return ""; }
+    var en = end_idx;
+    if (en > s.len) { en = s.len; }
+    if (en <= st) { return ""; }
+    let new_len = en - st;
+    if (new_len == 0) { return ""; }
+    return from_cstr_view_len(s.c_str() + st, new_len);
+}
+
+public fn str_substr(s: str, start: i64, length: i64) -> str {
+    return str_substring(s, start, start + length);
+}
+
+public fn str_contains(s: str, needle: str) -> bool {
+    if (needle.len == 0) { return true; }
+    if (needle.len > s.len) { return false; }
+    let result = strstr(s.c_str(), needle.c_str());
+    return result != null;
+}
+
+public fn str_index_of(s: str, needle: str) -> i64 {
+    if (needle.len == 0) { return 0; }
+    if (needle.len > s.len) { return -1; }
+    let result = strstr(s.c_str(), needle.c_str());
+    if (result == null) { return -1; }
+    var offset: i64 = 0;
+    unsafe { offset = result - s.c_str(); }
+    return offset;
+}
+
+public fn str_starts_with(s: str, prefix: str) -> bool {
+    if (prefix.len > s.len) { return false; }
+    return strncmp(s.c_str(), prefix.c_str(), prefix.len) == 0;
+}
+
+public fn str_ends_with(s: str, suffix: str) -> bool {
+    if (suffix.len > s.len) { return false; }
+    let offset = s.len - suffix.len;
+    return strncmp(s.c_str() + offset, suffix.c_str(), suffix.len) == 0;
+}
+
+public fn str_to_upper(s: str) -> str {
+    let buf = malloc(s.len + 1);
+    if (buf == null) { return ""; }
+    for (i in 0..s.len) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.c_str() + i, 1); }
+        ch = ch & 255;
+        if (ch >= 97 && ch <= 122) { ch = ch - 32; }
+        unsafe { memcpy(buf + i, to_rawptr(&ch), 1); }
+    }
+    memset(buf + s.len, 0, 1);
+    return from_raw_string_parts(buf, s.len, s.len + 1, str_malloc_flag());
+}
+
+public fn str_to_lower(s: str) -> str {
+    let buf = malloc(s.len + 1);
+    if (buf == null) { return ""; }
+    for (i in 0..s.len) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.c_str() + i, 1); }
+        ch = ch & 255;
+        if (ch >= 65 && ch <= 90) { ch = ch + 32; }
+        unsafe { memcpy(buf + i, to_rawptr(&ch), 1); }
+    }
+    memset(buf + s.len, 0, 1);
+    return from_raw_string_parts(buf, s.len, s.len + 1, str_malloc_flag());
+}
+
+public fn str_trim(s: str) -> str {
+    if (s.len == 0) { return ""; }
+    var start: i64 = 0;
+    while (start < s.len) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.c_str() + start, 1); }
+        ch = ch & 255;
+        if (ch != 32 && ch != 9 && ch != 10 && ch != 13) { break; }
+        start = start + 1;
+    }
+    var end = s.len;
+    while (end > start) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.c_str() + end - 1, 1); }
+        ch = ch & 255;
+        if (ch != 32 && ch != 9 && ch != 10 && ch != 13) { break; }
+        end = end - 1;
+    }
+    if (start >= end) { return ""; }
+    return from_cstr_view_len(s.c_str() + start, end - start);
+}
+
+public fn str_replace(s: str, old: str, new_str: str) -> str {
+    if (old.len == 0) { return from_cstr_len(s.c_str(), s.len); }
+    var buf_size = s.len + 1;
+    if (new_str.len > old.len) {
+        let max_reps = s.len / old.len + 1;
+        buf_size = s.len + max_reps * (new_str.len - old.len) + 1;
+    }
+    let buf = malloc(buf_size);
+    if (buf == null) { return ""; }
+    var out_len: i64 = 0;
+    var i: i64 = 0;
+    while (i < s.len) {
+        if (i + old.len <= s.len && strncmp(s.c_str() + i, old.c_str(), old.len) == 0) {
+            memcpy(buf + out_len, new_str.c_str(), new_str.len);
+            out_len = out_len + new_str.len;
+            i = i + old.len;
+        } else {
+            memcpy(buf + out_len, s.c_str() + i, 1);
+            out_len = out_len + 1;
+            i = i + 1;
+        }
+    }
+    memset(buf + out_len, 0, 1);
+    return from_raw_string_parts(buf, out_len, buf_size, str_malloc_flag());
+}
+
+public fn str_trim_left(s: str) -> str {
+    if (s.len == 0) { return ""; }
+    var start: i64 = 0;
+    while (start < s.len) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.c_str() + start, 1); }
+        ch = ch & 255;
+        if (ch != 32 && ch != 9 && ch != 10 && ch != 13) { break; }
+        start = start + 1;
+    }
+    return from_cstr_view_len(s.c_str() + start, s.len - start);
+}
+
+public fn str_trim_right(s: str) -> str {
+    if (s.len == 0) { return ""; }
+    var end = s.len;
+    while (end > 0) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.c_str() + end - 1, 1); }
+        ch = ch & 255;
+        if (ch != 32 && ch != 9 && ch != 10 && ch != 13) { break; }
+        end = end - 1;
+    }
+    return from_cstr_view_len(s.c_str(), end);
+}
+
+public fn str_repeat(s: str, n: i32) -> str {
+    if (n <= 0 || s.len == 0) { return ""; }
+    let total = s.len * (n as i64);
+    let buf = malloc(total + 1);
+    if (buf == null) { return ""; }
+    var i: i32 = 0;
+    while (i < n) {
+        memcpy(buf + (i as i64) * s.len, s.c_str(), s.len);
+        i = i + 1;
+    }
+    memset(buf + total, 0, 1);
+    return from_raw_string_parts(buf, total, total + 1, str_malloc_flag());
+}
+
+// --- Character utilities ---
+
+public fn char_is_digit(c: i32) -> bool { return c >= 48 && c <= 57; }
+public fn char_is_alpha(c: i32) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
+public fn char_is_upper(c: i32) -> bool { return c >= 65 && c <= 90; }
+public fn char_is_lower(c: i32) -> bool { return c >= 97 && c <= 122; }
+public fn char_is_whitespace(c: i32) -> bool { return c == 32 || c == 9 || c == 10 || c == 13; }
+public fn char_to_upper(c: i32) -> i32 { if (c >= 97 && c <= 122) { return c - 32; } return c; }
+public fn char_to_lower(c: i32) -> i32 { if (c >= 65 && c <= 90) { return c + 32; } return c; }
+
+public fn string_sso_capacity() -> i64 { return 23; }
+
+fn string_inline_flag() -> i64 { return 0; }
+fn string_heap_flag() -> i64 { return 1; }
+
+fn str_borrowed_flag() -> i64 { return 0; }
+fn str_malloc_flag() -> i64 { return 1; }
+fn str_header_flag() -> i64 { return 2; }
+fn str_runtime_flag() -> i64 { return 3; }
+fn str_pooled_flag() -> i64 { return 4; }
+
+/// Borrowed byte cursor over a `str` or `String` UTF-8 buffer.
+/// The cursor never owns or releases `data`; the source must remain alive and
+/// unmodified until iteration finishes.
+public class StrBytes {
+    private data: rawptr;
+    private len: i64;
+    private pos: i64;
+
+    @[borrow_args]
+    public static fn from_str(source: str) -> StrBytes {
+        return StrBytes { data: source.c_str(), len: source.len, pos: 0 };
+    }
+
+    public fn has_next() -> bool { return self.pos < self.len; }
+
+    public fn next() -> Option<u8> {
+        if (!self.has_next()) { return None; }
+        let value = ptr_read_u8(self.data + self.pos);
+        self.pos = self.pos + 1;
+        return Some((value & 255) as u8);
+    }
+}
+
+fn str_utf8_is_continuation(byte: i32) -> bool {
+    return byte >= 128 && byte <= 191;
+}
+
+/// Borrowed Unicode-scalar cursor over a `str` or `String` UTF-8 buffer.
+/// Invalid UTF-8 yields U+FFFD and consumes one byte, guaranteeing progress.
+public class StrChars {
+    private data: rawptr;
+    private len: i64;
+    private pos: i64;
+
+    @[borrow_args]
+    public static fn from_str(source: str) -> StrChars {
+        return StrChars { data: source.c_str(), len: source.len, pos: 0 };
+    }
+
+    public fn has_next() -> bool { return self.pos < self.len; }
+
+    fn _replacement() -> Option<char> {
+        self.pos = self.pos + 1;
+        return Some(65533 as char);
+    }
+
+    public fn next() -> Option<char> {
+        if (!self.has_next()) { return None; }
+
+        let b0 = ptr_read_u8(self.data + self.pos) & 255;
+        if (b0 <= 127) {
+            self.pos = self.pos + 1;
+            return Some(b0 as char);
+        }
+
+        if (b0 >= 194 && b0 <= 223) {
+            if (self.pos + 1 >= self.len) { return self._replacement(); }
+            let b1 = ptr_read_u8(self.data + self.pos + 1) & 255;
+            if (!str_utf8_is_continuation(b1)) { return self._replacement(); }
+            self.pos = self.pos + 2;
+            return Some((((b0 & 31) << 6) | (b1 & 63)) as char);
+        }
+
+        if (b0 >= 224 && b0 <= 239) {
+            if (self.pos + 2 >= self.len) { return self._replacement(); }
+            let b1 = ptr_read_u8(self.data + self.pos + 1) & 255;
+            let b2 = ptr_read_u8(self.data + self.pos + 2) & 255;
+            let second_valid = str_utf8_is_continuation(b1)
+                && !(b0 == 224 && b1 < 160)
+                && !(b0 == 237 && b1 > 159);
+            if (!second_valid || !str_utf8_is_continuation(b2)) {
+                return self._replacement();
+            }
+            self.pos = self.pos + 3;
+            return Some((((b0 & 15) << 12) | ((b1 & 63) << 6) | (b2 & 63)) as char);
+        }
+
+        if (b0 >= 240 && b0 <= 244) {
+            if (self.pos + 3 >= self.len) { return self._replacement(); }
+            let b1 = ptr_read_u8(self.data + self.pos + 1) & 255;
+            let b2 = ptr_read_u8(self.data + self.pos + 2) & 255;
+            let b3 = ptr_read_u8(self.data + self.pos + 3) & 255;
+            let second_valid = str_utf8_is_continuation(b1)
+                && !(b0 == 240 && b1 < 144)
+                && !(b0 == 244 && b1 > 143);
+            if (!second_valid
+                || !str_utf8_is_continuation(b2)
+                || !str_utf8_is_continuation(b3)) {
+                return self._replacement();
+            }
+            self.pos = self.pos + 4;
+            return Some((((b0 & 7) << 18)
+                | ((b1 & 63) << 12)
+                | ((b2 & 63) << 6)
+                | (b3 & 63)) as char);
+        }
+
+        return self._replacement();
+    }
+}
+
+trait StrIteratorExt {
+    fn iter() -> StrChars;
+    fn bytes() -> StrBytes;
+    fn chars() -> StrChars;
+}
+
+impl StrIteratorExt for str {
+    fn iter() -> StrChars { return StrChars.from_str(self); }
+    fn bytes() -> StrBytes { return StrBytes.from_str(self); }
+    fn chars() -> StrChars { return StrChars.from_str(self); }
+}
+
+public fn string_next_capacity(current: i64, needed: i64) -> i64 {
+    var cap = current;
+    if (cap < string_sso_capacity()) { cap = string_sso_capacity(); }
+    while (cap < needed) {
+        if (cap > 4611686018427387903) { return needed; }
+        cap = cap * 2 + 1;
+    }
+    return cap;
+}
+
+/// Vyx String — stdlib-owned modern string with small-string optimization.
+///
+/// The primitive `str` view is the compiler-facing borrowed text type.
+/// This class is the stdlib-owned user string: 23 bytes inline plus NUL,
+/// heap growth only after that, explicit reserve/shrink, and idempotent
+/// destroy/drop.
+@[lang_item("string")]
+public class String {
+    public ptr: rawptr;
+    public len: i64;
+    public cap: i64;
+    public owned: i64;
+    private inline0: i64;
+    private inline1: i64;
+    private inline2: i64;
+
+    // ── Construction ────────────────────────────────────────────────
+    public static fn fromBytes(src: rawptr, len: i64) -> String {
+        var out = String.empty();
+        out.appendBytes(src, len);
+        return out;
+    }
+
+    public static fn fromCStr(src: rawptr) -> String {
+        if (src == null) { return String.empty(); }
+        return String.fromBytes(src, strlen(src));
+    }
+
+    public static fn from(s: str) -> String {
+        var out = String.empty();
+        out.append(s);
+        return out;
+    }
+
+    public static fn empty() -> String {
+        return String {
+            ptr: null,
+            len: 0,
+            cap: string_sso_capacity(),
+            owned: string_inline_flag(),
+            inline0: 0,
+            inline1: 0,
+            inline2: 0
+        };
+    }
+
+    public static fn withCapacity(capacity: i64) -> String {
+        var out = String.empty();
+        if (capacity > string_sso_capacity()) { out.reserve(capacity); }
+        return out;
+    }
+
+    public static fn fromOwnedRaw(buf: rawptr, len: i64, capacity: i64) -> String {
+        if (buf == null || len <= string_sso_capacity()) {
+            if (buf == null) { return String.empty(); }
+            let raw = String.fromBytes(buf, len);
+            free(buf);
+            return raw;
+        }
+        var cap = capacity;
+        if (cap < len) { cap = len; }
+        return String {
+            ptr: buf,
+            len: len,
+            cap: cap,
+            owned: string_heap_flag(),
+            inline0: 0,
+            inline1: 0,
+            inline2: 0
+        };
+    }
+
+    public static fn default_value() -> String {
+        return String.empty();
+    }
+
+    public static fn fromStrResult(s: str) -> String {
+        if (s.len == 0) {
+            str_drop(s);
+            return String.empty();
+        }
+        let out = String.from(s);
+        str_drop(s);
+        return out;
+    }
+
+    // ── Inspection ──────────────────────────────────────────────────
+    /// Byte count.
+    public fn length() -> i64 { return self.len; }
+    /// Alias matching `.size()` convention used by Vec/Dict/Set.
+    public fn size() -> i64 { return self.len; }
+    public fn capacity() -> i64 { return self.cap; }
+
+    public fn isEmpty() -> bool { return self.len == 0; }
+    public fn isSmall() -> bool { return self.owned == string_inline_flag(); }
+    public fn isHeap() -> bool { return self.owned == string_heap_flag(); }
+
+    // ── Access ──────────────────────────────────────────────────────
+    @[inline]
+    fn _inline_ptr() -> rawptr {
+        return to_rawptr(&self.inline0);
+    }
+
+    @[inline]
+    fn _data_ptr() -> rawptr {
+        if (self.owned == string_heap_flag()) { return self.ptr; }
+        return self._inline_ptr();
+    }
+
+    /// Non-owning view of the data as the primitive `str` ABI.
+    /// Cheaper than `raw()` because it skips malloc+memcpy; only safe
+    /// for callees that READ ptr/len synchronously and never free.
+    /// Used internally by concat/appendString/predicates/transforms.
+    @[inline]
+    fn _borrow_raw() -> str {
+        if (self.len == 0) { return ""; }
+        return from_cstr_view_len(self.c_str(), self.len);
+    }
+
+    public fn byteAt(idx: i64) -> i32 {
+        if (idx < 0 || idx >= self.len) { return -1; }
+        var b: i32 = 0;
+        unsafe { memcpy(to_rawptr(&b), self._data_ptr() + idx, 1); }
+        return b & 255;
+    }
+
+    public fn charAt(idx: i64) -> i32 {
+        return self.byteAt(idx);
+    }
+
+    fn _write_nul() {
+        var zero: i64 = 0;
+        let data: rawptr = self._data_ptr();
+        if (data != null) { memcpy(data + self.len, to_rawptr(&zero), 1); }
+    }
+
+    @[cold]
+    fn _move_inline_to_heap(new_cap: i64) -> bool {
+        let new_buf = malloc(new_cap + 1);
+        if (new_buf == null) { return false; }
+        if (self.len > 0) { memcpy(new_buf, self._inline_ptr(), self.len); }
+        self.ptr = new_buf;
+        self.cap = new_cap;
+        self.owned = string_heap_flag();
+        self._write_nul();
+        return true;
+    }
+
+    @[cold]
+    fn _grow_to(needed_capacity: i64) -> bool {
+        if (needed_capacity <= self.cap) { return true; }
+        let new_cap = string_next_capacity(self.cap, needed_capacity);
+        if (self.owned == string_inline_flag()) {
+            return self._move_inline_to_heap(new_cap);
+        }
+        let new_buf = realloc(self.ptr, new_cap + 1);
+        if (new_buf == null) { return false; }
+        self.ptr = new_buf;
+        self.cap = new_cap;
+        self._write_nul();
+        return true;
+    }
+
+    /// Raw C string pointer. Stable while this String's storage is alive.
+    public fn asCStr() -> rawptr {
+        self._write_nul();
+        return self._data_ptr();
+    }
+
+    public fn c_str() -> rawptr { return self.asCStr(); }
+
+    public fn data() -> rawptr { return self.asCStr(); }
+
+    /// Borrow a `str` view over the current bytes.
+    public fn raw() -> str {
+        self._write_nul();
+        if (self.len == 0) { return ""; }
+        return from_cstr_view_len(self._data_ptr(), self.len);
+    }
+
+    /// Borrow the current UTF-8 bytes as a non-owning `str` view.
+    public fn as_str() -> str { return self._borrow_raw(); }
+
+    /// Borrowed iterators. Mutating this String invalidates outstanding
+    /// cursors, matching the existing iterator contract for std containers.
+    public fn iter() -> StrChars { return StrChars.from_str(self._borrow_raw()); }
+    public fn bytes() -> StrBytes { return StrBytes.from_str(self._borrow_raw()); }
+    public fn chars() -> StrChars { return StrChars.from_str(self._borrow_raw()); }
+
+    // ── Predicates ──────────────────────────────────────────────────
+    @[borrow_args]
+    public fn contains(needle: str) -> bool {
+        return str_contains(self.raw(), needle);
+    }
+    @[borrow_args]
+    public fn startsWith(prefix: str) -> bool {
+        return str_starts_with(self.raw(), prefix);
+    }
+    public fn starts_with(prefix: str) -> bool { return self.startsWith(prefix); }
+    @[borrow_args]
+    public fn endsWith(suffix: str) -> bool {
+        return str_ends_with(self.raw(), suffix);
+    }
+    public fn ends_with(suffix: str) -> bool { return self.endsWith(suffix); }
+    @[borrow_args]
+    public fn indexOf(needle: str) -> i64 {
+        return str_index_of(self.raw(), needle);
+    }
+    public fn index_of(needle: str) -> i64 { return self.indexOf(needle); }
+
+    // ── Slice / transform ───────────────────────────────────────────
+    /// Half-open substring `[lo, hi)`.  Out-of-range arguments are
+    /// clamped to valid indices (matches `str_substring`).
+    public fn substring(lo: i64, hi: i64) -> str {
+        return str_substring(self.raw(), lo, hi);
+    }
+    /// Bulk ASCII uppercase over [src, src+n) into dst: 8 bytes per
+    /// iteration via i64 loads/stores, branchless per-byte case flip.
+    /// Falls back to byte loop for the tail.
+    static fn _upper_bulk(src: rawptr, dst: rawptr, n: i64) {
+        var i: i64 = 0;
+        while (i + 8 <= n) {
+            let chunk = ptr_read_i64(src + i);
+            var out: i64 = 0;
+            var k: i64 = 0;
+            while (k < 8) {
+                let c = (chunk >> (k * 8)) & 255;
+                let up = if (c >= 97 && c <= 122) { c - 32 } else { c };
+                out = out | (up << (k * 8));
+                k = k + 1;
+            }
+            ptr_write_i64(dst + i, out);
+            i = i + 8;
+        }
+        while (i < n) {
+            var ch: i32 = 0;
+            unsafe { memcpy(to_rawptr(&ch), src + i, 1); }
+            ch = ch & 255;
+            if (ch >= 97 && ch <= 122) { ch = ch - 32; }
+            unsafe { memcpy(dst + i, to_rawptr(&ch), 1); }
+            i = i + 1;
+        }
+    }
+    /// Bulk ASCII lowercase: same structure as _upper_bulk.
+    static fn _lower_bulk(src: rawptr, dst: rawptr, n: i64) {
+        var i: i64 = 0;
+        while (i + 8 <= n) {
+            let chunk = ptr_read_i64(src + i);
+            var out: i64 = 0;
+            var k: i64 = 0;
+            while (k < 8) {
+                let c = (chunk >> (k * 8)) & 255;
+                let lo = if (c >= 65 && c <= 90) { c + 32 } else { c };
+                out = out | (lo << (k * 8));
+                k = k + 1;
+            }
+            ptr_write_i64(dst + i, out);
+            i = i + 8;
+        }
+        while (i < n) {
+            var ch: i32 = 0;
+            unsafe { memcpy(to_rawptr(&ch), src + i, 1); }
+            ch = ch & 255;
+            if (ch >= 65 && ch <= 90) { ch = ch + 32; }
+            unsafe { memcpy(dst + i, to_rawptr(&ch), 1); }
+            i = i + 1;
+        }
+    }
+    public fn toUpper() -> String {
+        let n = self.len;
+        if (n <= 0) { return String.empty(); }
+        var out = String.withCapacity(n);
+        // withCapacity deliberately leaves the small inline representation in
+        // place on allocation failure; capacity is therefore the authoritative
+        // success check rather than testing the non-null inline data pointer.
+        if (out.cap < n) { return out; }
+        let src = self._data_ptr();
+        let dst = out._data_ptr();
+        if (src == null || dst == null) { return out; }
+        String._upper_bulk(src, dst, n);
+        out.len = n;
+        out._write_nul();
+        return out;
+    }
+
+    public fn toLower() -> String {
+        let n = self.len;
+        if (n <= 0) { return String.empty(); }
+        var out = String.withCapacity(n);
+        if (out.cap < n) { return out; }
+        let src = self._data_ptr();
+        let dst = out._data_ptr();
+        if (src == null || dst == null) { return out; }
+        String._lower_bulk(src, dst, n);
+        out.len = n;
+        out._write_nul();
+        return out;
+    }
+    public fn to_upper() -> String { return self.toUpper(); }
+    public fn to_lower() -> String { return self.toLower(); }
+    public fn trim() -> str { return str_trim(self.raw()); }
+    public fn replace(old: str, new_str: str) -> String {
+        return String.fromStrResult(str_replace(self.raw(), old, new_str));
+    }
+    public fn repeat(n: i32) -> String {
+        return String.fromStrResult(str_repeat(self.raw(), n));
+    }
+
+    // ── Concatenation ────────────────────────────────────────────────
+    public fn reserve(needed_capacity: i64) {
+        if (needed_capacity > self.cap) { self._grow_to(needed_capacity); }
+    }
+
+    @[hot]
+    public fn appendBytes(src_in: rawptr, len: i64) {
+        if (src_in == null || len <= 0) { return; }
+        let old_len: i64 = self.len;
+        let needed = old_len + len;
+
+        var src = src_in;
+        var temp: rawptr = null;
+        if (src == self._data_ptr()) {
+            temp = malloc(len + 1);
+            if (temp == null) { return; }
+            memcpy(temp, src_in, len);
+            memset(temp + len, 0, 1);
+            src = temp;
+        }
+
+        // `_grow_to` is cold and its first branch is exactly this capacity
+        // check.  Keep the common append path in the caller so a pre-sized
+        // String does not pay a cold function call for every fragment.
+        if (needed > self.cap && !self._grow_to(needed)) {
+            if (temp != null) { free(temp); }
+            return;
+        }
+        memcpy(self._data_ptr() + old_len, src, len);
+        self.len = needed;
+        self._write_nul();
+        if (temp != null) { free(temp); }
+    }
+
+    @[hot]
+    public fn append(s: str) {
+        self.appendBytes(s.c_str(), s.len);
+    }
+
+    /// Append a signed decimal value without allocating a transient `str`.
+    /// The compiler recognizes `append(v.toString())` only for the primitive
+    /// builtin and lowers it to this ordinary stdlib call on both backends.
+    @[hot]
+    public fn appendI64(v: i64) {
+        let digits = vyx_int_decimal_len_abi(v);
+        if (digits <= 0) { return; }
+        let old_len = self.len;
+        let needed = old_len + digits;
+        if (needed > self.cap && !self._grow_to(needed)) { return; }
+        let written = vyx_int_to_string_into_abi(v, self._data_ptr() + old_len);
+        if (written != digits) {
+            self._write_nul();
+            return;
+        }
+        self.len = needed;
+        self._write_nul();
+    }
+
+    /// Unsigned counterpart of appendI64.  Kept separate so u64::MAX never
+    /// passes through a signed conversion or changes its textual spelling.
+    @[hot]
+    public fn appendU64(v: u64) {
+        let digits = vyx_uint_decimal_len_abi(v);
+        if (digits <= 0) { return; }
+        let old_len = self.len;
+        let needed = old_len + digits;
+        if (needed > self.cap && !self._grow_to(needed)) { return; }
+        let written = vyx_uint_to_string_into_abi(v, self._data_ptr() + old_len);
+        if (written != digits) {
+            self._write_nul();
+            return;
+        }
+        self.len = needed;
+        self._write_nul();
+    }
+
+    @[hot]
+    public fn appendCStr(src: rawptr) {
+        if (src == null) { return; }
+        self.appendBytes(src, strlen(src));
+    }
+
+    @[borrow_args]
+    public fn appendString(other: String) {
+        self.append(other.raw());
+    }
+
+    public fn push(c: i32) {
+        let old_len: i64 = self.len;
+        let needed = old_len + 1;
+        if (needed > self.cap && !self._grow_to(needed)) { return; }
+        let byte = c & 255;
+        memcpy(self._data_ptr() + old_len, to_rawptr(&byte), 1);
+        self.len = needed;
+        self._write_nul();
+    }
+
+    public fn clear() {
+        self.len = 0;
+        self._write_nul();
+    }
+
+    public fn shrinkToFit() {
+        if (self.owned == string_inline_flag()) { return; }
+        if (self.len <= string_sso_capacity()) {
+            let old: rawptr = self.ptr;
+            let n: i64 = self.len;
+            self.owned = string_inline_flag();
+            self.ptr = null;
+            self.cap = string_sso_capacity();
+            if (n > 0) { memcpy(self._inline_ptr(), old, n); }
+            self.len = n;
+            self._write_nul();
+            if (old != null) { free(old); }
+            return;
+        }
+        if (self.cap > self.len) {
+            let new_buf = realloc(self.ptr, self.len + 1);
+            if (new_buf != null) {
+                self.ptr = new_buf;
+                self.cap = self.len;
+                self._write_nul();
+            }
+        }
+    }
+
+    @[borrow_args]
+    public fn concat(other: str) -> String {
+        var out = String.withCapacity(self.len + other.len);
+        out.append(self.raw());
+        out.append(other);
+        return out;
+    }
+
+    @[borrow_args]
+    public fn operator_add(other: str) -> String {
+        return self.concat(other);
+    }
+
+    @[borrow_args]
+    public fn operator_add_assign(other: str) -> String {
+        self.append(other);
+        return self;
+    }
+
+    // ── Equality ────────────────────────────────────────────────────
+    public fn equalsBytes(data: rawptr, len: i64) -> bool {
+        if (len != self.len) { return false; }
+        if (len == 0) { return true; }
+        if (data == null) { return false; }
+        return strncmp(self._data_ptr(), data, len) == 0;
+    }
+
+    @[borrow_args]
+    public fn equals(other: str) -> bool {
+        return self.equalsBytes(other.c_str(), other.len);
+    }
+
+    @[borrow_args]
+    public fn operator_eq(other: str) -> bool {
+        return self.equals(other);
+    }
+
+    // ── Clone ───────────────────────────────────────────────────────
+    /// Deep copy. Independent from `self`; mutating the result does
+    /// not affect `self`. See std/clone.vyx Contract A.
+    public fn clone() -> String {
+        return String.fromBytes(self.c_str(), self.len);
+    }
+
+    public fn destroy() {
+        if (self.owned == string_heap_flag() && self.ptr != null) { free(self.ptr); }
+        self.ptr = null;
+        self.len = 0;
+        self.cap = string_sso_capacity();
+        self.owned = string_inline_flag();
+        self.inline0 = 0;
+        self.inline1 = 0;
+        self.inline2 = 0;
+    }
+
+    public fn drop() { self.destroy(); }
+}
+
+public class StringBuilder {
+    private buf: rawptr;
+    private len: i64;
+    private cap: i64;
+    private inline0: i64;
+    private inline1: i64;
+    private inline2: i64;
+    private inline3: i64;
+    private inline4: i64;
+    private inline5: i64;
+    private inline6: i64;
+    private inline7: i64;
+
+    fn _inline_capacity() -> i64 { return 63; }
+
+    fn _inline_ptr() -> rawptr {
+        return to_rawptr(&self.inline0);
+    }
+
+    fn _data_ptr() -> rawptr {
+        if (self.buf != null) { return self.buf; }
+        return self._inline_ptr();
+    }
+
+    public static fn create() -> StringBuilder {
+        return StringBuilder {
+            buf: null, len: 0, cap: 63,
+            inline0: 0, inline1: 0, inline2: 0, inline3: 0,
+            inline4: 0, inline5: 0, inline6: 0, inline7: 0
+        };
+    }
+
+    public static fn withCapacity(cap: i64) -> StringBuilder {
+        var c = cap;
+        if (c < 1) { c = 1; }
+        if (c <= 63) {
+            return StringBuilder {
+                buf: null, len: 0, cap: 63,
+                inline0: 0, inline1: 0, inline2: 0, inline3: 0,
+                inline4: 0, inline5: 0, inline6: 0, inline7: 0
+            };
+        }
+        let buf = malloc(c);
+        // Do not retain a large capacity when allocation failed: a null buf
+        // means _data_ptr() falls back to the fixed inline storage.
+        if (buf == null) { return StringBuilder.create(); }
+        return StringBuilder {
+            buf: buf, len: 0, cap: c,
+            inline0: 0, inline1: 0, inline2: 0, inline3: 0,
+            inline4: 0, inline5: 0, inline6: 0, inline7: 0
+        };
+    }
+
+    @[cold]
+    fn _grow(needed: i64) -> bool {
+        var newCap = string_next_capacity(self.cap, needed + 1);
+        if (self.buf == null) {
+            let newBuf = malloc(newCap);
+            if (newBuf == null) { return false; }
+            if (self.len > 0) { memcpy(newBuf, self._inline_ptr(), self.len); }
+            self.buf = newBuf;
+        } else {
+            let newBuf = realloc(self.buf, newCap);
+            if (newBuf == null) { return false; }
+            self.buf = newBuf;
+        }
+        self.cap = newCap;
+        return true;
+    }
+
+    @[hot]
+    public fn append(s: str) {
+        if (s.len <= 0) { return; }
+        let oldLen: i64 = self.len;
+        let needed = oldLen + s.len;
+        if (needed >= self.cap && !self._grow(needed)) { return; }
+        memcpy(self._data_ptr() + oldLen, s.c_str(), s.len);
+        self.len = needed;
+    }
+
+    @[hot]
+    public fn appendChar(c: i32) {
+        let oldLen: i64 = self.len;
+        if (oldLen + 1 >= self.cap && !self._grow(oldLen + 1)) { return; }
+        let byte = c & 255;
+        unsafe { memcpy(self._data_ptr() + oldLen, to_rawptr(&byte), 1); }
+        self.len = oldLen + 1;
+    }
+
+    @[hot]
+    public fn appendI64(val: i64) {
+        let digits = vyx_int_decimal_len_abi(val);
+        if (digits <= 0) { return; }
+        let oldLen = self.len;
+        let needed = oldLen + digits;
+        if (needed >= self.cap && !self._grow(needed)) { return; }
+        let written = vyx_int_to_string_into_abi(val, self._data_ptr() + oldLen);
+        if (written == digits) { self.len = needed; }
+    }
+
+    @[hot]
+    public fn appendU64(val: u64) {
+        let digits = vyx_uint_decimal_len_abi(val);
+        if (digits <= 0) { return; }
+        let oldLen = self.len;
+        let needed = oldLen + digits;
+        if (needed >= self.cap && !self._grow(needed)) { return; }
+        let written = vyx_uint_to_string_into_abi(val, self._data_ptr() + oldLen);
+        if (written == digits) { self.len = needed; }
+    }
+
+    public fn appendInt(val: i64) {
+        self.appendI64(val);
+    }
+
+    public fn length() -> i64 { return self.len; }
+    public fn capacity() -> i64 { return self.cap; }
+    public fn remaining() -> i64 { return self.cap - self.len; }
+
+    public fn build() -> String {
+        return String.fromBytes(self._data_ptr(), self.len);
+    }
+
+    public fn buildString() -> String {
+        return self.build();
+    }
+
+    public fn intoString() -> String {
+        if (self.len <= 0) {
+            self.len = 0;
+            return String.empty();
+        }
+        if (self.buf == null) {
+            memset(self._inline_ptr() + self.len, 0, 1);
+            let out = String.fromBytes(self._inline_ptr(), self.len);
+            self.len = 0;
+            return out;
+        }
+        memset(self.buf + self.len, 0, 1);
+        let out = String.fromOwnedRaw(self.buf, self.len, self.cap - 1);
+        self.buf = null;
+        self.len = 0;
+        self.cap = self._inline_capacity();
+        return out;
+    }
+
+    public fn clear() { self.len = 0; }
+
+    public fn destroy() {
+        if (self.buf != null) { free(self.buf); }
+        self.buf = null;
+        self.len = 0;
+        self.cap = self._inline_capacity();
+    }
+
+    /// SSS Drop — idempotent via `self.buf == null` sentinel.
+    public fn drop() { self.destroy(); }
+}
+
+impl Default for String {
+    static fn default_value() -> String {
+        return String.default_value();
+    }
+}
+
+impl Clone for String {
+    fn clone() -> String {
+        return String.fromBytes(self.c_str(), self.len);
+    }
+}

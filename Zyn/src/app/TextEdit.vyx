@@ -1,0 +1,664 @@
+module Zyn.App;
+
+use std.collections;
+use Clipboard = Zyn.Platform.Clipboard.Clipboard;
+
+// ---------------------------------------------------------------------------
+// ZC-07 text editing
+//
+// The editing model is platform-neutral and byte-indexed, because `string`
+// exposes `len` / `charAt` / `substring` in bytes. Every caret movement goes
+// through the grapheme helpers below, so Backspace never splits a combining
+// mark, a variation selector or a ZWJ emoji sequence in half.
+//
+// The state is a value: each operation returns a new state, which is what lets
+// the host write it into AppWorld resources and rebuild the view without losing
+// the caret or the selection.
+//
+// The module deliberately owns no I/O. Clipboard access goes through
+// `AppClipboardBridge`, so a headless test injects an in-memory buffer instead
+// of touching the platform.
+// ---------------------------------------------------------------------------
+
+public fn appTextUndoDepth() -> i32 { return 64; }
+public fn appTextMaskChar() -> string { return "*"; }
+
+// Edit actions a host (or a replayed timeline) can apply uniformly.
+public fn appTextActionInsert() -> i32 { return 1; }
+public fn appTextActionBackspace() -> i32 { return 2; }
+public fn appTextActionDeleteForward() -> i32 { return 3; }
+public fn appTextActionMoveLeft() -> i32 { return 4; }
+public fn appTextActionMoveRight() -> i32 { return 5; }
+public fn appTextActionMoveWordLeft() -> i32 { return 6; }
+public fn appTextActionMoveWordRight() -> i32 { return 7; }
+public fn appTextActionMoveHome() -> i32 { return 8; }
+public fn appTextActionMoveEnd() -> i32 { return 9; }
+public fn appTextActionSelectAll() -> i32 { return 10; }
+public fn appTextActionCopy() -> i32 { return 11; }
+public fn appTextActionCut() -> i32 { return 12; }
+public fn appTextActionPaste() -> i32 { return 13; }
+public fn appTextActionUndo() -> i32 { return 14; }
+public fn appTextActionRedo() -> i32 { return 15; }
+public fn appTextActionNewline() -> i32 { return 16; }
+
+// ------------------------------------------------------------------
+// Grapheme helpers (byte indexed)
+// ------------------------------------------------------------------
+
+public fn appTextLeadWidth(lead: i32) -> i32 {
+    if (lead >= 240) { return 4; }
+    if (lead >= 224) { return 3; }
+    if (lead >= 192) { return 2; }
+    return 1;
+}
+
+fn appTextByteAt(text: string, index: i32) -> i32 {
+    if (index < 0 || index >= text.len) { return -1; }
+    return text.charAt(index as i64);
+}
+
+// U+0300..U+037F combining marks are two bytes starting 0xCC / 0xCD.
+fn appTextIsCombiningAt(text: string, index: i32) -> bool {
+    let lead = appTextByteAt(text, index);
+    return lead == 204 || lead == 205;
+}
+
+// U+200D zero-width joiner, the glue inside emoji sequences.
+fn appTextIsJoinerAt(text: string, index: i32) -> bool {
+    if (appTextByteAt(text, index) != 226) { return false; }
+    if (appTextByteAt(text, index + 1) != 128) { return false; }
+    return appTextByteAt(text, index + 2) == 141;
+}
+
+// U+FE0E / U+FE0F variation selectors (text vs emoji presentation).
+fn appTextIsVariationAt(text: string, index: i32) -> bool {
+    if (appTextByteAt(text, index) != 239) { return false; }
+    if (appTextByteAt(text, index + 1) != 184) { return false; }
+    let last = appTextByteAt(text, index + 2);
+    return last == 142 || last == 143;
+}
+
+// Byte length of the grapheme that starts at `index`.
+//
+// This is a pragmatic cluster rule, not the full UAX #29 table: it covers
+// combining marks, variation selectors, ZWJ emoji sequences and CRLF, which is
+// what a text field has to get right. Anything else falls back to one code
+// point per cluster.
+public fn appTextClusterLength(text: string, index: i32) -> i32 {
+    if (index < 0 || index >= text.len) { return 0; }
+    let lead = appTextByteAt(text, index);
+    // CRLF is one cluster: otherwise a caret could sit between the two bytes.
+    if (lead == 13 && appTextByteAt(text, index + 1) == 10) { return 2; }
+    var end = index + appTextLeadWidth(lead);
+    if (end > text.len) { end = text.len; }
+    var guard: i32 = 0;
+    while (end < text.len && guard < 32) {
+        if (appTextIsCombiningAt(text, end)) { end = end + 2; guard = guard + 1; continue; }
+        if (appTextIsVariationAt(text, end)) { end = end + 3; guard = guard + 1; continue; }
+        if (appTextIsJoinerAt(text, end)) {
+            var next = end + 3;
+            if (next >= text.len) { end = text.len; break; }
+            next = next + appTextLeadWidth(appTextByteAt(text, next));
+            if (next > text.len) { next = text.len; }
+            end = next;
+            guard = guard + 1;
+            continue;
+        }
+        break;
+    }
+    if (end > text.len) { end = text.len; }
+    return end - index;
+}
+
+public fn appTextNextBoundary(text: string, index: i32) -> i32 {
+    if (index >= text.len) { return text.len; }
+    if (index < 0) { return 0; }
+    var out = index + appTextClusterLength(text, index);
+    if (out > text.len) { out = text.len; }
+    return out;
+}
+
+// Walks forward from the start so a caret can never land inside a cluster.
+// Linear in the text length; a text field is small enough that clarity wins
+// over the backward byte scan, which would stop at a combining mark.
+public fn appTextPrevBoundary(text: string, index: i32) -> i32 {
+    if (index <= 0) { return 0; }
+    var i: i32 = 0;
+    var last: i32 = 0;
+    while (i < index && i < text.len) {
+        last = i;
+        i = appTextNextBoundary(text, i);
+    }
+    return last;
+}
+
+public fn appTextClusterCount(text: string) -> i32 {
+    var count: i32 = 0;
+    var i: i32 = 0;
+    while (i < text.len) {
+        i = appTextNextBoundary(text, i);
+        count = count + 1;
+    }
+    return count;
+}
+
+fn appTextIsSpaceCode(code: i32) -> bool {
+    return code == 32 || code == 9 || code == 10 || code == 13;
+}
+
+// ASCII-oriented word boundary. Word selection in CJK text falls back to the
+// grapheme boundary, which is the behaviour a user of a mixed script expects
+// from a single tap of Ctrl+Arrow anyway.
+public fn appTextWordLeft(text: string, index: i32) -> i32 {
+    var i = index;
+    while (i > 0) {
+        let prev = appTextPrevBoundary(text, i);
+        if (!appTextIsSpaceCode(appTextByteAt(text, prev))) { break; }
+        i = prev;
+    }
+    while (i > 0) {
+        let prev = appTextPrevBoundary(text, i);
+        if (appTextIsSpaceCode(appTextByteAt(text, prev))) { break; }
+        i = prev;
+    }
+    return i;
+}
+
+public fn appTextWordRight(text: string, index: i32) -> i32 {
+    var i = index;
+    while (i < text.len && appTextIsSpaceCode(appTextByteAt(text, i))) {
+        i = appTextNextBoundary(text, i);
+    }
+    while (i < text.len && !appTextIsSpaceCode(appTextByteAt(text, i))) {
+        i = appTextNextBoundary(text, i);
+    }
+    return i;
+}
+
+// ------------------------------------------------------------------
+// Clipboard boundary
+// ------------------------------------------------------------------
+
+public interface AppClipboardBridge {
+    fn read(&self) -> string;
+    fn write(&mut self, value: string) -> i32;
+}
+
+// In-memory buffer: the headless default, and what a replayed timeline uses so
+// a recording never depends on the machine clipboard.
+public class AppMemoryClipboard : AppClipboardBridge {
+    public buffer: string;
+
+    public static fn create() -> AppMemoryClipboard {
+        return AppMemoryClipboard { buffer: "" };
+    }
+
+    public fn read(&self) -> string {
+        return self.buffer;
+    }
+
+    public fn write(&mut self, value: string) -> i32 {
+        self.buffer = value;
+        return 0;
+    }
+}
+
+public class AppPlatformClipboard : AppClipboardBridge {
+    public static fn create() -> AppPlatformClipboard {
+        return AppPlatformClipboard {};
+    }
+
+    public fn read(&self) -> string {
+        if (!Clipboard.hasText()) { return ""; }
+        return Clipboard.getText();
+    }
+
+    public fn write(&mut self, value: string) -> i32 {
+        let result = Clipboard.setText(value);
+        if (result.isOk()) { return 0; }
+        return 1;
+    }
+}
+
+// ------------------------------------------------------------------
+// Undo snapshots and the edit state
+// ------------------------------------------------------------------
+
+public class AppTextEditSnapshot {
+    public text: string;
+    public caret: i32;
+    public anchor: i32;
+
+    public static fn create(text: string, caret: i32, anchor: i32) -> AppTextEditSnapshot {
+        return AppTextEditSnapshot { text: text, caret: caret, anchor: anchor };
+    }
+
+    public fn dup(&self) -> AppTextEditSnapshot {
+        return AppTextEditSnapshot.create(self.text, self.caret, self.anchor);
+    }
+}
+
+public class AppTextEditState {
+    public text: string;
+    public caret: i32;
+    public anchor: i32;
+    public is_multiline: bool;
+    public is_readonly: bool;
+    public is_disabled: bool;
+    public is_password: bool;
+    public mask_char: string;
+    public max_length: i32;
+    public is_composing: bool;
+    public composition_start: i32;
+    public composition_text: string;
+    private undo_stack: Vec<AppTextEditSnapshot>;
+    private redo_stack: Vec<AppTextEditSnapshot>;
+
+    public static fn create() -> AppTextEditState {
+        return AppTextEditState {
+            text: "",
+            caret: 0,
+            anchor: 0,
+            is_multiline: false,
+            is_readonly: false,
+            is_disabled: false,
+            is_password: false,
+            mask_char: appTextMaskChar(),
+            max_length: 0,
+            is_composing: false,
+            composition_start: 0,
+            composition_text: "",
+            undo_stack: Vec::<AppTextEditSnapshot>.new(),
+            redo_stack: Vec::<AppTextEditSnapshot>.new()
+        };
+    }
+
+    public static fn withText(value: string) -> AppTextEditState {
+        var out = AppTextEditState.create();
+        out.text = value;
+        out.caret = value.len;
+        out.anchor = value.len;
+        return out;
+    }
+
+    public fn dup(&self) -> AppTextEditState {
+        var out = AppTextEditState.create();
+        out.text = self.text;
+        out.caret = self.caret;
+        out.anchor = self.anchor;
+        out.is_multiline = self.is_multiline;
+        out.is_readonly = self.is_readonly;
+        out.is_disabled = self.is_disabled;
+        out.is_password = self.is_password;
+        out.mask_char = self.mask_char;
+        out.max_length = self.max_length;
+        out.is_composing = self.is_composing;
+        out.composition_start = self.composition_start;
+        out.composition_text = self.composition_text;
+        var i: i32 = 0;
+        while (i < (self.undo_stack.len as i32)) {
+            out.undo_stack.push(self.undo_stack.get(i as i64).dup());
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (self.redo_stack.len as i32)) {
+            out.redo_stack.push(self.redo_stack.get(i as i64).dup());
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn acceptsInput(&self) -> bool {
+        return !self.is_readonly && !self.is_disabled;
+    }
+
+    public fn selectionStart(&self) -> i32 {
+        if (self.anchor < self.caret) { return self.anchor; }
+        return self.caret;
+    }
+
+    public fn selectionEnd(&self) -> i32 {
+        if (self.anchor > self.caret) { return self.anchor; }
+        return self.caret;
+    }
+
+    public fn hasSelection(&self) -> bool {
+        return self.selectionStart() < self.selectionEnd();
+    }
+
+    public fn selectedText(&self) -> string {
+        if (!self.hasSelection()) { return ""; }
+        return self.text.substring(self.selectionStart() as i64, self.selectionEnd() as i64);
+    }
+
+    public fn clusterCount(&self) -> i32 {
+        return appTextClusterCount(self.text);
+    }
+
+    // What a password field shows: one mask per grapheme, never per byte.
+    public fn displayText(&self) -> string {
+        if (!self.is_password) { return self.text; }
+        return self.mask_char.repeat(self.clusterCount());
+    }
+
+    // Caret and selection survive a rebuild because the host writes them into
+    // resources rather than holding them in the view.
+    public fn saveTo(&self, world: AppWorld, prefix: string) -> AppWorld {
+        if (prefix.len == 0) { return world; }
+        var out = world.setStringResource(prefix + ".text", self.text);
+        out = out.setStringResource(prefix + ".caret", format("%d", self.caret as i64));
+        out = out.setStringResource(prefix + ".anchor", format("%d", self.anchor as i64));
+        return out;
+    }
+
+    public static fn loadFrom(world: AppWorld, prefix: string) -> AppTextEditState {
+        var out = AppTextEditState.create();
+        if (prefix.len == 0) { return out; }
+        out.text = world.stringResource(prefix + ".text", "");
+        out.caret = app_parse_i32_or(world.stringResource(prefix + ".caret", "0"), 0);
+        out.anchor = app_parse_i32_or(world.stringResource(prefix + ".anchor", "0"), 0);
+        if (out.caret < 0 || out.caret > out.text.len) { out.caret = out.text.len; }
+        if (out.anchor < 0 || out.anchor > out.text.len) { out.anchor = out.text.len; }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // History
+    // ------------------------------------------------------------------
+
+    public fn canUndo(&self) -> bool { return self.undo_stack.len > 0; }
+    public fn canRedo(&self) -> bool { return self.redo_stack.len > 0; }
+    public fn undoDepth(&self) -> i32 { return self.undo_stack.len as i32; }
+    public fn redoDepth(&self) -> i32 { return self.redo_stack.len as i32; }
+
+    private fn pushUndo(mut self) -> AppTextEditState {
+        if ((self.undo_stack.len as i32) >= appTextUndoDepth()) {
+            self.undo_stack.remove(0 as i64);
+        }
+        self.undo_stack.push(AppTextEditSnapshot.create(self.text, self.caret, self.anchor));
+        self.redo_stack.clear();
+        return self;
+    }
+
+    private fn popUndo(mut self) -> AppTextEditState {
+        if (self.undo_stack.len > 0) { self.undo_stack.remove((self.undo_stack.len - 1) as i64); }
+        return self;
+    }
+
+    public fn clearHistory(mut self) -> AppTextEditState {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        return self;
+    }
+
+    private fn restore(mut self, snapshot: AppTextEditSnapshot) -> AppTextEditState {
+        self.text = snapshot.text;
+        self.caret = snapshot.caret;
+        self.anchor = snapshot.anchor;
+        return self;
+    }
+
+    public fn undo(mut self) -> AppTextEditState {
+        if (self.undo_stack.len <= 0) { return self; }
+        let index = self.undo_stack.len - 1;
+        let snapshot = self.undo_stack.get(index as i64).dup();
+        self.redo_stack.push(AppTextEditSnapshot.create(self.text, self.caret, self.anchor));
+        self.undo_stack.remove(index as i64);
+        return self.restore(snapshot);
+    }
+
+    public fn redo(mut self) -> AppTextEditState {
+        if (self.redo_stack.len <= 0) { return self; }
+        let index = self.redo_stack.len - 1;
+        let snapshot = self.redo_stack.get(index as i64).dup();
+        self.undo_stack.push(AppTextEditSnapshot.create(self.text, self.caret, self.anchor));
+        self.redo_stack.remove(index as i64);
+        return self.restore(snapshot);
+    }
+
+    // ------------------------------------------------------------------
+    // Selection and caret
+    // ------------------------------------------------------------------
+
+    public fn withCaret(mut self, index: i32) -> AppTextEditState {
+        var target = index;
+        if (target < 0) { target = 0; }
+        if (target > self.text.len) { target = self.text.len; }
+        self.caret = target;
+        self.anchor = target;
+        return self;
+    }
+
+    public fn extendTo(mut self, index: i32) -> AppTextEditState {
+        var target = index;
+        if (target < 0) { target = 0; }
+        if (target > self.text.len) { target = self.text.len; }
+        self.caret = target;
+        return self;
+    }
+
+    public fn selectRange(mut self, start: i32, length: i32) -> AppTextEditState {
+        var lo = start;
+        if (lo < 0) { lo = 0; }
+        if (lo > self.text.len) { lo = self.text.len; }
+        var hi = lo + length;
+        if (hi < lo) { hi = lo; }
+        if (hi > self.text.len) { hi = self.text.len; }
+        self.anchor = lo;
+        self.caret = hi;
+        return self;
+    }
+
+    public fn selectAll(mut self) -> AppTextEditState {
+        self.anchor = 0;
+        self.caret = self.text.len;
+        return self;
+    }
+
+    // Replaces the selection with `value`, honouring `max_length` (which counts
+    // graphemes, not bytes, so a limit of 10 does not cut a CJK string in half).
+    public fn insert(mut self, value: string) -> AppTextEditState {
+        if (!self.acceptsInput()) { return self; }
+        if (value.len == 0) { return self; }
+        let start = self.selectionStart();
+        let end = self.selectionEnd();
+        var added = value;
+        // A single-line field drops CR/LF rather than rejecting the paste, so
+        // pasting a multi-line snippet still does something useful.
+        if (!self.is_multiline) {
+            var cleaned = "";
+            var i: i32 = 0;
+            while (i < value.len) {
+                let code = value.charAt(i as i64);
+                let width = appTextClusterLength(value, i);
+                if (code != 10 && code != 13) {
+                    cleaned = cleaned + value.substring(i as i64, (i + width) as i64);
+                }
+                i = i + width;
+            }
+            added = cleaned;
+            if (added.len == 0) { return self; }
+        }
+        if (self.max_length > 0) {
+            let kept = self.text.substring(0, start as i64) + added + self.text.substring(end as i64, self.text.len as i64);
+            if (appTextClusterCount(kept) > self.max_length) { return self; }
+        }
+        self = self.pushUndo();
+        self.text = self.text.substring(0, start as i64) + added + self.text.substring(end as i64, self.text.len as i64);
+        self.caret = start + added.len;
+        self.anchor = self.caret;
+        return self;
+    }
+
+    public fn deleteSelection(mut self) -> AppTextEditState {
+        if (!self.hasSelection()) { return self; }
+        self = self.pushUndo();
+        let start = self.selectionStart();
+        let end = self.selectionEnd();
+        self.text = self.text.substring(0, start as i64) + self.text.substring(end as i64, self.text.len as i64);
+        self.caret = start;
+        self.anchor = start;
+        return self;
+    }
+
+    public fn backspace(mut self) -> AppTextEditState {
+        if (!self.acceptsInput()) { return self; }
+        if (self.hasSelection()) { return self.deleteSelection(); }
+        if (self.caret <= 0) { return self; }
+        let previous = appTextPrevBoundary(self.text, self.caret);
+        self = self.pushUndo();
+        self.text = self.text.substring(0, previous as i64) + self.text.substring(self.caret as i64, self.text.len as i64);
+        self.caret = previous;
+        self.anchor = previous;
+        return self;
+    }
+
+    public fn deleteForward(mut self) -> AppTextEditState {
+        if (!self.acceptsInput()) { return self; }
+        if (self.hasSelection()) { return self.deleteSelection(); }
+        if (self.caret >= self.text.len) { return self; }
+        let next = appTextNextBoundary(self.text, self.caret);
+        self = self.pushUndo();
+        self.text = self.text.substring(0, self.caret as i64) + self.text.substring(next as i64, self.text.len as i64);
+        return self;
+    }
+
+    private fn moveTo(mut self, index: i32, extend: bool) -> AppTextEditState {
+        if (extend) { return self.extendTo(index); }
+        return self.withCaret(index);
+    }
+
+    public fn moveLeft(mut self, extend: bool) -> AppTextEditState {
+        if (self.hasSelection() && !extend) {
+            return self.withCaret(self.selectionStart());
+        }
+        return self.moveTo(appTextPrevBoundary(self.text, self.caret), extend);
+    }
+
+    public fn moveRight(mut self, extend: bool) -> AppTextEditState {
+        if (self.hasSelection() && !extend) {
+            return self.withCaret(self.selectionEnd());
+        }
+        return self.moveTo(appTextNextBoundary(self.text, self.caret), extend);
+    }
+
+    public fn moveWordLeft(mut self, extend: bool) -> AppTextEditState {
+        return self.moveTo(appTextWordLeft(self.text, self.caret), extend);
+    }
+
+    public fn moveWordRight(mut self, extend: bool) -> AppTextEditState {
+        return self.moveTo(appTextWordRight(self.text, self.caret), extend);
+    }
+
+    public fn moveHome(mut self, extend: bool) -> AppTextEditState {
+        return self.moveTo(0, extend);
+    }
+
+    public fn moveEnd(mut self, extend: bool) -> AppTextEditState {
+        return self.moveTo(self.text.len, extend);
+    }
+
+    // ------------------------------------------------------------------
+    // Clipboard
+    // ------------------------------------------------------------------
+
+    public fn copyTo(mut self, mut clipboard: dyn AppClipboardBridge) -> AppTextEditState {
+        if (!self.hasSelection()) { return self; }
+        clipboard.write(self.selectedText());
+        return self;
+    }
+
+    public fn cutTo(mut self, mut clipboard: dyn AppClipboardBridge) -> AppTextEditState {
+        if (!self.acceptsInput() || !self.hasSelection()) { return self; }
+        clipboard.write(self.selectedText());
+        return self.deleteSelection();
+    }
+
+    public fn pasteFrom(mut self, clipboard: dyn AppClipboardBridge) -> AppTextEditState {
+        if (!self.acceptsInput()) { return self; }
+        return self.insert(clipboard.read());
+    }
+
+    // ------------------------------------------------------------------
+    // IME composition
+    // ------------------------------------------------------------------
+
+    public fn beginComposition(mut self) -> AppTextEditState {
+        if (!self.acceptsInput() || self.is_composing) { return self; }
+        self = self.pushUndo();
+        self.is_composing = true;
+        self.composition_start = self.selectionStart();
+        self.composition_text = "";
+        return self;
+    }
+
+    // Intermediate composition text replaces the previous intermediate text, so
+    // the user never sees the two versions concatenated.
+    public fn updateComposition(mut self, value: string) -> AppTextEditState {
+        if (!self.is_composing) { return self.beginComposition().updateComposition(value); }
+        let start = self.composition_start;
+        let end = start + self.composition_text.len;
+        self.text = self.text.substring(0, start as i64) + value + self.text.substring(end as i64, self.text.len as i64);
+        self.composition_text = value;
+        self.caret = start + value.len;
+        self.anchor = self.caret;
+        return self;
+    }
+
+    public fn commitComposition(mut self) -> AppTextEditState {
+        if (!self.is_composing) { return self; }
+        self.is_composing = false;
+        self.composition_text = "";
+        self.composition_start = self.caret;
+        return self;
+    }
+
+    public fn cancelComposition(mut self) -> AppTextEditState {
+        if (!self.is_composing) { return self; }
+        let start = self.composition_start;
+        let end = start + self.composition_text.len;
+        self.text = self.text.substring(0, start as i64) + self.text.substring(end as i64, self.text.len as i64);
+        self.caret = start;
+        self.anchor = start;
+        self.is_composing = false;
+        self.composition_text = "";
+        self.composition_start = start;
+        // The undo entry taken at beginComposition would otherwise restore the
+        // text as it was before an edit the user just cancelled.
+        return self.popUndo();
+    }
+
+    // ------------------------------------------------------------------
+    // Uniform entry point
+    // ------------------------------------------------------------------
+
+    // One action in, one state out. A host maps a key to an action, and a
+    // replayed timeline stores the action instead of the resulting text.
+    public fn apply(mut self, action: i32, payload: string, extend: bool, clipboard: dyn AppClipboardBridge) -> AppTextEditState {
+        if (action == appTextActionInsert()) { return self.insert(payload); }
+        if (action == appTextActionNewline()) {
+            if (!self.is_multiline) { return self; }
+            return self.insert("\n");
+        }
+        if (action == appTextActionBackspace()) { return self.backspace(); }
+        if (action == appTextActionDeleteForward()) { return self.deleteForward(); }
+        if (action == appTextActionMoveLeft()) { return self.moveLeft(extend); }
+        if (action == appTextActionMoveRight()) { return self.moveRight(extend); }
+        if (action == appTextActionMoveWordLeft()) { return self.moveWordLeft(extend); }
+        if (action == appTextActionMoveWordRight()) { return self.moveWordRight(extend); }
+        if (action == appTextActionMoveHome()) { return self.moveHome(extend); }
+        if (action == appTextActionMoveEnd()) { return self.moveEnd(extend); }
+        if (action == appTextActionSelectAll()) { return self.selectAll(); }
+        if (action == appTextActionCopy()) { return self.copyTo(clipboard); }
+        if (action == appTextActionCut()) { return self.cutTo(clipboard); }
+        if (action == appTextActionPaste()) { return self.pasteFrom(clipboard); }
+        if (action == appTextActionUndo()) { return self.undo(); }
+        if (action == appTextActionRedo()) { return self.redo(); }
+        return self;
+    }
+
+    public fn destroy(&mut self) {
+        self.undo_stack.destroy();
+        self.redo_stack.destroy();
+    }
+}

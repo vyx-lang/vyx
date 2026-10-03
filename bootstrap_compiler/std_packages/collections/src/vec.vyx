@@ -1,0 +1,886 @@
+module std.collections;
+
+use std.defaults;
+use std.string;
+
+/// Vyx Standard Library — Vec<T>
+/// True generic dynamic array — stores elements at their actual size.
+/// For i32: 4 bytes/elem, for i64: 8 bytes, for string: 32 bytes, etc.
+///
+/// Safety tiers (opt-in philosophy — defaults cost cycles, fast path available):
+///   - Checked:   `push` / `get` / `set` / `pop` — UAF guard + bounds
+///                + iter-invalidation bump. Default; correct by construction.
+///   - Unchecked: `push_unchecked` / `get_unchecked` / `set_unchecked`
+///                — zero-cost. Caller owns every invariant: capacity
+///                pre-reserved, no concurrent iterators, Vec not
+///                destroyed. Bump-less: in-flight iterators will NOT
+///                observe writes made via these methods. Use in inner
+///                loops where the caller has already proved safety.
+///   - Concurrent: wrap with `ConcurrentVec<T>` (std/concurrent.vyx).
+///                Mutex per container, coarse but correct under threads.
+
+extern "C" {
+    fn malloc(size: i64) -> rawptr;
+    fn realloc(ptr: rawptr, size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: i64) -> rawptr;
+    fn memmove(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: i64) -> i32;
+    fn vyx_sort_i64_abi(data: rawptr, len: i64);
+}
+
+@[lang_item("vec")]
+class Vec<T> : Iterable, Hashable, Eq {
+    public data: rawptr;
+    public len: i64;
+    public cap: i64;
+    public elem_size: i64;
+    // Structural-mutation counter. Incremented by push/pop/insert/remove/
+    // clear/set whenever the backing array or logical size changes. Iter
+    // captures a snapshot + a pointer here; Iter.next() compares and
+    // panics on mismatch so stale iterators don't silently read dangling
+    // data (the realloc hazard).
+    public gen: i64;
+
+    /// Panic with a clear message when a user operation runs on a Vec
+    /// whose backing buffer has already been freed via `.destroy()`.
+    /// Without this check, post-destroy push/get/set silently wrote to
+    /// (or read from) dangling memory — classic UAF.
+    fn _check_alive(&self) {
+        if (self.data == null && self.cap == 0) {
+            panic("Vec: use-after-destroy");
+        }
+    }
+
+    /// Construction, C++-vector aligned.  Vyx has no overloads, so the
+    /// `vector(n)` / `vector(n, val)` forms get dedicated names:
+    ///   - `new()`          — empty vec with default capacity (16).
+    ///   - `zeroed(n)`      — `vector(n)`: n zero-initialized elements.
+    ///   - `filled(n, val)` — `vector(n, val)`: n copies of `val`.
+    ///   - `from_array(arr, n)` — copies n elements from a raw array.
+    public static fn new() -> Vec<T> {
+        let es = sizeof::<T>();
+        let c: i64 = 16;
+        let d = malloc(c * es);
+        if (d != null) { memset(d, 0, c * es); }
+        return Vec::<T> { data: d, len: 0, cap: c, elem_size: es, gen: 0 };
+    }
+
+    /// `vector(n)`: n zero-initialized elements.
+    public static fn zeroed(n: i64) -> Vec<T> {
+        let es = sizeof::<T>();
+        var c = n;
+        if (c < 0) { c = 0; }
+        let d = malloc(c * es);
+        if (d == null) { panic("Vec: allocation failed"); }
+        memset(d, 0, c * es);
+        return Vec::<T> { data: d, len: c, cap: c, elem_size: es, gen: 0 };
+    }
+
+    /// `vector(n, val)` for any element type: n copies of `val`.
+    public static fn filled(n: i64, val: T) -> Vec<T> {
+        let es = sizeof::<T>();
+        var c = n;
+        if (c < 0) { c = 0; }
+        var out = Vec::<T>::with_capacity(c);
+        var i: i64 = 0;
+        while (i < c) {
+            out.push_unchecked(val);
+            i = i + 1;
+        }
+        out.gen = out.gen + 1;
+        return out;
+    }
+
+    /// Batch init from a raw array: copies `n` elements starting at `arr`.
+    /// `arr` is a *typed* `*T`, so `arr + i` already scales by the element
+    /// size — going through a `rawptr` local keeps the byte-wise `+ i * es`
+    /// arithmetic used everywhere else in this file (a typed `arr + i * es`
+    /// would scale twice and read past the buffer).
+    public static fn from_array(arr: *T, n: i64) -> Vec<T> {
+        let es = sizeof::<T>();
+        var count = n;
+        if (arr == null || count <= 0) { return Vec::<T>::new(); }
+        var out = Vec::<T>::with_capacity(count);
+        let src = arr as rawptr;
+        var i: i64 = 0;
+        while (i < count) {
+            let slot = out.data + out.len * es;
+            memcpy(slot, src + i * es, es);
+            out.len = out.len + 1;
+            i = i + 1;
+        }
+        out.gen = out.gen + 1;
+        return out;
+    }
+
+    /// `resize(n, val)`: grow fills new slots with `val`, shrink truncates.
+    /// Matches C++ `vector::resize(n, val)`.
+    public fn resize(n: i64, val: T) {
+        self._check_alive();
+        if (n < 0) { panic("Vec.resize: negative length"); }
+        if (n < self.len) {
+            self.len = n;
+            self.gen = self.gen + 1;
+            return;
+        }
+        if (n == self.len) { return; }
+        self.ensure_capacity(n);
+        let es = sizeof::<T>();
+        var i = self.len;
+        while (i < n) {
+            let slot = self.data + i * es;
+            memcpy(slot, to_rawptr(&val), es);
+            i = i + 1;
+        }
+        self.len = n;
+        self.gen = self.gen + 1;
+    }
+
+    @[inline]
+    public static fn with_capacity(cap: i64) -> Vec<T> {
+        let es = sizeof::<T>();
+        var c = cap;
+        if (c < 4) { c = 4; }
+        let d = malloc(c * es);
+        return Vec::<T> { data: d, len: 0, cap: c, elem_size: es, gen: 0 };
+    }
+
+    public fn ensure_capacity(min_cap: i64) {
+        // Negative request usually means i64 overflow in caller
+        // arithmetic (e.g. `self.len + huge_value`). Reject up-front so
+        // the "cap already >= min_cap" fast-path below doesn't silently
+        // swallow the bug.
+        if (min_cap < 0) { panic("Vec: capacity request overflowed i64"); }
+        if (self.cap >= min_cap) { return; }
+        var nc = self.cap;
+        if (nc <= 0) { nc = 16; }
+        while (nc < min_cap) {
+            // Doubling-until-overflow guard: MAX_I64 / 2 = 4611686018427387903.
+            if (nc > 4611686018427387903) {
+                panic("Vec: capacity doubling overflowed i64");
+            }
+            nc = nc * 2;
+        }
+        // Element-size × capacity can still overflow even when min_cap fits.
+        let es = sizeof::<T>();
+        if (es > 0 && nc > 9223372036854775807 / es) {
+            panic("Vec: nc * elem_size overflowed i64");
+        }
+        let nd = realloc(self.data, nc * es);
+        if (nd == null) { panic("Vec: allocation failed"); }
+        self.data = nd;
+        self.cap = nc;
+        self.gen = self.gen + 1;  // realloc invalidates live iterators
+    }
+
+    @[inline]
+    public fn push(val: T) {
+        self._check_alive();
+        self.ensure_capacity(self.len + 1);
+        let es = sizeof::<T>();
+        let slot = self.data + self.len * es;
+        memcpy(slot, to_rawptr(&val), es);
+        self.len = self.len + 1;
+        self.gen = self.gen + 1;
+    }
+
+    /// Hot-path push for benchmarks or known-safe code paths.
+    /// Skips the use-after-destroy check AND the gen bump (so any
+    /// outstanding iterator won't see this modification). Caller is
+    /// responsible for: (1) no concurrent iterators, (2) capacity
+    /// already ensured, (3) Vec not destroyed. Use with care — this
+    /// is the "zero-cost" tier.
+    @[inline]
+    public fn push_unchecked(val: T) {
+        let es = sizeof::<T>();
+        let slot = self.data + self.len * es;
+        memcpy(slot, to_rawptr(&val), es);
+        self.len = self.len + 1;
+    }
+
+    public fn iter(&self) -> Iterator<T> {
+        return Iterator::<T> {
+            data: self.data, len: self.len, pos: 0,
+            source_gen: to_rawptr(&self.gen),
+            gen_snapshot: self.gen
+        };
+    }
+
+    /// Element access. The returned T is an *owned* value: for elements
+    /// with heap storage (string, Vec, Box, ...) the element's Clone impl
+    /// deep-copies so the result does not alias `self.data`. This matches
+    /// the move-by-default ownership contract — every rvalue of an owning
+    /// type must own its bytes — and lets consumers (interpolation, print)
+    /// release the temporary without corrupting the vec slot.
+    ///
+    /// `@[lazy]` keeps the `e.clone()` requirement out of programs whose
+    /// element types have no Clone impl; see std/clone.vyx for the two
+    /// clone contracts and std/vec.vyx `clone()` for the same pattern.
+    @[lazy]
+    public fn get(&self, idx: i64) -> T {
+        self._check_alive();
+        if (idx < 0 || idx >= self.len) { panic("Vec.get out of bounds"); }
+        let slot = self.data + idx * sizeof::<T>();
+        var out: T;
+        memcpy(to_rawptr(&out), slot, sizeof::<T>());
+        return out.clone();
+    }
+
+    /// Same ownership contract as `get`: returns an owned copy.
+    @[inline]
+    @[lazy]
+    public fn get_unchecked(&self, idx: i64) -> T {
+        let slot = self.data + idx * sizeof::<T>();
+        var out: T;
+        memcpy(to_rawptr(&out), slot, sizeof::<T>());
+        return out.clone();
+    }
+
+    /// Returns a pointer to the element at idx, avoiding memcpy.
+    public fn get_ptr(&self, idx: i64) -> *T {
+        if (idx < 0 || idx >= self.len) { panic("Vec.get_ptr out of bounds"); }
+        return (self.data + idx * sizeof::<T>()) as *T;
+    }
+
+    /// Index operator. Returns an element reference so `v[i]` can be
+    /// used both for reads and as an assignment target.
+    /// Index operator. Returns a mutable reference view: `v[i]` reads like
+    /// the element, `v[i] = x` writes through the reference, and the
+    /// declared type stays WYSIWYG (`typeof(v[i])` is `&mut T`).
+    public fn operator[](&mut self, idx: i64) -> &mut T {
+        let p = self.get_ptr(idx);
+        return &mut p[0];
+    }
+
+    public fn set(idx: i64, val: T) {
+        self._check_alive();
+        if (idx < 0 || idx >= self.len) { panic("Vec.set out of bounds"); }
+        let es = sizeof::<T>();
+        let slot = self.data + idx * es;
+        memcpy(slot, to_rawptr(&val), es);
+    }
+
+    /// Zero-cost set — no bounds check, no UAF check. Caller owns the
+    /// invariants. Same opt-out tier as `get_unchecked` / `push_unchecked`.
+    @[inline]
+    public fn set_unchecked(idx: i64, val: T) {
+        let es = sizeof::<T>();
+        let slot = self.data + idx * es;
+        memcpy(slot, to_rawptr(&val), es);
+    }
+
+    public fn pop() -> T {
+        self._check_alive();
+        if (self.len <= 0) { panic("Vec.pop from empty vec"); }
+        self.len = self.len - 1;
+        self.gen = self.gen + 1;
+        let slot = self.data + self.len * sizeof::<T>();
+        var out: T;
+        memcpy(to_rawptr(&out), slot, sizeof::<T>());
+        return out;
+    }
+
+    public fn clear() { self.len = 0; self.gen = self.gen + 1; }
+    @[inline]
+    public fn isEmpty(&self) -> bool { return self.len == 0; }
+    @[inline]
+    public fn length(&self) -> i64 { return self.len; }
+    @[inline]
+    public fn size(&self) -> i64 { return self.len; }
+    @[inline]
+    public fn count(&self) -> i64 { return self.len; }
+    @[inline]
+    public fn capacity(&self) -> i64 { return self.cap; }
+
+    public fn first(&self) -> T {
+        if (self.len <= 0) { panic("Vec.first on empty vec"); }
+        return self.get_unchecked(0);
+    }
+
+    public fn last(&self) -> T {
+        if (self.len <= 0) { panic("Vec.last on empty vec"); }
+        return self.get_unchecked(self.len - 1);
+    }
+
+    public fn reserve(min_cap: i64) { self.ensure_capacity(min_cap); }
+
+    public fn shrink_to_fit() {
+        if (self.len >= self.cap) { return; }
+        var nc = self.len;
+        if (nc < 4) { nc = 4; }
+        let nd = realloc(self.data, nc * self.elem_size);
+        if (nd == null) { panic("Vec: allocation failed"); }
+        self.data = nd;
+        self.cap = nc;
+        self.gen = self.gen + 1;  // realloc invalidates live iterators
+    }
+
+    @[borrow_args]
+    public fn contains(&self, val: T) -> bool {
+        let es = sizeof::<T>();
+        if (es <= 8) {
+            var vh: i64 = 0;
+            memcpy(to_rawptr(&vh), to_rawptr(&val), es);
+            var i: i64 = 0;
+            while (i < self.len) {
+                var ev: i64 = 0;
+                memcpy(to_rawptr(&ev), self.data + i * es, es);
+                if (ev == vh) { return true; }
+                i = i + 1;
+            }
+            return false;
+        }
+        let val_buf = to_rawptr(&val);
+        var i: i64 = 0;
+        while (i < self.len) {
+            if (memcmp(self.data + i * es, val_buf, es) == 0) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    @[borrow_args]
+    public fn indexOf(&self, val: T) -> i64 {
+        let es = sizeof::<T>();
+        if (es <= 8) {
+            var vh: i64 = 0;
+            memcpy(to_rawptr(&vh), to_rawptr(&val), es);
+            var i: i64 = 0;
+            while (i < self.len) {
+                var ev: i64 = 0;
+                memcpy(to_rawptr(&ev), self.data + i * es, es);
+                if (ev == vh) { return i; }
+                i = i + 1;
+            }
+            return -1;
+        }
+        let val_buf = to_rawptr(&val);
+        var i: i64 = 0;
+        while (i < self.len) {
+            if (memcmp(self.data + i * es, val_buf, es) == 0) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn sum(&self) -> i64 {
+        let es = sizeof::<T>();
+        var total: i64 = 0;
+        var i: i64 = 0;
+        while (i < self.len) {
+            var ev: i64 = 0;
+            memcpy(to_rawptr(&ev), self.data + i * es, es);
+            total = total + ev;
+            i = i + 1;
+        }
+        return total;
+    }
+
+    public fn remove(idx: i64) -> T { return self.removeAt(idx); }
+
+    public fn insert(idx: i64, val: T) {
+        self._check_alive();
+        if (idx < 0 || idx > self.len) { panic("Vec.insert out of bounds"); }
+        self.ensure_capacity(self.len + 1);
+        let es = sizeof::<T>();
+        if (idx < self.len) {
+            let src = self.data + idx * es;
+            let dst = self.data + (idx + 1) * es;
+            let bytes = (self.len - idx) * es;
+            memmove(dst, src, bytes);
+        }
+        let slot = self.data + idx * es;
+        memcpy(slot, to_rawptr(&val), es);
+        self.len = self.len + 1;
+        self.gen = self.gen + 1;
+    }
+
+    public fn removeAt(idx: i64) -> T {
+        self._check_alive();
+        if (idx < 0 || idx >= self.len) { panic("Vec.removeAt out of bounds"); }
+        let es = sizeof::<T>();
+        let slot = self.data + idx * es;
+        var out: T;
+        memcpy(to_rawptr(&out), slot, es);
+        self.len = self.len - 1;
+        if (idx < self.len) {
+            let src = self.data + (idx + 1) * es;
+            let dst = self.data + idx * es;
+            let bytes = (self.len - idx) * es;
+            memmove(dst, src, bytes);
+        }
+        self.gen = self.gen + 1;
+        return out;
+    }
+
+    /// Zero-allocation swap: uses 8-byte chunk swapping on the stack.
+    @[inline]
+    public fn swap(i: i64, j: i64) {
+        let es = sizeof::<T>();
+        let si = self.data + i * es;
+        let sj = self.data + j * es;
+        var off: i64 = 0;
+        while (off + 8 <= es) {
+            var tmp: i64 = 0;
+            memcpy(to_rawptr(&tmp), si + off, 8);
+            memcpy(si + off, sj + off, 8);
+            memcpy(sj + off, to_rawptr(&tmp), 8);
+            off = off + 8;
+        }
+        while (off < es) {
+            var tmp: i64 = 0;
+            memcpy(to_rawptr(&tmp), si + off, 1);
+            memcpy(si + off, sj + off, 1);
+            memcpy(sj + off, to_rawptr(&tmp), 1);
+            off = off + 1;
+        }
+    }
+
+    public fn reverse() {
+        var lo: i64 = 0;
+        var hi = self.len - 1;
+        while (lo < hi) {
+            self.swap(lo, hi);
+            lo = lo + 1;
+            hi = hi - 1;
+        }
+    }
+
+    public fn sort() {
+        if (self.len <= 1) { return; }
+        let es = sizeof::<T>();
+        if (es == 8) {
+            vyx_sort_i64_abi(self.data, self.len);
+        } else if (es < 8) {
+            // Sub-8-byte elements: pad each slot into an i64 register by
+            // byte-loading and recombining little-endian. Comparison order
+            // is exact for unsigned payloads; signed sub-8 types compare
+            // correctly because the sign bit stays the highest set byte's
+            // high bit after recombination only when es==8 — so for es<8
+            // we fall back to the generic memcpy comparator instead of
+            // risking misordered negatives.
+            self._quicksort(0, self.len - 1);
+        } else {
+            self._quicksort(0, self.len - 1);
+        }
+    }
+
+    /// Load slot i as a full i64 (es == 8 only). Direct LLVM load.
+    @[inline]
+    fn _slot(i: i64) -> i64 {
+        return ptr_read_i64(self.data + i * 8);
+    }
+
+    /// Store slot i from a full i64 (es == 8 only). Direct LLVM store.
+    @[inline]
+    fn _set_slot(i: i64, v: i64) {
+        ptr_write_i64(self.data + i * 8, v);
+    }
+
+    /// Insertion sort over [lo, hi] with register-resident elements.
+    fn _insertion(lo: i64, hi: i64) {
+        // Cache the backing pointer in a local: LLVM keeps an SSA local
+        let p = self.data;
+        var i = lo + 1;
+        while (i <= hi) {
+            let key = ptr_read_i64(p + i * 8);
+            var j = i - 1;
+            while (j >= lo && ptr_read_i64(p + j * 8) > key) {
+                ptr_write_i64(p + (j + 1) * 8, ptr_read_i64(p + j * 8));
+                j = j - 1;
+            }
+            ptr_write_i64(p + (j + 1) * 8, key);
+            i = i + 1;
+        }
+    }
+
+    /// Order lo/mid/hi so data[hi] holds the median; returns that value.
+    /// Median-of-3 defeats sorted/reversed adversarial inputs.
+    fn _median3(lo: i64, hi: i64) -> i64 {
+        let p = self.data;
+        let mid = lo + (hi - lo) / 2;
+        var a = ptr_read_i64(p + lo * 8);
+        var b = ptr_read_i64(p + mid * 8);
+        let c = ptr_read_i64(p + hi * 8);
+        if (b < a) {
+            ptr_write_i64(p + lo * 8, b);
+            ptr_write_i64(p + mid * 8, a);
+            let t = a; a = b; b = t;
+        }
+        if (b > c) {
+            ptr_write_i64(p + mid * 8, c);
+            ptr_write_i64(p + hi * 8, b);
+            b = c;
+        }
+        if (a > b) {
+            ptr_write_i64(p + lo * 8, b);
+            ptr_write_i64(p + mid * 8, a);
+        }
+        // The three values are now ordered as [min, median, max].  Move the
+        // median to the partition hole at hi; returning the old hi value
+        // would select the maximum and create a persistently unbalanced
+        // quicksort partition.
+        let median = ptr_read_i64(p + mid * 8);
+        let maximum = ptr_read_i64(p + hi * 8);
+        ptr_write_i64(p + mid * 8, maximum);
+        ptr_write_i64(p + hi * 8, median);
+        return median;
+    }
+
+    /// Max-sift-down over virtual heap [base .. base+end).
+    fn _sift(base: i64, root_in: i64, end: i64) {
+        let p = self.data;
+        var root = root_in;
+        var go = true;
+        while (go) {
+            let child = 2 * root + 1;
+            if (child >= end) {
+                go = false;
+            } else {
+                var big = child;
+                var bv = ptr_read_i64(p + (base + child) * 8);
+                if (child + 1 < end) {
+                    let rv = ptr_read_i64(p + (base + child + 1) * 8);
+                    if (rv > bv) { big = child + 1; bv = rv; }
+                }
+                let rv2 = ptr_read_i64(p + (base + root) * 8);
+                if (rv2 >= bv) {
+                    go = false;
+                } else {
+                    ptr_write_i64(p + (base + root) * 8, bv);
+                    ptr_write_i64(p + (base + big) * 8, rv2);
+                    root = big;
+                }
+            }
+        }
+    }
+
+    /// Heapsort over [lo, hi]. O(n log n) worst case; introsort net.
+    fn _heap_range(lo: i64, hi: i64) {
+        let count = hi - lo + 1;
+        if (count < 2) { return; }
+        let p = self.data;
+        var start = count / 2;
+        while (start > 0) {
+            start = start - 1;
+            self._sift(lo, start, count);
+        }
+        var end = count - 1;
+        while (end > 0) {
+            let top = ptr_read_i64(p + lo * 8);
+            let last = ptr_read_i64(p + (lo + end) * 8);
+            ptr_write_i64(p + lo * 8, last);
+            ptr_write_i64(p + (lo + end) * 8, top);
+            self._sift(lo, 0, end);
+            end = end - 1;
+        }
+    }
+
+    /// LSD radix sort for the 8-byte sort representation. The existing fast
+    /// path compares every 8-byte slot as a signed i64, so flip the sign bit
+    /// before extracting digits to preserve that exact ordering. Four 16-bit
+    /// passes reduce full-array scans while the count table remains bounded.
+    fn _radix_i64() {
+        let count_bytes = 65536 * 8;
+        let counts = malloc(count_bytes);
+        let temp = malloc(self.len * 8);
+        if (counts == null || temp == null) {
+            if (counts != null) { free(counts); }
+            if (temp != null) { free(temp); }
+            var depth: i64 = 0;
+            var n = self.len;
+            while (n > 1) { depth = depth + 1; n = n / 2; }
+            self._isort(0, self.len - 1, depth * 2);
+            return;
+        }
+
+        let sign_flip: i64 = -9223372036854775807 - 1;
+        var src = self.data;
+        var dst = temp;
+        var shift: i64 = 0;
+        while (shift < 64) {
+            memset(counts, 0, count_bytes);
+            var i: i64 = 0;
+            while (i < self.len) {
+                let value = ptr_read_i64(src + i * 8);
+                let digit = ((value ^ sign_flip) >> shift) & 65535;
+                let slot = counts + digit * 8;
+                ptr_write_i64(slot, ptr_read_i64(slot) + 1);
+                i = i + 1;
+            }
+
+            var bucket: i64 = 0;
+            var offset: i64 = 0;
+            while (bucket < 65536) {
+                let slot = counts + bucket * 8;
+                let width = ptr_read_i64(slot);
+                ptr_write_i64(slot, offset);
+                offset = offset + width;
+                bucket = bucket + 1;
+            }
+
+            i = 0;
+            while (i < self.len) {
+                let value = ptr_read_i64(src + i * 8);
+                let digit = ((value ^ sign_flip) >> shift) & 65535;
+                let slot = counts + digit * 8;
+                let out = ptr_read_i64(slot);
+                ptr_write_i64(dst + out * 8, value);
+                ptr_write_i64(slot, out + 1);
+                i = i + 1;
+            }
+
+            let old_src = src;
+            src = dst;
+            dst = old_src;
+            shift = shift + 16;
+        }
+        free(counts);
+        free(temp);
+    }
+
+    /// Introsort driver: loop-partitioned quicksort with depth budget,
+    /// recursing into the smaller half to keep stack O(log n).
+    fn _isort(lo_in: i64, hi_in: i64, depth_in: i64) {
+        var lo = lo_in;
+        var hi = hi_in;
+        var depth = depth_in;
+        while (hi - lo > 15) {
+            if (depth <= 0) {
+                self._heap_range(lo, hi);
+                return;
+            }
+            depth = depth - 1;
+            let pivot = self._median3(lo, hi);
+            // Branchless partition (pdqsort-style) around the pivot value
+            // at data[hi]. Each iteration is a conditional swap selected by
+            // one predicate: when data[j] < pivot it swaps data[j] with the
+            // hole slot data[w]; otherwise both slots keep their own values.
+            let p = self.data;
+            var w = lo;
+            var j = lo;
+            while (j < hi) {
+                let jv = ptr_read_i64(p + j * 8);
+                let lt = jv < pivot;
+                let wv = ptr_read_i64(p + w * 8);
+                ptr_write_i64(p + j * 8, if (lt) { wv } else { jv });
+                ptr_write_i64(p + w * 8, if (lt) { jv } else { wv });
+                w = w + (if (lt) { 1 } else { 0 });
+                j = j + 1;
+            }
+            // Swap pivot into its final position at index w.
+            let iv2 = ptr_read_i64(p + w * 8);
+            ptr_write_i64(p + w * 8, pivot);
+            ptr_write_i64(p + hi * 8, iv2);
+            if (w - lo < hi - w) {
+                self._isort(lo, w - 1, depth);
+                lo = w + 1;
+            } else {
+                self._isort(w + 1, hi, depth);
+                hi = w - 1;
+            }
+        }
+        self._insertion(lo, hi);
+    }
+
+    /// Generic comparator quicksort for non-8-byte elements. Byte-wise
+    /// little-endian comparison via memcpy chunks; unchanged semantics.
+    fn _quicksort(lo: i64, hi: i64) {
+        if (lo >= hi) { return; }
+        let es = sizeof::<T>();
+        let pivot = malloc(es);
+        memcpy(pivot, self.data + hi * es, es);
+        var i = lo;
+        var j = lo;
+        while (j < hi) {
+            let jslot = self.data + j * es;
+            var less = false;
+            var off: i64 = 0;
+            while (off + 8 <= es) {
+                var a: i64 = 0; var b: i64 = 0;
+                memcpy(to_rawptr(&a), jslot + off, 8);
+                memcpy(to_rawptr(&b), pivot + off, 8);
+                if (a < b) { less = true; break; }
+                if (a > b) { break; }
+                off = off + 8;
+            }
+            if (!less && off + 8 > es && off < es) {
+                var tail_equal = true;
+                var t = off;
+                while (t < es) {
+                    var ab: i64 = 0; var bb: i64 = 0;
+                    memcpy(to_rawptr(&ab), jslot + t, 1);
+                    memcpy(to_rawptr(&bb), pivot + t, 1);
+                    if (ab < bb) { less = true; tail_equal = false; break; }
+                    if (ab > bb) { tail_equal = false; break; }
+                    t = t + 1;
+                }
+            }
+            if (less) {
+                self.swap(i, j);
+                i = i + 1;
+            }
+            j = j + 1;
+        }
+        self.swap(i, hi);
+        free(pivot);
+        if (i > lo) { self._quicksort(lo, i - 1); }
+        self._quicksort(i + 1, hi);
+    }
+
+    /// Frees the backing buffer. Does NOT call destructors on elements —
+    /// caller must manually destroy elements if T owns heap memory.
+    /// Idempotent: safe to call multiple times (second call is a no-op).
+    public fn destroy() {
+        if (to_rawptr(self) == null) { return; }
+        if (self.data != null) { free(self.data); }
+        self.data = null;
+        self.len = 0;
+        self.cap = 0;
+    }
+
+    /// SSS memory model (2026-04-24): `Drop` impl — the compiler emits
+    /// `self.drop()` at scope exit for every Vec local.  Pass-through to
+    /// `destroy()`; kept idempotent so shallow-struct aliasing
+    /// (`var a = v; var b = a;`) does not double-free the backing
+    /// buffer.  Element destructors are NOT invoked — same contract as
+    /// `destroy()`.
+    public fn drop() {
+        if (to_rawptr(self) == null) { return; }
+        self.destroy();
+    }
+
+    /// Deep copy. Independent from `self`; mutating the result does
+    /// not affect `self`. Allocates a fresh backing buffer and clones
+    /// each element via its `Clone` impl — see std/clone.vyx Contract A.
+    ///
+    /// Generic-instantiation policy: no class-level `where T: Clone`
+    /// bound is imposed (that would break users storing closures / raw
+    /// pointers / other non-Clone payloads).  Instead the requirement
+    /// fires at call-time — if `T` lacks an `impl Clone`, the inner
+    /// `e.clone()` call below fails during monomorphisation of
+    /// `Vec<T>.clone`, exactly where the unsupported operation was
+    /// requested.  This mirrors Rust's "inherent method with trait
+    /// bound" pattern and keeps non-cloneable-element Vecs first-class
+    /// citizens as long as the user never asks to copy them.
+    ///
+    /// Tagged `@[lazy]` so Mono only instantiates this method when a
+    /// call site actually invokes `.clone()`. Without that, a
+    /// `Vec<Box<dyn Job>>` in user code would force `Box<dyn Job>.clone`
+    /// to exist — which it doesn't, breaking unrelated programs.
+    @[lazy]
+    public fn clone(&self) -> Vec<T> {
+        var out = Vec::<T>.with_capacity(self.len);
+        var i: i64 = 0;
+        while (i < self.len) {
+            let e = self.get(i);
+            out.push(e.clone());
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// Structural (content-based) equality.
+    ///
+    /// Two Vecs are equal when they have identical length and each element
+    /// compares byte-equal.  For primitive / POD element types this is the
+    /// obvious value equality; for Vecs of structs without a custom
+    /// `operator_eq` this is bitwise identity of the per-element bytes
+    /// (which matches how Dict stores keys anyway).  Without this method
+    /// `==` on a Vec would fall back to nothing (no struct operator_eq) or
+    /// — worse — to identity of the struct header (pointer+len+cap), which
+    /// is useless for container semantics such as Dict keys.
+    @[borrow_args]
+    public fn operator_eq(other: Vec<T>) -> bool {
+        if (self.len != other.len) { return false; }
+        let es = sizeof::<T>();
+        if (self.len == 0) { return true; }
+        if (self.data == null || other.data == null) {
+            // Both empty was handled above; a null data pointer with len>0
+            // is an invariant violation — treat as unequal rather than
+            // dereferencing.
+            return self.data == other.data;
+        }
+        return memcmp(self.data, other.data, self.len * es) == 0;
+    }
+
+    /// FNV-1a 64-bit hash over the backing bytes.
+    ///
+    /// Matches the string/byte hash used by `Dict` (`_dict_hash_string` in
+    /// `std/dict.vyx`) so Vec-keyed Dicts get the same distribution as
+    /// string-keyed ones.  Empty Vecs hash to the splitmix64 of 0 to stay
+    /// consistent with `_dict_hash_i64(0)` — the Dict's "zero-length
+    /// string" convention.
+    public fn hash() -> i64 {
+        let es = sizeof::<T>();
+        let nbytes = self.len * es;
+        if (nbytes <= 0 || self.data == null) {
+            // splitmix64(0) — see `_dict_hash_i64` in dict.vyx
+            var h: i64 = 0;
+            h = h ^ (h >> 30);
+            h = h * -4658895280553007687;
+            h = h ^ (h >> 27);
+            h = h * -7723592293110705685;
+            h = h ^ (h >> 31);
+            return h;
+        }
+        var hash: i64 = -3750763034362895579;
+        var i: i64 = 0;
+        while (i < nbytes) {
+            var b: i64 = 0;
+            memcpy(to_rawptr(&b), self.data + i, 1);
+            b = b & 255;
+            hash = hash ^ b;
+            hash = hash * 1099511628211;
+            i = i + 1;
+        }
+        return hash;
+    }
+}
+
+impl Default for Vec<T> {
+    static fn default_value() -> Vec<T> {
+        return Vec::<T>.new();
+    }
+}
+
+/// Splitting extension for the primitive text type.
+///
+/// This lives here rather than in `std.string` because it hands back a
+/// `Vec<string>` and `std.collections` already depends on `std.string` —
+/// adding the reverse edge would make the dependency graph cyclic.
+trait StrSplitExt {
+    fn split(delim: str) -> Vec<string>;
+}
+
+impl StrSplitExt for str {
+    /// Split on every occurrence of `delim`, keeping empty pieces, so
+    /// `"a||b"` yields three parts and `"a|"` yields two.  Semantics match
+    /// `std.algorithm::str_split`, including the degenerate cases: an empty
+    /// delimiter or an empty subject returns the subject itself as a single
+    /// element.
+    fn split(delim: str) -> Vec<string> {
+        var out = Vec::<string>.new();
+        let dlen = delim.len;
+        let slen = self.len;
+        if (dlen == 0 || slen == 0) {
+            out.push(self);
+            return out;
+        }
+        var cursor: i64 = 0;
+        while (true) {
+            let rest = str_substring(self, cursor, slen);
+            let rel = str_index_of(rest, delim);
+            if (rel < 0) {
+                out.push(rest);
+                break;
+            }
+            let found = cursor + rel;
+            out.push(str_substring(self, cursor, found));
+            cursor = found + dlen;
+        }
+        return out;
+    }
+}

@@ -1,0 +1,190 @@
+module Zyn.App;
+
+use std.collections;
+use std.encoding;
+use std.fs;
+
+fn timelineHexValid(value: string) -> bool {
+    if ((value.len % 2) != 0) { return false; }
+    var i: i32 = 0;
+    while (i < value.len) {
+        let c = value.charAt(i);
+        if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102))) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+public class AppTimelineStep {
+    public sequence: i32;
+    public execution_frame: u64;
+    public action: AppAction;
+    public state_before: string;
+    public state_after: string;
+
+    public static fn create(sequence: i32, execution_frame: u64, action: AppAction, state_before: string, state_after: string) -> AppTimelineStep {
+        return AppTimelineStep { sequence: sequence, execution_frame: execution_frame, action: action.dup(), state_before: state_before, state_after: state_after };
+    }
+
+    public fn dup(&self) -> AppTimelineStep {
+        return AppTimelineStep.create(self.sequence, self.execution_frame, self.action, self.state_before, self.state_after);
+    }
+}
+
+// .zyns v1 records the exact order in which the AppWorld command queue is
+// consumed. Function pointers and external effects stay in application code.
+public class AppTimeline {
+    public initial_state: string;
+    public total_frames: i32;
+    private steps: Vec<AppTimelineStep>;
+
+    public static fn empty() -> AppTimeline {
+        return AppTimeline { initial_state: "", total_frames: 0, steps: Vec::<AppTimelineStep>.new() };
+    }
+
+    @[borrow_args]
+    public static fn start(world: AppWorld) -> AppTimeline {
+        return AppTimeline { initial_state: world.snapshotResources(), total_frames: 0, steps: Vec::<AppTimelineStep>.new() };
+    }
+
+    public fn count(&self) -> i32 { return self.steps.len as i32; }
+
+    public fn stepAt(&self, index: i32) -> AppTimelineStep {
+        if (index < 0 || index >= self.count()) { return AppTimelineStep.create(-1, 0 as u64, AppAction.create(""), "", ""); }
+        return self.steps.get(index as i64).dup();
+    }
+
+    @[borrow_args]
+    public fn record(mut self, execution_frame: u64, action: AppAction, state_before: string, world: AppWorld) -> AppTimeline {
+        self.steps.push(AppTimelineStep.create(self.count(), execution_frame, action, state_before, world.snapshotResources()));
+        return self;
+    }
+
+    public fn dup(&self) -> AppTimeline {
+        var out = AppTimeline.empty();
+        out.initial_state = self.initial_state;
+        out.total_frames = self.total_frames;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out.steps.push(self.stepAt(i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn serialize(&self) -> string {
+        var out = "ZYNS|1\nI|" + hex_encode(self.initial_state) + "\n";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            let step = self.stepAt(i);
+            out = out + "A|" + format("%d", step.sequence as i64)
+                + "|" + format("%d", step.execution_frame as i64)
+                + "|" + format("%d", step.action.frame_index as i64)
+                + "|" + hex_encode(step.action.name)
+                + "|" + hex_encode(step.action.source)
+                + "|" + hex_encode(step.action.payload)
+                + "|" + hex_encode(step.state_before)
+                + "|" + hex_encode(step.state_after) + "\n";
+            i = i + 1;
+        }
+        out = out + "F|" + format("%d", self.total_frames as i64) + "\n";
+        return out;
+    }
+
+    public fn exportTo(&self, path: string) -> Result<bool, AppError> {
+        if (path.len == 0) { return Err(AppError.create(80, "timeline path is empty")); }
+        if (writeFile(path, self.serialize()) != 0) {
+            return Err(AppError.create(81, "cannot write timeline: " + path));
+        }
+        return Ok(true);
+    }
+
+    public static fn load(path: string) -> Result<AppTimeline, AppError> {
+        if (path.len == 0 || !fileExists(path)) { return Err(AppError.create(82, "timeline not found: " + path)); }
+        return AppTimeline.loadText(readFile(path));
+    }
+
+    // Split out of `load` so that the v1 -> v2 migration can read a recording
+    // that is already in memory, without staging it through a scratch file.
+    public static fn loadText(contents: string) -> Result<AppTimeline, AppError> {
+        let lines = contents.split("\n");
+        if (lines.len < 2 || lines.get(0) != "ZYNS|1") {
+            return Err(AppError.create(83, "unsupported timeline format"));
+        }
+        let initial = lines.get(1).split("|");
+        if (initial.len != 2 || initial.get(0) != "I" || !timelineHexValid(initial.get(1))) {
+            return Err(AppError.create(84, "invalid initial state record"));
+        }
+        var out = AppTimeline.empty();
+        out.initial_state = hex_decode(initial.get(1));
+        var i: i32 = 2;
+        var footer_seen: bool = false;
+        while (i < (lines.len as i32)) {
+            let line = lines.get(i as i64);
+            if (line.len == 0 && i == (lines.len as i32) - 1) { break; }
+            let fields = line.split("|");
+            if (fields.len == 2 && fields.get(0) == "F" && !footer_seen) {
+                let frames = app_parse_i32_or(fields.get(1), -1);
+                if (frames < 0 || fields.get(1) != format("%d", frames as i64)) {
+                    out.destroy();
+                    return Err(AppError.create(86, "invalid timeline frame count"));
+                }
+                out.total_frames = frames;
+                footer_seen = true;
+                i = i + 1;
+                continue;
+            }
+            if (footer_seen) {
+                out.destroy();
+                return Err(AppError.create(85, "record after timeline footer"));
+            }
+            if (fields.len != 9 || fields.get(0) != "A"
+                || fields.get(1) != format("%d", out.count() as i64)
+                || !timelineHexValid(fields.get(4)) || !timelineHexValid(fields.get(5))
+                || !timelineHexValid(fields.get(6)) || !timelineHexValid(fields.get(7))
+                || !timelineHexValid(fields.get(8))) {
+                out.destroy();
+                return Err(AppError.create(85, "invalid action record at line " + format("%d", (i + 1) as i64)));
+            }
+            let execution_frame = app_parse_i32_or(fields.get(2), -1);
+            let action_frame = app_parse_i32_or(fields.get(3), -1);
+            if (execution_frame < 0 || fields.get(2) != format("%d", execution_frame as i64)
+                || action_frame < 0 || fields.get(3) != format("%d", action_frame as i64)) {
+                out.destroy();
+                return Err(AppError.create(86, "invalid frame at line " + format("%d", (i + 1) as i64)));
+            }
+            // NOTE: keep the cast parenthesized. A bare `<` right after a cast
+            // target (`x as u64 < y`) is only accepted by compilers that carry
+            // the `cast_target_ctx` parser fix (commit 9212b146); the released
+            // dist stage0 baseline predates it and reads `<` as a generic-arg
+            // list opener, then fails with `expected ')'` at EOF.
+            if (out.count() > 0 && (execution_frame as u64) < out.stepAt(out.count() - 1).execution_frame) {
+                out.destroy();
+                return Err(AppError.create(86, "timeline action frames are out of order"));
+            }
+            let action = AppAction.create(hex_decode(fields.get(4)))
+                .fromSource(hex_decode(fields.get(5)))
+                .withPayload(hex_decode(fields.get(6)))
+                .atFrame(action_frame as u64);
+            out.steps.push(AppTimelineStep.create(out.count(), execution_frame as u64, action, hex_decode(fields.get(7)), hex_decode(fields.get(8))));
+            i = i + 1;
+        }
+        if (!footer_seen) {
+            out.destroy();
+            return Err(AppError.create(85, "timeline frame count missing"));
+        }
+        var step_i: i32 = 0;
+        while (step_i < out.count()) {
+            let step = out.stepAt(step_i);
+            if ((out.total_frames == 0 && step.execution_frame != 0 as u64)
+                || (out.total_frames > 0 && step.execution_frame >= out.total_frames as u64)) {
+                out.destroy();
+                return Err(AppError.create(86, "action frame is outside the recording"));
+            }
+            step_i = step_i + 1;
+        }
+        return Ok(out);
+    }
+
+    public fn destroy(&mut self) { self.steps.destroy(); }
+}

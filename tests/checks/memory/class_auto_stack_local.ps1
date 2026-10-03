@@ -1,0 +1,174 @@
+[CmdletBinding()]
+param(
+    [string]$BootstrapCompiler = "",
+    [int]$TimeoutSec = 120,
+    [switch]$SkipMir2Cpp
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+if ($TimeoutSec -lt 1 -or $TimeoutSec -gt 600) {
+    throw "TimeoutSec must be between 1 and 600."
+}
+
+$testsRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $testsRoot "..")).Path
+. (Join-Path $repoRoot "bootstrap_compiler/scripts/VyxTestProcess.ps1")
+
+$windowsHost = if (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) {
+    [bool]$IsWindows
+} else {
+    $env:OS -eq "Windows_NT"
+}
+$compilerName = if ($windowsHost) { "boot.exe" } else { "boot" }
+$exeSuffix = if ($windowsHost) { ".exe" } else { "" }
+if ([string]::IsNullOrWhiteSpace($BootstrapCompiler)) {
+    $BootstrapCompiler = Join-Path $repoRoot ("bootstrap_compiler/out/" + $compilerName)
+}
+$BootstrapCompiler = (Resolve-Path -LiteralPath $BootstrapCompiler).Path
+$runtimeDir = Split-Path -Parent $BootstrapCompiler
+$source = Join-Path $testsRoot "cases/class_auto_stack_local.vyx"
+$runRoot = Join-Path $repoRoot ("tests/.cache/class_auto_stack_local_{0}_{1}" -f $PID, [DateTime]::UtcNow.Ticks)
+[void][IO.Directory]::CreateDirectory($runRoot)
+
+$originalPath = $env:Path
+$originalLdLibraryPath = $env:LD_LIBRARY_PATH
+$originalDyldLibraryPath = $env:DYLD_LIBRARY_PATH
+$pathSeparator = if ($windowsHost) { ";" } else { ":" }
+
+function Invoke-Checked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [int]$MemoryLimitMB = 0
+    )
+
+    $invokeArgs = @{
+        FilePath = $FilePath
+        ArgumentList = $Arguments
+        WorkingDirectory = $WorkingDirectory
+        StdoutLog = Join-Path $runRoot ($Name + ".stdout.log")
+        StderrLog = Join-Path $runRoot ($Name + ".stderr.log")
+        DialogLog = Join-Path $runRoot ($Name + ".dialog.log")
+        TimeoutSec = $TimeoutSec
+    }
+    if ($windowsHost) { $invokeArgs.MemoryLimitMB = $MemoryLimitMB }
+    $result = Invoke-VyxProcess @invokeArgs
+    if ($result.ExitCode -ne 0 -or $result.TimedOut -or
+        $result.MemoryExceeded -or $result.DialogCaught) {
+        throw "$Name failed: exit=$($result.ExitCode) timeout=$($result.TimedOut) memory=$($result.MemoryExceeded)"
+    }
+}
+
+function Get-IrFunctionBody {
+    param(
+        [Parameter(Mandatory = $true)][string]$IrText,
+        [Parameter(Mandatory = $true)][string]$FunctionName
+    )
+
+    # Vyx LLVM symbols escape source underscores as `_5F`.
+    $mangledName = $FunctionName.Replace("_", "_5F")
+    $escapedName = [regex]::Escape($mangledName)
+    $pattern = '(?ms)^define\b[^\r\n]*@(?<symbol>[^\s(]*' + $escapedName + '[^\s(]*)\([^)]*\)[^{]*\{\r?\n(?<body>.*?)^\}'
+    $matches = [regex]::Matches($IrText, $pattern)
+    if ($matches.Count -ne 1) {
+        throw "expected exactly one LLVM definition for $FunctionName, found $($matches.Count)"
+    }
+    return $matches[0].Groups["body"].Value
+}
+
+function Assert-AutomaticClassStorage {
+    param(
+        [Parameter(Mandatory = $true)][string]$IrPath,
+        [Parameter(Mandatory = $true)][string]$Optimization
+    )
+
+    $body = Get-IrFunctionBody -IrText ([IO.File]::ReadAllText($IrPath)) `
+        -FunctionName "class_auto_stack_local"
+    if ($body -match '(?m)\bcall\b[^\r\n]*@vyx_class_alloc_abi\s*\(') {
+        throw "$Optimization class_auto_stack_local still allocates its non-escaping class literal through vyx_class_alloc_abi"
+    }
+    if ($body -match '(?m)\bcall\b[^\r\n]*@(malloc|vyx_aligned_alloc_abi)\s*\(') {
+        throw "$Optimization class_auto_stack_local still performs heap allocation for its non-escaping class literal"
+    }
+}
+
+function Assert-ProgramOutput {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Stage
+    )
+
+    $output = [IO.File]::ReadAllText((Join-Path $runRoot ($Name + ".stdout.log"))).Replace("`r`n", "`n").Trim()
+    if ($output -cne "class_auto_stack_local OK") {
+        throw "$Stage output mismatch: $output"
+    }
+}
+
+try {
+    $env:Path = $runtimeDir + $pathSeparator + $originalPath
+    if (-not $windowsHost) {
+        $env:LD_LIBRARY_PATH = $runtimeDir + $pathSeparator + $originalLdLibraryPath
+        if (Get-Variable -Name IsMacOS -ErrorAction SilentlyContinue) {
+            if ([bool]$IsMacOS) {
+                $env:DYLD_LIBRARY_PATH = $runtimeDir + $pathSeparator + $originalDyldLibraryPath
+            }
+        }
+    }
+
+    foreach ($level in @("-O0", "-O2")) {
+        $stem = $level.Substring(1).ToLowerInvariant()
+        $ir = Join-Path $runRoot ("class_auto_stack_local_" + $stem + ".ll")
+        Invoke-Checked -Name ($stem + "_emit_ir") -FilePath $BootstrapCompiler `
+            -Arguments @("--src=file", $source, "--emit=ir", $level, "-o", $ir) `
+            -WorkingDirectory $repoRoot
+        Assert-AutomaticClassStorage -IrPath $ir -Optimization $level
+
+        $jitName = $stem + "_jit"
+        Invoke-Checked -Name $jitName -FilePath $BootstrapCompiler `
+            -Arguments @("--src=file", $source, "--run=jit", $level) `
+            -WorkingDirectory $repoRoot
+        Assert-ProgramOutput -Name $jitName -Stage ($level + " JIT")
+
+        $exe = Join-Path $runRoot ("class_auto_stack_local_" + $stem + $exeSuffix)
+        $aotEmitName = $stem + "_aot_emit"
+        Invoke-Checked -Name $aotEmitName -FilePath $BootstrapCompiler `
+            -Arguments @("--src=file", $source, "--emit=exe", $level, "-o", $exe) `
+            -WorkingDirectory $repoRoot
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "$level AOT did not produce $exe"
+        }
+        $aotRunName = $stem + "_aot_run"
+        Invoke-Checked -Name $aotRunName -FilePath $exe -WorkingDirectory $runRoot -MemoryLimitMB 0
+        Assert-ProgramOutput -Name $aotRunName -Stage ($level + " AOT")
+    }
+
+    if (-not $SkipMir2Cpp) {
+        $cppOut = Join-Path $runRoot "o2_cpp"
+        Invoke-Checked -Name "o2_cpp_emit" -FilePath $BootstrapCompiler `
+            -Arguments @("--src=file", $source, "--emit=cpp", "-O2", "-o", $cppOut) `
+            -WorkingDirectory $repoRoot
+        $cmake = (Get-Command cmake -ErrorAction Stop).Source
+        Invoke-Checked -Name "o2_cpp_configure" -FilePath $cmake `
+            -Arguments @("--preset", "ninja-release") -WorkingDirectory $cppOut
+        Invoke-Checked -Name "o2_cpp_build" -FilePath $cmake `
+            -Arguments @("--build", "--preset", "ninja-release") -WorkingDirectory $cppOut
+        $cppExe = Join-Path $cppOut ("build/ninja-release/vyx_class_auto_stack_local" + $exeSuffix)
+        if (-not (Test-Path -LiteralPath $cppExe -PathType Leaf)) {
+            throw "MIR2CPP build did not produce $cppExe"
+        }
+        Invoke-Checked -Name "o2_cpp_run" -FilePath $cppExe `
+            -WorkingDirectory (Split-Path -Parent $cppExe) -MemoryLimitMB 0
+        Assert-ProgramOutput -Name "o2_cpp_run" -Stage "O2 MIR2CPP"
+    }
+
+    Write-Host "class_auto_stack_local: OK"
+    Write-Host "class_auto_stack_local evidence=$runRoot"
+} finally {
+    $env:Path = $originalPath
+    $env:LD_LIBRARY_PATH = $originalLdLibraryPath
+    $env:DYLD_LIBRARY_PATH = $originalDyldLibraryPath
+}

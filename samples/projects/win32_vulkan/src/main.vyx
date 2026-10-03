@@ -1,0 +1,687 @@
+module sample.win32_vulkan;
+
+/// Win32 + Vulkan minimal demo for Vyx
+/// -------------------------------------------------------------
+/// Creates a top-level Win32 window with our own WndProc, then
+/// initializes a Vulkan instance, physical/logical device, KHR
+/// Win32 surface, swapchain (FIFO, 2 images, B8G8R8A8_UNORM),
+/// command pool/buffer, and per-frame sync objects, then runs a
+/// main loop that:
+///   * pumps Win32 messages (PeekMessageA)
+///   * acquires the next swapchain image
+///   * records a one-shot command buffer that
+///       - transitions the image UNDEFINED -> TRANSFER_DST_OPTIMAL
+///       - vkCmdClearColorImage with a slowly oscillating color
+///       - transitions TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR
+///   * submits + presents (no SPIR-V / graphics pipeline needed)
+///
+/// On exit (window closed, ESC pressed, or 600-frame budget hit)
+/// it idles the device and destroys every Vulkan object in
+/// reverse order before tearing the Win32 window down.
+///
+/// Build (with the host vyxc and the LunarG Vulkan SDK installed
+/// at D:/Vulkan):
+///     vyxc build              # picks up Vyx.toml in this directory
+///     vyxc --run build        # build and run the demo
+///
+/// The Vulkan SDK location is read from the `VULKAN_SDK` environment
+/// variable when present (LunarG's installer sets it). To override or
+/// when the variable is unset, pass `-L "D:/Vulkan/Lib"` on the
+/// command line, or edit `lib_paths` in Vyx.toml.
+///
+/// Compile only needs `vulkan-1.lib` to link; runtime requires a
+/// working `vulkan-1.dll` + ICD (any GPU vendor).
+///
+/// We intentionally do NOT import std/vulkan_raw.vyx: its auto-
+/// generated bindings declare every parameter as `rawptr`, which
+/// is wrong for value-typed flags such as VkPipelineStageFlags.
+/// Instead we declare each Vulkan entry point we actually use
+/// locally with the proper Win64 ABI types.
+
+use std.win32;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(p: rawptr);
+    fn memcpy(d: rawptr, s: rawptr, n: u64) -> rawptr;
+    fn memset(d: rawptr, v: i32, n: u64) -> rawptr;
+}
+
+// std/win32.vyx omitted PeekMessageA — declare it locally.
+extern "C" {
+    fn PeekMessageA(lpMsg: rawptr, hWnd: rawptr, wMsgFilterMin: u32, wMsgFilterMax: u32, wRemoveMsg: u32) -> i32;
+}
+
+// ── Vulkan core (subset, properly typed) ────────────────────────
+extern "C" {
+    fn vkCreateInstance(pCreateInfo: rawptr, pAllocator: rawptr, pInstance: rawptr) -> i32;
+    fn vkDestroyInstance(instance: rawptr, pAllocator: rawptr);
+    fn vkEnumeratePhysicalDevices(instance: rawptr, pCount: rawptr, pDevices: rawptr) -> i32;
+    fn vkGetPhysicalDeviceQueueFamilyProperties(phys: rawptr, pCount: rawptr, pProps: rawptr);
+    fn vkCreateDevice(phys: rawptr, pCreateInfo: rawptr, pAllocator: rawptr, pDevice: rawptr) -> i32;
+    fn vkDestroyDevice(device: rawptr, pAllocator: rawptr);
+    fn vkGetDeviceQueue(device: rawptr, qfi: u32, qi: u32, pQueue: rawptr);
+    fn vkDeviceWaitIdle(device: rawptr) -> i32;
+    fn vkQueueWaitIdle(queue: rawptr) -> i32;
+
+    fn vkCreateSemaphore(device: rawptr, pCreateInfo: rawptr, pAllocator: rawptr, pSem: rawptr) -> i32;
+    fn vkDestroySemaphore(device: rawptr, sem: rawptr, pAllocator: rawptr);
+    fn vkCreateFence(device: rawptr, pCreateInfo: rawptr, pAllocator: rawptr, pFence: rawptr) -> i32;
+    fn vkDestroyFence(device: rawptr, fence: rawptr, pAllocator: rawptr);
+    fn vkWaitForFences(device: rawptr, count: u32, pFences: rawptr, waitAll: u32, timeout: u64) -> i32;
+    fn vkResetFences(device: rawptr, count: u32, pFences: rawptr) -> i32;
+
+    fn vkCreateCommandPool(device: rawptr, pCreateInfo: rawptr, pAllocator: rawptr, pPool: rawptr) -> i32;
+    fn vkDestroyCommandPool(device: rawptr, pool: rawptr, pAllocator: rawptr);
+    fn vkAllocateCommandBuffers(device: rawptr, pInfo: rawptr, pBufs: rawptr) -> i32;
+    fn vkBeginCommandBuffer(cb: rawptr, pInfo: rawptr) -> i32;
+    fn vkEndCommandBuffer(cb: rawptr) -> i32;
+    fn vkResetCommandBuffer(cb: rawptr, flags: u32) -> i32;
+
+    fn vkQueueSubmit(queue: rawptr, count: u32, pSubmits: rawptr, fence: rawptr) -> i32;
+
+    fn vkCmdPipelineBarrier(cb: rawptr, srcStage: u32, dstStage: u32, depFlags: u32,
+                             memCount: u32, pMem: rawptr,
+                             bufCount: u32, pBuf: rawptr,
+                             imgCount: u32, pImg: rawptr);
+    fn vkCmdClearColorImage(cb: rawptr, image: rawptr, layout: u32,
+                             pColor: rawptr, rangeCount: u32, pRanges: rawptr);
+}
+
+// ── Vulkan KHR_surface / KHR_win32_surface / KHR_swapchain ──────
+extern "C" {
+    fn vkCreateWin32SurfaceKHR(instance: rawptr, pCreateInfo: rawptr, pAllocator: rawptr, pSurface: rawptr) -> i32;
+    fn vkDestroySurfaceKHR(instance: rawptr, surface: rawptr, pAllocator: rawptr);
+    fn vkGetPhysicalDeviceSurfaceSupportKHR(phys: rawptr, qfi: u32, surface: rawptr, pSupported: rawptr) -> i32;
+    fn vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys: rawptr, surface: rawptr, pCaps: rawptr) -> i32;
+
+    fn vkCreateSwapchainKHR(device: rawptr, pCreateInfo: rawptr, pAllocator: rawptr, pSwap: rawptr) -> i32;
+    fn vkDestroySwapchainKHR(device: rawptr, swap: rawptr, pAllocator: rawptr);
+    fn vkGetSwapchainImagesKHR(device: rawptr, swap: rawptr, pCount: rawptr, pImages: rawptr) -> i32;
+    fn vkAcquireNextImageKHR(device: rawptr, swap: rawptr, timeout: u64, semaphore: rawptr, fence: rawptr, pIndex: rawptr) -> i32;
+    fn vkQueuePresentKHR(queue: rawptr, pPresentInfo: rawptr) -> i32;
+}
+
+// ── Vulkan structure-type tags (subset we use) ──────────────────
+let ST_APPLICATION_INFO: u32 = 0;
+let ST_INSTANCE_CREATE_INFO: u32 = 1;
+let ST_DEVICE_QUEUE_CREATE_INFO: u32 = 2;
+let ST_DEVICE_CREATE_INFO: u32 = 3;
+let ST_SUBMIT_INFO: u32 = 4;
+let ST_FENCE_CREATE_INFO: u32 = 8;
+let ST_SEMAPHORE_CREATE_INFO: u32 = 9;
+let ST_IMAGE_MEMORY_BARRIER: u32 = 45;
+let ST_COMMAND_POOL_CREATE_INFO: u32 = 39;
+let ST_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40;
+let ST_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
+let ST_SWAPCHAIN_CREATE_INFO_KHR: u32 = 1000001000;
+let ST_PRESENT_INFO_KHR: u32 = 1000001001;
+let ST_WIN32_SURFACE_CREATE_INFO_KHR: u32 = 1000009000;
+
+// ── Vulkan enum / flag constants ────────────────────────────────
+let FORMAT_B8G8R8A8_UNORM: u32 = 44;
+let COLORSPACE_SRGB_NONLINEAR_KHR: u32 = 0;
+let PRESENT_MODE_FIFO_KHR: u32 = 2;
+let SHARING_MODE_EXCLUSIVE: u32 = 0;
+let SURFACE_TRANSFORM_IDENTITY_BIT_KHR: u32 = 1;
+let COMPOSITE_ALPHA_OPAQUE_BIT_KHR: u32 = 1;
+let IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 4;
+let IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 16;
+let IMAGE_LAYOUT_UNDEFINED: u32 = 0;
+let IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7;
+let IMAGE_LAYOUT_PRESENT_SRC_KHR: u32 = 1000001002;
+let IMAGE_ASPECT_COLOR_BIT: u32 = 1;
+let PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 1;
+let PIPELINE_STAGE_TRANSFER_BIT: u32 = 4096;
+let PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 8192;
+let ACCESS_TRANSFER_WRITE_BIT: u32 = 4096;
+let ACCESS_MEMORY_READ_BIT: u32 = 32768;
+let CMD_BUFFER_LEVEL_PRIMARY: u32 = 0;
+let CMD_POOL_CREATE_RESET_BIT: u32 = 2;
+let CMD_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT: u32 = 1;
+let QUEUE_FAMILY_IGNORED: u32 = 4294967295;
+let WAIT_NS_ONE_SEC: u64 = 1000000000;
+
+// ── App constants ───────────────────────────────────────────────
+let MAX_SWAP_IMAGES: i64 = 8;
+let FRAME_BUDGET: i32 = 600;
+let WIN_W: i32 = 800;
+let WIN_H: i32 = 600;
+let PM_REMOVE: u32 = 1;
+let WM_QUIT: u32 = 18;
+
+// ── Raw memory helpers ──────────────────────────────────────────
+fn p_off(p: rawptr, off: i64) -> rawptr { return p + (off as i32); }
+
+fn zalloc(n: i64) -> rawptr {
+    let p = malloc(n as u64);
+    if (p != null) { memset(p, 0, n as u64); }
+    return p;
+}
+
+fn w_u32(p: rawptr, off: i64, v: u32) {
+    var x: u32 = v;
+    memcpy(p_off(p, off), to_rawptr(&x), 4);
+}
+
+fn w_i32(p: rawptr, off: i64, v: i32) {
+    var x: i32 = v;
+    memcpy(p_off(p, off), to_rawptr(&x), 4);
+}
+
+fn w_u64(p: rawptr, off: i64, v: u64) {
+    var x: u64 = v;
+    memcpy(p_off(p, off), to_rawptr(&x), 8);
+}
+
+fn w_f32(p: rawptr, off: i64, v: f32) {
+    var x: f32 = v;
+    memcpy(p_off(p, off), to_rawptr(&x), 4);
+}
+
+fn w_ptr(p: rawptr, off: i64, v: rawptr) {
+    var x: rawptr = v;
+    memcpy(p_off(p, off), to_rawptr(&x), 8);
+}
+
+fn r_u32(p: rawptr, off: i64) -> u32 {
+    var x: u32 = 0;
+    memcpy(to_rawptr(&x), p_off(p, off), 4);
+    return x;
+}
+
+fn r_ptr(p: rawptr, off: i64) -> rawptr {
+    var x: rawptr = null;
+    memcpy(to_rawptr(&x), p_off(p, off), 8);
+    return x;
+}
+
+fn vk_check(label: string, rc: i32) -> bool {
+    if (rc != 0) {
+        print("[win32_vulkan] FAIL ${label} rc=${rc}");
+        return false;
+    }
+    return true;
+}
+
+// ── Win32 WindowProc ────────────────────────────────────────────
+fn win_proc(hwnd: rawptr, msg: u32, wparam: u64, lparam: i64) -> rawptr {
+    if (msg == WM_DESTROY) {
+        PostQuitMessage(0);
+        return null;
+    }
+    if (msg == WM_CLOSE) {
+        DestroyWindow(hwnd);
+        return null;
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+// ── Window creation (RegisterClassEx + CreateWindowEx) ──────────
+fn make_window(hinstance: rawptr, title: string, w: i32, h: i32) -> rawptr {
+    let class_name = "VyxVulkanDemoCls";
+    let wc = zalloc(80); // WNDCLASSEXA on x64 = 80 bytes
+    w_u32(wc, 0, 80);
+    w_u32(wc, 4, 0);
+    w_ptr(wc, 8, win_proc as rawptr);
+    w_i32(wc, 16, 0);
+    w_i32(wc, 20, 0);
+    w_ptr(wc, 24, hinstance);
+    w_ptr(wc, 32, null);
+    w_ptr(wc, 40, null);
+    w_ptr(wc, 48, null);
+    w_ptr(wc, 56, null);
+    w_ptr(wc, 64, class_name.c_str());
+    w_ptr(wc, 72, null);
+
+    let atom = RegisterClassExA(wc);
+    free(wc);
+    if (atom == 0) {
+        print("[win32_vulkan] RegisterClassExA failed");
+        return null;
+    }
+
+    let hwnd = CreateWindowExA(
+        0,
+        class_name.c_str(),
+        title.c_str(),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        100, 100, w, h,
+        null, null, hinstance, null);
+    if (hwnd == null) {
+        print("[win32_vulkan] CreateWindowExA failed");
+        return null;
+    }
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    return hwnd;
+}
+
+// Returns true if the window is still alive and we should keep rendering.
+fn pump_messages() -> bool {
+    let msg = zalloc(48); // MSG on x64 = 48 bytes
+    var alive: bool = true;
+    var done: bool = false;
+    while (!done) {
+        let r = PeekMessageA(msg, null, 0, 0, PM_REMOVE);
+        if (r == 0) { done = true; }
+        else {
+            let m = r_u32(msg, 8);
+            if (m == WM_QUIT) { alive = false; }
+            TranslateMessage(msg);
+            DispatchMessageA(msg);
+        }
+    }
+    free(msg);
+    return alive;
+}
+
+// ── Vulkan initialization ───────────────────────────────────────
+fn create_instance() -> rawptr {
+    let ai = zalloc(48); // VkApplicationInfo
+    w_u32(ai, 0, ST_APPLICATION_INFO);
+    w_ptr(ai, 16, "VyxWin32VulkanDemo".c_str());
+    w_u32(ai, 24, 1);
+    w_ptr(ai, 32, "VyxLan".c_str());
+    w_u32(ai, 40, 1);
+    w_u32(ai, 44, 4194304); // VK_API_VERSION_1_0 = 1<<22
+
+    var ext_names: [rawptr; 2];
+    ext_names[0] = "VK_KHR_surface".c_str();
+    ext_names[1] = "VK_KHR_win32_surface".c_str();
+
+    let ici = zalloc(64); // VkInstanceCreateInfo
+    w_u32(ici, 0, ST_INSTANCE_CREATE_INFO);
+    w_ptr(ici, 24, ai);
+    w_u32(ici, 48, 2);
+    w_ptr(ici, 56, to_rawptr(&ext_names));
+
+    var instance: rawptr = null;
+    let rc = vkCreateInstance(ici, null, to_rawptr(&instance));
+    free(ai); free(ici);
+    if (!vk_check("vkCreateInstance", rc)) { return null; }
+    return instance;
+}
+
+fn pick_physical_device(instance: rawptr) -> rawptr {
+    var count: u32 = 0;
+    vkEnumeratePhysicalDevices(instance, to_rawptr(&count), null);
+    if (count == 0) {
+        print("[win32_vulkan] no Vulkan physical devices");
+        return null;
+    }
+    if (count > 8) { count = 8; }
+    var devices: [rawptr; 8];
+    var i: i64 = 0;
+    while (i < 8) { devices[i] = null; i = i + 1; }
+    vkEnumeratePhysicalDevices(instance, to_rawptr(&count), to_rawptr(&devices));
+    return devices[0];
+}
+
+// Returns first queue family index that supports graphics + present.
+fn find_graphics_present_family(phys: rawptr, surface: rawptr) -> i32 {
+    var qf_count: u32 = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, to_rawptr(&qf_count), null);
+    if (qf_count == 0) { return -1; }
+    if (qf_count > 16) { qf_count = 16; }
+    // VkQueueFamilyProperties: queueFlags u32, queueCount u32,
+    //   timestampValidBits u32, minImageTransferGranularity {u32 x3} → 24 bytes
+    let qfp = zalloc((qf_count as i64) * 24);
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, to_rawptr(&qf_count), qfp);
+    var i: i32 = 0;
+    var found: i32 = -1;
+    while ((i as u32) < qf_count && found < 0) {
+        let flags = r_u32(qfp, (i as i64) * 24);
+        var ps: u32 = 0;
+        vkGetPhysicalDeviceSurfaceSupportKHR(phys, i as u32, surface, to_rawptr(&ps));
+        if ((flags & 1) != 0 && ps != 0) { found = i; }
+        i = i + 1;
+    }
+    free(qfp);
+    return found;
+}
+
+fn create_win32_surface(instance: rawptr, hinstance: rawptr, hwnd: rawptr) -> rawptr {
+    let ci = zalloc(40); // VkWin32SurfaceCreateInfoKHR
+    w_u32(ci, 0, ST_WIN32_SURFACE_CREATE_INFO_KHR);
+    w_ptr(ci, 24, hinstance);
+    w_ptr(ci, 32, hwnd);
+    var surface: rawptr = null;
+    let rc = vkCreateWin32SurfaceKHR(instance, ci, null, to_rawptr(&surface));
+    free(ci);
+    if (!vk_check("vkCreateWin32SurfaceKHR", rc)) { return null; }
+    return surface;
+}
+
+fn create_logical_device(phys: rawptr, qfi: u32) -> rawptr {
+    var prio: f32 = 1.0;
+    let qci = zalloc(40); // VkDeviceQueueCreateInfo
+    w_u32(qci, 0, ST_DEVICE_QUEUE_CREATE_INFO);
+    w_u32(qci, 20, qfi);
+    w_u32(qci, 24, 1);
+    w_ptr(qci, 32, to_rawptr(&prio));
+
+    var dev_exts: [rawptr; 1];
+    dev_exts[0] = "VK_KHR_swapchain".c_str();
+
+    let dci = zalloc(72); // VkDeviceCreateInfo
+    w_u32(dci, 0, ST_DEVICE_CREATE_INFO);
+    w_u32(dci, 20, 1);
+    w_ptr(dci, 24, qci);
+    w_u32(dci, 48, 1);
+    w_ptr(dci, 56, to_rawptr(&dev_exts));
+
+    var dev: rawptr = null;
+    let rc = vkCreateDevice(phys, dci, null, to_rawptr(&dev));
+    free(qci); free(dci);
+    if (!vk_check("vkCreateDevice", rc)) { return null; }
+    return dev;
+}
+
+// extent_out writes back actual swapchain extent (u32 w, u32 h) — 8 bytes.
+fn create_swapchain(phys: rawptr, dev: rawptr, surface: rawptr,
+                    w: i32, h: i32, extent_out: rawptr) -> rawptr {
+    let caps = zalloc(64); // VkSurfaceCapabilitiesKHR = 52, round up
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys, surface, caps);
+    var img_count: u32 = r_u32(caps, 0) + 1;
+    let max_count = r_u32(caps, 4);
+    if (max_count > 0 && img_count > max_count) { img_count = max_count; }
+    var ew: u32 = r_u32(caps, 8);
+    var eh: u32 = r_u32(caps, 12);
+    if (ew == 4294967295) { ew = w as u32; }
+    if (eh == 4294967295) { eh = h as u32; }
+    let pre_transform = r_u32(caps, 40);
+    free(caps);
+
+    w_u32(extent_out, 0, ew);
+    w_u32(extent_out, 4, eh);
+
+    let ci = zalloc(112); // VkSwapchainCreateInfoKHR = 104, round up
+    w_u32(ci, 0, ST_SWAPCHAIN_CREATE_INFO_KHR);
+    w_ptr(ci, 24, surface);
+    w_u32(ci, 32, img_count);
+    w_u32(ci, 36, FORMAT_B8G8R8A8_UNORM);
+    w_u32(ci, 40, COLORSPACE_SRGB_NONLINEAR_KHR);
+    w_u32(ci, 44, ew);
+    w_u32(ci, 48, eh);
+    w_u32(ci, 52, 1);
+    w_u32(ci, 56, IMAGE_USAGE_TRANSFER_DST_BIT | IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    w_u32(ci, 60, SHARING_MODE_EXCLUSIVE);
+    w_u32(ci, 64, 0);
+    w_u32(ci, 80, pre_transform);
+    w_u32(ci, 84, COMPOSITE_ALPHA_OPAQUE_BIT_KHR);
+    w_u32(ci, 88, PRESENT_MODE_FIFO_KHR);
+    w_u32(ci, 92, 1);
+
+    var swap: rawptr = null;
+    let rc = vkCreateSwapchainKHR(dev, ci, null, to_rawptr(&swap));
+    free(ci);
+    if (!vk_check("vkCreateSwapchainKHR", rc)) { return null; }
+    return swap;
+}
+
+fn create_command_pool(dev: rawptr, qfi: u32) -> rawptr {
+    let ci = zalloc(24); // VkCommandPoolCreateInfo
+    w_u32(ci, 0, ST_COMMAND_POOL_CREATE_INFO);
+    w_u32(ci, 16, CMD_POOL_CREATE_RESET_BIT);
+    w_u32(ci, 20, qfi);
+    var pool: rawptr = null;
+    let rc = vkCreateCommandPool(dev, ci, null, to_rawptr(&pool));
+    free(ci);
+    if (!vk_check("vkCreateCommandPool", rc)) { return null; }
+    return pool;
+}
+
+fn alloc_command_buffer(dev: rawptr, pool: rawptr) -> rawptr {
+    let ci = zalloc(32); // VkCommandBufferAllocateInfo
+    w_u32(ci, 0, ST_COMMAND_BUFFER_ALLOCATE_INFO);
+    w_ptr(ci, 16, pool);
+    w_u32(ci, 24, CMD_BUFFER_LEVEL_PRIMARY);
+    w_u32(ci, 28, 1);
+    var cb: rawptr = null;
+    let rc = vkAllocateCommandBuffers(dev, ci, to_rawptr(&cb));
+    free(ci);
+    if (!vk_check("vkAllocateCommandBuffers", rc)) { return null; }
+    return cb;
+}
+
+fn create_semaphore(dev: rawptr) -> rawptr {
+    let ci = zalloc(24);
+    w_u32(ci, 0, ST_SEMAPHORE_CREATE_INFO);
+    var s: rawptr = null;
+    vkCreateSemaphore(dev, ci, null, to_rawptr(&s));
+    free(ci);
+    return s;
+}
+
+fn create_fence(dev: rawptr, signaled: bool) -> rawptr {
+    let ci = zalloc(24);
+    w_u32(ci, 0, ST_FENCE_CREATE_INFO);
+    if (signaled) { w_u32(ci, 16, 1); }
+    var f: rawptr = null;
+    vkCreateFence(dev, ci, null, to_rawptr(&f));
+    free(ci);
+    return f;
+}
+
+// ── Per-frame command recording: clear image + transitions ──────
+fn record_clear_frame(cb: rawptr, image: rawptr, r: f32, g: f32, b: f32) {
+    vkResetCommandBuffer(cb, 0);
+
+    let bi = zalloc(32); // VkCommandBufferBeginInfo
+    w_u32(bi, 0, ST_COMMAND_BUFFER_BEGIN_INFO);
+    w_u32(bi, 16, CMD_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+    vkBeginCommandBuffer(cb, bi);
+    free(bi);
+
+    // Barrier 1: UNDEFINED -> TRANSFER_DST_OPTIMAL
+    let bar1 = zalloc(72); // VkImageMemoryBarrier
+    w_u32(bar1, 0, ST_IMAGE_MEMORY_BARRIER);
+    w_u32(bar1, 16, 0);
+    w_u32(bar1, 20, ACCESS_TRANSFER_WRITE_BIT);
+    w_u32(bar1, 24, IMAGE_LAYOUT_UNDEFINED);
+    w_u32(bar1, 28, IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    w_u32(bar1, 32, QUEUE_FAMILY_IGNORED);
+    w_u32(bar1, 36, QUEUE_FAMILY_IGNORED);
+    w_ptr(bar1, 40, image);
+    w_u32(bar1, 48, IMAGE_ASPECT_COLOR_BIT); // aspect
+    w_u32(bar1, 56, 1);                      // levelCount
+    w_u32(bar1, 64, 1);                      // layerCount
+    vkCmdPipelineBarrier(cb,
+        PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, null, 0, null, 1, bar1);
+
+    // VkClearColorValue is a union; we use the float[4] member.
+    var color: [f32; 4];
+    color[0] = r; color[1] = g; color[2] = b; color[3] = 1.0;
+
+    let range = zalloc(20); // VkImageSubresourceRange
+    w_u32(range, 0, IMAGE_ASPECT_COLOR_BIT);
+    w_u32(range, 8, 1);
+    w_u32(range, 16, 1);
+    vkCmdClearColorImage(cb, image,
+        IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        to_rawptr(&color), 1, range);
+    free(range);
+
+    // Barrier 2: TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR
+    let bar2 = zalloc(72);
+    w_u32(bar2, 0, ST_IMAGE_MEMORY_BARRIER);
+    w_u32(bar2, 16, ACCESS_TRANSFER_WRITE_BIT);
+    w_u32(bar2, 20, ACCESS_MEMORY_READ_BIT);
+    w_u32(bar2, 24, IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    w_u32(bar2, 28, IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    w_u32(bar2, 32, QUEUE_FAMILY_IGNORED);
+    w_u32(bar2, 36, QUEUE_FAMILY_IGNORED);
+    w_ptr(bar2, 40, image);
+    w_u32(bar2, 48, IMAGE_ASPECT_COLOR_BIT);
+    w_u32(bar2, 56, 1);
+    w_u32(bar2, 64, 1);
+    vkCmdPipelineBarrier(cb,
+        PIPELINE_STAGE_TRANSFER_BIT,
+        PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, null, 0, null, 1, bar2);
+
+    free(bar1); free(bar2);
+    vkEndCommandBuffer(cb);
+}
+
+fn submit_and_present(queue: rawptr, cb: rawptr,
+                       wait_sem: rawptr, signal_sem: rawptr,
+                       fence: rawptr,
+                       swap: rawptr, image_index: u32) {
+    var wait_stage: u32 = PIPELINE_STAGE_TRANSFER_BIT;
+    var wait_arr: [rawptr; 1]; wait_arr[0] = wait_sem;
+    var sig_arr: [rawptr; 1];  sig_arr[0] = signal_sem;
+    var cb_arr: [rawptr; 1];   cb_arr[0] = cb;
+
+    let si = zalloc(72); // VkSubmitInfo
+    w_u32(si, 0, ST_SUBMIT_INFO);
+    w_u32(si, 16, 1);
+    w_ptr(si, 24, to_rawptr(&wait_arr));
+    w_ptr(si, 32, to_rawptr(&wait_stage));
+    w_u32(si, 40, 1);
+    w_ptr(si, 48, to_rawptr(&cb_arr));
+    w_u32(si, 56, 1);
+    w_ptr(si, 64, to_rawptr(&sig_arr));
+    vkQueueSubmit(queue, 1, si, fence);
+    free(si);
+
+    var swap_arr: [rawptr; 1]; swap_arr[0] = swap;
+    var img_idx: u32 = image_index;
+    let pi = zalloc(64); // VkPresentInfoKHR
+    w_u32(pi, 0, ST_PRESENT_INFO_KHR);
+    w_u32(pi, 16, 1);
+    w_ptr(pi, 24, to_rawptr(&sig_arr));
+    w_u32(pi, 32, 1);
+    w_ptr(pi, 40, to_rawptr(&swap_arr));
+    w_ptr(pi, 48, to_rawptr(&img_idx));
+    vkQueuePresentKHR(queue, pi);
+    free(pi);
+}
+
+fn color_wave01(frame: i32, offset: i32, period: i32) -> f32 {
+    var x: i32 = (frame + offset) % period;
+    if (x < 0) { x = x + period; }
+    let half: i32 = period / 2;
+    if (x <= half) {
+        return (x as f32) / (half as f32);
+    }
+    return ((period - x) as f32) / (half as f32);
+}
+
+// ── Entry point ─────────────────────────────────────────────────
+fn main() -> i32 {
+    print("[win32_vulkan] starting");
+
+    let hinstance = GetModuleHandleA(null);
+    let hwnd = make_window(hinstance, "Vyx . Win32 + Vulkan", WIN_W, WIN_H);
+    if (hwnd == null) { return 10; }
+
+    let instance = create_instance();
+    if (instance == null) { DestroyWindow(hwnd); return 11; }
+
+    let surface = create_win32_surface(instance, hinstance, hwnd);
+    if (surface == null) { vkDestroyInstance(instance, null); DestroyWindow(hwnd); return 12; }
+
+    let phys = pick_physical_device(instance);
+    if (phys == null) {
+        vkDestroySurfaceKHR(instance, surface, null);
+        vkDestroyInstance(instance, null);
+        DestroyWindow(hwnd);
+        return 13;
+    }
+
+    let qfi_i = find_graphics_present_family(phys, surface);
+    if (qfi_i < 0) {
+        print("[win32_vulkan] no graphics+present queue family");
+        vkDestroySurfaceKHR(instance, surface, null);
+        vkDestroyInstance(instance, null);
+        DestroyWindow(hwnd);
+        return 14;
+    }
+    let qfi: u32 = qfi_i as u32;
+    print("[win32_vulkan] using queue family ${qfi_i}");
+
+    let dev = create_logical_device(phys, qfi);
+    if (dev == null) {
+        vkDestroySurfaceKHR(instance, surface, null);
+        vkDestroyInstance(instance, null);
+        DestroyWindow(hwnd);
+        return 15;
+    }
+
+    var queue: rawptr = null;
+    vkGetDeviceQueue(dev, qfi, 0, to_rawptr(&queue));
+
+    let extent = zalloc(8);
+    let swap = create_swapchain(phys, dev, surface, WIN_W, WIN_H, extent);
+    free(extent);
+    if (swap == null) {
+        vkDestroyDevice(dev, null);
+        vkDestroySurfaceKHR(instance, surface, null);
+        vkDestroyInstance(instance, null);
+        DestroyWindow(hwnd);
+        return 16;
+    }
+
+    var img_count: u32 = 0;
+    vkGetSwapchainImagesKHR(dev, swap, to_rawptr(&img_count), null);
+    if (img_count > (MAX_SWAP_IMAGES as u32)) { img_count = MAX_SWAP_IMAGES as u32; }
+    var images: [rawptr; 8];
+    var k: i64 = 0;
+    while (k < 8) { images[k] = null; k = k + 1; }
+    vkGetSwapchainImagesKHR(dev, swap, to_rawptr(&img_count), to_rawptr(&images));
+    print("[win32_vulkan] swapchain images = ${img_count}");
+
+    let pool = create_command_pool(dev, qfi);
+    let cb = alloc_command_buffer(dev, pool);
+    let sem_acquire = create_semaphore(dev);
+    let sem_render = create_semaphore(dev);
+    let fence = create_fence(dev, false);
+
+    var frame: i32 = 0;
+    var alive: bool = true;
+    while (alive && frame < FRAME_BUDGET) {
+        if (!pump_messages()) { alive = false; }
+        if (alive) {
+            if (win_key_pressed(VK_ESCAPE)) { alive = false; }
+        }
+        if (alive) {
+            var img_idx: u32 = 0;
+            let rc = vkAcquireNextImageKHR(dev, swap, WAIT_NS_ONE_SEC,
+                sem_acquire, null, to_rawptr(&img_idx));
+            if (rc == 0) {
+                let wr: f32 = color_wave01(frame, 0, 180);
+                let wg: f32 = color_wave01(frame, 60, 180);
+                let wb: f32 = color_wave01(frame, 120, 180);
+                let cr: f32 = (0.08 as f32) + (0.72 as f32) * wr;
+                let cg: f32 = (0.10 as f32) + (0.55 as f32) * wg;
+                let cb_col: f32 = (0.15 as f32) + (0.75 as f32) * wb;
+                record_clear_frame(cb, images[img_idx as i64], cr, cg, cb_col);
+                submit_and_present(queue, cb, sem_acquire, sem_render, fence,
+                                   swap, img_idx);
+                vkWaitForFences(dev, 1, to_rawptr(&fence), 1, WAIT_NS_ONE_SEC);
+                vkResetFences(dev, 1, to_rawptr(&fence));
+                vkQueueWaitIdle(queue);
+            }
+            frame = frame + 1;
+        }
+    }
+
+    print("[win32_vulkan] frames rendered = ${frame}");
+
+    vkDeviceWaitIdle(dev);
+    vkDestroyFence(dev, fence, null);
+    vkDestroySemaphore(dev, sem_render, null);
+    vkDestroySemaphore(dev, sem_acquire, null);
+    vkDestroyCommandPool(dev, pool, null);
+    vkDestroySwapchainKHR(dev, swap, null);
+    vkDestroyDevice(dev, null);
+    vkDestroySurfaceKHR(instance, surface, null);
+    vkDestroyInstance(instance, null);
+    DestroyWindow(hwnd);
+    print("[win32_vulkan] clean exit");
+    return 0;
+}

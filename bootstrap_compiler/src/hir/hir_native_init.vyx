@@ -1,0 +1,133 @@
+module bootstrap.hir_native_init;
+
+use bootstrap.ast;
+use bootstrap.sema;
+use bootstrap.policy;
+use bootstrap.dci_requests;
+use bootstrap.hir_type_table;
+
+fn hir_native_init_find_record(head: rawptr, name: string) -> rawptr {
+    var cur = head;
+    while (cur != null) {
+        if (decl_get_kind(cur) == de_CLASS() && decl_get_name(cur) == name) { return cur; }
+        let nested = hir_native_init_find_record(decl_get_members(cur), name);
+        if (nested != null) { return nested; }
+        cur = decl_get_next(cur);
+    }
+    return null;
+}
+
+fn hir_native_init_list(e: rawptr, source_unit: rawptr, type_table: HirTypeTable) -> rawptr {
+    if (e == null || expr_get_kind(e) != ex_STRUCT_INIT()) { return e; }
+    let owner = expr_get_name(e);
+    let record = hir_native_init_find_record(unit_get_decls(source_unit), policy_generic_call_base(owner.clone()));
+    if (record == null || policy_meta_attribute_value(decl_get_meta(record), "dci_list_init") != "true"
+        || !decl_get_meta(record).contains("|foreign_dci")) { return e; }
+    var cell = expr_get_args(e);
+    var count: i32 = 0;
+    while (cell != null) {
+        if (stmt_get_name(cell).len > 0 || stmt_get_init(cell) == null) { return e; }
+        count = count + 1;
+        cell = stmt_get_next(cell);
+    }
+    // A fixed argument list lets the producer check the real C++ brace
+    // constructor, including narrowing and default allocator selection.
+    let element = policy_generic_arg_at(policy_generic_call_args(owner.clone()), 0);
+    if (element.len == 0) { return e; }
+    let ctor = decl_alloc(de_METHOD(), "constructor");
+    decl_set_ty(ctor, tref_create_class(owner));
+    decl_set_is_public(ctor, true);
+    decl_set_meta(ctor, "|extern_abi:dci|foreign_dci|foreign_dci_native|foreign_dci_ctor");
+    var params: rawptr = null;
+    var tail: rawptr = null;
+    var argument_types: string = "";
+    cell = expr_get_args(e);
+    var index: i32 = 0;
+    while (cell != null) {
+        let param = decl_alloc(de_FIELD(), "item" + index.toString());
+        let value = stmt_get_init(cell);
+        let value_type = expr_get_ty(value);
+        if (value_type == null) { return e; }
+        decl_set_ty(param, value_type);
+        if (index > 0) { argument_types = argument_types + ","; }
+        argument_types = argument_types + type_table.text(type_table.intern_type_ref(value_type));
+        if (params == null) { params = param; } else { decl_set_next(tail, param); }
+        tail = param;
+        index = index + 1;
+        cell = stmt_get_next(cell);
+    }
+    decl_set_params(ctor, params);
+    let callee = expr_alloc(ex_IDENT());
+    expr_set_name(callee, owner);
+    expr_set_semantic(callee, expr_sem_METHOD(), ctor, record, 0);
+    let call = expr_alloc(ex_CALL());
+    expr_set_lhs(call, callee);
+    expr_set_args(call, expr_get_args(e));
+    expr_set_ty(call, expr_get_ty(e));
+    expr_set_semantic(call, expr_sem_METHOD(), ctor, record, 0);
+    dci_request_list_init(owner, argument_types);
+    return call;
+}
+
+// A qualified type call is still a constructor, rather than a method on a
+// namespace receiver. Sema has already selected the exact declaration.
+public fn hir_native_init_prepare(e: rawptr, source_unit: rawptr, type_table: HirTypeTable) -> rawptr {
+    e = hir_native_init_list(e, source_unit, type_table);
+    if (e == null || expr_get_kind(e) != ex_CALL()) { return e; }
+    let callee = expr_get_lhs(e);
+    if (callee == null || expr_get_kind(callee) != ex_MEMBER()) { return e; }
+    let target = expr_get_semantic_target(e);
+    if (target == null || decl_get_name(target) != "constructor"
+        || !decl_get_meta(target).contains("|foreign_dci_ctor")) { return e; }
+    let ty = expr_get_ty(e);
+    if (ty == null || tref_get_kind(ty) != ty_CLASS()) { return e; }
+    let name = tref_get_name(ty);
+    if (name.len == 0) { return e; }
+    expr_set_kind(callee, ex_IDENT());
+    expr_set_lhs(callee, null);
+    expr_set_name(callee, name);
+    expr_set_semantic(callee, expr_sem_METHOD(), target, expr_get_semantic_owner(e), 0);
+    return e;
+}
+
+public fn hir_native_init_array_call(type_name: string, cells: rawptr, count: i64) -> rawptr {
+        // Array literal sharing the positional cells as its element list —
+        // the cells already form the st_EXPR chain that build_arg_cells walks.
+        let arr = expr_alloc(ex_ARRAY_LIT());
+        if (arr == null) { return null; }
+        expr_set_args(arr, cells);
+        // Stamp the array type on the synthetic literal.  It is created
+        // during HIR building, after sema has run, so nothing else will set
+        // its AST ty stamp; without it the HIR expr type is invalid and the
+        // MIR array→pointer decay can never trigger (the call argument is
+        // then lowered as an aggregate under the pointer type and codegen
+        // fails with "no record layout for ptr<T>").
+        let first_elem_ast = stmt_get_init(cells);
+        var elem_ty = expr_get_ty(first_elem_ast);
+        if (elem_ty == null) { elem_ty = tref_create_kind(ty_I32()); }
+        expr_set_ty(arr, tref_alloc_array(elem_ty, count));
+        // Element count as an int literal AST node.
+        let num = expr_alloc(ex_INT_LIT());
+        if (num == null) { return null; }
+        expr_set_int_val(num, count);
+        // Two-arg static call: `Type::from_array([...], n)`.
+        let receiver = expr_alloc(ex_IDENT());
+        if (receiver == null) { return null; }
+        expr_set_name(receiver, type_name);
+        let member = expr_alloc(ex_MEMBER());
+        if (member == null) { return null; }
+        expr_set_lhs(member, receiver);
+        expr_set_name(member, "from_array");
+        let call = expr_alloc(ex_CALL());
+        if (call == null) { return null; }
+        expr_set_lhs(call, member);
+        let arg_cell = stmt_alloc(st_EXPR());
+        if (arg_cell == null) { return null; }
+        stmt_set_init(arg_cell, arr);
+        let count_cell = stmt_alloc(st_EXPR());
+        if (count_cell == null) { return null; }
+        stmt_set_init(count_cell, num);
+        stmt_set_next(arg_cell, count_cell);
+        expr_set_args(call, arg_cell);
+        return call;
+}

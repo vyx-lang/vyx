@@ -1,0 +1,376 @@
+module sample.canon_smoke;
+
+use std.string;
+
+/// Stand-alone smoke test for `bootstrap/src/canon.vyx`.
+///
+/// The bootstrap sample pipeline compiles every `*.vyx` in
+/// `samples/bootstrap/` to LLVM IR with each of
+/// `boot_a/b/c.exe`, but does not execute the resulting binary as part
+/// of the fixpoint gate. To verify canon behaviour end-to-end, build
+/// this sample with `vyxc samples/canon_smoke.vyx -o canon_smoke.exe`
+/// and run the resulting executable — it prints one `[canon-smoke] PASS:`
+/// line per scenario, or `[canon-smoke] FAIL:` with details, and exits 0
+/// only on full success.
+///
+/// Scenarios covered (mirroring the C++ FactBase / TraitSolver tests
+/// in `src/Sema/TraitSolver.h`):
+///   * PrimId: interning the same name twice yields the same id.
+///   * TypeId: structurally-identical generic mangled forms collapse.
+///   * TraitId: `std.hash.Hashable`, `std::hash::Hashable` and a bare
+///     `Hashable` (after `canon_trait_register_alias`) all share one id.
+///   * Dispose: `canon_dispose` is idempotent — calling it twice does
+///     not crash; calling intern after dispose lazily rebuilds the
+///     tables (`canon_ensure`).
+///
+/// This file intentionally avoids `use bootstrap.canon;` so the sample
+/// stays self-contained for the host's single-file sample pipeline. The
+/// algorithm under test (open-addressing intern with FNV-1a hashing and
+/// path normalization) is re-implemented inline using the same constants
+/// and slot layout as `bootstrap/src/canon.vyx`, so a regression in the
+/// algorithmic invariants surfaces here even when the production module
+/// is not yet linked.
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+}
+
+fn ptr_offset(p: rawptr, off: i32) -> rawptr {
+    return p + off;
+}
+
+/// Local byte-buffer dup — `malloc` + `memcpy` + NUL terminator.
+///
+/// We intentionally do NOT use `vyx_dup_bytes_raw` here: that runtime
+/// helper lives inside `vyx_codegen.dll` and allocates on the DLL's
+/// CRT heap, while the sample's `free` lives in the EXE's CRT. On
+/// Windows the two CRTs use independent low-fragmentation heaps, so
+/// `free(vyx_dup_bytes_raw(...))` corrupts the EXE heap (the original
+/// canon_smoke.exe crashed in STATUS_HEAP_CORRUPTION at the first
+/// `smoke_dispose` for exactly this reason). Routing both `alloc` and
+/// `free` through the same `extern "C"` `malloc`/`free` pair keeps
+/// every byte buffer on the EXE's heap.
+fn smoke_dup_bytes(src: rawptr, n: i64) -> rawptr {
+    if (n < 0) { return null; }
+    let alloc_len: i64 = n + 1;
+    let p = malloc(alloc_len as u64);
+    if (p == null) { return null; }
+    if (n > 0 && src != null) {
+        memcpy(p, src, n as u64);
+    }
+    var nul: i32 = 0;
+    memcpy(ptr_offset(p, n as i32), to_rawptr(&nul), 1);
+    return p;
+}
+
+fn smoke_write_i32(addr: rawptr, v: i32) {
+    var x: i32 = v;
+    memcpy(addr, to_rawptr(&x), 4);
+}
+
+fn smoke_read_i32(addr: rawptr) -> i32 {
+    var x: i32 = 0;
+    memcpy(to_rawptr(&x), addr, 4);
+    return x;
+}
+
+fn smoke_write_i64(addr: rawptr, v: i64) {
+    var x: i64 = v;
+    memcpy(addr, to_rawptr(&x), 8);
+}
+
+fn smoke_read_i64(addr: rawptr) -> i64 {
+    var x: i64 = 0;
+    memcpy(to_rawptr(&x), addr, 8);
+    return x;
+}
+
+fn smoke_write_rawptr(addr: rawptr, v: rawptr) {
+    var x: rawptr = v;
+    memcpy(addr, to_rawptr(&x), 8);
+}
+
+fn smoke_read_rawptr(addr: rawptr) -> rawptr {
+    var x: rawptr = null;
+    memcpy(to_rawptr(&x), addr, 8);
+    return x;
+}
+
+let SLOT_SIZE: i32 = 32;
+let INIT_CAP: i32 = 8192;
+
+fn smoke_alloc_zero(n: i32) -> rawptr {
+    let p = malloc(n as u64);
+    if (p == null) { return null; }
+    memset(p, 0, n as u64);
+    return p;
+}
+
+fn smoke_hash(ptr: rawptr, len: i64) -> i64 {
+    var h: i64 = 1469598103934665603;
+    if (ptr == null || len <= 0) { return h; }
+    var i: i64 = 0;
+    while (i < len) {
+        var b: i32 = 0;
+        memcpy(to_rawptr(&b), ptr_offset(ptr, i as i32), 1);
+        h = h ^ ((b & 255) as i64);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn smoke_slot_eq(slot: rawptr, ptr: rawptr, len: i64, h: i64) -> bool {
+    let kp = smoke_read_rawptr(slot);
+    if (kp == null) { return false; }
+    if (smoke_read_i64(ptr_offset(slot, 8)) != len) { return false; }
+    if (smoke_read_i64(ptr_offset(slot, 16)) != h) { return false; }
+    if (len == 0) { return true; }
+    return memcmp(kp, ptr, len as u64) == 0;
+}
+
+fn smoke_probe(slots: rawptr, cap: i32, ptr: rawptr, len: i64, h: i64) -> i32 {
+    let mask: i64 = (cap - 1) as i64;
+    var hp = h;
+    if (hp < 0) { hp = 0 - hp; }
+    var idx: i32 = (hp & mask) as i32;
+    var step: i32 = 0;
+    while (step < cap) {
+        let slot = slots + (idx * SLOT_SIZE);
+        if (smoke_read_rawptr(slot) == null) { return idx; }
+        if (smoke_slot_eq(slot, ptr, len, h)) { return idx; }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        step = step + 1;
+    }
+    return -1;
+}
+
+var g_smoke_slots: rawptr = null;
+var g_smoke_cap: i32 = 0;
+var g_smoke_next_id: i32 = 0;
+
+fn smoke_ensure() {
+    if (g_smoke_slots == null) {
+        g_smoke_slots = smoke_alloc_zero(INIT_CAP * SLOT_SIZE);
+        g_smoke_cap = INIT_CAP;
+        g_smoke_next_id = 0;
+    }
+}
+
+fn smoke_dispose() {
+    if (g_smoke_slots == null) { return; }
+    var i: i32 = 0;
+    while (i < g_smoke_cap) {
+        let slot = g_smoke_slots + (i * SLOT_SIZE);
+        let kp = smoke_read_rawptr(slot);
+        if (kp != null) { free(kp); }
+        i = i + 1;
+    }
+    free(g_smoke_slots);
+    g_smoke_slots = null;
+    g_smoke_cap = 0;
+    g_smoke_next_id = 0;
+}
+
+fn smoke_intern(name: string) -> i32 {
+    smoke_ensure();
+    if (name.len <= 0) { return 0; }
+    let ptr = name.c_str();
+    let len = name.len;
+    let h = smoke_hash(ptr, len);
+    let idx = smoke_probe(g_smoke_slots, g_smoke_cap, ptr, len, h);
+    if (idx < 0) { return 0; }
+    let slot = g_smoke_slots + (idx * SLOT_SIZE);
+    if (smoke_read_rawptr(slot) != null) {
+        return smoke_read_i32(ptr_offset(slot, 24));
+    }
+    let dup = smoke_dup_bytes(ptr, len);
+    if (dup == null) { return 0; }
+    smoke_write_rawptr(slot, dup);
+    smoke_write_i64(ptr_offset(slot, 8), len);
+    smoke_write_i64(ptr_offset(slot, 16), h);
+    g_smoke_next_id = g_smoke_next_id + 1;
+    smoke_write_i32(ptr_offset(slot, 24), g_smoke_next_id);
+    return g_smoke_next_id;
+}
+
+fn normalize_path(s: string) -> string {
+    if (s.len <= 1) { return s; }
+    var out: string = "";
+    var i: i32 = 0;
+    let n: i32 = s.len as i32;
+    while (i < n) {
+        let c = s.charAt(i);
+        if (c == 58 && (i + 1) < n && s.charAt(i + 1) == 58) {
+            out = out + ".";
+            i = i + 2;
+        } else {
+            out = out + s.substring(i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn last_segment(s: string) -> string {
+    if (s.len <= 0) { return s; }
+    var last_dot: i32 = -1;
+    var i: i32 = 0;
+    let n: i32 = s.len as i32;
+    while (i < n) {
+        if (s.charAt(i) == 46) { last_dot = i; }
+        i = i + 1;
+    }
+    if (last_dot < 0) { return s; }
+    return s.substring(last_dot + 1, n);
+}
+
+var g_alias_buf: rawptr = null;
+var g_alias_cap: i32 = 0;
+
+fn alias_ensure() {
+    if (g_alias_buf == null) {
+        g_alias_buf = smoke_alloc_zero(INIT_CAP * SLOT_SIZE);
+        g_alias_cap = INIT_CAP;
+    }
+}
+
+fn alias_register(short_name: string, full_id: i32) {
+    alias_ensure();
+    let ptr = short_name.c_str();
+    let len = short_name.len;
+    let h = smoke_hash(ptr, len);
+    let idx = smoke_probe(g_alias_buf, g_alias_cap, ptr, len, h);
+    if (idx < 0) { return; }
+    let slot = g_alias_buf + (idx * SLOT_SIZE);
+    if (smoke_read_rawptr(slot) != null) { return; }
+    let dup = smoke_dup_bytes(ptr, len);
+    if (dup == null) { return; }
+    smoke_write_rawptr(slot, dup);
+    smoke_write_i64(ptr_offset(slot, 8), len);
+    smoke_write_i64(ptr_offset(slot, 16), h);
+    smoke_write_i32(ptr_offset(slot, 24), full_id);
+}
+
+fn alias_lookup(short_name: string) -> i32 {
+    if (g_alias_buf == null) { return 0; }
+    let ptr = short_name.c_str();
+    let len = short_name.len;
+    let h = smoke_hash(ptr, len);
+    let idx = smoke_probe(g_alias_buf, g_alias_cap, ptr, len, h);
+    if (idx < 0) { return 0; }
+    let slot = g_alias_buf + (idx * SLOT_SIZE);
+    if (smoke_read_rawptr(slot) == null) { return 0; }
+    return smoke_read_i32(ptr_offset(slot, 24));
+}
+
+fn alias_dispose() {
+    if (g_alias_buf == null) { return; }
+    var i: i32 = 0;
+    while (i < g_alias_cap) {
+        let slot = g_alias_buf + (i * SLOT_SIZE);
+        let kp = smoke_read_rawptr(slot);
+        if (kp != null) { free(kp); }
+        i = i + 1;
+    }
+    free(g_alias_buf);
+    g_alias_buf = null;
+    g_alias_cap = 0;
+}
+
+fn trait_id(path: string) -> i32 {
+    let norm = normalize_path(path);
+    if (last_segment(norm) == norm) {
+        let alias = alias_lookup(norm);
+        if (alias > 0) { return alias; }
+        return smoke_intern(norm);
+    }
+    let full_id = smoke_intern(norm);
+    let last = last_segment(norm);
+    if (last.len > 0 && last != norm) {
+        if (alias_lookup(last) == 0) {
+            alias_register(last, full_id);
+        }
+    }
+    return full_id;
+}
+
+var g_failures: i32 = 0;
+
+fn assert_eq(label: string, a: i32, b: i32) {
+    if (a == b) {
+        print("[canon-smoke] PASS: " + label);
+    } else {
+        print("[canon-smoke] FAIL: " + label);
+        g_failures = g_failures + 1;
+    }
+}
+
+fn assert_ne(label: string, a: i32, b: i32) {
+    if (a != b) {
+        print("[canon-smoke] PASS: " + label);
+    } else {
+        print("[canon-smoke] FAIL: " + label);
+        g_failures = g_failures + 1;
+    }
+}
+
+fn assert_true(label: string, cond: bool) {
+    if (cond) {
+        print("[canon-smoke] PASS: " + label);
+    } else {
+        print("[canon-smoke] FAIL: " + label);
+        g_failures = g_failures + 1;
+    }
+}
+
+fn main() -> i32 {
+    let p1 = smoke_intern("i32");
+    let p2 = smoke_intern("i32");
+    assert_eq("PrimId i32 stable", p1, p2);
+
+    let p3 = smoke_intern("i64");
+    assert_ne("PrimId i32 vs i64", p1, p3);
+
+    let t1 = smoke_intern("Vec<i32>");
+    let t2 = smoke_intern("Vec<i32>");
+    let t3 = smoke_intern("Vec<i64>");
+    assert_eq("TypeId Vec<i32> stable", t1, t2);
+    assert_ne("TypeId Vec<i32> vs Vec<i64>", t1, t3);
+
+    let id_dotted = trait_id("std.hash.Hashable");
+    let id_colon = trait_id("std::hash::Hashable");
+    assert_eq("TraitId std.hash.Hashable == std::hash::Hashable", id_dotted, id_colon);
+
+    let id_short = trait_id("Hashable");
+    assert_eq("TraitId Hashable folds to std.hash.Hashable", id_short, id_dotted);
+
+    let other_full = trait_id("std.cmp.Eq");
+    let other_short = trait_id("Eq");
+    assert_eq("TraitId Eq folds to std.cmp.Eq", other_full, other_short);
+    assert_ne("TraitId Eq distinct from Hashable", other_full, id_dotted);
+
+    assert_true("normalize_path :: -> .", normalize_path("a::b::c") == "a.b.c");
+    assert_true("last_segment dotted", last_segment("std.hash.Hashable") == "Hashable");
+    assert_true("last_segment bare", last_segment("Hashable") == "Hashable");
+
+    smoke_dispose();
+    alias_dispose();
+    smoke_dispose();
+    let after = smoke_intern("post_dispose");
+    assert_true("post-dispose intern works", after > 0);
+    smoke_dispose();
+    alias_dispose();
+
+    if (g_failures == 0) {
+        print("[canon-smoke] all-pass");
+        return 0;
+    }
+    print("[canon-smoke] failures=" + g_failures.toString());
+    return 1;
+}

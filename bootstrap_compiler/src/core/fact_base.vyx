@@ -1,0 +1,610 @@
+module bootstrap.fact_base;
+
+use std.string;
+use bootstrap.ast;
+use bootstrap.policy;
+
+/// FactBase — bootstrap mirror of `src/Sema/TraitSolver.h::FactBase`
+/// (canonical at workspace root). PLAN_SEMA_ROOT_FIX S2/S3 sidecar.
+///
+/// Stores `(PrimId, TraitId)` satisfaction facts. Both the trait's
+/// full mangled path (`std.hash.Hashable`) and the last dotted
+/// segment (`Hashable`) are registered so callers don't have to
+/// second-guess short/long-name aliasing — same contract as host
+/// `FactBase::registerPrimImpl`.
+///
+/// Remaining heap growth is the packed fact arena / string buffer. New
+/// writes go through `FbSlot` (`fb_slot_pack`); there is no `fb_dup_bytes`.
+///
+/// Lifecycle:
+///
+///   * Sema's `host_analyze_phase_a_primitive_impl_facts` walks every
+///     top-level `impl <Trait> for <Primitive>` declaration once and
+///     calls `fact_base_register_prim_impl`. After the walk Sema
+///     calls `fact_base_freeze` and the base becomes read-only.
+///
+///   * `TraitSolver::solve` queries only via `fact_base_prim_satisfies`.
+///     The query path bumps `prim_queries` for telemetry parity with
+///     host `dumpSolverReconciliationStats`.
+///
+///   * Any genuinely new write that arrives after `freeze` (an
+///     "on-demand re-registration" leak — exactly what S3 removed)
+///     is silently absorbed, but the `post_freeze_writes` counter
+///     bumps so `dumpSolverReconciliationStats` can flag the
+///     regression with the same wording host prints.
+///
+/// State and hash slots are packed blobs. The public API still takes a
+/// `rawptr` handle (Sema is outside this work package). New slot writes
+/// go through `FbSlot` values (`fb_slot_pack` / `fb_slot_unpack`); the
+/// remaining `sl_*` readers are the packed-blob surface. Getters must
+/// not return FactBase by value (parser/sema still consume `rawptr`).
+///
+/// Composite key: `prim_name || '\x1f' || trait_name`. Matches the
+/// host `FactBase::makeKey` helper byte-for-byte.
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+}
+
+class FactBase {
+    public buf_ptr: rawptr
+    public buf_cap: i32
+    public buf_count: i32
+    public total_writes: i64
+    public post_freeze: i64
+    public prim_queries: i64
+    public frozen: i32
+    public _pad: i32
+}
+
+class FbSlot {
+    public key_ptr: rawptr
+    public key_len: i64
+    public key_hash: i64
+    public _pad: i64
+}
+
+fn fb_state_size() -> i32 { return 48; }
+fn fb_slot_size()  -> i32 { return 32; }
+fn fb_init_cap()   -> i32 { return 1024; }
+fn fb_sep_byte()   -> i32 { return 31; } // 0x1F unit-separator
+
+fn fb_buf_ptr(s: rawptr) -> rawptr { return ast_read_rawptr(s); }
+fn fb_set_buf_ptr(s: rawptr, v: rawptr) { ast_write_rawptr(s, v); }
+fn fb_buf_cap(s: rawptr) -> i32 { return ast_read_i32(ptr_offset(s, 8)); }
+fn fb_set_buf_cap(s: rawptr, v: i32) { ast_write_i32(ptr_offset(s, 8), v); }
+fn fb_buf_count(s: rawptr) -> i32 { return ast_read_i32(ptr_offset(s, 12)); }
+fn fb_set_buf_count(s: rawptr, v: i32) { ast_write_i32(ptr_offset(s, 12), v); }
+fn fb_total_writes(s: rawptr) -> i64 { return ast_read_i64(ptr_offset(s, 16)); }
+fn fb_set_total_writes(s: rawptr, v: i64) { ast_write_i64(ptr_offset(s, 16), v); }
+fn fb_post_freeze(s: rawptr) -> i64 { return ast_read_i64(ptr_offset(s, 24)); }
+fn fb_set_post_freeze(s: rawptr, v: i64) { ast_write_i64(ptr_offset(s, 24), v); }
+fn fb_prim_queries(s: rawptr) -> i64 { return ast_read_i64(ptr_offset(s, 32)); }
+fn fb_set_prim_queries(s: rawptr, v: i64) { ast_write_i64(ptr_offset(s, 32), v); }
+fn fb_frozen(s: rawptr) -> i32 { return ast_read_i32(ptr_offset(s, 40)); }
+fn fb_set_frozen(s: rawptr, v: i32) { ast_write_i32(ptr_offset(s, 40), v); }
+
+fn sl_key_ptr(p: rawptr) -> rawptr { return ast_read_rawptr(p); }
+fn sl_set_key_ptr(p: rawptr, v: rawptr) { ast_write_rawptr(p, v); }
+fn sl_key_len(p: rawptr) -> i64 { return ast_read_i64(ptr_offset(p, 8)); }
+fn sl_set_key_len(p: rawptr, v: i64) { ast_write_i64(ptr_offset(p, 8), v); }
+fn sl_key_hash(p: rawptr) -> i64 { return ast_read_i64(ptr_offset(p, 16)); }
+fn sl_set_key_hash(p: rawptr, v: i64) { ast_write_i64(ptr_offset(p, 16), v); }
+
+fn fb_slot_pack(dst: rawptr, rec: FbSlot) {
+    if (dst == null) { return; }
+    sl_set_key_ptr(dst, rec.key_ptr);
+    sl_set_key_len(dst, rec.key_len);
+    sl_set_key_hash(dst, rec.key_hash);
+}
+
+fn fb_slot_unpack(src: rawptr) -> FbSlot {
+    if (src == null) {
+        return FbSlot {
+            key_ptr: null,
+            key_len: 0,
+            key_hash: 0,
+            _pad: 0
+        };
+    }
+    return FbSlot {
+        key_ptr: sl_key_ptr(src),
+        key_len: sl_key_len(src),
+        key_hash: sl_key_hash(src),
+        _pad: 0
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Allocator / disposer / clear
+// ════════════════════════════════════════════════════════════════════
+
+fn fact_base_register_builtin_auto_traits(s: rawptr) {
+    if (s == null) { return; }
+    // Scalars are Copy/Clone without a source `impl`. Seed the solver so
+    // derive(Copy) on a class of i32 fields does not look like UNSAT.
+    var names: string = "i8,i16,i32,i64,u8,u16,u32,u64,isize,usize,f32,f64,bool,char,rawptr,";
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= names.len) {
+        if (i == names.len || names.charAt(i) == 44) {
+            if (i > start) {
+                let prim = names.substring(start as i64, i as i64);
+                fact_base_register_prim_impl(s, prim, "Copy");
+                fact_base_register_prim_impl(s, prim, "Clone");
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+}
+
+public fn fact_base_alloc() -> rawptr {
+    let s = malloc(fb_state_size() as u64);
+    if (s == null) { return null; }
+    memset(s, 0, fb_state_size() as u64);
+    let cap = fb_init_cap();
+    fb_set_buf_ptr(s, fb_table_alloc(cap));
+    fb_set_buf_cap(s, cap);
+    fact_base_register_builtin_auto_traits(s);
+    return s;
+}
+
+public fn fact_base_dispose(s: rawptr) {
+    if (s == null) { return; }
+    fb_table_dispose(fb_buf_ptr(s), fb_buf_cap(s));
+    free(s);
+}
+
+public fn fact_base_clear(s: rawptr) {
+    if (s == null) { return; }
+    fb_table_dispose(fb_buf_ptr(s), fb_buf_cap(s));
+    memset(s, 0, fb_state_size() as u64);
+    let fresh_cap = fb_init_cap();
+    fb_set_buf_ptr(s, fb_table_alloc(fresh_cap));
+    fb_set_buf_cap(s, fresh_cap);
+    fact_base_register_builtin_auto_traits(s);
+}
+
+public fn fact_base_freeze(s: rawptr) {
+    if (s == null) { return; }
+    fb_set_frozen(s, 1);
+}
+
+public fn fact_base_is_frozen(s: rawptr) -> bool {
+    if (s == null) { return false; }
+    return fb_frozen(s) != 0;
+}
+
+public fn fact_base_prim_fact_count(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return fb_buf_count(s) as i64;
+}
+
+public fn fact_base_total_writes(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return fb_total_writes(s);
+}
+
+public fn fact_base_post_freeze_writes(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return fb_post_freeze(s);
+}
+
+public fn fact_base_prim_queries(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return fb_prim_queries(s);
+}
+
+public fn fact_base_bump_prim_queries(s: rawptr) {
+    if (s == null) { return; }
+    fb_set_prim_queries(s, fb_prim_queries(s) + 1);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   register_prim_impl — mirrors `FactBase::registerPrimImpl`.
+//
+//   Both the full trait path and its last dotted segment are inserted
+//   so a call site that asks for `Hashable` resolves the same fact
+//   inserted for `std.hash.Hashable`.
+//
+//   Idempotent: redundant inserts collapse via set semantics. The
+//   `post_freeze_writes` counter bumps every time a *new* key arrives
+//   after `freeze`; duplicates of already-known facts are silently
+//   absorbed (matches the host invariant "Phase A is the only writer").
+// ════════════════════════════════════════════════════════════════════
+
+public fn fact_base_register_prim_impl(s: rawptr,
+                                       prim_name: string,
+                                       trait_name: string) {
+    if (s == null) { return; }
+    if (prim_name.len == 0 || trait_name.len == 0) { return; }
+    fb_set_total_writes(s, fb_total_writes(s) + 1);
+    fb_insert_key(s, prim_name, trait_name);
+    let last = fb_last_segment(trait_name);
+    if (last.len > 0 && last.len != trait_name.len) {
+        fb_insert_key(s, prim_name, last);
+    }
+}
+
+public fn fact_base_prim_satisfies(s: rawptr,
+                                   prim_name: string,
+                                   trait_name: string) -> bool {
+    if (s == null) { return false; }
+    if (prim_name.len == 0 || trait_name.len == 0) { return false; }
+    let slot = fb_lookup_only(fb_buf_ptr(s), fb_buf_cap(s), prim_name, trait_name);
+    if (slot == null) { return false; }
+    return fb_slot_unpack(slot).key_ptr != null;
+}
+
+/// Nominal `impl Trait for Type` uses the same (type, trait) key as prim facts.
+/// Layout of the 48-byte header is unchanged.
+public fn fact_base_register_type_impl(s: rawptr,
+                                       type_name: string,
+                                       trait_name: string) {
+    fact_base_register_prim_impl(s, type_name, trait_name);
+}
+
+public fn fact_base_type_satisfies(s: rawptr,
+                                   type_name: string,
+                                   trait_name: string) -> bool {
+    return fact_base_prim_satisfies(s, type_name, trait_name);
+}
+
+fn fb_blanket_prim() -> string { return "*blanket*"; }
+fn fb_rs_byte() -> i32 { return 30; }
+
+fn fb_text_contains(hay: string, needle: string) -> bool {
+    if (needle.len == 0) { return true; }
+    if (hay.len < needle.len) { return false; }
+    var i: i32 = 0;
+    while (i + needle.len <= hay.len) {
+        var k: i32 = 0;
+        var hit: bool = true;
+        while (k < needle.len && hit) {
+            if (hay.charAt(i + k) != needle.charAt(k)) { hit = false; }
+            k = k + 1;
+        }
+        if (hit) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn fb_csv_has_name(csv: string, name: string) -> bool {
+    if (csv.len == 0 || name.len == 0) { return false; }
+    if (csv == name) { return true; }
+    return fb_text_contains("," + csv + ",", "," + name + ",");
+}
+
+fn fb_payload_field(payload: string, index: i32) -> string {
+    var field: i32 = 0;
+    var start: i64 = 0;
+    var i: i64 = 0;
+    let sep = fb_rs_byte();
+    while (i <= payload.len) {
+        if (i == payload.len || payload.charAt(i as i32) == sep) {
+            if (field == index) {
+                return str_substring(payload, start, i);
+            }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Blanket rule key: prim=`*blanket*`, trait_path=`Trait\x1eTarget\x1eGenerics\x1eWhere`.
+public fn fact_base_register_blanket_impl(s: rawptr,
+                                          trait_name: string,
+                                          target_pat: string,
+                                          generics: string,
+                                          where_clause: string) {
+    if (s == null) { return; }
+    if (trait_name.len == 0 || target_pat.len == 0) { return; }
+    var sep: i32 = fb_rs_byte();
+    let mark = from_cstr_len(to_rawptr(&sep), 1);
+    let payload = trait_name + mark + target_pat + mark + generics + mark + where_clause;
+    fb_set_total_writes(s, fb_total_writes(s) + 1);
+    fb_insert_key(s, fb_blanket_prim(), payload);
+    let last = fb_last_segment(trait_name);
+    if (last.len > 0 && last.len != trait_name.len) {
+        let payload2 = last + mark + target_pat + mark + generics + mark + where_clause;
+        fb_insert_key(s, fb_blanket_prim(), payload2);
+    }
+}
+
+/// First matching blanket payload `generics\x1ewhere` for (type, trait), or "".
+public fn fact_base_first_blanket_payload(s: rawptr,
+                                          type_name: string,
+                                          trait_name: string) -> string {
+    if (s == null || type_name.len == 0 || trait_name.len == 0) { return ""; }
+    let buf = fb_buf_ptr(s);
+    let cap = fb_buf_cap(s);
+    if (buf == null || cap <= 0) { return ""; }
+    let trait_short = fb_last_segment(trait_name);
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * fb_slot_size());
+        let rec = fb_slot_unpack(slot);
+        let kp = rec.key_ptr;
+        let klen = rec.key_len;
+        if (kp != null && klen > 0) {
+            let key = from_cstr_len(kp, klen);
+            let prefix = fb_blanket_prim();
+            if (key.len > prefix.len + 1 && key.startsWith(prefix)
+                && key.charAt(prefix.len) == fb_sep_byte()) {
+                let payload = str_substring(key, (prefix.len + 1) as i64, key.len);
+                let tr = fb_payload_field(payload, 0);
+                let target = fb_payload_field(payload, 1);
+                let generics = fb_payload_field(payload, 2);
+                let where_clause = fb_payload_field(payload, 3);
+                var trait_hit = tr == trait_name;
+                if (!trait_hit && trait_short.len > 0) { trait_hit = tr == trait_short; }
+                if (!trait_hit && tr.len > 0) {
+                    let tr_short = fb_last_segment(tr);
+                    if (tr_short.len > 0) { trait_hit = tr_short == trait_name || tr_short == trait_short; }
+                }
+                if (trait_hit) {
+                    if (target == type_name || fb_csv_has_name(generics, target)) {
+                        var sep: i32 = fb_rs_byte();
+                        let mark = from_cstr_len(to_rawptr(&sep), 1);
+                        return generics + mark + where_clause;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   dump_solver_stats — byte-exact replica of
+//   `vyx::Sema::dumpSolverReconciliationStats`
+//   (src/Sema/Sema.cpp L162–L172).
+//
+//   Format (single line, no trailing colon):
+//     [S3 solver] prim_queries=N facts=N frozen=yes/no post_freeze_writes=N
+//   When `post_freeze_writes > 0` the regression note is appended:
+//     (REGRESSION — Phase A is no longer the only writer)
+//   Early-returns (prints nothing) when both prim_queries and
+//   post_freeze_writes are 0, matching the host guard.
+// ════════════════════════════════════════════════════════════════════
+
+public fn fact_base_dump_solver_stats(s: rawptr) {
+    if (s == null) { return; }
+    if (!policy_phase_summary_enabled()) { return; }
+    let queries = fact_base_prim_queries(s);
+    let post = fact_base_post_freeze_writes(s);
+    if (queries == 0 && post == 0) { return; }
+    var line: string = "[S3 solver] prim_queries=" + queries.toString()
+        + " facts=" + fact_base_prim_fact_count(s).toString()
+        + " frozen=";
+    if (fact_base_is_frozen(s)) {
+        line = line + "yes";
+    } else {
+        line = line + "no";
+    }
+    line = line + " post_freeze_writes=" + post.toString();
+    if (post > 0) {
+        line = line + " (REGRESSION — Phase A is no longer the only writer)";
+    }
+    print(line);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Internal: composite key insert / lookup
+// ════════════════════════════════════════════════════════════════════
+
+fn fb_insert_key(s: rawptr, prim: string, trait_path: string) {
+    let slot = fb_lookup_or_reserve(fb_buf_ptr(s), fb_buf_cap(s), prim, trait_path);
+    if (slot == null) { return; }
+    if (fb_slot_unpack(slot).key_ptr != null) {
+        return;
+    }
+    let composite = fb_build_key(prim, trait_path);
+    let key_dup = ast_dup_c_string(composite);
+    fb_slot_pack(slot, FbSlot {
+        key_ptr: key_dup,
+        key_len: composite.len,
+        key_hash: fb_hash_bytes(composite.c_str(), composite.len),
+        _pad: 0
+    });
+    let new_cnt = fb_buf_count(s) + 1;
+    fb_set_buf_count(s, new_cnt);
+    if (fb_frozen(s) != 0) {
+        fb_set_post_freeze(s, fb_post_freeze(s) + 1);
+    }
+    let cap = fb_buf_cap(s);
+    if (fb_needs_grow(new_cnt, cap)) {
+        fb_grow(s);
+    }
+}
+
+fn fb_lookup_only(buf: rawptr, cap: i32, prim: string, trait_path: string) -> rawptr {
+    if (buf == null || cap <= 0) { return null; }
+    let composite = fb_build_key(prim, trait_path);
+    let h = fb_hash_bytes(composite.c_str(), composite.len);
+    let mask = (cap - 1) as i64;
+    var idx = (h & mask) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = ptr_offset(buf, idx * fb_slot_size());
+        if (fb_slot_unpack(slot).key_ptr == null) {
+            return null;
+        }
+        if (fb_slot_matches(slot, composite, h)) {
+            return slot;
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn fb_lookup_or_reserve(buf: rawptr, cap: i32, prim: string, trait_path: string) -> rawptr {
+    if (buf == null || cap <= 0) { return null; }
+    let composite = fb_build_key(prim, trait_path);
+    let h = fb_hash_bytes(composite.c_str(), composite.len);
+    let mask = (cap - 1) as i64;
+    var idx = (h & mask) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = ptr_offset(buf, idx * fb_slot_size());
+        if (fb_slot_unpack(slot).key_ptr == null) {
+            return slot;
+        }
+        if (fb_slot_matches(slot, composite, h)) {
+            return slot;
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn fb_slot_matches(slot: rawptr, composite: string, h: i64) -> bool {
+    let rec = fb_slot_unpack(slot);
+    if (rec.key_hash != h) { return false; }
+    if (rec.key_len != composite.len) { return false; }
+    if (rec.key_len == 0) { return true; }
+    if (rec.key_ptr == null) { return false; }
+    return memcmp(rec.key_ptr, composite.c_str(), rec.key_len as u64) == 0;
+}
+
+/// Compose `prim || '\x1f' || trait_path`. Host uses the same byte.
+fn fb_build_key(prim: string, trait_path: string) -> string {
+    let total: i64 = prim.len + 1 + trait_path.len;
+    let buf = malloc((total + 1) as u64);
+    if (buf == null) { return ""; }
+    if (prim.len > 0) {
+        memcpy(buf, prim.c_str(), prim.len as u64);
+    }
+    var sep: i32 = fb_sep_byte();
+    memcpy(ptr_offset(buf, prim.len as i32), to_rawptr(&sep), 1);
+    if (trait_path.len > 0) {
+        memcpy(ptr_offset(buf, (prim.len + 1) as i32),
+               trait_path.c_str(),
+               trait_path.len as u64);
+    }
+    var nul: i32 = 0;
+    memcpy(ptr_offset(buf, total as i32), to_rawptr(&nul), 1);
+    let s = from_cstr_len(buf, total);
+    free(buf);
+    return s;
+}
+
+/// FNV-1a 64-bit. Offset basis matches `canon.vyx` / `mono_scheduler.vyx`
+/// (`1469598103934665603`).
+fn fb_hash_bytes(ptr: rawptr, n: i64) -> i64 {
+    var h: i64 = 1469598103934665603;
+    if (ptr == null) { return h; }
+    var i: i64 = 0;
+    while (i < n) {
+        let b = ptr_read_u8_at(ptr, i as i32) as i64;
+        h = (h ^ b) * 1099511628211;
+        i = i + 1;
+    }
+    if (h < 0) { h = 0 - h; }
+    if (h < 0) { h = 0; }
+    return h;
+}
+
+/// Last dotted segment of a trait path (`std.hash.Hashable` → `Hashable`).
+/// Mirrors host `FactBase::registerPrimImpl`'s `rfind('.')` branch.
+fn fb_last_segment(path: string) -> string {
+    var last_dot: i32 = -1;
+    var i: i32 = 0;
+    while (i < path.len) {
+        if (path.charAt(i) == 46) { last_dot = i; }
+        i = i + 1;
+    }
+    if (last_dot < 0) { return ""; }
+    return str_substring(path, (last_dot + 1) as i64, path.len);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Internal: open-addressing table primitives
+// ════════════════════════════════════════════════════════════════════
+
+fn fb_table_alloc(cap: i32) -> rawptr {
+    let bytes = (cap * fb_slot_size()) as u64;
+    let buf = malloc(bytes);
+    if (buf != null) { memset(buf, 0, bytes); }
+    return buf;
+}
+
+fn fb_table_dispose(buf: rawptr, cap: i32) {
+    if (buf == null) { return; }
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * fb_slot_size());
+        let kp = fb_slot_unpack(slot).key_ptr;
+        if (kp != null) {
+            free(kp);
+        }
+        i = i + 1;
+    }
+    free(buf);
+}
+
+fn fb_needs_grow(count: i32, cap: i32) -> bool {
+    // Load factor 0.7 — host uses std::set which auto-grows; here we
+    // pick 70% to keep probe chains short under the 5–50 prim×trait
+    // workload typical of bootstrap inputs.
+    return (count * 10) > (cap * 7);
+}
+
+fn fb_grow(s: rawptr) {
+    let old_buf = fb_buf_ptr(s);
+    let old_cap = fb_buf_cap(s);
+    if (old_buf == null || old_cap <= 0) { return; }
+    let new_cap = old_cap * 2;
+    let new_buf = fb_table_alloc(new_cap);
+    if (new_buf == null) { return; }
+    var i: i32 = 0;
+    let mask = (new_cap - 1) as i64;
+    while (i < old_cap) {
+        let slot = ptr_offset(old_buf, i * fb_slot_size());
+        let rec = fb_slot_unpack(slot);
+        if (rec.key_ptr != null) {
+            var idx = (rec.key_hash & mask) as i32;
+            var probes: i32 = 0;
+            while (probes < new_cap) {
+                let dst = ptr_offset(new_buf, idx * fb_slot_size());
+                if (fb_slot_unpack(dst).key_ptr == null) {
+                    fb_slot_pack(dst, rec);
+                    memset(slot, 0, fb_slot_size() as u64);
+                    break;
+                }
+                idx = idx + 1;
+                if (idx >= new_cap) { idx = 0; }
+                probes = probes + 1;
+            }
+        }
+        i = i + 1;
+    }
+    fb_table_dispose(old_buf, old_cap);
+    fb_set_buf_ptr(s, new_buf);
+    fb_set_buf_cap(s, new_cap);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Internal: byte-level helpers (mirror those in `bootstrap.canon`
+//   so we don't pull in std.string just for `charAt(rawptr)`).
+// ════════════════════════════════════════════════════════════════════
+
+fn ptr_read_u8_at(p: rawptr, off: i32) -> i32 {
+    if (p == null) { return 0; }
+    var b: i32 = 0;
+    memcpy(to_rawptr(&b), ptr_offset(p, off), 1);
+    return b & 0xFF;
+}
