@@ -1,0 +1,2062 @@
+module bootstrap.ast;
+
+use std.string;
+
+/// AST surface — Token / TypeRef / Expr / Stmt / Decl / Unit.
+///
+/// Nodes live in packed heap blobs; the public handle remains `rawptr`
+/// because parser/sema/HIR live outside this work package. The class
+/// types below document that packed layout. `ast_*_pack` / `ast_*_unpack`
+/// are the typed write path used by alloc and setters. Getters still
+/// return scalars from the blob — they must not return a class value,
+/// because seed-lowered class-by-value copies heap-allocate on every
+/// call and OOM the hir_builder self-host compile.
+/// Remaining heap growth in this file is arena space for packed blobs, not
+/// a per-node byte-accessor bypass. New node writes go through `ast_*_pack`.
+/// `ast_read_*` / `ast_write_*` stay as the shared raw-memory helpers
+/// used by HIR/MIR tables.
+///
+/// Layouts (LE, packed; offsets in bytes):
+///   TypeRef (24 B)
+///     0..3   kind         : i32
+///     4..7   _pad         : i32
+///     8..15  name_ptr     : rawptr
+///     16..23 name_len     : i64
+///
+///   Expr core (112 B before SourceLoc)
+///     0..3   kind         : i32
+///     4..7   op           : i32
+///     8..15  int_val      : i64
+///     16..23 str_val_ptr  : rawptr
+///     24..31 str_val_len  : i64
+///     32..39 name_ptr     : rawptr
+///     40..47 name_len     : i64
+///     48..55 lhs          : rawptr  (Expr*)
+///     56..63 rhs          : rawptr  (Expr*)  / call-arg next via rhs slot
+///     64..71 args         : rawptr  (Expr*)
+///     72..79 ty           : rawptr  (TypeRef*)
+///     80..87 captures     : rawptr  (Stmt* capture cells / Expr* aux)
+///     88..91 sem_kind     : i32     (Sema-resolved target category)
+///     92..95 sem_flags    : i32     (Sema lowering flags)
+///     96..103 sem_target  : rawptr  (resolved Decl*/Sym* when available)
+///     104..111 sem_owner  : rawptr  (owner Decl* for fields/methods/variants)
+///
+///   Stmt core (96 B before SourceLoc)
+///     0..3   kind         : i32
+///     4..7   _pad         : i32
+///     8..15  name_ptr     : rawptr
+///     16..23 name_len     : i64
+///     24..31 ty           : rawptr  (TypeRef*)
+///     32..39 init         : rawptr  (Expr* or first-stmt for ST_BLOCK
+///                                      / first-arg-cell for call args)
+///     40..47 cond         : rawptr  (Expr*)
+///     48..55 then_blk     : rawptr  (Stmt*)
+///     56..63 else_blk     : rawptr  (Stmt*)
+///     64..71 body         : rawptr  (Stmt*)
+///     72..79 next         : rawptr  (Stmt*)
+///     80..83 sem_kind     : i32     (Sema-resolved local/target category)
+///     84..87 sem_flags    : i32
+///     88..95 sem_target   : rawptr  (builder-only source fact)
+///
+///   Decl core (136 B before SourceLoc)
+///     0..3   kind         : i32
+///     4..7   is_public    : i32
+///     8..11  is_static    : i32
+///     12..15 generic_flags: i32 (cached markers from generic_ptr)
+///     16..23 name_ptr     : rawptr
+///     24..31 name_len     : i64
+///     32..39 ty           : rawptr  (TypeRef*)
+///     40..47 params       : rawptr  (Decl* chain — DE_FIELD)
+///     48..55 body         : rawptr  (Stmt*)
+///     56..63 members      : rawptr  (Decl* chain)
+///     64..71 next         : rawptr  (Decl*)
+///     72..79 generic_ptr  : rawptr  (comma-separated generic parameter names)
+///     80..87 generic_len  : i64
+///     88..95 meta_ptr     : rawptr  (visibility / attrs / markers)
+///     96..103 meta_len    : i64
+///     104..111 doc_ptr    : rawptr  (cooked `///` doc comment)
+///     112..119 doc_len    : i64
+///     120..123 sem_kind   : i32     (Sema-resolved decl-local category)
+///     124..127 sem_flags  : i32
+///     128..135 sem_target : rawptr  (builder-only source fact)
+///
+///   Unit (16 B)
+///     0..7   decls        : rawptr  (Decl* chain)
+///     8..11  decl_count   : i32
+///     12..15 _pad         : i32
+///
+/// The Token node is unchanged from the lexer's existing 32 B slot and
+/// keeps its public class shell (no caller invokes `Token.create()`).
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn vyx_note_string_len(s: rawptr, len: i64);
+    fn vyx_forget_string_len(s: rawptr);
+    fn vyx_rt_ast_dup_profile(bytes: i64);
+    fn vyx_rt_ast_node_alloc_profile(bytes: i64);
+    fn from_cstr_borrowed_cstr_len(s: rawptr, len: i64) -> string;
+}
+
+public fn ptr_offset(ptr: rawptr, offset: i32) -> rawptr {
+    return ptr + offset;
+}
+
+public fn ptr_write_i32(ptr: rawptr, value: i32) {
+    var v = value;
+    memcpy(ptr, to_rawptr(&v), 4);
+}
+
+public fn ptr_read_i32(ptr: rawptr) -> i32 {
+    var v: i32 = 0;
+    memcpy(to_rawptr(&v), ptr, 4);
+    return v;
+}
+
+public fn ptr_write_i64(ptr: rawptr, value: i64) {
+    var v = value;
+    memcpy(ptr, to_rawptr(&v), 8);
+}
+
+public fn ptr_read_i64(ptr: rawptr) -> i64 {
+    var v: i64 = 0;
+    memcpy(to_rawptr(&v), ptr, 8);
+    return v;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   1. Token kind constants — MUST match `vyx::TokenKind` in
+//      `src/Lexer/Token.h` (enum class underlying int from 0, same order).
+//      Use `static_cast<int>(TokenKind)` in `src/main.cpp --dump-tokens`.
+// ════════════════════════════════════════════════════════════════════
+
+public fn tk_INT() -> i32 {
+    return 0;
+}
+public fn tk_FLOAT() -> i32 {
+    return 1;
+}
+public fn tk_STRING() -> i32 {
+    return 2;
+}
+public fn tk_CHAR() -> i32 {
+    return 3;
+}
+public fn tk_BOOL() -> i32 {
+    return 4;
+}
+public fn tk_IDENT() -> i32 {
+    return 5;
+}
+public fn tk_NULL() -> i32 {
+    return 35;
+}
+/// `self` receiver — same ordinal as `TokenKind::KW_self` in `Token.h`.
+public fn tk_KEYWORD_SELF() -> i32 {
+    return 36;
+}
+public fn tk_KEYWORD_MUT() -> i32 {
+    return 37;
+}
+public fn tk_KEYWORD_FN() -> i32 {
+    return 6;
+}
+public fn tk_KEYWORD_LET() -> i32 {
+    return 7;
+}
+public fn tk_KEYWORD_VAR() -> i32 {
+    return 8;
+}
+public fn tk_KEYWORD_STRUCT() -> i32 {
+    return 9;
+}
+public fn tk_KEYWORD_CLASS() -> i32 {
+    return 10;
+}
+public fn tk_KEYWORD_INTERFACE() -> i32 {
+    return 11;
+}
+public fn tk_KEYWORD_ENUM() -> i32 {
+    return 12;
+}
+public fn tk_KEYWORD_ERROR() -> i32 {
+    return 13;
+}
+public fn tk_KEYWORD_IMPL() -> i32 {
+    return 14;
+}
+public fn tk_KEYWORD_IF() -> i32 {
+    return 20;
+}
+public fn tk_KEYWORD_ELIF() -> i32 {
+    return 21;
+}
+public fn tk_KEYWORD_ELSE() -> i32 {
+    return 22;
+}
+public fn tk_KEYWORD_WHILE() -> i32 {
+    return 23;
+}
+public fn tk_KEYWORD_FOR() -> i32 {
+    return 24;
+}
+public fn tk_KEYWORD_FOREACH() -> i32 {
+    return 25;
+}
+public fn tk_KEYWORD_IN() -> i32 {
+    return 80;
+}
+public fn tk_KEYWORD_MATCH() -> i32 {
+    return 26;
+}
+public fn tk_KEYWORD_CASE() -> i32 {
+    return 27;
+}
+public fn tk_KEYWORD_DEFAULT() -> i32 {
+    return 28;
+}
+public fn tk_KEYWORD_RETURN() -> i32 {
+    return 29;
+}
+public fn tk_KEYWORD_BREAK() -> i32 {
+    return 30;
+}
+public fn tk_KEYWORD_CONTINUE() -> i32 {
+    return 31;
+}
+public fn tk_KEYWORD_YIELD() -> i32 {
+    return 32;
+}
+public fn tk_KEYWORD_EXTERN() -> i32 {
+    return 19;
+}
+public fn tk_KEYWORD_IMPORT() -> i32 {
+    return 15;
+}
+public fn tk_KEYWORD_USE() -> i32 {
+    return 17;
+}
+public fn tk_KEYWORD_MODULE() -> i32 {
+    return 16;
+}
+public fn tk_KEYWORD_PUBLIC() -> i32 {
+    return 38;
+}
+public fn tk_KEYWORD_STATIC() -> i32 {
+    return 48;
+}
+public fn tk_KEYWORD_CONST() -> i32 {
+    return 49;
+}
+public fn tk_KEYWORD_TYPE() -> i32 {
+    return 50;
+}
+public fn tk_KEYWORD_DEFER() -> i32 {
+    return 52;
+}
+public fn tk_KEYWORD_STATIC_ASSERT() -> i32 {
+    return 53;
+}
+public fn tk_KEYWORD_COMPTIME() -> i32 {
+    return 54;
+}
+public fn tk_KEYWORD_AWAIT() -> i32 {
+    return 44;
+}
+public fn tk_KEYWORD_FAIL() -> i32 {
+    return 46;
+}
+public fn tk_KEYWORD_CONCEPT() -> i32 {
+    return 56;
+}
+public fn tk_KEYWORD_WHERE() -> i32 {
+    return 57;
+}
+public fn tk_KEYWORD_REQUIRES() -> i32 {
+    return 58;
+}
+public fn tk_KEYWORD_UNSAFE() -> i32 {
+    return 59;
+}
+public fn tk_KEYWORD_ASM() -> i32 {
+    return 60;
+}
+/// `volatile` local-variable qualifier — kind 138 sits beyond host Token.h's
+/// last `Invalid=136` and the bootstrap-private f-string kind 137, so it does
+/// not collide with any host token ordinal.
+public fn tk_KEYWORD_VOLATILE() -> i32 {
+    return 138;
+}
+public fn tk_LPAREN() -> i32 {
+    return 124;
+}
+public fn tk_RPAREN() -> i32 {
+    return 125;
+}
+public fn tk_LBRACE() -> i32 {
+    return 126;
+}
+public fn tk_RBRACE() -> i32 {
+    return 127;
+}
+public fn tk_LBRACKET() -> i32 {
+    return 128;
+}
+public fn tk_RBRACKET() -> i32 {
+    return 129;
+}
+public fn tk_COMMA() -> i32 {
+    return 130;
+}
+public fn tk_SEMI() -> i32 {
+    return 131;
+}
+public fn tk_COLON() -> i32 {
+    return 132;
+}
+public fn tk_DOT() -> i32 {
+    return 133;
+}
+public fn tk_AT() -> i32 {
+    return 134;
+}
+public fn tk_ARROW() -> i32 {
+    return 112;
+}
+public fn tk_FATARROW() -> i32 {
+    return 113;
+}
+public fn tk_DOTDOT() -> i32 {
+    return 114;
+}
+public fn tk_DOTDOTEQ() -> i32 {
+    return 115;
+}
+public fn tk_ELLIPSIS() -> i32 {
+    return 116;
+}
+public fn tk_COLONCOLON() -> i32 {
+    return 117;
+}
+public fn tk_QUESTION() -> i32 {
+    return 118;
+}
+public fn tk_QUESTIONQUESTION() -> i32 {
+    return 119;
+}
+public fn tk_PLUSPLUS() -> i32 {
+    return 121;
+}
+public fn tk_MINUSMINUS() -> i32 {
+    return 122;
+}
+public fn tk_PIPEARROW() -> i32 {
+    return 123;
+}
+public fn tk_PLUS() -> i32 {
+    return 81;
+}
+public fn tk_MINUS() -> i32 {
+    return 82;
+}
+public fn tk_STAR() -> i32 {
+    return 83;
+}
+public fn tk_SLASH() -> i32 {
+    return 84;
+}
+public fn tk_PERCENT() -> i32 {
+    return 85;
+}
+public fn tk_EQ() -> i32 {
+    return 101;
+}
+public fn tk_PLUSEQ() -> i32 {
+    return 102;
+}
+public fn tk_MINUSEQ() -> i32 {
+    return 103;
+}
+public fn tk_STAREQ() -> i32 {
+    return 104;
+}
+public fn tk_SLASHEQ() -> i32 {
+    return 105;
+}
+public fn tk_PERCENTEQ() -> i32 {
+    return 106;
+}
+public fn tk_LSHIFTEQ() -> i32 {
+    return 107;
+}
+public fn tk_RSHIFTEQ() -> i32 {
+    return 108;
+}
+public fn tk_AMPEQ() -> i32 {
+    return 109;
+}
+public fn tk_PIPEEQ() -> i32 {
+    return 110;
+}
+public fn tk_CARETEQ() -> i32 {
+    return 111;
+}
+public fn tk_MATCHOP() -> i32 {
+    return 120;
+}
+public fn tk_EQEQ() -> i32 {
+    return 86;
+}
+public fn tk_NEQ() -> i32 {
+    return 87;
+}
+public fn tk_LT() -> i32 {
+    return 88;
+}
+public fn tk_LE() -> i32 {
+    return 89;
+}
+public fn tk_GT() -> i32 {
+    return 90;
+}
+public fn tk_GE() -> i32 {
+    return 91;
+}
+public fn tk_AND() -> i32 {
+    return 92;
+}
+public fn tk_OR() -> i32 {
+    return 93;
+}
+public fn tk_NOT() -> i32 {
+    return 94;
+}
+public fn tk_AMP() -> i32 {
+    return 95;
+}
+public fn tk_PIPE() -> i32 {
+    return 96;
+}
+public fn tk_CARET() -> i32 {
+    return 97;
+}
+public fn tk_TILDE() -> i32 {
+    return 98;
+}
+public fn tk_LSHIFT() -> i32 {
+    return 99;
+}
+public fn tk_RSHIFT() -> i32 {
+    return 100;
+}
+public fn tk_EOF() -> i32 {
+    return 135;
+}
+public fn tk_INVALID() -> i32 {
+    return 136;
+}
+
+/// Convenience alias for `'a'` style literals — same numeric kind as
+/// `tk_CHAR()` (=3, host `CharLiteral`). Token slot pad (offset 12..15)
+/// carries the decoded i32 codepoint value when this kind is set.
+public fn tk_CHAR_LIT() -> i32 {
+    return 3;
+}
+
+/// Fstring raw token — emitted when a `"..."` literal contains `${...}`
+/// interpolation. Payload (lexeme) keeps the raw inner body INCLUDING the
+/// `${...}` segments so a later parser pass can split it. Numeric kind
+/// 137 sits beyond host Token.h's last `Invalid=136` and is bootstrap-private.
+public fn tk_FSTRING_RAW() -> i32 {
+    return 137;
+}
+/// Contextual top-level `effect` declaration.  The bootstrap lexer keeps
+/// `effect` as an identifier so existing expression code can continue to use
+/// that spelling; the parser promotes it only in declaration position.  This
+/// private ordinal is reserved for token-stream fixtures and diagnostics.
+public fn tk_KEYWORD_EFFECT() -> i32 {
+    return 139;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   2. TypeRef kind constants — TY_*  (8 entries)
+// ════════════════════════════════════════════════════════════════════
+
+public fn ty_I32() -> i32 {
+    return 1;
+}
+public fn ty_I64() -> i32 {
+    return 2;
+}
+public fn ty_BOOL() -> i32 {
+    return 3;
+}
+public fn ty_CHAR() -> i32 {
+    return 26;
+}
+public fn ty_STRING() -> i32 {
+    return 4;
+}
+public fn ty_RAWPTR() -> i32 {
+    return 5;
+}
+public fn ty_VOID() -> i32 {
+    return 6;
+}
+public fn ty_CLASS() -> i32 {
+    return 7;
+}
+public fn ty_PTR() -> i32 {
+    return 8;
+}
+public fn ty_F32() -> i32 {
+    return 9;
+}
+public fn ty_F64() -> i32 {
+    return 10;
+}
+public fn ty_REF() -> i32 {
+    return 11;
+}
+public fn ty_MUTREF() -> i32 {
+    return 12;
+}
+public fn ty_ARRAY() -> i32 {
+    return 13;
+}
+public fn ty_TUPLE() -> i32 {
+    return 14;
+}
+// Numeric width-tagged integer kinds. Host vyxc's `VyxTypeKind::Integer`
+// is a single enum value parameterised by `bitWidth/isSigned/isSizeType`;
+// the bootstrap flattens those into one kind per (width × signedness)
+// because `TypeRef` only carries a kind tag plus a name. Numbers below
+// extend the existing enumeration after `ty_TUPLE = 14`.
+public fn ty_I8() -> i32 {
+    return 15;
+}
+public fn ty_I16() -> i32 {
+    return 16;
+}
+public fn ty_U8() -> i32 {
+    return 17;
+}
+public fn ty_U16() -> i32 {
+    return 18;
+}
+public fn ty_U32() -> i32 {
+    return 19;
+}
+public fn ty_U64() -> i32 {
+    return 20;
+}
+public fn ty_ISIZE() -> i32 {
+    return 21;
+}
+public fn ty_USIZE() -> i32 {
+    return 22;
+}
+/// Function type — corresponds to host `VyxTypeKind::Function`.
+/// TypeRef layout for ty_FN:
+///   offset 8  = params tuple TypeRef
+///   offset 16 = return TypeRef
+public fn ty_FN() -> i32 {
+    return 23;
+}
+/// Range value — host `VyxTypeKind::Range`, represented as `{ i64, i64 }`.
+public fn ty_RANGE() -> i32 {
+    return 24;
+}
+/// `unsafe fn(...)` C ABI function type — same layout as `ty_FN` but
+/// distinguished so codegen / sema can reason about ABI-level differences
+/// (e.g. variadic C calls, calling-convention attributes).
+public fn ty_CFN() -> i32 {
+    return 25;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   3. Expr kind constants — EX_*  (13 entries)
+// ════════════════════════════════════════════════════════════════════
+
+public fn ex_INT_LIT() -> i32 {
+    return 1;
+}
+public fn ex_STR_LIT() -> i32 {
+    return 2;
+}
+public fn ex_BOOL_LIT() -> i32 {
+    return 3;
+}
+public fn ex_NULL_LIT() -> i32 {
+    return 4;
+}
+public fn ex_IDENT() -> i32 {
+    return 5;
+}
+public fn ex_BIN() -> i32 {
+    return 6;
+}
+public fn ex_UNARY() -> i32 {
+    return 7;
+}
+public fn ex_CALL() -> i32 {
+    return 8;
+}
+public fn ex_MEMBER() -> i32 {
+    return 9;
+}
+public fn ex_INDEX() -> i32 {
+    return 10;
+}
+public fn ex_ASSIGN() -> i32 {
+    return 11;
+}
+public fn ex_ADDR_OF() -> i32 {
+    return 12;
+}
+/// `IDENT { f1: e1, f2: e2 }` — struct/class instance literal.
+///
+/// Layout reuses the standard Expr slots:
+///   * name  → class name (the leading IDENT).
+///   * args  → head of a singly-linked field-cell chain. Each cell is
+///             a `Stmt(ST_EXPR)` with `name` = field name, `init` =
+///             field-value Expr, and `next` linking to the next cell.
+///             That mirrors `parse_call_args` so codegen can walk both
+///             argument lists and field initializers with the same
+///             helper (`expr_get_args` → cell list, `stmt_get_init`
+///             on each cell yields the value Expr).
+public fn ex_STRUCT_INIT() -> i32 {
+    return 13;
+}
+public fn ex_MATCH_EXPR() -> i32 {
+    return 14;
+}
+public fn ex_CLOSURE() -> i32 {
+    return 15;
+}
+public fn ex_COMPTIME() -> i32 {
+    return 16;
+}
+public fn ex_ARRAY_LIT() -> i32 {
+    return 17;
+}
+public fn ex_TUPLE_LIT() -> i32 {
+    return 18;
+}
+/// `cond ? a : b` ternary expression.
+///
+/// Layout:
+///   * lhs   → cond (Expr*)
+///   * rhs   → then-branch (Expr*)
+///   * args  → else-branch (Expr*)
+///
+/// `args` deliberately stores a single Expr* (not a stmt-cell chain) so codegen
+/// can read all three operands with the same lhs/rhs/args triplet pattern used
+/// by other binary-ish expressions.
+public fn ex_TERNARY() -> i32 {
+    return 19;
+}
+/// `'a'` char literal.
+///
+/// Layout:
+///   * int_val → decoded codepoint (i32 widened to i64)
+///   * str_val → original lexeme including surrounding quotes (`'a'`, `'\\n'`),
+///               kept for diagnostics / pretty-printing
+public fn ex_CHAR_LIT() -> i32 {
+    return 20;
+}
+/// `f"hello {expr} world"` interpolated string literal.
+///
+/// Layout:
+///   * str_val → the raw text inside the quotes (post-strip, no quotes)
+///   * args    → head of a singly-linked segment chain. Each cell is a
+///               `Stmt(ST_EXPR)` whose:
+///                 - `name`  = `"lit"` for a literal segment, `"expr"` for an
+///                             interpolated segment (parser-level marker so
+///                             codegen / sema can choose between direct emit
+///                             and `.toString()` lowering).
+///                 - `init`  = the segment's payload Expr — `ex_STR_LIT` for a
+///                             literal segment, the parsed expression for an
+///                             interpolated segment.
+///                 - `next`  = link to the next segment.
+///
+/// MCP-2 (lexer) protocol: parser is agnostic about whether the lexer produced
+/// `IDENT("f") + STRING(raw)` (current path) or a single `tk_FSTRING_RAW` (the
+/// fall-back lexer plan). Either way the parser entry is `parse_fstring_inner`
+/// taking the original quoted lexeme.
+public fn ex_FSTRING() -> i32 {
+    return 21;
+}
+/// `expr as Type` cast.
+///
+/// Layout:
+///   * lhs → inner Expr being cast
+///   * ty  → target TypeRef (parser stamps this; sema only echoes it back
+///           via `expr_set_ty` after recursing on `lhs`)
+///
+/// Bootstrap sema does not fully validate cast legality here — codegen picks the LLVM
+/// op (sext/zext/trunc/bitcast/inttoptr/ptrtoint) based on `lhs.ty` and
+/// `target.ty` kinds.
+public fn ex_CAST() -> i32 {
+    return 22;
+}
+/// `*expr` raw / typed pointer dereference (loads the pointee).
+///
+/// Layout:
+///   * lhs → ptr-typed Expr being dereferenced
+///   * ty  → element type, computed by sema. If `lhs.ty` is a typed
+///           pointer / reference whose element TypeRef is reachable,
+///           use it; otherwise fall back to `ty_I32` so codegen still
+///           gets a concrete type to emit `load`.
+public fn ex_DEREF() -> i32 {
+    return 23;
+}
+/// `fail Error.Variant(payload?)` / `fail Error.Variant.with(msg)`.
+///
+/// Layout:
+///   * name    -> error type name
+///   * str_val -> variant name
+///   * lhs     -> payload or debug-message expression
+///   * op      -> 1 for payload form, 0 for `.with(...)`/no message
+public fn ex_FAIL() -> i32 {
+    return 24;
+}
+/// `await expr`. Sema unwraps `Task`/`Promise` payload types; HIR/MIR lower
+/// to `await_value()`, which parks on the `vyx_runtime` fiber scheduler.
+public fn ex_AWAIT() -> i32 {
+    return 25;
+}
+/// Inline LLVM asm expression: `asm("template", "constraints", operands...)`.
+///
+/// Layout:
+///   * str_val -> template
+///   * name    -> comma-joined constraint string
+///   * args    -> operand Expr chain
+public fn ex_INLINE_ASM() -> i32 {
+    return 26;
+}
+/// `if (cond) { ... } elif (...) { ... } else { ... }` expression.
+///
+/// Layout:
+///   * lhs  -> cond Expr
+///   * rhs  -> then branch Stmt block
+///   * args -> else branch Stmt block or nested ex_IF_EXPR for elif
+public fn ex_IF_EXPR() -> i32 {
+    return 27;
+}
+/// Explicit heap allocation: `new T(...)`, `new T{...}` or
+/// `new::<T>(...)`.
+///
+/// Layout:
+///   * captures -> the allocated payload type `T`
+///   * ty      -> allocation result type, filled by Sema
+///   * lhs     -> optional allocator expression
+///   * rhs     -> optional aggregate initializer (`ex_STRUCT_INIT` /
+///                `ex_ARRAY_LIT`)
+///   * args    -> constructor / scalar initializer argument cells
+///   * name    -> canonical payload type text
+///   * op bits -> NEW_EXPR_* flags declared below
+public fn ex_NEW() -> i32 {
+    return 28;
+}
+/// Explicit one-level deallocation: `delete ptr` or
+/// `delete::<T>(allocator) ptr`.
+///
+/// `lhs` is the pointer expression, `rhs` is the optional allocator,
+/// `captures` is the optional explicit payload type and `name` carries its
+/// canonical text.  Delete never recursively follows the pointee.
+public fn ex_DELETE() -> i32 {
+    return 29;
+}
+
+public fn new_expr_has_paren_init() -> i32 { return 1; }
+public fn new_expr_has_brace_init() -> i32 { return 2; }
+public fn new_expr_generic_form() -> i32 { return 4; }
+public fn new_expr_has_allocator() -> i32 { return 8; }
+public fn new_expr_empty_init() -> i32 { return 16; }
+
+/// Contextual unary ownership transfer: `own expr`.
+/// Kept outside the lexer token range so the bootstrap lexer can continue to
+/// treat `own` as an identifier everywhere except unary-expression position.
+public fn unary_op_own() -> i32 { return 1001; }
+
+// ════════════════════════════════════════════════════════════════════
+//   4. Stmt kind constants — ST_*  (9 entries)
+// ════════════════════════════════════════════════════════════════════
+
+public fn st_EXPR() -> i32 {
+    return 1;
+}
+public fn st_LET() -> i32 {
+    return 2;
+}
+public fn st_VAR() -> i32 {
+    return 3;
+}
+public fn st_IF() -> i32 {
+    return 4;
+}
+public fn st_WHILE() -> i32 {
+    return 5;
+}
+public fn st_BREAK() -> i32 {
+    return 6;
+}
+public fn st_CONTINUE() -> i32 {
+    return 7;
+}
+public fn st_RETURN() -> i32 {
+    return 8;
+}
+public fn st_BLOCK() -> i32 {
+    return 9;
+}
+public fn st_FOR() -> i32 {
+    return 10;
+}
+public fn st_FOREACH() -> i32 {
+    return 11;
+}
+public fn st_MATCH() -> i32 {
+    return 12;
+}
+public fn st_DEFER() -> i32 {
+    return 13;
+}
+public fn st_STATIC_ASSERT() -> i32 {
+    return 14;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   5. Decl kind constants — DE_*  (13 entries)
+// ════════════════════════════════════════════════════════════════════
+
+public fn de_FN() -> i32 {
+    return 1;
+}
+public fn de_EXTERN_FN() -> i32 {
+    return 2;
+}
+public fn de_CLASS() -> i32 {
+    return 3;
+}
+public fn de_FIELD() -> i32 {
+    return 4;
+}
+public fn de_METHOD() -> i32 {
+    return 5;
+}
+public fn de_USE() -> i32 {
+    return 6;
+}
+public fn de_MODULE() -> i32 {
+    return 7;
+}
+public fn de_ENUM() -> i32 {
+    return 8;
+}
+public fn de_VARIANT() -> i32 {
+    return 9;
+}
+public fn de_CONST() -> i32 {
+    return 10;
+}
+public fn de_TYPE_ALIAS() -> i32 {
+    return 11;
+}
+public fn de_GLOBAL_VAR() -> i32 {
+    return 12;
+}
+/// Declarative MOSP Effect block.  Its canonical field text is stored in the
+/// declaration's generic-parameter payload with the `|effect` marker; this
+/// keeps the packed Decl ABI unchanged while allowing later semantic passes
+/// to consume the source declaration as data rather than a function.
+public fn de_EFFECT() -> i32 {
+    return 13;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   6. Token  —  one tagged token in the lexer's stream
+//
+//   The lexer writes 48 B raw byte slots for tokens; the public Token
+//   class shell is kept for ABI continuity but is never instantiated
+//   today (all callers go through `lex_token_at` + `token_kind/lexeme`
+//   in `bootstrap.lexer`).
+// ════════════════════════════════════════════════════════════════════
+
+public class Token {
+    public kind: i32
+    public lexeme: string
+    public line: i32
+    public col: i32
+
+    public static fn create(kind: i32, lexeme: string, line: i32, col: i32) -> Token {
+        return Token { kind: kind, lexeme: lexeme, line: line, col: col };
+    }
+}
+
+fn ast_tref_node_size() -> i32 { return 40; }
+fn ast_expr_node_size() -> i32 { return 128; }
+fn ast_stmt_node_size() -> i32 { return 112; }
+fn ast_decl_node_size() -> i32 { return 152; }
+fn ast_unit_node_size() -> i32 { return 16; }
+
+class AstTypeRef {
+    public kind: i32
+    public _pad: i32
+    public a: rawptr
+    public b: i64
+    public loc_line: i32
+    public loc_col: i32
+    public loc_end_line: i32
+    public loc_end_col: i32
+}
+
+class AstExpr {
+    public kind: i32
+    public op: i32
+    public int_val: i64
+    public str_val_ptr: rawptr
+    public str_val_len: i64
+    public name_ptr: rawptr
+    public name_len: i64
+    public lhs: rawptr
+    public rhs: rawptr
+    public args: rawptr
+    public ty: rawptr
+    public captures: rawptr
+    public sem_kind: i32
+    public sem_flags: i32
+    public sem_target: rawptr
+    public sem_owner: rawptr
+    public loc_line: i32
+    public loc_col: i32
+    public loc_end_line: i32
+    public loc_end_col: i32
+}
+
+class AstStmt {
+    public kind: i32
+    public _pad: i32
+    public name_ptr: rawptr
+    public name_len: i64
+    public ty: rawptr
+    public init: rawptr
+    public cond: rawptr
+    public then_blk: rawptr
+    public else_blk: rawptr
+    public body: rawptr
+    public next: rawptr
+    public sem_kind: i32
+    public sem_flags: i32
+    public sem_target: rawptr
+    public loc_line: i32
+    public loc_col: i32
+    public loc_end_line: i32
+    public loc_end_col: i32
+}
+
+class AstDecl {
+    public kind: i32
+    public is_public: i32
+    public is_static: i32
+    public generic_flags: i32
+    public name_ptr: rawptr
+    public name_len: i64
+    public ty: rawptr
+    public params: rawptr
+    public body: rawptr
+    public members: rawptr
+    public next: rawptr
+    public generic_ptr: rawptr
+    public generic_len: i64
+    public meta_ptr: rawptr
+    public meta_len: i64
+    public doc_ptr: rawptr
+    public doc_len: i64
+    public sem_kind: i32
+    public sem_flags: i32
+    public sem_target: rawptr
+    public loc_line: i32
+    public loc_col: i32
+    public loc_end_line: i32
+    public loc_end_col: i32
+}
+
+class AstUnit {
+    public decls: rawptr
+    public decl_count: i32
+    public _pad: i32
+}
+
+fn ast_bits_i64(p: rawptr) -> i64 {
+    var n: i64 = 0;
+    var q = p;
+    memcpy(to_rawptr(&n), to_rawptr(&q), 8);
+    return n;
+}
+
+fn ast_bits_ptr(n: i64) -> rawptr {
+    var p: rawptr = null;
+    var v = n;
+    memcpy(to_rawptr(&p), to_rawptr(&v), 8);
+    return p;
+}
+
+fn ast_i32_at(p: rawptr, off: i32) -> i32 {
+    if (p == null) { return 0; }
+    return ast_read_i32(ptr_offset(p, off));
+}
+fn ast_put_i32(p: rawptr, off: i32, v: i32) {
+    if (p == null) { return; }
+    ast_write_i32(ptr_offset(p, off), v);
+}
+fn ast_i64_at(p: rawptr, off: i32) -> i64 {
+    if (p == null) { return 0; }
+    return ast_read_i64(ptr_offset(p, off));
+}
+fn ast_put_i64(p: rawptr, off: i32, v: i64) {
+    if (p == null) { return; }
+    ast_write_i64(ptr_offset(p, off), v);
+}
+fn ast_ptr_at(p: rawptr, off: i32) -> rawptr {
+    if (p == null) { return null; }
+    return ast_read_rawptr(ptr_offset(p, off));
+}
+fn ast_put_ptr(p: rawptr, off: i32, v: rawptr) {
+    if (p == null) { return; }
+    ast_write_rawptr(ptr_offset(p, off), v);
+}
+fn ast_cstr_at(p: rawptr, ptr_off: i32, len_off: i32) -> string {
+    if (p == null) { return ""; }
+    let buf = ast_ptr_at(p, ptr_off);
+    let n = ast_i64_at(p, len_off);
+    // TypeRef overlays name_ptr/name_len with payload pointers for ARRAY/PTR/FN.
+    // A pointer-sized "length" would make from_cstr_* request terabytes and abort.
+    if (buf == null || n <= 0 || n > 1048576) { return ""; }
+    return from_cstr_view_len(buf, n);
+}
+fn ast_put_cstr(p: rawptr, ptr_off: i32, len_off: i32, s: string) {
+    if (p == null) { return; }
+    ast_put_ptr(p, ptr_off, ast_replace_cstr(ast_ptr_at(p, ptr_off), s));
+    ast_put_i64(p, len_off, s.len);
+}
+
+fn ast_tref_pack(dst: rawptr, rec: AstTypeRef) {
+    if (dst == null) { return; }
+    ast_put_i32(dst, 0, rec.kind);
+    ast_put_i32(dst, 4, rec._pad);
+    ast_put_ptr(dst, 8, rec.a);
+    ast_put_i64(dst, 16, rec.b);
+    ast_put_i32(dst, 24, rec.loc_line);
+    ast_put_i32(dst, 28, rec.loc_col);
+    ast_put_i32(dst, 32, rec.loc_end_line);
+    ast_put_i32(dst, 36, rec.loc_end_col);
+}
+
+fn ast_tref_unpack(src: rawptr) -> AstTypeRef {
+    if (src == null) {
+        return AstTypeRef {
+            kind: 0, _pad: 0, a: null, b: 0,
+            loc_line: 0, loc_col: 0, loc_end_line: 0, loc_end_col: 0
+        };
+    }
+    return AstTypeRef {
+        kind: ast_i32_at(src, 0),
+        _pad: ast_i32_at(src, 4),
+        a: ast_ptr_at(src, 8),
+        b: ast_i64_at(src, 16),
+        loc_line: ast_i32_at(src, 24),
+        loc_col: ast_i32_at(src, 28),
+        loc_end_line: ast_i32_at(src, 32),
+        loc_end_col: ast_i32_at(src, 36)
+    };
+}
+
+fn ast_expr_pack(dst: rawptr, rec: AstExpr) {
+    if (dst == null) { return; }
+    ast_put_i32(dst, 0, rec.kind);
+    ast_put_i32(dst, 4, rec.op);
+    ast_put_i64(dst, 8, rec.int_val);
+    ast_put_ptr(dst, 16, rec.str_val_ptr);
+    ast_put_i64(dst, 24, rec.str_val_len);
+    ast_put_ptr(dst, 32, rec.name_ptr);
+    ast_put_i64(dst, 40, rec.name_len);
+    ast_put_ptr(dst, 48, rec.lhs);
+    ast_put_ptr(dst, 56, rec.rhs);
+    ast_put_ptr(dst, 64, rec.args);
+    ast_put_ptr(dst, 72, rec.ty);
+    ast_put_ptr(dst, 80, rec.captures);
+    ast_put_i32(dst, 88, rec.sem_kind);
+    ast_put_i32(dst, 92, rec.sem_flags);
+    ast_put_ptr(dst, 96, rec.sem_target);
+    ast_put_ptr(dst, 104, rec.sem_owner);
+    ast_put_i32(dst, 112, rec.loc_line);
+    ast_put_i32(dst, 116, rec.loc_col);
+    ast_put_i32(dst, 120, rec.loc_end_line);
+    ast_put_i32(dst, 124, rec.loc_end_col);
+}
+
+fn ast_expr_unpack(src: rawptr) -> AstExpr {
+    if (src == null) {
+        return AstExpr {
+            kind: 0, op: 0, int_val: 0, str_val_ptr: null, str_val_len: 0,
+            name_ptr: null, name_len: 0, lhs: null, rhs: null, args: null,
+            ty: null, captures: null, sem_kind: 0, sem_flags: 0,
+            sem_target: null, sem_owner: null,
+            loc_line: 0, loc_col: 0, loc_end_line: 0, loc_end_col: 0
+        };
+    }
+    return AstExpr {
+        kind: ast_i32_at(src, 0),
+        op: ast_i32_at(src, 4),
+        int_val: ast_i64_at(src, 8),
+        str_val_ptr: ast_ptr_at(src, 16),
+        str_val_len: ast_i64_at(src, 24),
+        name_ptr: ast_ptr_at(src, 32),
+        name_len: ast_i64_at(src, 40),
+        lhs: ast_ptr_at(src, 48),
+        rhs: ast_ptr_at(src, 56),
+        args: ast_ptr_at(src, 64),
+        ty: ast_ptr_at(src, 72),
+        captures: ast_ptr_at(src, 80),
+        sem_kind: ast_i32_at(src, 88),
+        sem_flags: ast_i32_at(src, 92),
+        sem_target: ast_ptr_at(src, 96),
+        sem_owner: ast_ptr_at(src, 104),
+        loc_line: ast_i32_at(src, 112),
+        loc_col: ast_i32_at(src, 116),
+        loc_end_line: ast_i32_at(src, 120),
+        loc_end_col: ast_i32_at(src, 124)
+    };
+}
+
+fn ast_stmt_pack(dst: rawptr, rec: AstStmt) {
+    if (dst == null) { return; }
+    ast_put_i32(dst, 0, rec.kind);
+    ast_put_i32(dst, 4, rec._pad);
+    ast_put_ptr(dst, 8, rec.name_ptr);
+    ast_put_i64(dst, 16, rec.name_len);
+    ast_put_ptr(dst, 24, rec.ty);
+    ast_put_ptr(dst, 32, rec.init);
+    ast_put_ptr(dst, 40, rec.cond);
+    ast_put_ptr(dst, 48, rec.then_blk);
+    ast_put_ptr(dst, 56, rec.else_blk);
+    ast_put_ptr(dst, 64, rec.body);
+    ast_put_ptr(dst, 72, rec.next);
+    ast_put_i32(dst, 80, rec.sem_kind);
+    ast_put_i32(dst, 84, rec.sem_flags);
+    ast_put_ptr(dst, 88, rec.sem_target);
+    ast_put_i32(dst, 96, rec.loc_line);
+    ast_put_i32(dst, 100, rec.loc_col);
+    ast_put_i32(dst, 104, rec.loc_end_line);
+    ast_put_i32(dst, 108, rec.loc_end_col);
+}
+
+fn ast_stmt_unpack(src: rawptr) -> AstStmt {
+    if (src == null) {
+        return AstStmt {
+            kind: 0, _pad: 0, name_ptr: null, name_len: 0, ty: null,
+            init: null, cond: null, then_blk: null, else_blk: null,
+            body: null, next: null, sem_kind: 0, sem_flags: 0, sem_target: null,
+            loc_line: 0, loc_col: 0, loc_end_line: 0, loc_end_col: 0
+        };
+    }
+    return AstStmt {
+        kind: ast_i32_at(src, 0),
+        _pad: ast_i32_at(src, 4),
+        name_ptr: ast_ptr_at(src, 8),
+        name_len: ast_i64_at(src, 16),
+        ty: ast_ptr_at(src, 24),
+        init: ast_ptr_at(src, 32),
+        cond: ast_ptr_at(src, 40),
+        then_blk: ast_ptr_at(src, 48),
+        else_blk: ast_ptr_at(src, 56),
+        body: ast_ptr_at(src, 64),
+        next: ast_ptr_at(src, 72),
+        sem_kind: ast_i32_at(src, 80),
+        sem_flags: ast_i32_at(src, 84),
+        sem_target: ast_ptr_at(src, 88),
+        loc_line: ast_i32_at(src, 96),
+        loc_col: ast_i32_at(src, 100),
+        loc_end_line: ast_i32_at(src, 104),
+        loc_end_col: ast_i32_at(src, 108)
+    };
+}
+
+fn ast_decl_pack(dst: rawptr, rec: AstDecl) {
+    if (dst == null) { return; }
+    ast_put_i32(dst, 0, rec.kind);
+    ast_put_i32(dst, 4, rec.is_public);
+    ast_put_i32(dst, 8, rec.is_static);
+    ast_put_i32(dst, 12, rec.generic_flags);
+    ast_put_ptr(dst, 16, rec.name_ptr);
+    ast_put_i64(dst, 24, rec.name_len);
+    ast_put_ptr(dst, 32, rec.ty);
+    ast_put_ptr(dst, 40, rec.params);
+    ast_put_ptr(dst, 48, rec.body);
+    ast_put_ptr(dst, 56, rec.members);
+    ast_put_ptr(dst, 64, rec.next);
+    ast_put_ptr(dst, 72, rec.generic_ptr);
+    ast_put_i64(dst, 80, rec.generic_len);
+    ast_put_ptr(dst, 88, rec.meta_ptr);
+    ast_put_i64(dst, 96, rec.meta_len);
+    ast_put_ptr(dst, 104, rec.doc_ptr);
+    ast_put_i64(dst, 112, rec.doc_len);
+    ast_put_i32(dst, 120, rec.sem_kind);
+    ast_put_i32(dst, 124, rec.sem_flags);
+    ast_put_ptr(dst, 128, rec.sem_target);
+    ast_put_i32(dst, 136, rec.loc_line);
+    ast_put_i32(dst, 140, rec.loc_col);
+    ast_put_i32(dst, 144, rec.loc_end_line);
+    ast_put_i32(dst, 148, rec.loc_end_col);
+}
+
+fn ast_decl_unpack(src: rawptr) -> AstDecl {
+    if (src == null) {
+        return AstDecl {
+            kind: 0, is_public: 0, is_static: 0, generic_flags: 0,
+            name_ptr: null, name_len: 0, ty: null, params: null, body: null,
+            members: null, next: null, generic_ptr: null, generic_len: 0,
+            meta_ptr: null, meta_len: 0, doc_ptr: null, doc_len: 0,
+            sem_kind: 0, sem_flags: 0, sem_target: null,
+            loc_line: 0, loc_col: 0, loc_end_line: 0, loc_end_col: 0
+        };
+    }
+    return AstDecl {
+        kind: ast_i32_at(src, 0),
+        is_public: ast_i32_at(src, 4),
+        is_static: ast_i32_at(src, 8),
+        generic_flags: ast_i32_at(src, 12),
+        name_ptr: ast_ptr_at(src, 16),
+        name_len: ast_i64_at(src, 24),
+        ty: ast_ptr_at(src, 32),
+        params: ast_ptr_at(src, 40),
+        body: ast_ptr_at(src, 48),
+        members: ast_ptr_at(src, 56),
+        next: ast_ptr_at(src, 64),
+        generic_ptr: ast_ptr_at(src, 72),
+        generic_len: ast_i64_at(src, 80),
+        meta_ptr: ast_ptr_at(src, 88),
+        meta_len: ast_i64_at(src, 96),
+        doc_ptr: ast_ptr_at(src, 104),
+        doc_len: ast_i64_at(src, 112),
+        sem_kind: ast_i32_at(src, 120),
+        sem_flags: ast_i32_at(src, 124),
+        sem_target: ast_ptr_at(src, 128),
+        loc_line: ast_i32_at(src, 136),
+        loc_col: ast_i32_at(src, 140),
+        loc_end_line: ast_i32_at(src, 144),
+        loc_end_col: ast_i32_at(src, 148)
+    };
+}
+
+fn ast_unit_pack(dst: rawptr, rec: AstUnit) {
+    if (dst == null) { return; }
+    ast_put_ptr(dst, 0, rec.decls);
+    ast_put_i32(dst, 8, rec.decl_count);
+    ast_put_i32(dst, 12, rec._pad);
+}
+
+fn ast_unit_unpack(src: rawptr) -> AstUnit {
+    if (src == null) {
+        return AstUnit { decls: null, decl_count: 0, _pad: 0 };
+    }
+    return AstUnit {
+        decls: ast_ptr_at(src, 0),
+        decl_count: ast_i32_at(src, 8),
+        _pad: ast_i32_at(src, 12)
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   7. Low-level slot helpers — pure rawptr ops, no class state.
+// ════════════════════════════════════════════════════════════════════
+
+public fn ast_alloc_zero(size: i32) -> rawptr {
+    let p = malloc(size as u64);
+    if (p == null) { return null; }
+    vyx_rt_ast_node_alloc_profile(size as i64);
+    memset(p, 0, size as u64);
+    return p;
+}
+
+// ── 7.b SourceLoc embedding ────────────────────────────────────────
+//
+// Every TypeRef / Expr / Stmt / Decl node carries a 16 B SourceLoc tail
+// at the end of its byte layout:
+//
+//     offset 0..3   : line       (i32, 1-based; 0 = unstamped)
+//     offset 4..7   : col        (i32, 1-based; 0 = unstamped)
+//     offset 8..11  : end_line   (i32, 1-based; 0 = open-ended)
+//     offset 12..15 : end_col    (i32, 1-based; 0 = open-ended)
+//
+// The file path component is shared per translation unit and travels
+// via `bootstrap.diag::diag_set_current_file`; baking a per-node
+// `(ptr,len)` pair would bloat every node by another 16 B without
+// adding signal for the single-input boot_a driver.
+//
+// To avoid plumbing line/col through 100+ parser callsites we keep
+// four module-globals that the parser updates inside `advance()` /
+// `Parser.create()`. Every *_alloc helper picks up the current values
+// at allocation time, matching the WU1 spec rule "stamp loc 取当前
+// token 的 line/col".
+//
+// `LOC_FIELD_SIZE` = 16; per-node tail offset constants live below
+// their respective allocators so the layout stays self-documenting.
+
+let AST_LOC_FIELD_SIZE: i32 = 16;
+let AST_TREF_LOC_OFFSET: i32 = 24;
+let AST_EXPR_LOC_OFFSET: i32 = 112;
+let AST_STMT_LOC_OFFSET: i32 = 96;
+let AST_DECL_LOC_OFFSET: i32 = 136;
+
+var g_ast_loc_line: i32 = 0;
+var g_ast_loc_col: i32 = 0;
+var g_ast_loc_end_line: i32 = 0;
+var g_ast_loc_end_col: i32 = 0;
+
+public fn ast_set_current_loc(line: i32, col: i32) {
+    g_ast_loc_line = line;
+    g_ast_loc_col = col;
+    g_ast_loc_end_line = line;
+    g_ast_loc_end_col = col;
+}
+
+public fn ast_set_current_loc_full(line: i32, col: i32, end_line: i32, end_col: i32) {
+    g_ast_loc_line = line;
+    g_ast_loc_col = col;
+    g_ast_loc_end_line = end_line;
+    g_ast_loc_end_col = end_col;
+}
+
+public fn ast_clear_current_loc() {
+    g_ast_loc_line = 0;
+    g_ast_loc_col = 0;
+    g_ast_loc_end_line = 0;
+    g_ast_loc_end_col = 0;
+}
+
+public fn ast_current_line() -> i32 { return g_ast_loc_line; }
+public fn ast_current_col()  -> i32 { return g_ast_loc_col; }
+
+fn ast_stamp_loc(node: rawptr, off: i32) {
+    if (node == null) { return; }
+    // Root-chunk codegen may place this private helper in a different object
+    // from the mutable location state.  Reading the private globals directly
+    // then turns them into per-partition zero-initialized state.  The public
+    // accessors are emitted with the state owner and give every partition the
+    // same parser cursor location.
+    let line = ast_current_line();
+    let col = ast_current_col();
+    ast_write_i32(ptr_offset(node, off),       line);
+    ast_write_i32(ptr_offset(node, off + 4),   col);
+    ast_write_i32(ptr_offset(node, off + 8),   line);
+    ast_write_i32(ptr_offset(node, off + 12),  col);
+}
+
+fn ast_node_loc_ptr(node: rawptr, off: i32) -> rawptr {
+    if (node == null) { return null; }
+    return ptr_offset(node, off);
+}
+
+fn ast_node_loc_line(node: rawptr, off: i32) -> i32 {
+    if (node == null) { return 0; }
+    return ast_read_i32(ptr_offset(node, off));
+}
+
+fn ast_node_loc_col(node: rawptr, off: i32) -> i32 {
+    if (node == null) { return 0; }
+    return ast_read_i32(ptr_offset(node, off + 4));
+}
+
+fn ast_node_loc_end_line(node: rawptr, off: i32) -> i32 {
+    if (node == null) { return 0; }
+    return ast_read_i32(ptr_offset(node, off + 8));
+}
+
+fn ast_node_loc_end_col(node: rawptr, off: i32) -> i32 {
+    if (node == null) { return 0; }
+    return ast_read_i32(ptr_offset(node, off + 12));
+}
+
+fn ast_node_set_loc(node: rawptr, off: i32, line: i32, col: i32, end_line: i32, end_col: i32) {
+    if (node == null) { return; }
+    ast_write_i32(ptr_offset(node, off),       line);
+    ast_write_i32(ptr_offset(node, off + 4),   col);
+    ast_write_i32(ptr_offset(node, off + 8),   end_line);
+    ast_write_i32(ptr_offset(node, off + 12),  end_col);
+}
+
+public fn ast_dup_c_string(s: string) -> rawptr {
+    let n: i64 = s.len;
+    let buf = malloc((n + 1) as u64);
+    if (buf == null) { return null; }
+    vyx_rt_ast_dup_profile(n + 1);
+    if (n > 0) {
+        memcpy(buf, s.c_str(), n as u64);
+    }
+    var nul: i32 = 0;
+    memcpy(ptr_offset(buf, n as i32), to_rawptr(&nul), 1);
+    return buf;
+}
+
+fn ast_replace_cstr(old: rawptr, s: string) -> rawptr {
+    let buf = ast_dup_c_string(s);
+    if (old != null) {
+        vyx_forget_string_len(old);
+        free(old);
+    }
+    return buf;
+}
+
+public fn ast_write_rawptr(addr: rawptr, value: rawptr) {
+    var v: rawptr = value;
+    memcpy(addr, to_rawptr(&v), 8);
+}
+
+public fn ast_read_rawptr(addr: rawptr) -> rawptr {
+    var v: rawptr = null;
+    memcpy(to_rawptr(&v), addr, 8);
+    return v;
+}
+
+public fn ast_write_i32(addr: rawptr, value: i32) {
+    var v = value;
+    memcpy(addr, to_rawptr(&v), 4);
+}
+
+public fn ast_read_i32(addr: rawptr) -> i32 {
+    var v: i32 = 0;
+    memcpy(to_rawptr(&v), addr, 4);
+    return v;
+}
+
+public fn ast_write_i64(addr: rawptr, value: i64) {
+    var v = value;
+    memcpy(addr, to_rawptr(&v), 8);
+}
+
+public fn ast_read_i64(addr: rawptr) -> i64 {
+    var v: i64 = 0;
+    memcpy(to_rawptr(&v), addr, 8);
+    return v;
+}
+
+public fn ast_borrow_c_string(buf: rawptr, len: i64) -> string {
+    if (buf == null || len <= 0) { return ""; }
+    return from_cstr_borrowed_cstr_len(buf, len);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   8. TypeRef
+// ════════════════════════════════════════════════════════════════════
+
+fn ast_tref_new(kind: i32) -> rawptr {
+    let p = ast_alloc_zero(ast_tref_node_size());
+    if (p == null) { return null; }
+    var rec = ast_tref_unpack(p);
+    rec.kind = kind;
+    rec.loc_line = ast_current_line();
+    rec.loc_col = ast_current_col();
+    rec.loc_end_line = rec.loc_line;
+    rec.loc_end_col = rec.loc_col;
+    ast_tref_pack(p, rec);
+    return p;
+}
+
+public fn tref_alloc(kind: i32, name: string) -> rawptr {
+    let p = ast_tref_new(kind);
+    if (p == null) { return null; }
+    var rec = ast_tref_unpack(p);
+    rec.a = ast_replace_cstr(rec.a, name);
+    rec.b = name.len;
+    ast_tref_pack(p, rec);
+    return p;
+}
+
+public fn tref_get_kind(p: rawptr) -> i32 {
+    return ast_i32_at(p, 0);
+}
+
+public fn tref_get_name(p: rawptr) -> string {
+    if (p == null) { return ""; }
+    let k = tref_get_kind(p);
+    if (k == ty_PTR() || k == ty_REF() || k == ty_MUTREF()
+        || k == ty_ARRAY() || k == ty_TUPLE()
+        || k == ty_FN() || k == ty_CFN()) {
+        return "";
+    }
+    return ast_cstr_at(p, 8, 16);
+}
+
+public fn tref_set_kind(p: rawptr, k: i32) {
+    var rec = ast_tref_unpack(p);
+    rec.kind = k;
+    ast_tref_pack(p, rec);
+}
+
+public fn tref_set_name(p: rawptr, name: string) {
+    var rec = ast_tref_unpack(p);
+    rec.a = ast_replace_cstr(rec.a, name);
+    rec.b = name.len;
+    ast_tref_pack(p, rec);
+}
+
+public fn tref_alloc_array_expr(elem_ty: rawptr, size_expr: rawptr) -> rawptr {
+    let p = ast_tref_new(ty_ARRAY());
+    if (p == null) { return null; }
+    var rec = ast_tref_unpack(p);
+    rec.a = elem_ty;
+    rec.b = ast_bits_i64(size_expr);
+    ast_tref_pack(p, rec);
+    return p;
+}
+
+public fn tref_alloc_array(elem_ty: rawptr, size: i64) -> rawptr {
+    let size_expr = expr_alloc(ex_INT_LIT());
+    if (size_expr != null) {
+        expr_set_int_val(size_expr, size);
+    }
+    return tref_alloc_array_expr(elem_ty, size_expr);
+}
+
+public fn tref_array_elem(p: rawptr) -> rawptr {
+    return ast_ptr_at(p, 8);
+}
+public fn tref_array_size_expr(p: rawptr) -> rawptr {
+    return ast_bits_ptr(ast_i64_at(p, 16));
+}
+public fn tref_array_size(p: rawptr) -> i64 {
+    if (p == null) { return 0; }
+    let e = tref_array_size_expr(p);
+    if (e == null) { return 0; }
+    if (expr_get_kind(e) == ex_INT_LIT()) { return expr_get_int_val(e); }
+    return 0;
+}
+
+public fn tref_alloc_tuple(elems: rawptr, count: i64) -> rawptr {
+    let p = ast_tref_new(ty_TUPLE());
+    if (p == null) { return null; }
+    var rec = ast_tref_unpack(p);
+    rec.a = elems;
+    rec.b = count;
+    ast_tref_pack(p, rec);
+    return p;
+}
+public fn tref_tuple_elems(p: rawptr) -> rawptr {
+    return ast_ptr_at(p, 8);
+}
+public fn tref_tuple_count(p: rawptr) -> i64 {
+    return ast_i64_at(p, 16);
+}
+public fn tref_tuple_elem_at(p: rawptr, i: i64) -> rawptr {
+    let base = ast_ptr_at(p, 8);
+    if (base == null) { return null; }
+    return ast_read_rawptr(ptr_offset(base, (i * 8) as i32));
+}
+
+public fn tref_alloc_fn(params_tuple: rawptr, ret_ty: rawptr) -> rawptr {
+    let p = ast_tref_new(ty_FN());
+    if (p == null) { return null; }
+    var rec = ast_tref_unpack(p);
+    rec.a = params_tuple;
+    rec.b = ast_bits_i64(ret_ty);
+    ast_tref_pack(p, rec);
+    return p;
+}
+public fn tref_alloc_c_fn(params_tuple: rawptr, ret_ty: rawptr) -> rawptr {
+    let p = ast_tref_new(ty_CFN());
+    if (p == null) { return null; }
+    var rec = ast_tref_unpack(p);
+    rec.a = params_tuple;
+    rec.b = ast_bits_i64(ret_ty);
+    ast_tref_pack(p, rec);
+    return p;
+}
+public fn tref_fn_params(p: rawptr) -> rawptr {
+    return ast_ptr_at(p, 8);
+}
+public fn tref_fn_ret(p: rawptr) -> rawptr {
+    return ast_bits_ptr(ast_i64_at(p, 16));
+}
+public fn tref_fn_param_count(p: rawptr) -> i64 {
+    return tref_tuple_count(tref_fn_params(p));
+}
+public fn tref_fn_param_at(p: rawptr, i: i64) -> rawptr {
+    return tref_tuple_elem_at(tref_fn_params(p), i);
+}
+
+public fn tref_alloc_ptr_like(kind: i32, elem_ty: rawptr) -> rawptr {
+    let p = ast_tref_new(kind);
+    if (p == null) { return null; }
+    var rec = ast_tref_unpack(p);
+    rec.a = elem_ty;
+    ast_tref_pack(p, rec);
+    return p;
+}
+public fn tref_pointee(p: rawptr) -> rawptr {
+    return ast_ptr_at(p, 8);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   9. Expr
+// ════════════════════════════════════════════════════════════════════
+
+public fn expr_sem_NONE() -> i32 { return 0; }
+public fn expr_sem_LOCAL() -> i32 { return 1; }
+public fn expr_sem_CONST() -> i32 { return 2; }
+public fn expr_sem_GLOBAL() -> i32 { return 3; }
+public fn expr_sem_DIRECT_FN() -> i32 { return 4; }
+public fn expr_sem_METHOD() -> i32 { return 5; }
+public fn expr_sem_FIELD() -> i32 { return 6; }
+public fn expr_sem_VARIANT() -> i32 { return 7; }
+public fn expr_sem_CLASS() -> i32 { return 8; }
+public fn expr_sem_BUILTIN() -> i32 { return 9; }
+public fn expr_sem_INDIRECT_FN() -> i32 { return 10; }
+
+// Stmt semantic-flags bit reserved by the parser: the statement is an
+// `unsafe { ... }` block.  Sema never writes semantic fields on block
+// statements, so this bit survives to HIR building.
+public fn stmt_flag_unsafe_block() -> i32 { return 1; }
+
+// Stmt semantic-flags bit reserved by the parser: the let/var statement
+// carries the `volatile` qualifier (`let volatile x = ...;`).  Sema
+// preserves this bit when it writes the LOCAL semantic kind, so it survives
+// into HIR local flags without touching the TypeRef layout.
+public fn stmt_flag_volatile_local() -> i32 { return 2; }
+
+// `unsafe let` / `unsafe var`: the binding is parsed outside an unsafe
+// block but still opts out of the ownership oracle for that statement.
+public fn stmt_flag_unsafe_local() -> i32 { return 4; }
+
+// Member spelling retained in the expression operator slot.  `.` remains
+// zero for backwards compatibility; `->` is an explicit typed-pointer
+// spelling and is consumed by the same member-resolution/lowering path.  The
+// distinction is intentionally lightweight so old AST/HIR records keep their
+// layout and reference receivers can continue using `.` transparently.
+public fn expr_member_access_dot() -> i32 { return 0; }
+public fn expr_member_access_arrow() -> i32 { return 1; }
+
+public fn expr_alloc(kind: i32) -> rawptr {
+    let p = ast_alloc_zero(ast_expr_node_size());
+    if (p == null) { return null; }
+    var rec = ast_expr_unpack(p);
+    rec.kind = kind;
+    rec.loc_line = ast_current_line();
+    rec.loc_col = ast_current_col();
+    rec.loc_end_line = rec.loc_line;
+    rec.loc_end_col = rec.loc_col;
+    ast_expr_pack(p, rec);
+    return p;
+}
+
+public fn expr_get_kind(p: rawptr) -> i32 { return ast_i32_at(p, 0); }
+public fn expr_set_kind(p: rawptr, v: i32) {
+    var rec = ast_expr_unpack(p);
+    rec.kind = v;
+    ast_expr_pack(p, rec);
+}
+public fn expr_get_op(p: rawptr) -> i32 { return ast_i32_at(p, 4); }
+public fn expr_get_int_val(p: rawptr) -> i64 { return ast_i64_at(p, 8); }
+public fn expr_get_str_val(p: rawptr) -> string { return ast_cstr_at(p, 16, 24); }
+public fn expr_get_name(p: rawptr) -> string { return ast_cstr_at(p, 32, 40); }
+public fn expr_get_lhs(p: rawptr) -> rawptr { return ast_ptr_at(p, 48); }
+public fn expr_get_rhs(p: rawptr) -> rawptr { return ast_ptr_at(p, 56); }
+public fn expr_get_args(p: rawptr) -> rawptr { return ast_ptr_at(p, 64); }
+public fn expr_get_ty(p: rawptr) -> rawptr { return ast_ptr_at(p, 72); }
+public fn expr_get_captures(p: rawptr) -> rawptr { return ast_ptr_at(p, 80); }
+public fn expr_get_semantic_kind(p: rawptr) -> i32 { return ast_i32_at(p, 88); }
+public fn expr_get_semantic_flags(p: rawptr) -> i32 { return ast_i32_at(p, 92); }
+public fn expr_get_semantic_target(p: rawptr) -> rawptr { return ast_ptr_at(p, 96); }
+public fn expr_get_semantic_owner(p: rawptr) -> rawptr { return ast_ptr_at(p, 104); }
+
+public fn expr_set_op(p: rawptr, v: i32) {
+    var rec = ast_expr_unpack(p);
+    rec.op = v;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_int_val(p: rawptr, v: i64) {
+    var rec = ast_expr_unpack(p);
+    rec.int_val = v;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_str_val(p: rawptr, s: string) {
+    var rec = ast_expr_unpack(p);
+    rec.str_val_ptr = ast_replace_cstr(rec.str_val_ptr, s);
+    rec.str_val_len = s.len;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_name(p: rawptr, s: string) {
+    var rec = ast_expr_unpack(p);
+    rec.name_ptr = ast_replace_cstr(rec.name_ptr, s);
+    rec.name_len = s.len;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_lhs(p: rawptr, v: rawptr) {
+    var rec = ast_expr_unpack(p);
+    rec.lhs = v;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_rhs(p: rawptr, v: rawptr) {
+    var rec = ast_expr_unpack(p);
+    rec.rhs = v;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_args(p: rawptr, v: rawptr) {
+    var rec = ast_expr_unpack(p);
+    rec.args = v;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_ty(p: rawptr, v: rawptr) {
+    var rec = ast_expr_unpack(p);
+    rec.ty = v;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_captures(p: rawptr, v: rawptr) {
+    var rec = ast_expr_unpack(p);
+    rec.captures = v;
+    ast_expr_pack(p, rec);
+}
+public fn expr_set_semantic(p: rawptr, kind: i32, target: rawptr, owner: rawptr, flags: i32) {
+    var rec = ast_expr_unpack(p);
+    rec.sem_kind = kind;
+    rec.sem_flags = flags;
+    rec.sem_target = target;
+    rec.sem_owner = owner;
+    ast_expr_pack(p, rec);
+}
+public fn expr_clear_semantic(p: rawptr) {
+    expr_set_semantic(p, expr_sem_NONE(), null, null, 0);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   10. Stmt
+// ════════════════════════════════════════════════════════════════════
+
+public fn stmt_alloc(kind: i32) -> rawptr {
+    let p = ast_alloc_zero(ast_stmt_node_size());
+    if (p == null) { return null; }
+    var rec = ast_stmt_unpack(p);
+    rec.kind = kind;
+    rec.loc_line = ast_current_line();
+    rec.loc_col = ast_current_col();
+    rec.loc_end_line = rec.loc_line;
+    rec.loc_end_col = rec.loc_col;
+    ast_stmt_pack(p, rec);
+    return p;
+}
+
+public fn stmt_get_kind(p: rawptr) -> i32 { return ast_i32_at(p, 0); }
+public fn stmt_get_name(p: rawptr) -> string { return ast_cstr_at(p, 8, 16); }
+public fn stmt_get_ty(p: rawptr) -> rawptr { return ast_ptr_at(p, 24); }
+public fn stmt_get_init(p: rawptr) -> rawptr { return ast_ptr_at(p, 32); }
+public fn stmt_get_cond(p: rawptr) -> rawptr { return ast_ptr_at(p, 40); }
+public fn stmt_get_then_blk(p: rawptr) -> rawptr { return ast_ptr_at(p, 48); }
+public fn stmt_get_else_blk(p: rawptr) -> rawptr { return ast_ptr_at(p, 56); }
+public fn stmt_get_body(p: rawptr) -> rawptr { return ast_ptr_at(p, 64); }
+public fn stmt_get_next(p: rawptr) -> rawptr { return ast_ptr_at(p, 72); }
+public fn stmt_get_semantic_kind(p: rawptr) -> i32 {
+    if (p == null) { return expr_sem_NONE(); }
+    return ast_i32_at(p, 80);
+}
+public fn stmt_get_semantic_flags(p: rawptr) -> i32 { return ast_i32_at(p, 84); }
+public fn stmt_get_semantic_target(p: rawptr) -> rawptr { return ast_ptr_at(p, 88); }
+
+public fn stmt_set_name(p: rawptr, s: string) {
+    var rec = ast_stmt_unpack(p);
+    rec.name_ptr = ast_replace_cstr(rec.name_ptr, s);
+    rec.name_len = s.len;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_set_ty(p: rawptr, v: rawptr) {
+    var rec = ast_stmt_unpack(p);
+    rec.ty = v;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_set_init(p: rawptr, v: rawptr) {
+    var rec = ast_stmt_unpack(p);
+    rec.init = v;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_set_cond(p: rawptr, v: rawptr) {
+    var rec = ast_stmt_unpack(p);
+    rec.cond = v;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_set_then_blk(p: rawptr, v: rawptr) {
+    var rec = ast_stmt_unpack(p);
+    rec.then_blk = v;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_set_else_blk(p: rawptr, v: rawptr) {
+    var rec = ast_stmt_unpack(p);
+    rec.else_blk = v;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_set_body(p: rawptr, v: rawptr) {
+    var rec = ast_stmt_unpack(p);
+    rec.body = v;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_set_next(p: rawptr, v: rawptr) {
+    var rec = ast_stmt_unpack(p);
+    rec.next = v;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_set_semantic(p: rawptr, kind: i32, target: rawptr, flags: i32) {
+    var rec = ast_stmt_unpack(p);
+    rec.sem_kind = kind;
+    rec.sem_flags = flags;
+    rec.sem_target = target;
+    ast_stmt_pack(p, rec);
+}
+public fn stmt_clear_semantic(p: rawptr) {
+    stmt_set_semantic(p, expr_sem_NONE(), null, 0);
+}
+
+fn ast_string_contains_marker(s: string, needle: string) -> bool {
+    if (needle.len == 0) { return true; }
+    if (s.len < needle.len) { return false; }
+    var i: i32 = 0;
+    while (i + needle.len <= s.len) {
+        var j: i32 = 0;
+        var ok: bool = true;
+        while (j < needle.len && ok) {
+            if (s.charAt(i + j) != needle.charAt(j)) { ok = false; }
+            j = j + 1;
+        }
+        if (ok) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn decl_compute_generic_flags(s: string) -> i32 {
+    var flags: i32 = 0;
+    if (ast_string_contains_marker(s, "|kind:error")) { flags = flags | 1; }
+    if (ast_string_contains_marker(s, "|kind:interface")) { flags = flags | 2; }
+    if (ast_string_contains_marker(s, "|kind:struct")) { flags = flags | 4; }
+    if (ast_string_contains_marker(s, "|kind:assoc_const")) { flags = flags | 8; }
+    if (ast_string_contains_marker(s, "|kind:assoc_type")) { flags = flags | 16; }
+    if (ast_string_contains_marker(s, "|variadic")) { flags = flags | 32; }
+    if (ast_string_contains_marker(s, "|impl:")) { flags = flags | 64; }
+    if (ast_string_contains_marker(s, "|payload")) { flags = flags | 128; }
+    return flags;
+}
+
+fn decl_compute_name_flags(s: string) -> i32 {
+    if (s == "extern_C_block") { return 256; }
+    if (s == "extern_cpp_block" || s == "extern_dci_block") { return 512; }
+    return 0;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   11. Decl
+// ════════════════════════════════════════════════════════════════════
+
+public fn decl_alloc(kind: i32, name: string) -> rawptr {
+    let p = ast_alloc_zero(ast_decl_node_size());
+    if (p == null) { return null; }
+    var rec = ast_decl_unpack(p);
+    rec.kind = kind;
+    rec.name_ptr = ast_replace_cstr(rec.name_ptr, name);
+    rec.name_len = name.len;
+    rec.generic_flags = decl_compute_name_flags(name);
+    rec.loc_line = ast_current_line();
+    rec.loc_col = ast_current_col();
+    rec.loc_end_line = rec.loc_line;
+    rec.loc_end_col = rec.loc_col;
+    ast_decl_pack(p, rec);
+    return p;
+}
+
+public fn decl_get_kind(p: rawptr) -> i32 { return ast_i32_at(p, 0); }
+public fn decl_get_is_public(p: rawptr) -> bool { return ast_i32_at(p, 4) != 0; }
+public fn decl_get_is_static(p: rawptr) -> bool { return ast_i32_at(p, 8) != 0; }
+public fn decl_get_generic_flags(p: rawptr) -> i32 { return ast_i32_at(p, 12); }
+public fn decl_get_name(p: rawptr) -> string { return ast_cstr_at(p, 16, 24); }
+public fn decl_get_ty(p: rawptr) -> rawptr { return ast_ptr_at(p, 32); }
+public fn decl_get_params(p: rawptr) -> rawptr { return ast_ptr_at(p, 40); }
+public fn decl_get_body(p: rawptr) -> rawptr { return ast_ptr_at(p, 48); }
+public fn decl_get_members(p: rawptr) -> rawptr { return ast_ptr_at(p, 56); }
+public fn decl_get_next(p: rawptr) -> rawptr { return ast_ptr_at(p, 64); }
+public fn decl_get_generic_params(p: rawptr) -> string { return ast_cstr_at(p, 72, 80); }
+public fn decl_get_meta(p: rawptr) -> string { return ast_cstr_at(p, 88, 96); }
+public fn decl_get_doc(p: rawptr) -> string { return ast_cstr_at(p, 104, 112); }
+public fn decl_get_semantic_kind(p: rawptr) -> i32 {
+    if (p == null) { return expr_sem_NONE(); }
+    return ast_i32_at(p, 120);
+}
+public fn decl_get_semantic_flags(p: rawptr) -> i32 { return ast_i32_at(p, 124); }
+public fn decl_get_semantic_target(p: rawptr) -> rawptr { return ast_ptr_at(p, 128); }
+
+public fn decl_set_is_public(p: rawptr, v: bool) {
+    var rec = ast_decl_unpack(p);
+    rec.is_public = 0;
+    if (v) { rec.is_public = 1; }
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_is_static(p: rawptr, v: bool) {
+    var rec = ast_decl_unpack(p);
+    rec.is_static = 0;
+    if (v) { rec.is_static = 1; }
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_name(p: rawptr, s: string) {
+    var rec = ast_decl_unpack(p);
+    rec.name_ptr = ast_replace_cstr(rec.name_ptr, s);
+    rec.name_len = s.len;
+    rec.generic_flags = decl_compute_name_flags(s) | decl_compute_generic_flags(decl_get_generic_params(p));
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_ty(p: rawptr, v: rawptr) {
+    var rec = ast_decl_unpack(p);
+    rec.ty = v;
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_params(p: rawptr, v: rawptr) {
+    var rec = ast_decl_unpack(p);
+    rec.params = v;
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_body(p: rawptr, v: rawptr) {
+    var rec = ast_decl_unpack(p);
+    rec.body = v;
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_members(p: rawptr, v: rawptr) {
+    var rec = ast_decl_unpack(p);
+    rec.members = v;
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_next(p: rawptr, v: rawptr) {
+    var rec = ast_decl_unpack(p);
+    rec.next = v;
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_generic_params(p: rawptr, s: string) {
+    var rec = ast_decl_unpack(p);
+    rec.generic_ptr = ast_replace_cstr(rec.generic_ptr, s);
+    rec.generic_len = s.len;
+    rec.generic_flags = decl_compute_name_flags(decl_get_name(p)) | decl_compute_generic_flags(s);
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_meta(p: rawptr, s: string) {
+    var rec = ast_decl_unpack(p);
+    rec.meta_ptr = ast_replace_cstr(rec.meta_ptr, s);
+    rec.meta_len = s.len;
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_doc(p: rawptr, s: string) {
+    var rec = ast_decl_unpack(p);
+    rec.doc_ptr = ast_replace_cstr(rec.doc_ptr, s);
+    rec.doc_len = s.len;
+    ast_decl_pack(p, rec);
+}
+public fn decl_set_semantic(p: rawptr, kind: i32, target: rawptr, flags: i32) {
+    var rec = ast_decl_unpack(p);
+    rec.sem_kind = kind;
+    rec.sem_flags = flags;
+    rec.sem_target = target;
+    ast_decl_pack(p, rec);
+}
+public fn decl_clear_semantic(p: rawptr) {
+    decl_set_semantic(p, expr_sem_NONE(), null, 0);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   11.b SourceLoc accessors per node kind.
+//
+//   Each *_loc_ptr returns a non-owning pointer to the 16 B inline
+//   loc record so diag emitters can pass it to `diag_emit_at` without
+//   copying. The line/col scalar accessors are handy for sema-level
+//   string formatting that already has the node handy.
+// ════════════════════════════════════════════════════════════════════
+
+public fn tref_loc_ptr(p: rawptr)       -> rawptr { return ast_node_loc_ptr(p, AST_TREF_LOC_OFFSET); }
+public fn tref_loc_line(p: rawptr)      -> i32    { return ast_node_loc_line(p, AST_TREF_LOC_OFFSET); }
+public fn tref_loc_col(p: rawptr)       -> i32    { return ast_node_loc_col(p, AST_TREF_LOC_OFFSET); }
+public fn tref_loc_end_line(p: rawptr)  -> i32    { return ast_node_loc_end_line(p, AST_TREF_LOC_OFFSET); }
+public fn tref_loc_end_col(p: rawptr)   -> i32    { return ast_node_loc_end_col(p, AST_TREF_LOC_OFFSET); }
+public fn tref_set_loc(p: rawptr, l: i32, c: i32, el: i32, ec: i32) {
+    var rec = ast_tref_unpack(p);
+    rec.loc_line = l;
+    rec.loc_col = c;
+    rec.loc_end_line = el;
+    rec.loc_end_col = ec;
+    ast_tref_pack(p, rec);
+}
+
+public fn expr_loc_ptr(p: rawptr)       -> rawptr { return ast_node_loc_ptr(p, AST_EXPR_LOC_OFFSET); }
+public fn expr_loc_line(p: rawptr)      -> i32    { return ast_node_loc_line(p, AST_EXPR_LOC_OFFSET); }
+public fn expr_loc_col(p: rawptr)       -> i32    { return ast_node_loc_col(p, AST_EXPR_LOC_OFFSET); }
+public fn expr_loc_end_line(p: rawptr)  -> i32    { return ast_node_loc_end_line(p, AST_EXPR_LOC_OFFSET); }
+public fn expr_loc_end_col(p: rawptr)   -> i32    { return ast_node_loc_end_col(p, AST_EXPR_LOC_OFFSET); }
+public fn expr_set_loc(p: rawptr, l: i32, c: i32, el: i32, ec: i32) {
+    var rec = ast_expr_unpack(p);
+    rec.loc_line = l;
+    rec.loc_col = c;
+    rec.loc_end_line = el;
+    rec.loc_end_col = ec;
+    ast_expr_pack(p, rec);
+}
+
+public fn stmt_loc_ptr(p: rawptr)       -> rawptr { return ast_node_loc_ptr(p, AST_STMT_LOC_OFFSET); }
+public fn stmt_loc_line(p: rawptr)      -> i32    { return ast_node_loc_line(p, AST_STMT_LOC_OFFSET); }
+public fn stmt_loc_col(p: rawptr)       -> i32    { return ast_node_loc_col(p, AST_STMT_LOC_OFFSET); }
+public fn stmt_loc_end_line(p: rawptr)  -> i32    { return ast_node_loc_end_line(p, AST_STMT_LOC_OFFSET); }
+public fn stmt_loc_end_col(p: rawptr)   -> i32    { return ast_node_loc_end_col(p, AST_STMT_LOC_OFFSET); }
+public fn stmt_set_loc(p: rawptr, l: i32, c: i32, el: i32, ec: i32) {
+    var rec = ast_stmt_unpack(p);
+    rec.loc_line = l;
+    rec.loc_col = c;
+    rec.loc_end_line = el;
+    rec.loc_end_col = ec;
+    ast_stmt_pack(p, rec);
+}
+
+public fn decl_loc_ptr(p: rawptr)       -> rawptr { return ast_node_loc_ptr(p, AST_DECL_LOC_OFFSET); }
+public fn decl_loc_line(p: rawptr)      -> i32    { return ast_node_loc_line(p, AST_DECL_LOC_OFFSET); }
+public fn decl_loc_col(p: rawptr)       -> i32    { return ast_node_loc_col(p, AST_DECL_LOC_OFFSET); }
+public fn decl_loc_end_line(p: rawptr)  -> i32    { return ast_node_loc_end_line(p, AST_DECL_LOC_OFFSET); }
+public fn decl_loc_end_col(p: rawptr)   -> i32    { return ast_node_loc_end_col(p, AST_DECL_LOC_OFFSET); }
+public fn decl_set_loc(p: rawptr, l: i32, c: i32, el: i32, ec: i32) {
+    var rec = ast_decl_unpack(p);
+    rec.loc_line = l;
+    rec.loc_col = c;
+    rec.loc_end_line = el;
+    rec.loc_end_col = ec;
+    ast_decl_pack(p, rec);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   12. Unit
+// ════════════════════════════════════════════════════════════════════
+
+public fn unit_alloc() -> rawptr {
+    let p = ast_alloc_zero(ast_unit_node_size());
+    return p;
+}
+
+public fn unit_get_decls(p: rawptr) -> rawptr { return ast_ptr_at(p, 0); }
+public fn unit_get_decl_count(p: rawptr) -> i32 { return ast_i32_at(p, 8); }
+public fn unit_set_decls(p: rawptr, v: rawptr) {
+    var rec = ast_unit_unpack(p);
+    rec.decls = v;
+    ast_unit_pack(p, rec);
+}
+public fn unit_set_decl_count(p: rawptr, n: i32) {
+    var rec = ast_unit_unpack(p);
+    rec.decl_count = n;
+    ast_unit_pack(p, rec);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   13. Module init / dispose hooks
+// ════════════════════════════════════════════════════════════════════
+
+public fn ast_init() -> i32 { return 0; }
+public fn ast_dispose() -> i32 { return 0; }

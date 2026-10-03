@@ -1,0 +1,830 @@
+module Zyn.App;
+
+use std.collections;
+use Color = Zyn.Nut.Types.Color;
+
+// ---------------------------------------------------------------------------
+// ZC-09 data display
+//
+// The data layer keeps three things apart, because mixing them is what makes a
+// grid slow:
+//
+//   1. identity  - stable row keys, so a sort or a filter never rebinds the
+//                  selection, the focus or the checked state to another row;
+//   2. order     - the visible row order after filter and sort, stored as a
+//                  resource so it survives a rebuild;
+//   3. window    - the slice that is actually on screen, so the number of
+//                  materialised rows depends on the viewport, not on the row
+//                  count. Ten thousand rows cost the same as twenty.
+//
+// Windowing is a model step, not a view step: `projectWindow` writes the slice
+// into resources from an update system, and `Component.view(world)` stays a
+// pure function that only reads them. That is also why rendering can reuse
+// `ListView`, which already gives each row a stable key, a focus entry and an
+// action - a second interaction model for grids would be a second set of bugs.
+//
+// Row storage is resource based for the same reason as in `Form.vyx`: a `Vec`
+// field inside a class would be shared by every shallow copy.
+// ---------------------------------------------------------------------------
+
+public fn appSortAscending() -> i32 { return 1; }
+public fn appSortDescending() -> i32 { return 2; }
+
+public fn appDataIdle() -> i32 { return 0; }
+public fn appDataLoading() -> i32 { return 1; }
+public fn appDataReady() -> i32 { return 2; }
+public fn appDataEmpty() -> i32 { return 3; }
+public fn appDataError() -> i32 { return 4; }
+
+public fn appSelectionNone() -> i32 { return 0; }
+public fn appSelectionSingle() -> i32 { return 1; }
+public fn appSelectionMultiple() -> i32 { return 2; }
+
+// ------------------------------------------------------------------
+// Resource keys
+// ------------------------------------------------------------------
+
+public class AppRowStore {
+    public static fn rowsKey(grid_id: string) -> string { return "rows:" + grid_id; }
+    public static fn cellsKey(grid_id: string) -> string { return "cells:" + grid_id; }
+    public static fn columnsKey(grid_id: string) -> string { return "columns:" + grid_id; }
+    public static fn orderKey(grid_id: string) -> string { return "order:" + grid_id; }
+    public static fn windowKey(grid_id: string) -> string { return "window:" + grid_id; }
+    public static fn windowKeysKey(grid_id: string) -> string { return "windowkeys:" + grid_id; }
+    public static fn selectionKey(grid_id: string) -> string { return "selection:" + grid_id; }
+    public static fn columnWidthKey(grid_id: string, column: i32) -> string {
+        return "colwidth:" + grid_id + ":" + format("%d", column as i64);
+    }
+
+    // ------------------------------------------------------------------
+    // Rows
+    // ------------------------------------------------------------------
+
+    @[borrow_args]
+    public static fn declareRows(world: AppWorld, grid_id: string, keys: Vec<string>) -> AppWorld {
+        if (grid_id.len == 0) { return world; }
+        var out = AppRowStore.clearList(world, AppRowStore.rowsKey(grid_id));
+        var i: i32 = 0;
+        while (i < (keys.len as i32)) {
+            out = out.appendStringListResource(AppRowStore.rowsKey(grid_id), keys.get(i as i64));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn rowCount(world: AppWorld, grid_id: string) -> i32 {
+        if (grid_id.len == 0) { return 0; }
+        return world.stringListResourceCount(AppRowStore.rowsKey(grid_id));
+    }
+
+    public static fn rowKeyAt(world: AppWorld, grid_id: string, index: i32) -> string {
+        if (grid_id.len == 0 || index < 0) { return ""; }
+        return world.stringListResourceAt(AppRowStore.rowsKey(grid_id), index);
+    }
+
+    public static fn rowIndexOfKey(world: AppWorld, grid_id: string, key: string) -> i32 {
+        var i: i32 = 0;
+        let total = AppRowStore.rowCount(world, grid_id);
+        while (i < total) {
+            if (world.stringListResourceAt(AppRowStore.rowsKey(grid_id), i) == key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // ------------------------------------------------------------------
+    // Columns and cells (cells are row-major: row * columns + column)
+    // ------------------------------------------------------------------
+
+    @[borrow_args]
+    public static fn declareColumns(world: AppWorld, grid_id: string, titles: Vec<string>) -> AppWorld {
+        if (grid_id.len == 0) { return world; }
+        var out = AppRowStore.clearList(world, AppRowStore.columnsKey(grid_id));
+        var i: i32 = 0;
+        while (i < (titles.len as i32)) {
+            out = out.appendStringListResource(AppRowStore.columnsKey(grid_id), titles.get(i as i64));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn columnCount(world: AppWorld, grid_id: string) -> i32 {
+        if (grid_id.len == 0) { return 0; }
+        return world.stringListResourceCount(AppRowStore.columnsKey(grid_id));
+    }
+
+    public static fn columnTitle(world: AppWorld, grid_id: string, column: i32) -> string {
+        if (grid_id.len == 0 || column < 0) { return ""; }
+        return world.stringListResourceAt(AppRowStore.columnsKey(grid_id), column);
+    }
+
+    public static fn setCell(world: AppWorld, grid_id: string, row: i32, column: i32, columns: i32, value: string) -> AppWorld {
+        if (grid_id.len == 0 || row < 0 || column < 0 || columns <= 0) { return world; }
+        let flat = (row * columns) + column;
+        var out = world;
+        let count = out.stringListResourceCount(AppRowStore.cellsKey(grid_id));
+        while (count < flat) {
+            out = out.appendStringListResource(AppRowStore.cellsKey(grid_id), "");
+        }
+        out = out.appendStringListResource(AppRowStore.cellsKey(grid_id), value);
+        return out;
+    }
+
+    public static fn cellAt(world: AppWorld, grid_id: string, row: i32, column: i32, columns: i32) -> string {
+        if (grid_id.len == 0 || row < 0 || column < 0 || columns <= 0) { return ""; }
+        return world.stringListResourceAt(AppRowStore.cellsKey(grid_id), (row * columns) + column);
+    }
+
+    // ------------------------------------------------------------------
+    // List helpers
+    // ------------------------------------------------------------------
+
+    public static fn clearList(world: AppWorld, key: string) -> AppWorld {
+        if (key.len == 0) { return world; }
+        var out = world;
+        var guard: i32 = 0;
+        while (out.stringListResourceCount(key) > 0 && guard < 100000) {
+            out = out.removeStringListResourceAt(key, 0);
+            guard = guard + 1;
+        }
+        return out;
+    }
+}
+
+// ------------------------------------------------------------------
+// Virtual window (pure computation)
+// ------------------------------------------------------------------
+
+public class AppVirtualWindow {
+    public first: i32;
+    public count: i32;
+    public lead_offset: f32;
+    public total: i32;
+    public total_extent: f32;
+
+    public static fn create(first: i32, count: i32, lead_offset: f32, total: i32, total_extent: f32) -> AppVirtualWindow {
+        return AppVirtualWindow {
+            first: first,
+            count: count,
+            lead_offset: lead_offset,
+            total: total,
+            total_extent: total_extent
+        };
+    }
+
+    public fn last(&self) -> i32 { return self.first + self.count - 1; }
+
+    public fn contains(&self, row: i32) -> bool {
+        return row >= self.first && row <= self.last();
+    }
+
+    public static fn stride(item_height: f32, gap: f32) -> f32 {
+        var out = item_height + gap;
+        if (out <= 0.0) { out = 1.0; }
+        return out;
+    }
+
+    public static fn totalExtent(item_height: f32, gap: f32, total: i32) -> f32 {
+        if (total <= 0) { return 0.0; }
+        return (f32FromInt(total) * AppVirtualWindow.stride(item_height, gap)) - gap;
+    }
+
+    public static fn maxOffset(viewport: f32, item_height: f32, gap: f32, total: i32) -> f32 {
+        var max_value = AppVirtualWindow.totalExtent(item_height, gap, total) - viewport;
+        if (max_value < 0.0) { max_value = 0.0; }
+        return max_value;
+    }
+
+    public static fn clampOffset(offset: f32, viewport: f32, item_height: f32, gap: f32, total: i32) -> f32 {
+        var out = offset;
+        if (out < 0.0) { out = 0.0; }
+        let max_value = AppVirtualWindow.maxOffset(viewport, item_height, gap, total);
+        if (out > max_value) { out = max_value; }
+        return out;
+    }
+
+    // The only function that decides how many rows exist on screen. `count` is
+    // bounded by the viewport, so it does not grow with `total` - that is the
+    // property the 10k-row acceptance test asserts.
+    public static fn compute(offset: f32, viewport: f32, item_height: f32, gap: f32, total: i32, overscan: i32) -> AppVirtualWindow {
+        let extent = AppVirtualWindow.totalExtent(item_height, gap, total);
+        if (total <= 0) {
+            return AppVirtualWindow.create(0, 0, 0.0, 0, extent);
+        }
+        let stride = AppVirtualWindow.stride(item_height, gap);
+        let clamped = AppVirtualWindow.clampOffset(offset, viewport, item_height, gap, total);
+        var first = (clamped / stride) as i32;
+        if (first < 0) { first = 0; }
+        if (first >= total) { first = total - 1; }
+        var visible = 1;
+        if (viewport > 0.0) { visible = ((viewport / stride) as i32) + 1; }
+        var start = first - overscan;
+        if (start < 0) { start = 0; }
+        var count = visible + (overscan * 2);
+        if (start + count > total) { count = total - start; }
+        if (count < 0) { count = 0; }
+        return AppVirtualWindow.create(start, count, f32FromInt(start) * stride, total, extent);
+    }
+
+    // Which row is under a point, or -1 when the point falls in the gap below
+    // the last row.
+    public static fn rowAt(point_y: f32, offset: f32, item_height: f32, gap: f32, total: i32) -> i32 {
+        if (total <= 0 || item_height <= 0.0) { return -1; }
+        let stride = AppVirtualWindow.stride(item_height, gap);
+        let local = point_y + offset;
+        if (local < 0.0) { return -1; }
+        let row = (local / stride) as i32;
+        if (row < 0 || row >= total) { return -1; }
+        let within = local - (f32FromInt(row) * stride);
+        if (within > item_height) { return -1; }
+        return row;
+    }
+}
+
+// ------------------------------------------------------------------
+// Sorting and filtering
+// ------------------------------------------------------------------
+
+public class AppSortSpec {
+    public column: i32;
+    public direction: i32;
+
+    public static fn create(column: i32, direction: i32) -> AppSortSpec {
+        return AppSortSpec { column: column, direction: direction };
+    }
+
+    public static fn none() -> AppSortSpec {
+        return AppSortSpec.create(-1, appSortAscending());
+    }
+
+    public static fn byColumn(column: i32, direction: i32) -> AppSortSpec {
+        return AppSortSpec.create(column, direction);
+    }
+
+    public fn isNone(&self) -> bool { return self.column < 0; }
+
+    public fn isDescending(&self) -> bool { return self.direction == appSortDescending(); }
+
+    // Clicking a header toggles: the same column flips, a new column starts
+    // ascending. This is the behaviour every table in every app already has.
+    public fn toggledFor(&self, column: i32) -> AppSortSpec {
+        if (self.column == column) {
+            if (self.isDescending()) { return AppSortSpec.create(column, appSortAscending()); }
+            return AppSortSpec.create(column, appSortDescending());
+        }
+        return AppSortSpec.create(column, appSortAscending());
+    }
+
+    public fn dup(&self) -> AppSortSpec {
+        return AppSortSpec.create(self.column, self.direction);
+    }
+}
+
+public class AppFilterSpec {
+    public query: string;
+    public column: i32;
+
+    public static fn create(query: string, column: i32) -> AppFilterSpec {
+        return AppFilterSpec { query: query, column: column };
+    }
+
+    public static fn none() -> AppFilterSpec {
+        return AppFilterSpec.create("", -1);
+    }
+
+    public static fn allColumns(query: string) -> AppFilterSpec {
+        return AppFilterSpec.create(query, -1);
+    }
+
+    public fn isActive(&self) -> bool { return self.query.len > 0; }
+
+    public fn dup(&self) -> AppFilterSpec {
+        return AppFilterSpec.create(self.query, self.column);
+    }
+}
+
+public fn appCompareText(a: string, b: string) -> i32 {
+    var i: i32 = 0;
+    while (i < a.len && i < b.len) {
+        let ca = a.charAt(i as i64);
+        let cb = b.charAt(i as i64);
+        if (ca < cb) { return -1; }
+        if (ca > cb) { return 1; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { return -1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+// Numbers sort as numbers, everything else as text. A column of prices that
+// sorted as text ("10" before "9") is the classic grid bug.
+public fn appCompareCell(a: string, b: string) -> i32 {
+    if (appLooksLikeNumber(a) && appLooksLikeNumber(b)) {
+        let na = app_parse_f32_or(a, 0.0);
+        let nb = app_parse_f32_or(b, 0.0);
+        if (na < nb) { return -1; }
+        if (na > nb) { return 1; }
+        return 0;
+    }
+    return appCompareText(a, b);
+}
+
+public class AppDataGrid {
+    // Applies the filter, then sorts, then writes the visible order into
+    // `order:<grid>`. Merge sort keeps 10k rows at n log n instead of the
+    // n squared an insertion sort would cost on a column that is nearly sorted.
+    public static fn apply(world: AppWorld, grid_id: string, sort: AppSortSpec, filter: AppFilterSpec) -> AppWorld {
+        if (grid_id.len == 0) { return world; }
+        let total = AppRowStore.rowCount(world, grid_id);
+        let columns = AppRowStore.columnCount(world, grid_id);
+        var order = Vec::<i32>.new();
+        var i: i32 = 0;
+        while (i < total) {
+            if (AppDataGrid.rowMatches(world, grid_id, i, columns, filter)) {
+                order.push(i);
+            }
+            i = i + 1;
+        }
+        if (!sort.isNone() && sort.column >= 0 && sort.column < columns) {
+            AppDataGrid.sortOrder(world, grid_id, order, columns, sort);
+        }
+        var out = AppRowStore.clearList(world, AppRowStore.orderKey(grid_id));
+        i = 0;
+        while (i < (order.len as i32)) {
+            out = out.appendStringListResource(AppRowStore.orderKey(grid_id), format("%d", order.get(i as i64) as i64));
+            i = i + 1;
+        }
+        order.destroy();
+        return out;
+    }
+
+    private static fn rowMatches(world: AppWorld, grid_id: string, row: i32, columns: i32, filter: AppFilterSpec) -> bool {
+        if (!filter.isActive()) { return true; }
+        if (filter.column >= 0) {
+            return AppDataGrid.containsText(AppRowStore.cellAt(world, grid_id, row, filter.column, columns), filter.query);
+        }
+        var column: i32 = 0;
+        while (column < columns) {
+            if (AppDataGrid.containsText(AppRowStore.cellAt(world, grid_id, row, column, columns), filter.query)) { return true; }
+            column = column + 1;
+        }
+        return false;
+    }
+
+    // Case-insensitive substring test; an empty needle matches everything, which
+    // is what a search box wants while the user is still typing.
+    public static fn containsText(haystack: string, needle: string) -> bool {
+        if (needle.len == 0) { return true; }
+        if (needle.len > haystack.len) { return false; }
+        let lower_hay = haystack.toLower();
+        let lower_needle = needle.toLower();
+        return lower_hay.contains(lower_needle);
+    }
+
+    // Sorts `order` in place. The Vec is borrowed and not returned: a Vec is an
+    // owning handle, so handing it out of the function and back would leave two
+    // bindings responsible for one buffer.
+    @[borrow_args]
+    private static fn sortOrder(world: AppWorld, grid_id: string, order: Vec<i32>, columns: i32, sort: AppSortSpec) -> i32 {
+        let n = order.len as i32;
+        if (n < 2) { return n; }
+        var scratch = Vec::<i32>.new();
+        var i: i32 = 0;
+        while (i < n) {
+            scratch.push(0);
+            i = i + 1;
+        }
+        var width: i32 = 1;
+        while (width < n) {
+            var base: i32 = 0;
+            while (base < n) {
+                let mid = base + width;
+                var end = base + (width * 2);
+                if (end > n) { end = n; }
+                var left = base;
+                var right = mid;
+                if (right > end) { right = end; }
+                var write: i32 = base;
+                while (write < end) {
+                    var take_left: bool = false;
+                    if (left >= mid || left >= end) {
+                        take_left = false;
+                    } else if (right >= end) {
+                        take_left = true;
+                    } else {
+                        let cmp = appCompareCell(
+                            AppRowStore.cellAt(world, grid_id, order.get(left as i64), sort.column, columns),
+                            AppRowStore.cellAt(world, grid_id, order.get(right as i64), sort.column, columns));
+                        if (sort.isDescending()) {
+                            take_left = cmp >= 0;
+                        } else {
+                            take_left = cmp <= 0;
+                        }
+                    }
+                    if (take_left) {
+                        scratch.set(write as i64, order.get(left as i64));
+                        left = left + 1;
+                    } else {
+                        scratch.set(write as i64, order.get(right as i64));
+                        right = right + 1;
+                    }
+                    write = write + 1;
+                }
+                base = end;
+            }
+            i = 0;
+            while (i < n) {
+                order.set(i as i64, scratch.get(i as i64));
+                i = i + 1;
+            }
+            width = width * 2;
+        }
+        scratch.destroy();
+        return n;
+    }
+
+    public static fn visibleCount(world: AppWorld, grid_id: string) -> i32 {
+        if (grid_id.len == 0) { return 0; }
+        return world.stringListResourceCount(AppRowStore.orderKey(grid_id));
+    }
+
+    // The row index in declaration order, which is what the cell store uses.
+    public static fn visibleRowAt(world: AppWorld, grid_id: string, index: i32) -> i32 {
+        if (grid_id.len == 0 || index < 0 || index >= AppDataGrid.visibleCount(world, grid_id)) { return -1; }
+        return app_parse_i32_or(world.stringListResourceAt(AppRowStore.orderKey(grid_id), index), -1);
+    }
+
+    public static fn visibleRowKeyAt(world: AppWorld, grid_id: string, index: i32) -> string {
+        let row = AppDataGrid.visibleRowAt(world, grid_id, index);
+        if (row < 0) { return ""; }
+        return AppRowStore.rowKeyAt(world, grid_id, row);
+    }
+
+    // ------------------------------------------------------------------
+    // Column widths
+    // ------------------------------------------------------------------
+
+    public static fn columnWidth(world: AppWorld, grid_id: string, column: i32, fallback: f32) -> f32 {
+        if (grid_id.len == 0 || column < 0) { return fallback; }
+        return world.floatResource(AppRowStore.columnWidthKey(grid_id, column), fallback);
+    }
+
+    public static fn setColumnWidth(world: AppWorld, grid_id: string, column: i32, width: f32) -> AppWorld {
+        if (grid_id.len == 0 || column < 0) { return world; }
+        var value = width;
+        if (value < 24.0) { value = 24.0; }
+        return world.setFloatResource(AppRowStore.columnWidthKey(grid_id, column), value);
+    }
+
+    public static fn resizeColumn(world: AppWorld, grid_id: string, column: i32, delta: f32, fallback: f32) -> AppWorld {
+        return AppDataGrid.setColumnWidth(world, grid_id, column, AppDataGrid.columnWidth(world, grid_id, column, fallback) + delta);
+    }
+
+    public static fn totalColumnWidth(world: AppWorld, grid_id: string, fallback: f32) -> f32 {
+        var out = 0.0;
+        var column: i32 = 0;
+        let columns = AppRowStore.columnCount(world, grid_id);
+        while (column < columns) {
+            out = out + AppDataGrid.columnWidth(world, grid_id, column, fallback);
+            column = column + 1;
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------
+    // Window projection
+    // ------------------------------------------------------------------
+
+    // Copies the on-screen slice into the window resources. Called from an
+    // update system, never from `view()`, because it writes to the world.
+    public static fn projectWindow(world: AppWorld, grid_id: string, offset: f32, viewport: f32, item_height: f32, gap: f32, overscan: i32) -> AppWorld {
+        if (grid_id.len == 0) { return world; }
+        let total = AppDataGrid.visibleCount(world, grid_id);
+        let window = AppVirtualWindow.compute(offset, viewport, item_height, gap, total, overscan);
+        var out = AppRowStore.clearList(world, AppRowStore.windowKey(grid_id));
+        out = AppRowStore.clearList(out, AppRowStore.windowKeysKey(grid_id));
+        var i: i32 = window.first;
+        while (i <= window.last()) {
+            out = out.appendStringListResource(AppRowStore.windowKey(grid_id), AppDataGrid.rowLabel(world, grid_id, i));
+            out = out.appendStringListResource(AppRowStore.windowKeysKey(grid_id), AppDataGrid.visibleRowKeyAt(world, grid_id, i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn rowLabel(world: AppWorld, grid_id: string, visible_index: i32) -> string {
+        let row = AppDataGrid.visibleRowAt(world, grid_id, visible_index);
+        if (row < 0) { return ""; }
+        let columns = AppRowStore.columnCount(world, grid_id);
+        var out = "";
+        var column: i32 = 0;
+        while (column < columns) {
+            if (column > 0) { out = out + "  |  "; }
+            out = out + AppRowStore.cellAt(world, grid_id, row, column, columns);
+            column = column + 1;
+        }
+        return out;
+    }
+
+    public static fn windowCount(world: AppWorld, grid_id: string) -> i32 {
+        return world.stringListResourceCount(AppRowStore.windowKey(grid_id));
+    }
+}
+
+// ------------------------------------------------------------------
+// Selection (keyed, so it survives sort and filter)
+// ------------------------------------------------------------------
+
+public class AppSelection {
+    public static fn clear(world: AppWorld, grid_id: string) -> AppWorld {
+        return AppRowStore.clearList(world, AppRowStore.selectionKey(grid_id));
+    }
+
+    public static fn isSelected(world: AppWorld, grid_id: string, key: string) -> bool {
+        if (key.len == 0) { return false; }
+        var i: i32 = 0;
+        let total = AppSelection.count(world, grid_id);
+        while (i < total) {
+            if (world.stringListResourceAt(AppRowStore.selectionKey(grid_id), i) == key) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public static fn count(world: AppWorld, grid_id: string) -> i32 {
+        if (grid_id.len == 0) { return 0; }
+        return world.stringListResourceCount(AppRowStore.selectionKey(grid_id));
+    }
+
+    public static fn keyAt(world: AppWorld, grid_id: string, index: i32) -> string {
+        if (grid_id.len == 0 || index < 0) { return ""; }
+        return world.stringListResourceAt(AppRowStore.selectionKey(grid_id), index);
+    }
+
+    public static fn add(world: AppWorld, grid_id: string, key: string) -> AppWorld {
+        if (grid_id.len == 0 || key.len == 0 || AppSelection.isSelected(world, grid_id, key)) { return world; }
+        return world.appendStringListResource(AppRowStore.selectionKey(grid_id), key);
+    }
+
+    public static fn remove(world: AppWorld, grid_id: string, key: string) -> AppWorld {
+        var out = world;
+        var i: i32 = AppSelection.count(out, grid_id) - 1;
+        while (i >= 0) {
+            if (out.stringListResourceAt(AppRowStore.selectionKey(grid_id), i) == key) {
+                out = out.removeStringListResourceAt(AppRowStore.selectionKey(grid_id), i);
+            }
+            i = i - 1;
+        }
+        return out;
+    }
+
+    public static fn toggle(world: AppWorld, grid_id: string, key: string) -> AppWorld {
+        if (AppSelection.isSelected(world, grid_id, key)) { return AppSelection.remove(world, grid_id, key); }
+        return AppSelection.add(world, grid_id, key);
+    }
+
+    // Single-selection mode: the previous selection is replaced, never merged.
+    public static fn selectOnly(world: AppWorld, grid_id: string, key: string) -> AppWorld {
+        return AppSelection.add(AppSelection.clear(world, grid_id), grid_id, key);
+    }
+
+    public static fn toggleVisibleRow(world: AppWorld, grid_id: string, mode: i32, visible_index: i32) -> AppWorld {
+        let key = AppDataGrid.visibleRowKeyAt(world, grid_id, visible_index);
+        if (key.len == 0) { return world; }
+        if (mode == appSelectionSingle()) { return AppSelection.selectOnly(world, grid_id, key); }
+        if (mode == appSelectionMultiple()) { return AppSelection.toggle(world, grid_id, key); }
+        return world;
+    }
+
+    public static fn selectAllVisible(world: AppWorld, grid_id: string) -> AppWorld {
+        var out = AppSelection.clear(world, grid_id);
+        var i: i32 = 0;
+        let total = AppDataGrid.visibleCount(out, grid_id);
+        while (i < total) {
+            out = AppSelection.add(out, grid_id, AppDataGrid.visibleRowKeyAt(out, grid_id, i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Bulk action: the app reads the selected keys and clears them when done.
+    public static fn countOfSelected(world: AppWorld, grid_id: string) -> i32 {
+        return AppSelection.count(world, grid_id);
+    }
+}
+
+// ------------------------------------------------------------------
+// Tree view
+// ------------------------------------------------------------------
+
+public class AppTreeStore {
+    public static fn parentKey(tree_id: string) -> string { return "treeparent:" + tree_id; }
+    public static fn depthKey(tree_id: string) -> string { return "treedepth:" + tree_id; }
+    public static fn expandedKey(tree_id: string) -> string { return "treeexpanded:" + tree_id; }
+
+    // Declaration order must list a parent before its children, which is how a
+    // flattened query result arrives anyway.
+    @[borrow_args]
+    public static fn declare(world: AppWorld, tree_id: string, keys: Vec<string>, parents: Vec<string>, depths: Vec<i32>) -> AppWorld {
+        if (tree_id.len == 0) { return world; }
+        var out = AppRowStore.declareRows(world, tree_id, keys);
+        out = AppRowStore.clearList(out, AppTreeStore.parentKey(tree_id));
+        out = AppRowStore.clearList(out, AppTreeStore.depthKey(tree_id));
+        var i: i32 = 0;
+        while (i < (parents.len as i32)) {
+            out = out.appendStringListResource(AppTreeStore.parentKey(tree_id), parents.get(i as i64));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (depths.len as i32)) {
+            out = out.appendStringListResource(AppTreeStore.depthKey(tree_id), format("%d", depths.get(i as i64) as i64));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn parentOf(world: AppWorld, tree_id: string, key: string) -> string {
+        let index = AppRowStore.rowIndexOfKey(world, tree_id, key);
+        if (index < 0) { return ""; }
+        return world.stringListResourceAt(AppTreeStore.parentKey(tree_id), index);
+    }
+
+    public static fn depthOf(world: AppWorld, tree_id: string, key: string) -> i32 {
+        let index = AppRowStore.rowIndexOfKey(world, tree_id, key);
+        if (index < 0) { return 0; }
+        return app_parse_i32_or(world.stringListResourceAt(AppTreeStore.depthKey(tree_id), index), 0);
+    }
+
+    public static fn isExpanded(world: AppWorld, tree_id: string, key: string) -> bool {
+        let index = AppRowStore.rowIndexOfKey(world, tree_id, key);
+        if (index < 0) { return false; }
+        return world.boolListResourceAt(AppTreeStore.expandedKey(tree_id), index);
+    }
+
+    public static fn ensureExpandedList(world: AppWorld, tree_id: string) -> AppWorld {
+        var out = world;
+        let total = AppRowStore.rowCount(out, tree_id);
+        while (out.boolListResourceCount(AppTreeStore.expandedKey(tree_id)) < total) {
+            out = out.appendBoolListResource(AppTreeStore.expandedKey(tree_id), false);
+        }
+        return out;
+    }
+
+    public static fn toggleExpanded(world: AppWorld, tree_id: string, key: string) -> AppWorld {
+        let index = AppRowStore.rowIndexOfKey(world, tree_id, key);
+        if (index < 0) { return world; }
+        var out = AppTreeStore.ensureExpandedList(world, tree_id);
+        out = out.toggleBoolListResourceAt(AppTreeStore.expandedKey(tree_id), index);
+        return AppTreeView.flatten(out, tree_id);
+    }
+}
+
+public class AppTreeView {
+    // A row is visible when every ancestor is expanded. Walking up is bounded by
+    // the depth, so this stays linear in the row count.
+    public static fn isRowVisible(world: AppWorld, tree_id: string, index: i32) -> bool {
+        var key = AppRowStore.rowKeyAt(world, tree_id, index);
+        var guard: i32 = 0;
+        while (key.len > 0 && guard < 64) {
+            let parent = AppTreeStore.parentOf(world, tree_id, key);
+            if (parent.len == 0) { return true; }
+            if (!AppTreeStore.isExpanded(world, tree_id, parent)) { return false; }
+            key = parent;
+            guard = guard + 1;
+        }
+        return key.len > 0;
+    }
+
+    public static fn flatten(world: AppWorld, tree_id: string) -> AppWorld {
+        if (tree_id.len == 0) { return world; }
+        var out = AppTreeStore.ensureExpandedList(world, tree_id);
+        out = AppRowStore.clearList(out, AppRowStore.orderKey(tree_id));
+        var i: i32 = 0;
+        let total = AppRowStore.rowCount(out, tree_id);
+        while (i < total) {
+            if (AppTreeView.isRowVisible(out, tree_id, i)) {
+                out = out.appendStringListResource(AppRowStore.orderKey(tree_id), format("%d", i as i64));
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // The label carries the indentation, because the row renderer is the shared
+    // focusable list and a per-depth view would be a second layout path.
+    public static fn rowLabel(world: AppWorld, tree_id: string, visible_index: i32) -> string {
+        let row = AppDataGrid.visibleRowAt(world, tree_id, visible_index);
+        if (row < 0) { return ""; }
+        let key = AppRowStore.rowKeyAt(world, tree_id, row);
+        let depth = AppTreeStore.depthOf(world, tree_id, key);
+        var indent = "";
+        var i: i32 = 0;
+        while (i < depth) {
+            indent = indent + "    ";
+            i = i + 1;
+        }
+        return indent + key;
+    }
+}
+
+// ------------------------------------------------------------------
+// Load state (empty, loading and error are separate states, not one flag)
+// ------------------------------------------------------------------
+
+public class AppDataState {
+    public status: i32;
+    public total: i32;
+    public error_message: string;
+
+    public static fn create(status: i32, total: i32, error_message: string) -> AppDataState {
+        return AppDataState { status: status, total: total, error_message: error_message };
+    }
+
+    public static fn idle() -> AppDataState { return AppDataState.create(appDataIdle(), 0, ""); }
+    public static fn loading() -> AppDataState { return AppDataState.create(appDataLoading(), 0, ""); }
+    public static fn ready(total: i32) -> AppDataState { return AppDataState.create(appDataReady(), total, ""); }
+    public static fn empty() -> AppDataState { return AppDataState.create(appDataEmpty(), 0, ""); }
+    public static fn failed(message: string) -> AppDataState { return AppDataState.create(appDataError(), 0, message); }
+
+    public fn isLoading(&self) -> bool { return self.status == appDataLoading(); }
+    public fn isFailed(&self) -> bool { return self.status == appDataError(); }
+    public fn isEmpty(&self) -> bool { return self.status == appDataEmpty(); }
+    public fn isReady(&self) -> bool { return self.status == appDataReady(); }
+
+    // Ready with zero rows means empty; the caller does not have to remember to
+    // switch the status itself.
+    public static fn fromCount(count: i32) -> AppDataState {
+        if (count <= 0) { return AppDataState.empty(); }
+        return AppDataState.ready(count);
+    }
+
+    public fn dup(&self) -> AppDataState {
+        return AppDataState.create(self.status, self.total, self.error_message);
+    }
+}
+
+// ------------------------------------------------------------------
+// Views
+// ------------------------------------------------------------------
+
+public class DataStatusView {
+    public static fn create(id: string, state: AppDataState, retry_action: string) -> View {
+        if (state.isLoading()) {
+            return Column.create().id(id).gap(8.0).alignCenter()
+                .child(Progress.create("").id(id + ".spinner").size(32.0, 32.0))
+                .child(Text.muted("Loading").id(id + ".text").height(24.0));
+        }
+        if (state.isFailed()) {
+            return Column.create().id(id).gap(8.0).alignCenter()
+                .child(Text.body(state.error_message).id(id + ".message").height(24.0)
+                    .foreground(Color.rgba(0.70, 0.08, 0.12, 1.0)))
+                .child(Button.tonalAction(id + ".retry", "Retry", retry_action).height(40.0));
+        }
+        if (state.isEmpty()) {
+            return Column.create().id(id).gap(8.0).alignCenter()
+                .child(Text.muted("No records").id(id + ".text").height(24.0));
+        }
+        return Spacer.vertical(0.0).id(id + ".ready");
+    }
+}
+
+public class DataGridHeader {
+    // Widths come from the model, so a resize survives a rebuild; the sort
+    // button reuses the same action registry as everything else.
+    public static fn create(id: string, grid_id: string, action_prefix: string, world: AppWorld, default_width: f32, height: f32) -> View {
+        var out = Row.create().id(id).gap(4.0).height(height);
+        var column: i32 = 0;
+        let columns = AppRowStore.columnCount(world, grid_id);
+        while (column < columns) {
+            let title = AppRowStore.columnTitle(world, grid_id, column);
+            let width = AppDataGrid.columnWidth(world, grid_id, column, default_width);
+            out = out.child(Button.tonalAction(id + ".head." + format("%d", column as i64), title, action_prefix + "sort." + format("%d", column as i64))
+                .width(width).height(height)
+                .accessibility("columnheader", title, "Sort by " + title));
+            out = out.child(Button.tonalAction(id + ".resize." + format("%d", column as i64), "|", action_prefix + "resize." + format("%d", column as i64))
+                .size(16.0, height)
+                .accessibility("button", "Resize " + title, "Resize the column"));
+            column = column + 1;
+        }
+        return out;
+    }
+}
+
+public class VirtualList {
+    // Renders the window resources written by `AppDataGrid.projectWindow`. The
+    // materialised row count is the window size, not the row count.
+    public static fn create(id: string, grid_id: string, action_prefix: string, item_height: f32, checked_resource: string) -> View {
+        return ListView.bound(id, AppRowStore.windowKey(grid_id), checked_resource, action_prefix)
+            .itemHeight(item_height)
+            .keyResource(AppRowStore.windowKeysKey(grid_id));
+    }
+}
+
+public class TreeView {
+    public static fn create(id: string, tree_id: string, action_prefix: string, item_height: f32) -> View {
+        return ListView.bound(id, AppRowStore.windowKey(tree_id), "", action_prefix)
+            .itemHeight(item_height)
+            .keyResource(AppRowStore.windowKeysKey(tree_id));
+    }
+}

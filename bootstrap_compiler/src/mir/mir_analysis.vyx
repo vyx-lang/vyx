@@ -1,0 +1,2403 @@
+module bootstrap.mir_analysis;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memset(dst: rawptr, value: i32, size: u64) -> rawptr;
+    fn getenv(name: rawptr) -> rawptr;
+}
+
+public fn mir_analysis_cfg() -> i32 { return 1; }
+public fn mir_analysis_use_def() -> i32 { return 2; }
+public fn mir_analysis_effects() -> i32 { return 4; }
+public fn mir_analysis_dominance() -> i32 { return 8; }
+public fn mir_analysis_liveness() -> i32 { return 16; }
+public fn mir_analysis_escape() -> i32 { return 32; }
+
+// Effects are conservative query facts.  A zero mask means that the queried
+// MIR node is structurally pure; `unknown` is deliberately sticky and must
+// never be optimized as pure by callers.
+public fn mir_effect_read_memory() -> i32 { return 1; }
+public fn mir_effect_write_memory() -> i32 { return 2; }
+public fn mir_effect_call() -> i32 { return 4; }
+public fn mir_effect_drop() -> i32 { return 8; }
+public fn mir_effect_control() -> i32 { return 16; }
+public fn mir_effect_unknown() -> i32 { return 32; }
+
+// Storage intervals describe MIR events, not a proven contiguous runtime
+// interval. A single StorageLive may legitimately have multiple path exits.
+public fn mir_local_storage_interval_none() -> i32 { return 0; }
+public fn mir_local_storage_interval_single_open() -> i32 { return 1; }
+public fn mir_local_storage_interval_single_live_path_ends() -> i32 { return 2; }
+public fn mir_local_storage_interval_multi_or_malformed() -> i32 { return 3; }
+
+// These CFG classifications are audit facts only. `closed` does not establish
+// non-escape, dominance, ABI suitability, or permission to emit lifetime
+// intrinsics or reuse a stack slot.
+public fn mir_local_cfg_interval_none() -> i32 { return 0; }
+public fn mir_local_cfg_interval_closed() -> i32 { return 1; }
+public fn mir_local_cfg_interval_open_exit() -> i32 { return 2; }
+public fn mir_local_cfg_interval_conflict() -> i32 { return 3; }
+public fn mir_local_cfg_interval_barrier() -> i32 { return 4; }
+
+// Escape facts are intentionally one-way barriers. No combination of these
+// flags establishes that a local is non-escaping or lifetime-intrinsic safe.
+// They are L0 audit facts, not complete pointer provenance: receiver target
+// references are only followed through their explicit lhs, and intrinsics and
+// other higher-level origins are intentionally out of scope.
+public fn mir_local_escape_capture_barrier() -> i32 { return 1; }
+public fn mir_local_escape_reference_capture() -> i32 { return 2; }
+public fn mir_local_escape_direct_address() -> i32 { return 4; }
+public fn mir_local_escape_derived_address() -> i32 { return 8; }
+public fn mir_local_escape_may_escape() -> i32 { return 16; }
+public fn mir_local_escape_via_call() -> i32 { return 32; }
+public fn mir_local_escape_via_return() -> i32 { return 64; }
+public fn mir_local_escape_via_assignment() -> i32 { return 128; }
+public fn mir_local_escape_via_aggregate() -> i32 { return 256; }
+public fn mir_local_escape_unknown_indirection() -> i32 { return 512; }
+
+public fn mir_use_owner_local() -> i32 { return 1; }
+public fn mir_use_owner_place() -> i32 { return 2; }
+public fn mir_use_owner_value() -> i32 { return 3; }
+public fn mir_use_owner_instr() -> i32 { return 4; }
+public fn mir_use_owner_block() -> i32 { return 5; }
+public fn mir_use_owner_case() -> i32 { return 6; }
+
+public fn mir_use_slot_capture_init() -> i32 { return 1; }
+public fn mir_use_slot_place_index() -> i32 { return 2; }
+public fn mir_use_slot_value_lhs() -> i32 { return 3; }
+public fn mir_use_slot_value_rhs() -> i32 { return 4; }
+public fn mir_use_slot_value_aux() -> i32 { return 5; }
+public fn mir_use_slot_value_first_arg() -> i32 { return 6; }
+public fn mir_use_slot_value_next_arg() -> i32 { return 7; }
+public fn mir_use_slot_instr_value() -> i32 { return 8; }
+public fn mir_use_slot_instr_lhs() -> i32 { return 9; }
+public fn mir_use_slot_instr_rhs() -> i32 { return 10; }
+public fn mir_use_slot_term_value() -> i32 { return 11; }
+public fn mir_use_slot_case_pattern() -> i32 { return 12; }
+public fn mir_use_slot_case_guard() -> i32 { return 13; }
+
+public fn mir_analysis_audit_enabled() -> bool {
+    let raw = getenv("VYX_MIR_PASS_AUDIT".c_str());
+    if (raw == null) { return false; }
+    let value = from_cstr(raw).trim();
+    if (value.len == 0 || value == "0") { return false; }
+    if (value == "false" || value == "FALSE" || value == "False") { return false; }
+    if (value == "off" || value == "OFF" || value == "Off") { return false; }
+    return true;
+}
+
+public fn mir_analysis_audit(message: string) {
+    if (mir_analysis_audit_enabled()) { print("[mir-analysis] " + message); }
+}
+
+// Local facts can be expensive to print for a large selfhost unit, so keep
+// their construction/audit behind a separate opt-in from normal pass audit.
+public fn mir_analysis_local_facts_audit_enabled() -> bool {
+    let raw = getenv("VYX_MIR_LOCAL_FACTS_AUDIT".c_str());
+    if (raw == null) { return false; }
+    let value = from_cstr(raw).trim();
+    if (value.len == 0 || value == "0") { return false; }
+    if (value == "false" || value == "FALSE" || value == "False") { return false; }
+    if (value == "off" || value == "OFF" || value == "Off") { return false; }
+    return true;
+}
+
+fn ma_i32_text(value: i32) -> string {
+    return policy_i64_to_string(value as i64);
+}
+
+fn ma_local_facts_max_cells() -> i64 { return 2000000; }
+fn ma_local_facts_max_bytes() -> i64 { return 64 * 1024 * 1024; }
+
+fn ma_alloc_i32(count: i32) -> rawptr {
+    var n = count;
+    if (n < 1) { n = 1; }
+    if (n > 536870911) { return null; }
+    let out = malloc(((n as i64) * 4) as u64);
+    if (out != null) { memset(out, 0, ((n as i64) * 4) as u64); }
+    return out;
+}
+
+fn ma_get_i32(values: rawptr, index: i32) -> i32 {
+    if (values == null || index < 0) { return 0; }
+    return ast_read_i32(ptr_offset(values, index * 4));
+}
+
+fn ma_set_i32(values: rawptr, index: i32, value: i32) {
+    if (values != null && index >= 0) {
+        ast_write_i32(ptr_offset(values, index * 4), value);
+    }
+}
+
+fn ma_inc_i32(values: rawptr, index: i32) {
+    ma_set_i32(values, index, ma_get_i32(values, index) + 1);
+}
+
+fn ma_record_has_id(record: rawptr, id: i32) -> bool {
+    return record != null && id > 0 && ast_read_i32(record) == id;
+}
+
+fn ma_valid_block(m: MirUnit, block_id: i32) -> bool {
+    return block_id >= 1
+        && block_id <= m.block_count
+        && ma_record_has_id(m.block_record(block_id), block_id)
+        && !m.block_is_removed( block_id);
+}
+
+fn ma_valid_value(m: MirUnit, value_id: i32) -> bool {
+    return value_id >= 1
+        && value_id <= m.value_count
+        && ma_record_has_id(m.value_record(value_id), value_id);
+}
+
+fn ma_valid_local(m: MirUnit, local_id: i32) -> bool {
+    return local_id >= 1
+        && local_id <= m.local_count
+        && ma_record_has_id(m.local_record(local_id), local_id);
+}
+
+fn ma_valid_place(m: MirUnit, place_id: i32) -> bool {
+    return place_id >= 1
+        && place_id <= m.place_count
+        && ma_record_has_id(m.place_record(place_id), place_id);
+}
+
+class MirCfgEdgeList {
+    public sources: rawptr
+    public targets: rawptr
+    public seen_targets: rawptr
+    public count: i32
+    public capacity: i32
+    public failed: bool
+    public error_message: string
+
+    public static fn create(capacity: i32, block_count: i32) -> MirCfgEdgeList {
+        return MirCfgEdgeList {
+            sources: ma_alloc_i32(capacity),
+            targets: ma_alloc_i32(capacity),
+            seen_targets: ma_alloc_i32(block_count + 1),
+            count: 0,
+            capacity: capacity,
+            failed: false,
+            error_message: ""
+        };
+    }
+
+    public fn storage_ok(self) -> bool {
+        return self.sources != null && self.targets != null && self.seen_targets != null;
+    }
+
+    public fn mark_failed(self, message: string) {
+        if (!self.failed) { self.error_message = message; }
+        self.failed = true;
+    }
+
+    public fn add(self, m: MirUnit, source: i32, target: i32) {
+        if (self.failed) { return; }
+        if (!ma_valid_block(m, source) || !ma_valid_block(m, target)) {
+            self.mark_failed("invalid CFG edge #" + ma_i32_text(source) + " -> #" + ma_i32_text(target));
+            return;
+        }
+        if (m.block_function(source) != m.block_function(target)) {
+            self.mark_failed("cross-function CFG edge #" + ma_i32_text(source) + " -> #" + ma_i32_text(target));
+            return;
+        }
+        if (ma_get_i32(self.seen_targets, target) == source) { return; }
+        ma_set_i32(self.seen_targets, target, source);
+        if (self.count >= self.capacity) {
+            self.mark_failed("CFG edge capacity exceeded");
+            return;
+        }
+        ma_set_i32(self.sources, self.count, source);
+        ma_set_i32(self.targets, self.count, target);
+        self.count = self.count + 1;
+    }
+
+    public fn dispose(self) {
+        if (self.sources != null) { free(self.sources); self.sources = null; }
+        if (self.targets != null) { free(self.targets); self.targets = null; }
+        if (self.seen_targets != null) { free(self.seen_targets); self.seen_targets = null; }
+    }
+}
+
+fn ma_collect_cfg_edges(m: MirUnit, edges: &mut MirCfgEdgeList) -> bool {
+    var block_id: i32 = 1;
+    while (block_id <= m.block_count) {
+        if (ma_valid_block(m, block_id)) {
+            let term = m.block_term_kind(block_id);
+            if (term == mir_term_goto()) {
+                edges.add(m, block_id, m.block_term_target(block_id));
+            } else if (term == mir_term_branch() || term == mir_term_foreach_next()) {
+                edges.add(m, block_id, m.block_term_target(block_id));
+                edges.add(m, block_id, m.block_term_false(block_id));
+            } else if (term == mir_term_match()) {
+                var case_id = m.block_term_first_case(block_id);
+                var guard: i32 = 0;
+                while (case_id != mir_id_invalid()) {
+                    if (case_id < 1 || case_id > m.case_count
+                        || !ma_record_has_id(m.case_record(case_id), case_id)) {
+                        edges.mark_failed("invalid match case #" + ma_i32_text(case_id));
+                        break;
+                    }
+                    edges.add(m, block_id, m.case_target_block(case_id));
+                    case_id = m.case_next(case_id);
+                    guard = guard + 1;
+                    if (guard > m.case_count + 1) {
+                        edges.mark_failed("cyclic match case chain for block #" + ma_i32_text(block_id));
+                        break;
+                    }
+                }
+                let fallback = m.block_term_false(block_id);
+                if (fallback != mir_id_invalid()) { edges.add(m, block_id, fallback); }
+            }
+        }
+        if (edges.failed) { return false; }
+        block_id = block_id + 1;
+    }
+    return true;
+}
+
+class MirUseEdgeList {
+    public values: rawptr
+    public owner_kinds: rawptr
+    public owner_ids: rawptr
+    public slots: rawptr
+    public count: i32
+    public capacity: i32
+    public failed: bool
+    public error_message: string
+
+    public static fn create(capacity: i32) -> MirUseEdgeList {
+        return MirUseEdgeList {
+            values: ma_alloc_i32(capacity),
+            owner_kinds: ma_alloc_i32(capacity),
+            owner_ids: ma_alloc_i32(capacity),
+            slots: ma_alloc_i32(capacity),
+            count: 0,
+            capacity: capacity,
+            failed: false,
+            error_message: ""
+        };
+    }
+
+    public fn storage_ok(self) -> bool {
+        return self.values != null
+            && self.owner_kinds != null
+            && self.owner_ids != null
+            && self.slots != null;
+    }
+
+    public fn mark_failed(self, message: string) {
+        if (!self.failed) { self.error_message = message; }
+        self.failed = true;
+    }
+
+    public fn add(self,
+                  m: MirUnit,
+                  value_id: i32,
+                  owner_kind: i32,
+                  owner_id: i32,
+                  slot: i32) {
+        if (self.failed || value_id == mir_id_invalid()) { return; }
+        if (!ma_valid_value(m, value_id)) {
+            self.mark_failed("invalid value use #" + ma_i32_text(value_id)
+                      + " from owner #" + ma_i32_text(owner_id));
+            return;
+        }
+        if (self.count >= self.capacity) {
+            self.mark_failed("use-def edge capacity exceeded");
+            return;
+        }
+        ma_set_i32(self.values, self.count, value_id);
+        ma_set_i32(self.owner_kinds, self.count, owner_kind);
+        ma_set_i32(self.owner_ids, self.count, owner_id);
+        ma_set_i32(self.slots, self.count, slot);
+        self.count = self.count + 1;
+    }
+
+    public fn dispose(self) {
+        if (self.values != null) { free(self.values); self.values = null; }
+        if (self.owner_kinds != null) { free(self.owner_kinds); self.owner_kinds = null; }
+        if (self.owner_ids != null) { free(self.owner_ids); self.owner_ids = null; }
+        if (self.slots != null) { free(self.slots); self.slots = null; }
+    }
+}
+
+fn ma_collect_use_edges(m: MirUnit, uses: &mut MirUseEdgeList) -> bool {
+    var id: i32 = 1;
+    while (id <= m.local_count) {
+        if (ma_record_has_id(m.local_record(id), id)) {
+            uses.add(m, m.local_capture_init_value(id), mir_use_owner_local(), id,
+                     mir_use_slot_capture_init());
+        }
+        id = id + 1;
+    }
+    id = 1;
+    while (id <= m.place_count) {
+        if (ma_record_has_id(m.place_record(id), id)) {
+            uses.add(m, m.place_index_value(id), mir_use_owner_place(), id,
+                     mir_use_slot_place_index());
+        }
+        id = id + 1;
+    }
+    id = 1;
+    while (id <= m.value_count) {
+        if (ma_valid_value(m, id)) {
+            uses.add(m, m.value_lhs(id), mir_use_owner_value(), id, mir_use_slot_value_lhs());
+            uses.add(m, m.value_rhs(id), mir_use_owner_value(), id, mir_use_slot_value_rhs());
+            uses.add(m, m.value_aux(id), mir_use_owner_value(), id, mir_use_slot_value_aux());
+            uses.add(m, m.value_first_arg(id), mir_use_owner_value(), id,
+                     mir_use_slot_value_first_arg());
+            uses.add(m, m.value_next_arg(id), mir_use_owner_value(), id,
+                     mir_use_slot_value_next_arg());
+        }
+        id = id + 1;
+    }
+    id = 1;
+    while (id <= m.instr_count) {
+        if (ma_record_has_id(m.instr_record(id), id)
+            && !mir_unit_instr_owner_is_removed(&m,  id)) {
+            uses.add(m, m.instr_value(id), mir_use_owner_instr(), id, mir_use_slot_instr_value());
+            uses.add(m, m.instr_lhs(id), mir_use_owner_instr(), id, mir_use_slot_instr_lhs());
+            uses.add(m, m.instr_rhs(id), mir_use_owner_instr(), id, mir_use_slot_instr_rhs());
+        }
+        id = id + 1;
+    }
+    id = 1;
+    while (id <= m.block_count) {
+        if (ma_valid_block(m, id)) {
+            uses.add(m, m.block_term_value(id), mir_use_owner_block(), id,
+                     mir_use_slot_term_value());
+        }
+        id = id + 1;
+    }
+    id = 1;
+    while (id <= m.case_count) {
+        if (ma_record_has_id(m.case_record(id), id)
+            && mir_unit_case_is_active(&m,  id)) {
+            uses.add(m, m.case_pattern_value(id), mir_use_owner_case(), id,
+                     mir_use_slot_case_pattern());
+            uses.add(m, m.case_guard_value(id), mir_use_owner_case(), id,
+                     mir_use_slot_case_guard());
+        }
+        id = id + 1;
+    }
+    return !uses.failed;
+}
+
+public class MirLocalStorageEscapeFacts {
+    public local_count: i32
+    public instr_count: i32
+    public flags: rawptr
+    public live_counts: rawptr
+    public live_instrs: rawptr
+    public dead_offsets: rawptr
+    public dead_instrs: rawptr
+    public dead_total: i32
+    public cfg_intervals: rawptr
+    public cfg_barriers: rawptr
+    public ok: bool
+    public error_message: string
+
+    public static fn create(m: MirUnit) -> MirLocalStorageEscapeFacts {
+        let capacity64 = (m.local_count as i64) + 2;
+        if (m.local_count < 0 || capacity64 < 1 || capacity64 > ma_local_facts_max_cells()) {
+            return MirLocalStorageEscapeFacts {
+                local_count: m.local_count,
+                instr_count: m.instr_count,
+                flags: null,
+                live_counts: null,
+                live_instrs: null,
+                dead_offsets: null,
+                dead_instrs: null,
+                dead_total: 0,
+                cfg_intervals: null,
+                cfg_barriers: null,
+                ok: false,
+                error_message: "local storage/escape facts local capacity exceeds 2000000 cells"
+            };
+        }
+        let capacity = capacity64 as i32;
+        var out = MirLocalStorageEscapeFacts {
+            local_count: m.local_count,
+            instr_count: m.instr_count,
+            flags: ma_alloc_i32(capacity),
+            live_counts: ma_alloc_i32(capacity),
+            live_instrs: ma_alloc_i32(capacity),
+            dead_offsets: null,
+            dead_instrs: null,
+            dead_total: 0,
+            cfg_intervals: null,
+            cfg_barriers: null,
+            ok: true,
+            error_message: ""
+        };
+        if (out.flags == null || out.live_counts == null || out.live_instrs == null) {
+            out.ok = false;
+            out.error_message = "cannot allocate local storage/escape fact arrays";
+        }
+        return out;
+    }
+
+    public fn set_error(self, message: string) {
+        if (self.ok) { self.error_message = message; }
+        self.ok = false;
+    }
+
+    public fn dispose(self) {
+        if (self.flags != null) { free(self.flags); self.flags = null; }
+        if (self.live_counts != null) { free(self.live_counts); self.live_counts = null; }
+        if (self.live_instrs != null) { free(self.live_instrs); self.live_instrs = null; }
+        if (self.dead_offsets != null) { free(self.dead_offsets); self.dead_offsets = null; }
+        if (self.dead_instrs != null) { free(self.dead_instrs); self.dead_instrs = null; }
+        if (self.cfg_intervals != null) { free(self.cfg_intervals); self.cfg_intervals = null; }
+        if (self.cfg_barriers != null) { free(self.cfg_barriers); self.cfg_barriers = null; }
+        self.local_count = 0;
+        self.instr_count = 0;
+        self.dead_total = 0;
+        self.ok = false;
+    }
+
+    public fn add_flags(self, local_id: i32, flags_to_add: i32) {
+        if (!self.ok || local_id < 1 || local_id > self.local_count) { return; }
+        ma_set_i32(self.flags, local_id, ma_get_i32(self.flags, local_id) | flags_to_add);
+    }
+
+    public fn flags_for(self, local_id: i32) -> i32 {
+        if (!self.ok || local_id < 1 || local_id > self.local_count) { return 0; }
+        return ma_get_i32(self.flags, local_id);
+    }
+
+    public fn live_count_for(self, local_id: i32) -> i32 {
+        if (!self.ok || local_id < 1 || local_id > self.local_count) { return 0; }
+        return ma_get_i32(self.live_counts, local_id);
+    }
+
+    public fn first_live_for(self, local_id: i32) -> i32 {
+        if (!self.ok || local_id < 1 || local_id > self.local_count) { return mir_id_invalid(); }
+        return ma_get_i32(self.live_instrs, local_id);
+    }
+
+    public fn dead_count_for(self, local_id: i32) -> i32 {
+        if (!self.ok || local_id < 1 || local_id > self.local_count || self.dead_offsets == null) { return 0; }
+        return ma_get_i32(self.dead_offsets, local_id + 1)
+            - ma_get_i32(self.dead_offsets, local_id);
+    }
+
+    public fn dead_at(self, local_id: i32, ordinal: i32) -> i32 {
+        let count = self.dead_count_for(local_id);
+        if (ordinal < 0 || ordinal >= count || self.dead_instrs == null) { return mir_id_invalid(); }
+        return ma_get_i32(self.dead_instrs,
+                          ma_get_i32(self.dead_offsets, local_id) + ordinal);
+    }
+
+    public fn interval_kind_for(self, local_id: i32) -> i32 {
+        let live_count = self.live_count_for(local_id);
+        let dead_count = self.dead_count_for(local_id);
+        if (live_count == 0 && dead_count == 0) { return mir_local_storage_interval_none(); }
+        if (live_count == 1 && dead_count == 0) { return mir_local_storage_interval_single_open(); }
+        if (live_count == 1 && dead_count > 0) { return mir_local_storage_interval_single_live_path_ends(); }
+        return mir_local_storage_interval_multi_or_malformed();
+    }
+
+    // CFG-only arrays are deferred until after the StorageDead CSR has been
+    // materialized. That keeps the L0 materialization peak bounded and means
+    // a failed audit never leaves partially initialized CFG facts behind.
+    public fn prepare_cfg_storage(self) -> bool {
+        if (!self.ok) { return false; }
+        if (self.cfg_intervals != null && self.cfg_barriers != null) { return true; }
+        if (self.cfg_intervals != null) { free(self.cfg_intervals); self.cfg_intervals = null; }
+        if (self.cfg_barriers != null) { free(self.cfg_barriers); self.cfg_barriers = null; }
+        let capacity64 = (self.local_count as i64) + 2;
+        if (capacity64 < 1 || capacity64 > ma_local_facts_max_cells()) {
+            self.set_error("CFG local fact capacity exceeds 2000000 cells");
+            return false;
+        }
+        let capacity = capacity64 as i32;
+        self.cfg_intervals = ma_alloc_i32(capacity);
+        self.cfg_barriers = ma_alloc_i32(capacity);
+        if (self.cfg_intervals == null || self.cfg_barriers == null) {
+            if (self.cfg_intervals != null) { free(self.cfg_intervals); self.cfg_intervals = null; }
+            if (self.cfg_barriers != null) { free(self.cfg_barriers); self.cfg_barriers = null; }
+            self.set_error("cannot allocate CFG local fact arrays");
+            return false;
+        }
+        return true;
+    }
+
+    public fn cfg_interval_for(self, local_id: i32) -> i32 {
+        if (!self.ok || local_id < 1 || local_id > self.local_count) {
+            return mir_local_cfg_interval_none();
+        }
+        return ma_get_i32(self.cfg_intervals, local_id);
+    }
+
+    public fn add_cfg_barrier(self, local_id: i32) {
+        if (!self.ok || local_id < 1 || local_id > self.local_count) { return; }
+        ma_set_i32(self.cfg_barriers, local_id, 1);
+    }
+
+    public fn has_cfg_barrier(self, local_id: i32) -> bool {
+        if (!self.ok || local_id < 1 || local_id > self.local_count) { return true; }
+        return ma_get_i32(self.cfg_barriers, local_id) != 0;
+    }
+}
+
+fn ma_type_is_indirect_base(m: MirUnit, type_id: i32) -> bool {
+    if (type_id == mir_id_invalid()) { return true; }
+    let kind = hir_type_table_kind(m.types, type_id);
+    if (kind == ty_CLASS()) {
+        return (hir_type_table_flags(m.types, type_id) & hir_type_flag_value_struct()) == 0;
+    }
+    return kind == ty_RAWPTR()
+        || kind == ty_PTR()
+        || kind == ty_REF()
+        || kind == ty_MUTREF();
+}
+
+fn ma_pointer_value_local(m: MirUnit, value_id: i32, depth: i32) -> i32 {
+    if (!ma_valid_value(m, value_id) || depth > 16) { return mir_id_invalid(); }
+    let kind = m.value_kind(value_id);
+    if (kind == mir_value_read_place()) {
+        let place = m.value_place(value_id);
+        if (ma_valid_place(m, place) && m.place_kind(place) == mir_place_local()) {
+            let local_id = m.place_local(place);
+            if (ma_valid_local(m, local_id)) { return local_id; }
+        }
+        return mir_id_invalid();
+    }
+    if (kind == mir_value_cast() || kind == mir_value_arg()) {
+        return ma_pointer_value_local(m, m.value_lhs(value_id), depth + 1);
+    }
+    return mir_id_invalid();
+}
+
+fn ma_address_place_local(m: MirUnit, place_id: i32, depth: i32) -> i32 {
+    if (!ma_valid_place(m, place_id) || depth > 16) { return mir_id_invalid(); }
+    let kind = m.place_kind(place_id);
+    if (kind == mir_place_local()) {
+        let local_id = m.place_local(place_id);
+        if (ma_valid_local(m, local_id)) { return local_id; }
+        return mir_id_invalid();
+    }
+    if (kind == mir_place_field() || kind == mir_place_index()) {
+        return ma_address_place_local(m, m.place_base(place_id), depth + 1);
+    }
+    if (kind == mir_place_deref()) {
+        return ma_pointer_value_local(m, m.place_index_value(place_id), depth + 1);
+    }
+    return mir_id_invalid();
+}
+
+// 1=direct local storage, 2=direct aggregate/array storage, 3=unknown
+// indirection. The caller only records a fact when a root local is known.
+fn ma_address_place_mode(m: MirUnit, place_id: i32, depth: i32) -> i32 {
+    if (!ma_valid_place(m, place_id) || depth > 16) { return 3; }
+    let kind = m.place_kind(place_id);
+    if (kind == mir_place_local()) { return 1; }
+    if (kind == mir_place_deref()) { return 3; }
+    if (kind == mir_place_field() || kind == mir_place_index()) {
+        let base = m.place_base(place_id);
+        if (!ma_valid_place(m, base) || ma_type_is_indirect_base(m, m.place_type(base))) { return 3; }
+        let base_mode = ma_address_place_mode(m, base, depth + 1);
+        if (base_mode == 3) { return 3; }
+        return 2;
+    }
+    return 3;
+}
+
+fn ma_mark_address_place(m: MirUnit,
+                         facts: MirLocalStorageEscapeFacts,
+                         place_id: i32,
+                         flow_flags: i32) {
+    let local_id = ma_address_place_local(m, place_id, 0);
+    if (!ma_valid_local(m, local_id)) { return; }
+    let mode = ma_address_place_mode(m, place_id, 0);
+    if (mode == 1) {
+        facts.add_flags(local_id, mir_local_escape_direct_address() | flow_flags);
+    } else if (mode == 2) {
+        facts.add_flags(local_id, mir_local_escape_derived_address() | flow_flags);
+    } else {
+        // A dereference rooted at a known local is still derived from that
+        // local, but its ultimate storage is conservatively unknown.
+        facts.add_flags(local_id, mir_local_escape_derived_address()
+                        | mir_local_escape_unknown_indirection()
+                        | flow_flags);
+    }
+}
+
+fn ma_mark_address_provenance(m: MirUnit,
+                              facts: MirLocalStorageEscapeFacts,
+                              value_id: i32,
+                              flow_flags: i32,
+                              depth: i32) {
+    if (!ma_valid_value(m, value_id) || depth > 24) { return; }
+    let kind = m.value_kind(value_id);
+    if (kind == mir_value_address_of()) {
+        ma_mark_address_place(m, facts, m.value_place(value_id), flow_flags);
+        return;
+    }
+    if (kind == mir_value_cast() || kind == mir_value_arg()) {
+        ma_mark_address_provenance(m, facts, m.value_lhs(value_id), flow_flags, depth + 1);
+        return;
+    }
+    if (kind == mir_value_call()
+        && m.value_target_kind(value_id) == mir_target_builtin()
+        && policy_generic_call_base(m.value_name(value_id).clone()) == "to_rawptr") {
+        ma_mark_address_arg_chain(m, facts, m.value_first_arg(value_id), flow_flags, depth + 1);
+        return;
+    }
+    if (kind == mir_value_target_ref()) {
+        ma_mark_address_provenance(m, facts, m.value_lhs(value_id), flow_flags, depth + 1);
+        return;
+    }
+    if (kind == mir_value_control_result()) {
+        ma_mark_address_provenance(m, facts, m.value_lhs(value_id), flow_flags, depth + 1);
+        ma_mark_address_provenance(m, facts, m.value_rhs(value_id), flow_flags, depth + 1);
+        ma_mark_address_provenance(m, facts, m.value_aux(value_id), flow_flags, depth + 1);
+        return;
+    }
+    if (kind == mir_value_aggregate()) {
+        ma_mark_address_provenance(m, facts, m.value_lhs(value_id), flow_flags, depth + 1);
+        ma_mark_address_provenance(m, facts, m.value_rhs(value_id), flow_flags, depth + 1);
+        ma_mark_address_provenance(m, facts, m.value_aux(value_id), flow_flags, depth + 1);
+        ma_mark_address_arg_chain(m, facts, m.value_first_arg(value_id), flow_flags, depth + 1);
+    }
+}
+
+fn ma_mark_address_arg_chain(m: MirUnit,
+                             facts: MirLocalStorageEscapeFacts,
+                             first_arg: i32,
+                             flow_flags: i32,
+                             depth: i32) {
+    var arg = first_arg;
+    var guard: i32 = 0;
+    while (arg != mir_id_invalid() && guard <= m.value_count) {
+        ma_mark_address_provenance(m, facts, arg, flow_flags, depth + 1);
+        if (!ma_valid_value(m, arg)) { return; }
+        arg = m.value_next_arg(arg);
+        guard = guard + 1;
+    }
+}
+
+fn ma_storage_local_for_instr(m: MirUnit, instr_id: i32) -> i32 {
+    if (instr_id < 1 || instr_id > m.instr_count
+        || !ma_record_has_id(m.instr_record(instr_id), instr_id)
+        || mir_unit_instr_owner_is_removed(&m,  instr_id)) {
+        return mir_id_invalid();
+    }
+    let place_id = m.instr_place(instr_id);
+    if (!ma_valid_place(m, place_id) || m.place_kind(place_id) != mir_place_local()) {
+        return mir_id_invalid();
+    }
+    let local_id = m.place_local(place_id);
+    if (!ma_valid_local(m, local_id)) { return mir_id_invalid(); }
+    return local_id;
+}
+
+fn ma_collect_local_storage_events(m: MirUnit,
+                                   facts: MirLocalStorageEscapeFacts,
+                                   dead_counts: rawptr) -> bool {
+    var instr_id: i32 = 1;
+    while (instr_id <= m.instr_count) {
+        let kind = m.instr_kind(instr_id);
+        if (kind == mir_instr_storage_live() || kind == mir_instr_storage_dead()) {
+            let local_id = ma_storage_local_for_instr(m, instr_id);
+            if (local_id != mir_id_invalid()) {
+                if (kind == mir_instr_storage_live()) {
+                    let prior = ma_get_i32(facts.live_counts, local_id);
+                    ma_set_i32(facts.live_counts, local_id, prior + 1);
+                    if (prior == 0) { ma_set_i32(facts.live_instrs, local_id, instr_id); }
+                } else {
+                    ma_inc_i32(dead_counts, local_id);
+                }
+            }
+        }
+        instr_id = instr_id + 1;
+    }
+    return true;
+}
+
+fn ma_materialize_storage_dead_csr(m: MirUnit,
+                                   facts: &mut MirLocalStorageEscapeFacts,
+                                   dead_counts: rawptr) -> bool {
+    var total: i64 = 0;
+    var local_id: i32 = 1;
+    while (local_id <= facts.local_count) {
+        let count = ma_get_i32(dead_counts, local_id);
+        if (count < 0) {
+            facts.set_error("StorageDead CSR count overflow");
+            return false;
+        }
+        total = total + (count as i64);
+        if (total > ma_local_facts_max_cells()) {
+            facts.set_error("StorageDead CSR total exceeds 2000000 cells");
+            return false;
+        }
+        local_id = local_id + 1;
+    }
+    let capacity64 = (facts.local_count as i64) + 2;
+    // flags/live-counts/live-instrs/dead-counts/unique-defs/offsets/cursor
+    // are all resident while CSR is materialized, followed by dead instr ids.
+    let peak_cells = capacity64 * 7 + total;
+    let peak_bytes = peak_cells * 4;
+    if (capacity64 < 1 || peak_cells < 0 || peak_bytes < 0
+        || peak_bytes > ma_local_facts_max_bytes()) {
+        facts.set_error("StorageDead CSR peak allocation exceeds 64 MiB");
+        return false;
+    }
+    let capacity = capacity64 as i32;
+    let offsets = ma_alloc_i32(capacity);
+    if (offsets == null) {
+        facts.set_error("cannot allocate StorageDead offsets");
+        return false;
+    }
+    local_id = 1;
+    var prefix: i32 = 0;
+    while (local_id <= facts.local_count) {
+        ma_set_i32(offsets, local_id, prefix);
+        prefix = prefix + ma_get_i32(dead_counts, local_id);
+        local_id = local_id + 1;
+    }
+    ma_set_i32(offsets, facts.local_count + 1, total as i32);
+    let instrs = ma_alloc_i32(total as i32);
+    let cursor = ma_alloc_i32(capacity);
+    if (instrs == null || cursor == null) {
+        if (instrs != null) { free(instrs); }
+        if (cursor != null) { free(cursor); }
+        free(offsets);
+        facts.set_error("cannot allocate StorageDead CSR");
+        return false;
+    }
+    local_id = 1;
+    while (local_id <= facts.local_count) {
+        ma_set_i32(cursor, local_id, ma_get_i32(offsets, local_id));
+        local_id = local_id + 1;
+    }
+    var instr_id: i32 = 1;
+    while (instr_id <= m.instr_count) {
+        if (m.instr_kind(instr_id) == mir_instr_storage_dead()) {
+            let local = ma_storage_local_for_instr(m, instr_id);
+            if (local != mir_id_invalid()) {
+                let pos = ma_get_i32(cursor, local);
+                ma_set_i32(instrs, pos, instr_id);
+                ma_set_i32(cursor, local, pos + 1);
+            }
+        }
+        instr_id = instr_id + 1;
+    }
+    free(cursor);
+    facts.dead_offsets = offsets;
+    facts.dead_instrs = instrs;
+    facts.dead_total = total as i32;
+    return true;
+}
+
+// `unique_defs[local]` holds one active direct-local assignment value.  Zero
+// means no definition and -1 means multiple or unusable definitions, so the
+// provenance walk can only cross a local when doing so is conservative.
+fn ma_collect_unique_local_assignments(m: MirUnit, unique_defs: rawptr) {
+    var instr_id: i32 = 1;
+    while (instr_id <= m.instr_count) {
+        if (ma_record_has_id(m.instr_record(instr_id), instr_id)
+            && !mir_unit_instr_owner_is_removed(&m,  instr_id)
+            && m.instr_kind(instr_id) == mir_instr_assign()) {
+            let place_id = m.instr_place(instr_id);
+            if (ma_valid_place(m, place_id) && m.place_kind(place_id) == mir_place_local()) {
+                let local_id = m.place_local(place_id);
+                if (ma_valid_local(m, local_id)) {
+                    let prior = ma_get_i32(unique_defs, local_id);
+                    let value_id = m.instr_value(instr_id);
+                    if (prior == 0 && ma_valid_value(m, value_id)) {
+                        ma_set_i32(unique_defs, local_id, value_id);
+                    } else {
+                        ma_set_i32(unique_defs, local_id, -1);
+                    }
+                }
+            }
+        }
+        instr_id = instr_id + 1;
+    }
+}
+
+// This bounded walk is intentionally used only at assignment and return
+// boundaries. It follows a direct local read only when that local has one
+// active assignment, then delegates ordinary address provenance to the L0
+// tracer. It never treats arbitrary calls as transparent.
+fn ma_mark_local_read_assignment_provenance(m: MirUnit,
+                                            facts: MirLocalStorageEscapeFacts,
+                                            unique_defs: rawptr,
+                                            value_id: i32,
+                                            flow_flags: i32,
+                                            depth: i32) {
+    if (!ma_valid_value(m, value_id) || depth > 24) { return; }
+    let kind = m.value_kind(value_id);
+    if (kind == mir_value_read_place()) {
+        let place_id = m.value_place(value_id);
+        if (ma_valid_place(m, place_id) && m.place_kind(place_id) == mir_place_local()) {
+            let local_id = m.place_local(place_id);
+            if (ma_valid_local(m, local_id)) {
+                let definition = ma_get_i32(unique_defs, local_id);
+                if (definition > 0) {
+                    ma_mark_local_read_assignment_provenance(m,
+                                                              facts,
+                                                              unique_defs,
+                                                              definition,
+                                                              flow_flags,
+                                                              depth + 1);
+                }
+            }
+        }
+        return;
+    }
+    if (kind == mir_value_cast() || kind == mir_value_arg()) {
+        ma_mark_local_read_assignment_provenance(m,
+                                                  facts,
+                                                  unique_defs,
+                                                  m.value_lhs(value_id),
+                                                  flow_flags,
+                                                  depth + 1);
+        return;
+    }
+    ma_mark_address_provenance(m, facts, value_id, flow_flags, depth + 1);
+}
+
+fn ma_collect_local_escape_facts(m: MirUnit,
+                                  facts: MirLocalStorageEscapeFacts,
+                                  unique_defs: rawptr) {
+    var local_id: i32 = 1;
+    while (local_id <= m.local_count) {
+        if (ma_valid_local(m, local_id) && (m.local_flags(local_id) & mir_local_flag_capture()) != 0) {
+            let source = m.local_capture_source(local_id);
+            if (ma_valid_local(m, source)) {
+                var flags = mir_local_escape_capture_barrier();
+                if ((m.local_flags(local_id) & mir_local_flag_reference_capture()) != 0) {
+                    flags = flags | mir_local_escape_reference_capture() | mir_local_escape_may_escape();
+                }
+                facts.add_flags(source, flags);
+            }
+            ma_mark_address_provenance(m,
+                                       facts,
+                                       m.local_capture_init_value(local_id),
+                                       mir_local_escape_capture_barrier() | mir_local_escape_may_escape(),
+                                       0);
+        }
+        local_id = local_id + 1;
+    }
+    var value_id: i32 = 1;
+    while (value_id <= m.value_count) {
+        if (ma_valid_value(m, value_id)) {
+            let kind = m.value_kind(value_id);
+            if (kind == mir_value_address_of()) {
+                ma_mark_address_place(m, facts, m.value_place(value_id), 0);
+            } else if (kind == mir_value_aggregate()) {
+                ma_mark_address_provenance(m,
+                                           facts,
+                                           value_id,
+                                           mir_local_escape_may_escape() | mir_local_escape_via_aggregate(),
+                                           0);
+            } else if (kind == mir_value_call()) {
+                // A method receiver is carried by call.lhs -> target_ref.lhs,
+                // rather than the ordinary first_arg chain.
+                ma_mark_address_provenance(m,
+                                           facts,
+                                           m.value_lhs(value_id),
+                                           mir_local_escape_may_escape() | mir_local_escape_via_call(),
+                                           0);
+                ma_mark_address_arg_chain(m,
+                                          facts,
+                                          m.value_first_arg(value_id),
+                                          mir_local_escape_may_escape() | mir_local_escape_via_call(),
+                                          0);
+            }
+        }
+        value_id = value_id + 1;
+    }
+    var instr_id: i32 = 1;
+    while (instr_id <= m.instr_count) {
+        if (ma_record_has_id(m.instr_record(instr_id), instr_id)
+            && !mir_unit_instr_owner_is_removed(&m,  instr_id)
+            && m.instr_kind(instr_id) == mir_instr_assign()) {
+            ma_mark_local_read_assignment_provenance(m,
+                                                      facts,
+                                                      unique_defs,
+                                                      m.instr_value(instr_id),
+                                                      mir_local_escape_may_escape() | mir_local_escape_via_assignment(),
+                                                      0);
+        }
+        instr_id = instr_id + 1;
+    }
+    var block_id: i32 = 1;
+    while (block_id <= m.block_count) {
+        if (ma_valid_block(m, block_id) && m.block_term_kind(block_id) == mir_term_return()) {
+            ma_mark_local_read_assignment_provenance(m,
+                                                      facts,
+                                                      unique_defs,
+                                                      m.block_term_value(block_id),
+                                                      mir_local_escape_may_escape() | mir_local_escape_via_return(),
+                                                      0);
+        }
+        block_id = block_id + 1;
+    }
+}
+
+// Flow states are local to the CFG audit. Zero means that no executable path
+// has reached the block yet; all other states merge monotonically.
+fn ma_cfg_flow_none() -> i32 { return 0; }
+fn ma_cfg_flow_dead() -> i32 { return 1; }
+fn ma_cfg_flow_live() -> i32 { return 2; }
+fn ma_cfg_flow_conflict() -> i32 { return 3; }
+
+fn ma_cfg_flow_merge(old_state: i32, next_state: i32) -> i32 {
+    if (old_state == ma_cfg_flow_none()) { return next_state; }
+    if (next_state == ma_cfg_flow_none() || old_state == next_state) { return old_state; }
+    return ma_cfg_flow_conflict();
+}
+
+fn ma_cfg_flow_after_event(state: i32, instr_kind: i32) -> i32 {
+    if (state == ma_cfg_flow_conflict()) { return state; }
+    if (instr_kind == mir_instr_storage_live()) {
+        if (state == ma_cfg_flow_dead()) { return ma_cfg_flow_live(); }
+        return ma_cfg_flow_conflict();
+    }
+    if (instr_kind == mir_instr_storage_dead()) {
+        if (state == ma_cfg_flow_live()) { return ma_cfg_flow_dead(); }
+        return ma_cfg_flow_conflict();
+    }
+    return state;
+}
+
+fn ma_cfg_direct_local_place(m: MirUnit, local_id: i32) -> bool {
+    if (!ma_valid_local(m, local_id)) { return false; }
+    let place_id = m.local_place(local_id);
+    return ma_valid_place(m, place_id)
+        && m.place_kind(place_id) == mir_place_local()
+        && m.place_local(place_id) == local_id
+        && m.place_function(place_id) == m.local_function(local_id)
+        && m.place_type(place_id) == m.local_type(local_id);
+}
+
+// Transport barriers need the root local even for deeply nested field/index
+// places. The L0 address resolver deliberately has a short recursion cap;
+// using it here would silently turn a deep by-value transport into `closed`.
+// This walk is iterative and only rejects malformed/cyclic place chains.
+fn ma_mark_transport_read_place(m: MirUnit,
+                                facts: MirLocalStorageEscapeFacts,
+                                unique_defs: rawptr,
+                                seen_values: rawptr,
+                                place_id: i32,
+                                depth: i32) -> bool {
+    var current_place = place_id;
+    var guard: i32 = 0;
+    while (true) {
+        if (!ma_valid_place(m, current_place)) {
+            facts.set_error("invalid place in CFG local transport audit");
+            return false;
+        }
+        let kind = m.place_kind(current_place);
+        if (kind == mir_place_local()) {
+            let local_id = m.place_local(current_place);
+            if (!ma_valid_local(m, local_id)) {
+                facts.set_error("invalid local place in CFG local transport audit");
+                return false;
+            }
+            facts.add_cfg_barrier(local_id);
+            let definition = ma_get_i32(unique_defs, local_id);
+            if (definition > 0) {
+                return ma_mark_value_local_reads(m,
+                                                 facts,
+                                                 unique_defs,
+                                                 seen_values,
+                                                 definition,
+                                                 depth + 1);
+            }
+            return true;
+        }
+        if (kind == mir_place_field() || kind == mir_place_index()) {
+            current_place = m.place_base(current_place);
+            guard = guard + 1;
+            if (guard > m.place_count + 1) {
+                facts.set_error("cyclic place chain in CFG local transport audit");
+                return false;
+            }
+            continue;
+        }
+        if (kind == mir_place_deref()) {
+            return ma_mark_value_local_reads(m,
+                                             facts,
+                                             unique_defs,
+                                             seen_values,
+                                             m.place_index_value(current_place),
+                                             depth + 1);
+        }
+        return true;
+    }
+}
+
+fn ma_mark_value_local_reads(m: MirUnit,
+                             facts: MirLocalStorageEscapeFacts,
+                             unique_defs: rawptr,
+                             seen_values: rawptr,
+                             value_id: i32,
+                             depth: i32) -> bool {
+    if (value_id == mir_id_invalid()) { return true; }
+    if (!ma_valid_value(m, value_id)) {
+        facts.set_error("invalid value in CFG local transport audit");
+        return false;
+    }
+    // The work is rooted at every call, aggregate, and return. A shared
+    // expression DAG must only be walked once; otherwise nested aggregates
+    // can make this audit exponential on selfhost input.
+    if (ma_get_i32(seen_values, value_id) != 0) { return true; }
+    ma_set_i32(seen_values, value_id, 1);
+    if (depth > 24) {
+        facts.set_error("CFG local transport audit value depth exceeds 24");
+        return false;
+    }
+    if (m.value_kind(value_id) == mir_value_read_place()) {
+        return ma_mark_transport_read_place(m,
+                                            facts,
+                                            unique_defs,
+                                            seen_values,
+                                            m.value_place(value_id),
+                                            depth);
+    }
+    if (!ma_mark_value_local_reads(m,
+                                   facts,
+                                   unique_defs,
+                                   seen_values,
+                                   m.value_lhs(value_id),
+                                   depth + 1)
+        || !ma_mark_value_local_reads(m,
+                                      facts,
+                                      unique_defs,
+                                      seen_values,
+                                      m.value_rhs(value_id),
+                                      depth + 1)
+        || !ma_mark_value_local_reads(m,
+                                      facts,
+                                      unique_defs,
+                                      seen_values,
+                                      m.value_aux(value_id),
+                                      depth + 1)) {
+        return false;
+    }
+    var arg_id = m.value_first_arg(value_id);
+    var guard: i32 = 0;
+    while (arg_id != mir_id_invalid() && guard <= m.value_count) {
+        if (!ma_mark_value_local_reads(m,
+                                       facts,
+                                       unique_defs,
+                                       seen_values,
+                                       arg_id,
+                                       depth + 1)) {
+            return false;
+        }
+        arg_id = m.value_next_arg(arg_id);
+        guard = guard + 1;
+    }
+    if (guard > m.value_count) {
+        facts.set_error("cyclic value argument chain in CFG local transport audit");
+        return false;
+    }
+    return true;
+}
+
+// A single scan records L1 transport barriers. This deliberately treats even
+// by-value calls/returns as barriers: the audit is a future-proof proof input,
+// not a claim that scalar transport is harmless for lifetime optimization.
+fn ma_collect_cfg_barriers(m: MirUnit,
+                           facts: MirLocalStorageEscapeFacts,
+                           unique_defs: rawptr) -> bool {
+    let value_capacity64 = (m.value_count as i64) + 2;
+    let local_capacity64 = (facts.local_count as i64) + 2;
+    let peak_cells = local_capacity64 * 7 + (facts.dead_total as i64) + value_capacity64;
+    if (m.value_count < 0 || value_capacity64 < 1 || value_capacity64 > ma_local_facts_max_cells()
+        || peak_cells < 0 || peak_cells > ma_local_facts_max_bytes() / 4) {
+        facts.set_error("CFG local transport audit memory budget exceeded");
+        return false;
+    }
+    let seen_values = ma_alloc_i32(value_capacity64 as i32);
+    if (seen_values == null) {
+        facts.set_error("cannot allocate CFG local transport audit scratch");
+        return false;
+    }
+    var instr_id: i32 = 1;
+    while (instr_id <= m.instr_count) {
+        if (ma_record_has_id(m.instr_record(instr_id), instr_id)
+            && !mir_unit_instr_owner_is_removed(&m,  instr_id)
+            && m.instr_kind(instr_id) == mir_instr_drop()) {
+            facts.add_cfg_barrier(ma_address_place_local(m, m.instr_place(instr_id), 0));
+        }
+        instr_id = instr_id + 1;
+    }
+    var value_id: i32 = 1;
+    while (value_id <= m.value_count) {
+        if (ma_valid_value(m, value_id)) {
+            let kind = m.value_kind(value_id);
+            if (kind == mir_value_call() || kind == mir_value_aggregate()) {
+                if (!ma_mark_value_local_reads(m,
+                                               facts,
+                                               unique_defs,
+                                               seen_values,
+                                               value_id,
+                                               0)) {
+                    free(seen_values);
+                    return false;
+                }
+            }
+        }
+        value_id = value_id + 1;
+    }
+    var block_id: i32 = 1;
+    while (block_id <= m.block_count) {
+        if (ma_valid_block(m, block_id) && m.block_term_kind(block_id) == mir_term_return()) {
+            if (!ma_mark_value_local_reads(m,
+                                           facts,
+                                           unique_defs,
+                                           seen_values,
+                                           m.block_term_value(block_id),
+                                           0)) {
+                free(seen_values);
+                return false;
+            }
+        }
+        block_id = block_id + 1;
+    }
+    free(seen_values);
+    return true;
+}
+
+fn ma_cfg_local_is_candidate(m: MirUnit,
+                             facts: MirLocalStorageEscapeFacts,
+                             local_id: i32) -> bool {
+    if (!ma_valid_local(m, local_id)) { return false; }
+    let live_count = facts.live_count_for(local_id);
+    let dead_count = facts.dead_count_for(local_id);
+    if (live_count == 0 && dead_count == 0) {
+        ma_set_i32(facts.cfg_intervals, local_id, mir_local_cfg_interval_none());
+        return false;
+    }
+    if (live_count != 1 || dead_count < 1) {
+        ma_set_i32(facts.cfg_intervals, local_id, mir_local_cfg_interval_conflict());
+        return false;
+    }
+    let local_flags = m.local_flags(local_id);
+    if (!ma_cfg_direct_local_place(m, local_id)
+        || facts.flags_for(local_id) != 0
+        || (local_flags & mir_local_flag_param()) != 0
+        || (local_flags & mir_local_flag_capture()) != 0
+        || (local_flags & mir_local_flag_reference_capture()) != 0
+        || (local_flags & mir_local_flag_auto_drop()) != 0
+        || (local_flags & mir_local_flag_move_arg()) != 0
+        || (local_flags & mir_local_flag_self_receiver()) != 0
+        || (local_flags & mir_local_flag_if_expr_result()) != 0
+        || facts.has_cfg_barrier(local_id)) {
+        ma_set_i32(facts.cfg_intervals, local_id, mir_local_cfg_interval_barrier());
+        return false;
+    }
+    return true;
+}
+
+fn ma_cfg_function_block_count(m: MirUnit, function_id: i32) -> i32 {
+    var count: i32 = 0;
+    var block_id = m.function_first_block(function_id);
+    var guard: i32 = 0;
+    while (block_id != mir_id_invalid()) {
+        if (!ma_valid_block(m, block_id) || m.block_function(block_id) != function_id) { return -1; }
+        count = count + 1;
+        guard = guard + 1;
+        if (guard > m.block_count + 1) { return -1; }
+        block_id = m.block_next(block_id);
+    }
+    return count;
+}
+
+// The local state table is sized by blocks, but each candidate also scans the
+// block instruction chains and outgoing CFG edges. Keep that actual work
+// bounded as well, otherwise one huge block can evade a block-only budget.
+fn ma_cfg_function_work_units(m: MirUnit, function_id: i32) -> i64 {
+    var units: i64 = 0;
+    var block_id = m.function_first_block(function_id);
+    var block_guard: i32 = 0;
+    while (block_id != mir_id_invalid()) {
+        if (!ma_valid_block(m, block_id) || m.block_function(block_id) != function_id) {
+            return -1;
+        }
+        units = units + 1;
+        var instr_id = m.block_first_instr(block_id);
+        var instr_guard: i32 = 0;
+        while (instr_id != mir_id_invalid()) {
+            if (!ma_record_has_id(m.instr_record(instr_id), instr_id)
+                || m.instr_block(instr_id) != block_id) {
+                return -1;
+            }
+            units = units + 1;
+            instr_id = m.instr_next(instr_id);
+            instr_guard = instr_guard + 1;
+            if (instr_guard > m.instr_count + 1) { return -1; }
+        }
+        let term = m.block_term_kind(block_id);
+        if (term == mir_term_goto()) {
+            units = units + 1;
+        } else if (term == mir_term_branch() || term == mir_term_foreach_next()) {
+            units = units + 2;
+        } else if (term == mir_term_match()) {
+            var case_id = m.block_term_first_case(block_id);
+            var case_guard: i32 = 0;
+            while (case_id != mir_id_invalid()) {
+                if (case_id < 1 || case_id > m.case_count
+                    || !ma_record_has_id(m.case_record(case_id), case_id)) {
+                    return -1;
+                }
+                units = units + 1;
+                case_id = m.case_next(case_id);
+                case_guard = case_guard + 1;
+                if (case_guard > m.case_count + 1) { return -1; }
+            }
+            if (m.block_term_false(block_id) != mir_id_invalid()) { units = units + 1; }
+        }
+        if (units < 0) { return -1; }
+        block_id = m.block_next(block_id);
+        block_guard = block_guard + 1;
+        if (block_guard > m.block_count + 1) { return -1; }
+    }
+    return units;
+}
+
+// The audit keeps state by a function-local block ordinal. This is important:
+// allocating four `m.block_count` arrays for every candidate local was both
+// needlessly quadratic for many small functions and outside its own budget.
+class MirLocalCfgFunctionScratch {
+    public function_id: i32
+    public block_count: i32
+    public block_ids: rawptr
+    public block_slots: rawptr
+    public in_states: rawptr
+    public out_states: rawptr
+    public queued: rawptr
+    public worklist: rawptr
+
+    public static fn create(function_id: i32,
+                            block_count: i32,
+                            block_slots: rawptr) -> MirLocalCfgFunctionScratch {
+        return MirLocalCfgFunctionScratch {
+            function_id: function_id,
+            block_count: block_count,
+            block_ids: ma_alloc_i32(block_count),
+            block_slots: block_slots,
+            in_states: ma_alloc_i32(block_count),
+            out_states: ma_alloc_i32(block_count),
+            queued: ma_alloc_i32(block_count),
+            worklist: ma_alloc_i32(block_count)
+        };
+    }
+
+    public fn storage_ok(self) -> bool {
+        return self.block_count > 0 && self.block_ids != null && self.block_slots != null
+            && self.in_states != null && self.out_states != null && self.queued != null
+            && self.worklist != null;
+    }
+
+    public fn dispose(self) {
+        if (self.block_ids != null) { free(self.block_ids); self.block_ids = null; }
+        if (self.in_states != null) { free(self.in_states); self.in_states = null; }
+        if (self.out_states != null) { free(self.out_states); self.out_states = null; }
+        if (self.queued != null) { free(self.queued); self.queued = null; }
+        if (self.worklist != null) { free(self.worklist); self.worklist = null; }
+        self.block_slots = null;
+        self.block_count = 0;
+    }
+
+    public fn index_blocks(self, m: MirUnit) -> bool {
+        var ordinal: i32 = 0;
+        var block_id = m.function_first_block(self.function_id);
+        while (block_id != mir_id_invalid() && ordinal < self.block_count) {
+            if (!ma_valid_block(m, block_id) || m.block_function(block_id) != self.function_id) {
+                return false;
+            }
+            ma_set_i32(self.block_ids, ordinal, block_id);
+            ma_set_i32(self.block_slots, block_id, ordinal + 1);
+            ordinal = ordinal + 1;
+            block_id = m.block_next(block_id);
+        }
+        return ordinal == self.block_count && block_id == mir_id_invalid();
+    }
+
+    public fn reset_states(self) {
+        let bytes = ((self.block_count as i64) * 4) as u64;
+        memset(self.in_states, 0, bytes);
+        memset(self.out_states, 0, bytes);
+        memset(self.queued, 0, bytes);
+    }
+
+    public fn ordinal_for(self, block_id: i32) -> i32 {
+        let ordinal = ma_get_i32(self.block_slots, block_id) - 1;
+        if (ordinal < 0 || ordinal >= self.block_count
+            || ma_get_i32(self.block_ids, ordinal) != block_id) {
+            return -1;
+        }
+        return ordinal;
+    }
+}
+
+fn ma_cfg_fact_resident_cells(facts: MirLocalStorageEscapeFacts) -> i64 {
+    // flags/live-counts/live-instrs/dead-offsets/cfg-intervals/cfg-barriers
+    return ((facts.local_count as i64) + 2) * 6 + (facts.dead_total as i64);
+}
+
+fn ma_cfg_cache_build_peak_cells(m: MirUnit) -> i64 {
+    if (m.block_count < 0 || m.case_count < 0) { return -1; }
+    let block_capacity = (m.block_count as i64) + 2;
+    let edge_capacity = (m.block_count as i64) * 2 + (m.case_count as i64) + 1;
+    if (block_capacity < 1 || edge_capacity < 1) { return -1; }
+    // MirCfgEdgeList (2E+B) plus CFG CSR construction (2E+6B).
+    return edge_capacity * 4 + block_capacity * 7;
+}
+
+fn ma_cfg_cache_resident_cells(m: MirUnit, cache: MirAnalysisCache) -> i64 {
+    if (m.block_count < 0 || cache.cfg_edge_count < 0) { return -1; }
+    return ((m.block_count as i64) + 2) * 2 + (cache.cfg_edge_count as i64) * 2;
+}
+
+fn ma_cfg_analyze_local(m: MirUnit,
+                        cache: MirAnalysisCache,
+                        facts: MirLocalStorageEscapeFacts,
+                        scratch: MirLocalCfgFunctionScratch,
+                        local_id: i32) -> bool {
+    let function_id = m.local_function(local_id);
+    let entry_ordinal = scratch.ordinal_for(m.function_first_block(function_id));
+    if (function_id != scratch.function_id || entry_ordinal < 0) {
+        facts.set_error("CFG storage-state function scratch is invalid");
+        return false;
+    }
+    scratch.reset_states();
+    ma_set_i32(scratch.in_states, entry_ordinal, ma_cfg_flow_dead());
+    ma_set_i32(scratch.queued, entry_ordinal, 1);
+    ma_set_i32(scratch.worklist, 0, entry_ordinal);
+    var work_count: i32 = 1;
+    var steps: i64 = 0;
+    let step_limit = ((scratch.block_count as i64) * 4) + 8;
+    var saw_conflict = false;
+    var saw_live_exit = false;
+    while (work_count > 0) {
+        work_count = work_count - 1;
+        let block_ordinal = ma_get_i32(scratch.worklist, work_count);
+        ma_set_i32(scratch.queued, block_ordinal, 0);
+        if (block_ordinal < 0 || block_ordinal >= scratch.block_count) {
+            saw_conflict = true;
+            continue;
+        }
+        let block_id = ma_get_i32(scratch.block_ids, block_ordinal);
+        if (!ma_valid_block(m, block_id) || m.block_function(block_id) != function_id) {
+            saw_conflict = true;
+            continue;
+        }
+        var state = ma_get_i32(scratch.in_states, block_ordinal);
+        var instr_id = m.block_first_instr(block_id);
+        var instr_guard: i32 = 0;
+        while (instr_id != mir_id_invalid()) {
+            if (!ma_record_has_id(m.instr_record(instr_id), instr_id)
+                || m.instr_block(instr_id) != block_id) {
+                saw_conflict = true;
+                break;
+            }
+            let instr_kind = m.instr_kind(instr_id);
+            if ((instr_kind == mir_instr_storage_live() || instr_kind == mir_instr_storage_dead())
+                && ma_storage_local_for_instr(m, instr_id) == local_id) {
+                state = ma_cfg_flow_after_event(state, instr_kind);
+            }
+            instr_id = m.instr_next(instr_id);
+            instr_guard = instr_guard + 1;
+            if (instr_guard > m.instr_count + 1) {
+                saw_conflict = true;
+                break;
+            }
+        }
+        if (state == ma_cfg_flow_conflict()) { saw_conflict = true; }
+        let old_out = ma_get_i32(scratch.out_states, block_ordinal);
+        let merged_out = ma_cfg_flow_merge(old_out, state);
+        if (merged_out != old_out) { ma_set_i32(scratch.out_states, block_ordinal, merged_out); }
+        let succ_count = cache.cfg_successor_count(block_id);
+        if (succ_count == 0 && (merged_out == ma_cfg_flow_live()
+            || merged_out == ma_cfg_flow_conflict())) {
+            if (merged_out == ma_cfg_flow_live()) { saw_live_exit = true; }
+            if (merged_out == ma_cfg_flow_conflict()) { saw_conflict = true; }
+        }
+        var succ_ordinal: i32 = 0;
+        while (succ_ordinal < succ_count) {
+            let successor = cache.cfg_successor_at(block_id, succ_ordinal);
+            let successor_ordinal = scratch.ordinal_for(successor);
+            if (!ma_valid_block(m, successor) || m.block_function(successor) != function_id
+                || successor_ordinal < 0) {
+                saw_conflict = true;
+            } else {
+                let old_in = ma_get_i32(scratch.in_states, successor_ordinal);
+                let merged_in = ma_cfg_flow_merge(old_in, merged_out);
+                if (merged_in != old_in) {
+                    ma_set_i32(scratch.in_states, successor_ordinal, merged_in);
+                    if (ma_get_i32(scratch.queued, successor_ordinal) == 0) {
+                        if (work_count >= scratch.block_count) {
+                            saw_conflict = true;
+                        } else {
+                            ma_set_i32(scratch.queued, successor_ordinal, 1);
+                            ma_set_i32(scratch.worklist, work_count, successor_ordinal);
+                            work_count = work_count + 1;
+                        }
+                    }
+                }
+            }
+            succ_ordinal = succ_ordinal + 1;
+        }
+        steps = steps + 1;
+        if (steps > step_limit) { saw_conflict = true; break; }
+    }
+    if (saw_conflict) {
+        ma_set_i32(facts.cfg_intervals, local_id, mir_local_cfg_interval_conflict());
+    } else if (saw_live_exit) {
+        ma_set_i32(facts.cfg_intervals, local_id, mir_local_cfg_interval_open_exit());
+    } else {
+        ma_set_i32(facts.cfg_intervals, local_id, mir_local_cfg_interval_closed());
+    }
+    return true;
+}
+
+fn ma_analyze_cfg_storage_intervals(m: MirUnit,
+                                    cache: MirAnalysisCache,
+                                    facts: MirLocalStorageEscapeFacts) -> bool {
+    var function_id: i32 = 1;
+    var total_cells: i64 = 0;
+    var total_work_units: i64 = 0;
+    var has_candidates = false;
+    while (function_id <= m.function_count) {
+        if (m.function_record(function_id) != null) {
+            var candidates: i32 = 0;
+            var local_id = m.function_first_local(function_id);
+            var local_guard: i32 = 0;
+            while (local_id != mir_id_invalid()) {
+                if (!ma_valid_local(m, local_id) || m.local_function(local_id) != function_id) {
+                    facts.set_error("invalid function local chain in local storage-state analysis");
+                    return false;
+                }
+                if (ma_cfg_local_is_candidate(m, facts, local_id)) { candidates = candidates + 1; }
+                local_id = m.local_next(local_id);
+                local_guard = local_guard + 1;
+                if (local_guard > m.local_count + 1) {
+                    facts.set_error("cyclic function local chain in local storage-state analysis");
+                    return false;
+                }
+            }
+            if (candidates == 0) {
+                function_id = function_id + 1;
+                continue;
+            }
+            has_candidates = true;
+            let block_count = ma_cfg_function_block_count(m, function_id);
+            let work_units = ma_cfg_function_work_units(m, function_id);
+            if (block_count < 0 || work_units < 0) {
+                facts.set_error("invalid function CFG/instruction chain in local storage-state analysis");
+                return false;
+            }
+            total_cells = total_cells + (block_count as i64) * (candidates as i64);
+            if (total_cells < 0 || total_cells > ma_local_facts_max_cells()) {
+                facts.set_error("CFG storage-state analysis exceeds 2000000 cells");
+                return false;
+            }
+            // A block can be revisited as its monotone state moves through
+            // none/dead-or-live/conflict. Four visits safely covers that
+            // lattice and keeps the preflight independent from cache layout.
+            let work_limit = ma_local_facts_max_cells();
+            if (candidates > 0 && work_units < 1) {
+                facts.set_error("candidate local has no CFG work units");
+                return false;
+            }
+            if (candidates > 0 && (work_units > work_limit / 4
+                || (candidates as i64) > work_limit / (work_units * 4))) {
+                facts.set_error("CFG storage-state instruction/edge work exceeds 2000000 units");
+                return false;
+            }
+            let function_work_units = work_units * (candidates as i64) * 4;
+            if (total_work_units > work_limit - function_work_units) {
+                facts.set_error("CFG storage-state instruction/edge work exceeds 2000000 units");
+                return false;
+            }
+            total_work_units = total_work_units + function_work_units;
+        }
+        function_id = function_id + 1;
+    }
+    if (!has_candidates) { return true; }
+
+    let fact_cells = ma_cfg_fact_resident_cells(facts);
+    let cfg_build_cells = ma_cfg_cache_build_peak_cells(m);
+    let audit_cell_limit = ma_local_facts_max_bytes() / 4;
+    if (fact_cells < 0 || cfg_build_cells < 0 || fact_cells + cfg_build_cells > audit_cell_limit) {
+        facts.set_error("CFG storage-state cache build exceeds 64 MiB audit budget");
+        return false;
+    }
+    if (!cache.ensure(m, mir_analysis_cfg())) {
+        facts.set_error("cannot build CFG for local storage-state analysis: " + cache.error_message);
+        return false;
+    }
+    let block_slots_capacity64 = (m.block_count as i64) + 2;
+    let cache_cells = ma_cfg_cache_resident_cells(m, cache);
+    if (block_slots_capacity64 < 1 || block_slots_capacity64 > ma_local_facts_max_cells()
+        || cache_cells < 0) {
+        facts.set_error("CFG storage-state block slot capacity is invalid");
+        return false;
+    }
+    let block_slots = ma_alloc_i32(block_slots_capacity64 as i32);
+    if (block_slots == null) {
+        facts.set_error("cannot allocate CFG storage-state block slots");
+        return false;
+    }
+
+    function_id = 1;
+    while (function_id <= m.function_count) {
+        if (m.function_record(function_id) != null) {
+            let block_count = ma_cfg_function_block_count(m, function_id);
+            if (block_count < 0) {
+                free(block_slots);
+                facts.set_error("invalid function block chain in CFG storage-state analysis");
+                return false;
+            }
+            var has_function_candidate = false;
+            var local_id2 = m.function_first_local(function_id);
+            var local_guard2: i32 = 0;
+            while (local_id2 != mir_id_invalid()) {
+                if (!ma_valid_local(m, local_id2) || m.local_function(local_id2) != function_id) {
+                    free(block_slots);
+                    facts.set_error("invalid function local chain in CFG storage-state analysis");
+                    return false;
+                }
+                if (ma_cfg_local_is_candidate(m, facts, local_id2)) { has_function_candidate = true; }
+                local_id2 = m.local_next(local_id2);
+                local_guard2 = local_guard2 + 1;
+                if (local_guard2 > m.local_count + 1) {
+                    free(block_slots);
+                    facts.set_error("cyclic function local chain in CFG storage-state analysis");
+                    return false;
+                }
+            }
+            if (has_function_candidate) {
+                let phase_cells = fact_cells + cache_cells + block_slots_capacity64
+                    + (block_count as i64) * 5;
+                if (block_count <= 0 || phase_cells < 0 || phase_cells > audit_cell_limit) {
+                    free(block_slots);
+                    facts.set_error("CFG storage-state function scratch exceeds 64 MiB audit budget");
+                    return false;
+                }
+                let scratch = MirLocalCfgFunctionScratch.create(function_id, block_count, block_slots);
+                if (!scratch.storage_ok() || !scratch.index_blocks(m)) {
+                    scratch.dispose();
+                    free(block_slots);
+                    facts.set_error("cannot initialize CFG storage-state function scratch");
+                    return false;
+                }
+                var local_id3 = m.function_first_local(function_id);
+                var local_guard3: i32 = 0;
+                while (local_id3 != mir_id_invalid()) {
+                    if (ma_cfg_local_is_candidate(m, facts, local_id3)
+                        && !ma_cfg_analyze_local(m, cache, facts, scratch, local_id3)) {
+                        scratch.dispose();
+                        free(block_slots);
+                        return false;
+                    }
+                    local_id3 = m.local_next(local_id3);
+                    local_guard3 = local_guard3 + 1;
+                    if (local_guard3 > m.local_count + 1) {
+                        scratch.dispose();
+                        free(block_slots);
+                        facts.set_error("cyclic function local chain in CFG storage-state analysis");
+                        return false;
+                    }
+                }
+                scratch.dispose();
+            }
+        }
+        function_id = function_id + 1;
+    }
+    free(block_slots);
+    return true;
+}
+
+fn ma_build_local_storage_escape_facts(m: MirUnit,
+                                       cache: MirAnalysisCache) -> MirLocalStorageEscapeFacts {
+    var facts = MirLocalStorageEscapeFacts.create(m);
+    if (!facts.ok) { return facts; }
+    let capacity64 = (facts.local_count as i64) + 2;
+    if (capacity64 < 1 || capacity64 > ma_local_facts_max_cells()) {
+        facts.set_error("local storage/escape facts local capacity exceeds 2000000 cells");
+        return facts;
+    }
+    let dead_counts = ma_alloc_i32(capacity64 as i32);
+    if (dead_counts == null) {
+        facts.set_error("cannot allocate StorageDead count scratch array");
+        return facts;
+    }
+    let unique_defs = ma_alloc_i32(capacity64 as i32);
+    if (unique_defs == null) {
+        free(dead_counts);
+        facts.set_error("cannot allocate unique local definition scratch array");
+        return facts;
+    }
+    ma_collect_unique_local_assignments(m, unique_defs);
+    if (!ma_collect_local_storage_events(m, facts, dead_counts)
+        || !ma_materialize_storage_dead_csr(m, &mut facts, dead_counts)) {
+        free(unique_defs);
+        free(dead_counts);
+        return facts;
+    }
+    free(dead_counts);
+    ma_collect_local_escape_facts(m, facts, unique_defs);
+    if (!facts.prepare_cfg_storage() || !ma_collect_cfg_barriers(m, facts, unique_defs)) {
+        free(unique_defs);
+        return facts;
+    }
+    free(unique_defs);
+    if (!ma_analyze_cfg_storage_intervals(m, cache, facts)) { return facts; }
+    return facts;
+}
+
+// This is deliberately audit-only: normal pipelines do not request local
+// facts. The audit goes through the public cache/query facade so it also
+// exercises generation ownership and never drifts from pass-visible facts.
+public fn mir_analysis_audit_local_storage_escape_facts(m: MirUnit) {
+    if (!mir_analysis_local_facts_audit_enabled()) { return; }
+    let cache = MirAnalysisCache.create();
+    if (!cache.ensure(m, mir_analysis_liveness() | mir_analysis_escape())) {
+        diag_emit_codegen_at(mir_unit_diag_first_loc(&m),
+                             "MIR analysis failed: " + cache.error_message);
+        cache.dispose();
+        return;
+    }
+    var local_id: i32 = 1;
+    while (local_id <= m.local_count) {
+        if (ma_valid_local(m, local_id)) {
+            print("[mir-analysis] local-facts local=#" + ma_i32_text(local_id)
+                  + " fn=#" + ma_i32_text(m.local_function(local_id))
+                  + " name=" + m.local_name(local_id)
+                  + " live=" + ma_i32_text(ma_get_i32(cache.cached_local_live_counts, local_id))
+                  + " first_live=#" + ma_i32_text(ma_get_i32(cache.cached_local_live_instrs, local_id))
+                  + " dead=" + ma_i32_text(ma_get_i32(cache.cached_local_dead_offsets, local_id + 1)
+                                               - ma_get_i32(cache.cached_local_dead_offsets, local_id))
+                  + " interval=" + ma_i32_text(cache.local_storage_interval_kind(m, local_id))
+                  + " cfg=" + ma_i32_text(cache.local_cfg_liveness_kind(m, local_id))
+                  + " flags=" + ma_i32_text(cache.local_escape_flags(m, local_id)));
+        }
+        local_id = local_id + 1;
+    }
+    cache.dispose();
+}
+
+public class MirAnalysisCache {
+    public valid_analyses: i32
+    public generation: i32
+    public cfg_generation: i32
+    public use_def_generation: i32
+    public effect_generation: i32
+    public cfg_block_count: i32
+    public cfg_edge_count: i32
+    public cfg_succ_offsets: rawptr
+    public cfg_succ_ids: rawptr
+    public cfg_pred_offsets: rawptr
+    public cfg_pred_ids: rawptr
+    public use_value_count: i32
+    public use_edge_count: i32
+    public use_offsets: rawptr
+    public use_owner_kinds: rawptr
+    public use_owner_ids: rawptr
+    public use_slots: rawptr
+    public effect_value_count: i32
+    public cached_value_effects: rawptr
+    public local_fact_generation: i32
+    public local_fact_count: i32
+    public cached_local_live_counts: rawptr
+    public cached_local_live_instrs: rawptr
+    public cached_local_dead_offsets: rawptr
+    public cached_local_escape_flags: rawptr
+    public local_storage_intervals: rawptr
+    public local_cfg_intervals: rawptr
+    public error_message: string
+
+    public static fn create() -> MirAnalysisCache {
+        return MirAnalysisCache {
+            valid_analyses: 0,
+            generation: 0,
+            cfg_generation: -1,
+            use_def_generation: -1,
+            effect_generation: -1,
+            cfg_block_count: 0,
+            cfg_edge_count: 0,
+            cfg_succ_offsets: null,
+            cfg_succ_ids: null,
+            cfg_pred_offsets: null,
+            cfg_pred_ids: null,
+            use_value_count: 0,
+            use_edge_count: 0,
+            use_offsets: null,
+            use_owner_kinds: null,
+            use_owner_ids: null,
+            use_slots: null,
+            effect_value_count: 0,
+            cached_value_effects: null,
+            local_fact_generation: -1,
+            local_fact_count: 0,
+            cached_local_live_counts: null,
+            cached_local_live_instrs: null,
+            cached_local_dead_offsets: null,
+            cached_local_escape_flags: null,
+            local_storage_intervals: null,
+            local_cfg_intervals: null,
+            error_message: ""
+        };
+    }
+
+    public fn set_error(self, message: string) -> bool {
+        self.error_message = message;
+        return false;
+    }
+
+    public fn dispose_cfg(self) {
+        if (self.cfg_succ_offsets != null) { free(self.cfg_succ_offsets); self.cfg_succ_offsets = null; }
+        if (self.cfg_succ_ids != null) { free(self.cfg_succ_ids); self.cfg_succ_ids = null; }
+        if (self.cfg_pred_offsets != null) { free(self.cfg_pred_offsets); self.cfg_pred_offsets = null; }
+        if (self.cfg_pred_ids != null) { free(self.cfg_pred_ids); self.cfg_pred_ids = null; }
+        self.cfg_block_count = 0;
+        self.cfg_edge_count = 0;
+        self.cfg_generation = -1;
+        self.valid_analyses = self.valid_analyses & (~mir_analysis_cfg());
+    }
+
+    public fn dispose_use_def(self) {
+        if (self.use_offsets != null) { free(self.use_offsets); self.use_offsets = null; }
+        if (self.use_owner_kinds != null) { free(self.use_owner_kinds); self.use_owner_kinds = null; }
+        if (self.use_owner_ids != null) { free(self.use_owner_ids); self.use_owner_ids = null; }
+        if (self.use_slots != null) { free(self.use_slots); self.use_slots = null; }
+        self.use_value_count = 0;
+        self.use_edge_count = 0;
+        self.use_def_generation = -1;
+        self.valid_analyses = self.valid_analyses & (~mir_analysis_use_def());
+    }
+
+    public fn dispose_effects(self) {
+        if (self.cached_value_effects != null) { free(self.cached_value_effects); self.cached_value_effects = null; }
+        self.effect_value_count = 0;
+        self.effect_generation = -1;
+        self.valid_analyses = self.valid_analyses & (~mir_analysis_effects());
+    }
+
+    public fn dispose_local_facts(self) {
+        if (self.cached_local_live_counts != null) { free(self.cached_local_live_counts); self.cached_local_live_counts = null; }
+        if (self.cached_local_live_instrs != null) { free(self.cached_local_live_instrs); self.cached_local_live_instrs = null; }
+        if (self.cached_local_dead_offsets != null) { free(self.cached_local_dead_offsets); self.cached_local_dead_offsets = null; }
+        if (self.cached_local_escape_flags != null) { free(self.cached_local_escape_flags); self.cached_local_escape_flags = null; }
+        if (self.local_storage_intervals != null) { free(self.local_storage_intervals); self.local_storage_intervals = null; }
+        if (self.local_cfg_intervals != null) { free(self.local_cfg_intervals); self.local_cfg_intervals = null; }
+        self.local_fact_generation = -1;
+        self.local_fact_count = 0;
+        self.valid_analyses = self.valid_analyses & (~mir_analysis_liveness());
+        self.valid_analyses = self.valid_analyses & (~mir_analysis_escape());
+    }
+
+    public fn dispose(self) {
+        self.dispose_cfg();
+        self.dispose_use_def();
+        self.dispose_effects();
+        self.dispose_local_facts();
+        self.valid_analyses = 0;
+    }
+
+    public fn build_local_facts(self, m: MirUnit) -> bool {
+        self.dispose_local_facts();
+        var facts = ma_build_local_storage_escape_facts(m, self);
+        if (!facts.ok) {
+            let message = facts.error_message.clone();
+            facts.dispose();
+            return self.set_error(message);
+        }
+        let capacity = m.local_count + 2;
+        let intervals = ma_alloc_i32(capacity);
+        let cfg_intervals = ma_alloc_i32(capacity);
+        if (intervals == null || cfg_intervals == null) {
+            if (intervals != null) { free(intervals); }
+            if (cfg_intervals != null) { free(cfg_intervals); }
+            facts.dispose();
+            return self.set_error("cannot allocate cached local fact intervals");
+        }
+        var local_id: i32 = 1;
+        while (local_id <= m.local_count) {
+            ma_set_i32(intervals, local_id, facts.interval_kind_for(local_id));
+            ma_set_i32(cfg_intervals, local_id, facts.cfg_interval_for(local_id));
+            local_id = local_id + 1;
+        }
+        self.cached_local_live_counts = facts.live_counts;
+        facts.live_counts = null;
+        self.cached_local_live_instrs = facts.live_instrs;
+        facts.live_instrs = null;
+        self.cached_local_dead_offsets = facts.dead_offsets;
+        facts.dead_offsets = null;
+        self.cached_local_escape_flags = facts.flags;
+        facts.flags = null;
+        self.local_storage_intervals = intervals;
+        self.local_cfg_intervals = cfg_intervals;
+        self.local_fact_count = m.local_count;
+        facts.dispose();
+        return true;
+    }
+
+    public fn build_cfg(self, m: MirUnit) -> bool {
+        self.dispose_cfg();
+        self.error_message = "";
+        let cap64 = (m.block_count as i64) * 2 + (m.case_count as i64) + 1;
+        if (cap64 < 1 || cap64 > 536870911) {
+            return self.set_error("CFG edge capacity overflow");
+        }
+        var edges = MirCfgEdgeList.create(cap64 as i32, m.block_count);
+        if (!edges.storage_ok()) {
+            edges.dispose();
+            return self.set_error("cannot allocate CFG edge scratch storage");
+        }
+        if (!ma_collect_cfg_edges(m, &mut edges)) {
+            let message = edges.error_message.clone();
+            edges.dispose();
+            return self.set_error(message);
+        }
+        let succ_counts = ma_alloc_i32(m.block_count + 2);
+        let pred_counts = ma_alloc_i32(m.block_count + 2);
+        let succ_offsets = ma_alloc_i32(m.block_count + 2);
+        let pred_offsets = ma_alloc_i32(m.block_count + 2);
+        let succ_cursor = ma_alloc_i32(m.block_count + 2);
+        let pred_cursor = ma_alloc_i32(m.block_count + 2);
+        let succ_ids = ma_alloc_i32(edges.count);
+        let pred_ids = ma_alloc_i32(edges.count);
+        if (succ_counts == null || pred_counts == null
+            || succ_offsets == null || pred_offsets == null
+            || succ_cursor == null || pred_cursor == null
+            || succ_ids == null || pred_ids == null) {
+            if (succ_counts != null) { free(succ_counts); }
+            if (pred_counts != null) { free(pred_counts); }
+            if (succ_offsets != null) { free(succ_offsets); }
+            if (pred_offsets != null) { free(pred_offsets); }
+            if (succ_cursor != null) { free(succ_cursor); }
+            if (pred_cursor != null) { free(pred_cursor); }
+            if (succ_ids != null) { free(succ_ids); }
+            if (pred_ids != null) { free(pred_ids); }
+            edges.dispose();
+            return self.set_error("cannot allocate CFG CSR storage");
+        }
+        var edge: i32 = 0;
+        while (edge < edges.count) {
+            ma_inc_i32(succ_counts, ma_get_i32(edges.sources, edge));
+            ma_inc_i32(pred_counts, ma_get_i32(edges.targets, edge));
+            edge = edge + 1;
+        }
+        var offset: i32 = 0;
+        var id: i32 = 1;
+        while (id <= m.block_count) {
+            ma_set_i32(succ_offsets, id, offset);
+            ma_set_i32(succ_cursor, id, offset);
+            offset = offset + ma_get_i32(succ_counts, id);
+            id = id + 1;
+        }
+        ma_set_i32(succ_offsets, m.block_count + 1, offset);
+        offset = 0;
+        id = 1;
+        while (id <= m.block_count) {
+            ma_set_i32(pred_offsets, id, offset);
+            ma_set_i32(pred_cursor, id, offset);
+            offset = offset + ma_get_i32(pred_counts, id);
+            id = id + 1;
+        }
+        ma_set_i32(pred_offsets, m.block_count + 1, offset);
+        edge = 0;
+        while (edge < edges.count) {
+            let source = ma_get_i32(edges.sources, edge);
+            let target = ma_get_i32(edges.targets, edge);
+            let succ_pos = ma_get_i32(succ_cursor, source);
+            let pred_pos = ma_get_i32(pred_cursor, target);
+            ma_set_i32(succ_ids, succ_pos, target);
+            ma_set_i32(pred_ids, pred_pos, source);
+            ma_set_i32(succ_cursor, source, succ_pos + 1);
+            ma_set_i32(pred_cursor, target, pred_pos + 1);
+            edge = edge + 1;
+        }
+        free(succ_counts);
+        free(pred_counts);
+        free(succ_cursor);
+        free(pred_cursor);
+        edges.dispose();
+        self.cfg_block_count = m.block_count;
+        self.cfg_edge_count = edge;
+        self.cfg_succ_offsets = succ_offsets;
+        self.cfg_succ_ids = succ_ids;
+        self.cfg_pred_offsets = pred_offsets;
+        self.cfg_pred_ids = pred_ids;
+        return true;
+    }
+
+    public fn build_effects(self, m: MirUnit) -> bool {
+        self.dispose_effects();
+        let effects = ma_alloc_i32(m.value_count + 2);
+        if (effects == null) { return self.set_error("cannot allocate cached value effects"); }
+        var value_id: i32 = 1;
+        while (value_id <= m.value_count) {
+            if (ma_valid_value(m, value_id)) {
+                ma_set_i32(effects, value_id, self.value_effects_uncached(m, value_id, 0));
+            }
+            value_id = value_id + 1;
+        }
+        self.cached_value_effects = effects;
+        self.effect_value_count = m.value_count;
+        return true;
+    }
+
+    public fn build_use_def(self, m: MirUnit) -> bool {
+        self.dispose_use_def();
+        self.error_message = "";
+        let cap64 = (m.local_count as i64)
+            + (m.place_count as i64)
+            + (m.value_count as i64) * 5
+            + (m.instr_count as i64) * 3
+            + (m.block_count as i64)
+            + (m.case_count as i64) * 2
+            + 1;
+        if (cap64 < 1 || cap64 > 536870911) {
+            return self.set_error("use-def edge capacity overflow");
+        }
+        var uses = MirUseEdgeList.create(cap64 as i32);
+        if (!uses.storage_ok()) {
+            uses.dispose();
+            return self.set_error("cannot allocate use-def edge scratch storage");
+        }
+        if (!ma_collect_use_edges(m, &mut uses)) {
+            let message = uses.error_message.clone();
+            uses.dispose();
+            return self.set_error(message);
+        }
+        let counts = ma_alloc_i32(m.value_count + 2);
+        let offsets = ma_alloc_i32(m.value_count + 2);
+        let cursor = ma_alloc_i32(m.value_count + 2);
+        let owner_kinds = ma_alloc_i32(uses.count);
+        let owner_ids = ma_alloc_i32(uses.count);
+        let slots = ma_alloc_i32(uses.count);
+        if (counts == null || offsets == null || cursor == null
+            || owner_kinds == null || owner_ids == null || slots == null) {
+            if (counts != null) { free(counts); }
+            if (offsets != null) { free(offsets); }
+            if (cursor != null) { free(cursor); }
+            if (owner_kinds != null) { free(owner_kinds); }
+            if (owner_ids != null) { free(owner_ids); }
+            if (slots != null) { free(slots); }
+            uses.dispose();
+            return self.set_error("cannot allocate use-def CSR storage");
+        }
+        var edge: i32 = 0;
+        while (edge < uses.count) {
+            ma_inc_i32(counts, ma_get_i32(uses.values, edge));
+            edge = edge + 1;
+        }
+        var offset: i32 = 0;
+        var id: i32 = 1;
+        while (id <= m.value_count) {
+            ma_set_i32(offsets, id, offset);
+            ma_set_i32(cursor, id, offset);
+            offset = offset + ma_get_i32(counts, id);
+            id = id + 1;
+        }
+        ma_set_i32(offsets, m.value_count + 1, offset);
+        edge = 0;
+        while (edge < uses.count) {
+            let value_id = ma_get_i32(uses.values, edge);
+            let pos = ma_get_i32(cursor, value_id);
+            ma_set_i32(owner_kinds, pos, ma_get_i32(uses.owner_kinds, edge));
+            ma_set_i32(owner_ids, pos, ma_get_i32(uses.owner_ids, edge));
+            ma_set_i32(slots, pos, ma_get_i32(uses.slots, edge));
+            ma_set_i32(cursor, value_id, pos + 1);
+            edge = edge + 1;
+        }
+        free(counts);
+        free(cursor);
+        uses.dispose();
+        self.use_value_count = m.value_count;
+        self.use_edge_count = edge;
+        self.use_offsets = offsets;
+        self.use_owner_kinds = owner_kinds;
+        self.use_owner_ids = owner_ids;
+        self.use_slots = slots;
+        return true;
+    }
+
+    public fn ensure(self, m: MirUnit, analysis_mask: i32) -> bool {
+        if ((analysis_mask & mir_analysis_cfg()) != 0) {
+            if ((self.valid_analyses & mir_analysis_cfg()) != 0
+                && self.cfg_generation == self.generation) {
+                mir_analysis_audit("reuse cfg generation=" + ma_i32_text(self.generation));
+            } else {
+                if (!self.build_cfg(m)) { return false; }
+                self.cfg_generation = self.generation;
+                self.valid_analyses = self.valid_analyses | mir_analysis_cfg();
+                mir_analysis_audit("build cfg generation=" + ma_i32_text(self.generation)
+                                   + " edges=" + ma_i32_text(self.cfg_edge_count));
+            }
+        }
+        if ((analysis_mask & mir_analysis_use_def()) != 0) {
+            if ((self.valid_analyses & mir_analysis_use_def()) != 0
+                && self.use_def_generation == self.generation) {
+                mir_analysis_audit("reuse use-def generation=" + ma_i32_text(self.generation));
+            } else {
+                if (!self.build_use_def(m)) { return false; }
+                self.use_def_generation = self.generation;
+                self.valid_analyses = self.valid_analyses | mir_analysis_use_def();
+                mir_analysis_audit("build use-def generation=" + ma_i32_text(self.generation)
+                                   + " uses=" + ma_i32_text(self.use_edge_count));
+            }
+        }
+        if ((analysis_mask & mir_analysis_effects()) != 0) {
+            if ((self.valid_analyses & mir_analysis_effects()) != 0
+                && self.effect_generation == self.generation) {
+                mir_analysis_audit("reuse effects generation=" + ma_i32_text(self.generation));
+            } else {
+                if (!self.build_effects(m)) { return false; }
+                self.effect_generation = self.generation;
+                self.valid_analyses = self.valid_analyses | mir_analysis_effects();
+                mir_analysis_audit("build effects generation=" + ma_i32_text(self.generation));
+            }
+        }
+        let local_mask = mir_analysis_liveness() | mir_analysis_escape();
+        if ((analysis_mask & local_mask) != 0) {
+            if ((self.valid_analyses & local_mask) == local_mask
+                && self.local_fact_generation == self.generation) {
+                mir_analysis_audit("reuse local-facts generation=" + ma_i32_text(self.generation));
+            } else {
+                if (!self.build_local_facts(m)) { return false; }
+                self.local_fact_generation = self.generation;
+                self.valid_analyses = self.valid_analyses | local_mask;
+                mir_analysis_audit("build local-facts generation=" + ma_i32_text(self.generation));
+            }
+        }
+        return true;
+    }
+
+    public fn apply_change(self, preserved_mask: i32, next_generation: i32) {
+        self.generation = next_generation;
+        if ((self.valid_analyses & mir_analysis_cfg()) != 0) {
+            if ((preserved_mask & mir_analysis_cfg()) != 0) {
+                self.cfg_generation = next_generation;
+                mir_analysis_audit("preserve cfg generation=" + ma_i32_text(next_generation));
+            } else {
+                mir_analysis_audit("invalidate cfg generation=" + ma_i32_text(next_generation));
+                self.dispose_cfg();
+            }
+        }
+        if ((self.valid_analyses & mir_analysis_use_def()) != 0) {
+            if ((preserved_mask & mir_analysis_use_def()) != 0) {
+                self.use_def_generation = next_generation;
+                mir_analysis_audit("preserve use-def generation=" + ma_i32_text(next_generation));
+            } else {
+                mir_analysis_audit("invalidate use-def generation=" + ma_i32_text(next_generation));
+                self.dispose_use_def();
+            }
+        }
+        if ((self.valid_analyses & mir_analysis_effects()) != 0) {
+            if ((preserved_mask & mir_analysis_effects()) != 0) {
+                self.effect_generation = next_generation;
+                mir_analysis_audit("preserve effects generation=" + ma_i32_text(next_generation));
+            } else {
+                mir_analysis_audit("invalidate effects generation=" + ma_i32_text(next_generation));
+                self.dispose_effects();
+            }
+        }
+        let local_mask = mir_analysis_liveness() | mir_analysis_escape();
+        if ((self.valid_analyses & local_mask) != 0) {
+            if ((preserved_mask & local_mask) == local_mask) {
+                self.local_fact_generation = next_generation;
+                mir_analysis_audit("preserve local-facts generation=" + ma_i32_text(next_generation));
+            } else {
+                mir_analysis_audit("invalidate local-facts generation=" + ma_i32_text(next_generation));
+                self.dispose_local_facts();
+            }
+        }
+        self.valid_analyses = self.valid_analyses & preserved_mask;
+    }
+
+    public fn cfg_successor_count(self, block_id: i32) -> i32 {
+        if ((self.valid_analyses & mir_analysis_cfg()) == 0
+            || block_id < 1 || block_id > self.cfg_block_count) { return 0; }
+        return ma_get_i32(self.cfg_succ_offsets, block_id + 1)
+            - ma_get_i32(self.cfg_succ_offsets, block_id);
+    }
+
+    public fn cfg_successor_at(self, block_id: i32, ordinal: i32) -> i32 {
+        let count = self.cfg_successor_count(block_id);
+        if (ordinal < 0 || ordinal >= count) { return mir_id_invalid(); }
+        return ma_get_i32(self.cfg_succ_ids,
+                          ma_get_i32(self.cfg_succ_offsets, block_id) + ordinal);
+    }
+
+    public fn cfg_predecessor_count(self, block_id: i32) -> i32 {
+        if ((self.valid_analyses & mir_analysis_cfg()) == 0
+            || block_id < 1 || block_id > self.cfg_block_count) { return 0; }
+        return ma_get_i32(self.cfg_pred_offsets, block_id + 1)
+            - ma_get_i32(self.cfg_pred_offsets, block_id);
+    }
+
+    public fn cfg_predecessor_at(self, block_id: i32, ordinal: i32) -> i32 {
+        let count = self.cfg_predecessor_count(block_id);
+        if (ordinal < 0 || ordinal >= count) { return mir_id_invalid(); }
+        return ma_get_i32(self.cfg_pred_ids,
+                          ma_get_i32(self.cfg_pred_offsets, block_id) + ordinal);
+    }
+
+    // Query dominance without materializing a dense dominator matrix.  The
+    // pass pipeline mostly asks sparse, local questions; a pair of bounded
+    // reachability walks is both safer for selfhost-sized units and avoids a
+    // block^2 allocation.  `blocked` is excluded from traversal, so A
+    // dominates B exactly when B is reachable from the function entry and is
+    // no longer reachable after removing A (with A == B handled directly).
+    public fn cfg_reachable_avoiding(self,
+                                     m: MirUnit,
+                                     entry: i32,
+                                     target: i32,
+                                     blocked: i32) -> bool {
+        if (entry == mir_id_invalid() || target == mir_id_invalid()
+            || entry < 1 || entry > m.block_count
+            || target < 1 || target > m.block_count
+            || entry == blocked) {
+            return false;
+        }
+        let seen = ma_alloc_i32(m.block_count + 2);
+        let queue = ma_alloc_i32(m.block_count + 2);
+        if (seen == null || queue == null) {
+            if (seen != null) { free(seen); }
+            if (queue != null) { free(queue); }
+            self.error_message = "cannot allocate dominance reachability scratch";
+            return false;
+        }
+        var head: i32 = 0;
+        var tail: i32 = 0;
+        ma_set_i32(seen, entry, 1);
+        ma_set_i32(queue, tail, entry);
+        tail = tail + 1;
+        var found = false;
+        while (head < tail) {
+            let current = ma_get_i32(queue, head);
+            head = head + 1;
+            if (current == target) { found = true; break; }
+            var ordinal: i32 = 0;
+            let count = self.cfg_successor_count(current);
+            while (ordinal < count) {
+                let next = self.cfg_successor_at(current, ordinal);
+                if (next != blocked && next >= 1 && next <= m.block_count
+                    && m.block_function(next) == m.block_function(entry)
+                    && ma_get_i32(seen, next) == 0) {
+                    ma_set_i32(seen, next, 1);
+                    ma_set_i32(queue, tail, next);
+                    tail = tail + 1;
+                }
+                ordinal = ordinal + 1;
+            }
+        }
+        free(seen);
+        free(queue);
+        return found;
+    }
+
+    public fn cfg_dominates(self, m: MirUnit, dominator: i32, block: i32) -> bool {
+        if (!self.ensure(m, mir_analysis_cfg())
+            || !ma_valid_block(m, dominator) || !ma_valid_block(m, block)
+            || m.block_function(dominator) != m.block_function(block)) {
+            return false;
+        }
+        let entry = m.function_first_block(m.block_function(block));
+        if (entry == mir_id_invalid()
+            || !self.cfg_reachable_avoiding(m, entry, block, mir_id_invalid())) {
+            return false;
+        }
+        if (dominator == block || dominator == entry) { return true; }
+        return !self.cfg_reachable_avoiding(m, entry, block, dominator);
+    }
+
+    fn value_effects_uncached(self, m: MirUnit, value_id: i32, depth: i32) -> i32 {
+        if (value_id == mir_id_invalid()) { return 0; }
+        if (!ma_valid_value(m, value_id) || depth > m.value_count) {
+            return mir_effect_unknown();
+        }
+        let kind = m.value_kind(value_id);
+        if (kind == mir_value_call()) { return mir_effect_call() | mir_effect_unknown(); }
+        if (kind == mir_value_intrinsic()) { return mir_effect_unknown(); }
+        var effects: i32 = 0;
+        if (kind == mir_value_read_place()) { effects = mir_effect_read_memory(); }
+        if (kind == mir_value_address_of()) { effects = mir_effect_read_memory(); }
+        effects = effects | self.value_effects_uncached(m, m.value_lhs(value_id), depth + 1);
+        effects = effects | self.value_effects_uncached(m, m.value_rhs(value_id), depth + 1);
+        effects = effects | self.value_effects_uncached(m, m.value_aux(value_id), depth + 1);
+        var arg = m.value_first_arg(value_id);
+        var guard: i32 = 0;
+        while (arg != mir_id_invalid()) {
+            if (guard > m.value_count) { return effects | mir_effect_unknown(); }
+            effects = effects | self.value_effects_uncached(m, arg, depth + 1);
+            arg = m.value_next_arg(arg);
+            guard = guard + 1;
+        }
+        return effects;
+    }
+
+    public fn value_effects(self, m: MirUnit, value_id: i32, depth: i32) -> i32 {
+        if (value_id == mir_id_invalid()) { return 0; }
+        if (!ma_valid_value(m, value_id)
+            || !self.ensure(m, mir_analysis_effects())
+            || self.cached_value_effects == null || value_id > self.effect_value_count) {
+            return mir_effect_unknown();
+        }
+        return ma_get_i32(self.cached_value_effects, value_id);
+    }
+
+    public fn instr_effects(self, m: MirUnit, instr_id: i32) -> i32 {
+        if (instr_id < 1 || instr_id > m.instr_count || m.instr_record(instr_id) == null) {
+            return mir_effect_unknown();
+        }
+        let kind = m.instr_kind(instr_id);
+        if (kind == mir_instr_storage_live() || kind == mir_instr_storage_dead()
+            || kind == mir_instr_static_assert()) { return 0; }
+        if (kind == mir_instr_drop()) { return mir_effect_drop() | mir_effect_write_memory(); }
+        if (kind == mir_instr_defer() || kind == mir_instr_foreach_bind()
+            || kind == mir_instr_match_arm()) { return mir_effect_control() | mir_effect_unknown(); }
+        var effects = self.value_effects(m, m.instr_value(instr_id), 0)
+            | self.value_effects(m, m.instr_lhs(instr_id), 0)
+            | self.value_effects(m, m.instr_rhs(instr_id), 0);
+        if (kind == mir_instr_assign()) { effects = effects | mir_effect_write_memory(); }
+        return effects;
+    }
+
+    // This is a query facade over the bounded local-facts builder.  It is
+    // intentionally conservative: allocation/analysis failure returns the
+    // unknown-indirection and may-escape barriers, never a false no-escape.
+    public fn local_escape_flags(self, m: MirUnit, local_id: i32) -> i32 {
+        if (!ma_valid_local(m, local_id)) { return mir_local_escape_may_escape() | mir_local_escape_unknown_indirection(); }
+        if (!self.ensure(m, mir_analysis_liveness() | mir_analysis_escape())
+            || self.cached_local_escape_flags == null || local_id > self.local_fact_count) {
+            return mir_local_escape_may_escape() | mir_local_escape_unknown_indirection();
+        }
+        return ma_get_i32(self.cached_local_escape_flags, local_id);
+    }
+
+    public fn local_storage_interval_kind(self, m: MirUnit, local_id: i32) -> i32 {
+        if (!ma_valid_local(m, local_id)) { return mir_local_storage_interval_multi_or_malformed(); }
+        if (!self.ensure(m, mir_analysis_liveness() | mir_analysis_escape())
+            || self.local_storage_intervals == null || local_id > self.local_fact_count) {
+            return mir_local_storage_interval_multi_or_malformed();
+        }
+        return ma_get_i32(self.local_storage_intervals, local_id);
+    }
+
+    public fn local_cfg_liveness_kind(self, m: MirUnit, local_id: i32) -> i32 {
+        if (!ma_valid_local(m, local_id)) { return mir_local_cfg_interval_barrier(); }
+        if (!self.ensure(m, mir_analysis_liveness() | mir_analysis_escape())
+            || self.local_cfg_intervals == null || local_id > self.local_fact_count) {
+            return mir_local_cfg_interval_barrier();
+        }
+        return ma_get_i32(self.local_cfg_intervals, local_id);
+    }
+
+    public fn use_count(self, value_id: i32) -> i32 {
+        if ((self.valid_analyses & mir_analysis_use_def()) == 0
+            || value_id < 1 || value_id > self.use_value_count) { return 0; }
+        return ma_get_i32(self.use_offsets, value_id + 1)
+            - ma_get_i32(self.use_offsets, value_id);
+    }
+
+    public fn use_owner_kind_at(self, value_id: i32, ordinal: i32) -> i32 {
+        let count = self.use_count(value_id);
+        if (ordinal < 0 || ordinal >= count) { return 0; }
+        return ma_get_i32(self.use_owner_kinds,
+                          ma_get_i32(self.use_offsets, value_id) + ordinal);
+    }
+
+    public fn use_owner_id_at(self, value_id: i32, ordinal: i32) -> i32 {
+        let count = self.use_count(value_id);
+        if (ordinal < 0 || ordinal >= count) { return mir_id_invalid(); }
+        return ma_get_i32(self.use_owner_ids,
+                          ma_get_i32(self.use_offsets, value_id) + ordinal);
+    }
+
+    public fn use_slot_at(self, value_id: i32, ordinal: i32) -> i32 {
+        let count = self.use_count(value_id);
+        if (ordinal < 0 || ordinal >= count) { return 0; }
+        return ma_get_i32(self.use_slots,
+                          ma_get_i32(self.use_offsets, value_id) + ordinal);
+    }
+
+    public fn verify_cfg(self, m: MirUnit) -> bool {
+        if ((self.valid_analyses & mir_analysis_cfg()) == 0) {
+            return self.set_error("CFG cache is not valid");
+        }
+        let fresh = MirAnalysisCache.create();
+        if (!fresh.build_cfg(m)) {
+            let message = fresh.error_message.clone();
+            fresh.dispose();
+            return self.set_error(message);
+        }
+        var ok = fresh.cfg_block_count == self.cfg_block_count
+            && fresh.cfg_edge_count == self.cfg_edge_count;
+        var id: i32 = 0;
+        while (ok && id <= self.cfg_block_count + 1) {
+            ok = ma_get_i32(fresh.cfg_succ_offsets, id)
+                    == ma_get_i32(self.cfg_succ_offsets, id)
+                && ma_get_i32(fresh.cfg_pred_offsets, id)
+                    == ma_get_i32(self.cfg_pred_offsets, id);
+            id = id + 1;
+        }
+        id = 0;
+        while (ok && id < self.cfg_edge_count) {
+            ok = ma_get_i32(fresh.cfg_succ_ids, id) == ma_get_i32(self.cfg_succ_ids, id)
+                && ma_get_i32(fresh.cfg_pred_ids, id) == ma_get_i32(self.cfg_pred_ids, id);
+            id = id + 1;
+        }
+        fresh.dispose();
+        if (!ok) { return self.set_error("stale or inconsistent CFG cache"); }
+        return true;
+    }
+
+    public fn verify_use_def(self, m: MirUnit) -> bool {
+        if ((self.valid_analyses & mir_analysis_use_def()) == 0) {
+            return self.set_error("use-def cache is not valid");
+        }
+        let fresh = MirAnalysisCache.create();
+        if (!fresh.build_use_def(m)) {
+            let message = fresh.error_message.clone();
+            fresh.dispose();
+            return self.set_error(message);
+        }
+        var ok = fresh.use_value_count == self.use_value_count
+            && fresh.use_edge_count == self.use_edge_count;
+        var id: i32 = 0;
+        while (ok && id <= self.use_value_count + 1) {
+            ok = ma_get_i32(fresh.use_offsets, id) == ma_get_i32(self.use_offsets, id);
+            id = id + 1;
+        }
+        id = 0;
+        while (ok && id < self.use_edge_count) {
+            ok = ma_get_i32(fresh.use_owner_kinds, id) == ma_get_i32(self.use_owner_kinds, id)
+                && ma_get_i32(fresh.use_owner_ids, id) == ma_get_i32(self.use_owner_ids, id)
+                && ma_get_i32(fresh.use_slots, id) == ma_get_i32(self.use_slots, id);
+            id = id + 1;
+        }
+        fresh.dispose();
+        if (!ok) { return self.set_error("stale or inconsistent use-def cache"); }
+        return true;
+    }
+
+    public fn verify(self, m: MirUnit, analysis_mask: i32) -> bool {
+        if ((analysis_mask & mir_analysis_cfg()) != 0 && !self.verify_cfg(m)) { return false; }
+        if ((analysis_mask & mir_analysis_use_def()) != 0 && !self.verify_use_def(m)) { return false; }
+        return true;
+    }
+}

@@ -1,0 +1,2062 @@
+module vyx.runtime;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn realloc(ptr: rawptr, size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, size: u64) -> rawptr;
+    fn memcmp(lhs: rawptr, rhs: rawptr, size: u64) -> i32;
+    fn memset(dst: rawptr, value: i32, size: u64) -> rawptr;
+    fn strlen(value: rawptr) -> u64;
+    fn putchar(value: i32) -> i32;
+    fn abort();
+    fn vyx_host_argc() -> i32;
+    fn vyx_host_argv() -> rawptr;
+    fn __vyx_atomic_load_i64_intrinsic(value: rawptr) -> i64;
+    fn __vyx_atomic_fetch_add_i64_intrinsic(value: rawptr, delta: i64) -> i64;
+    fn __vyx_atomic_compare_exchange_i64_intrinsic(value: rawptr,
+                                                    expected: i64,
+                                                    desired: i64) -> i64;
+}
+
+@[platform("windows")]
+extern "C" {
+    fn GetActiveProcessorCount(group: u32) -> u32;
+    fn CreateThread(attrs: rawptr, stack: u64, start: rawptr, param: rawptr, flags: u32, tid: rawptr) -> rawptr;
+    fn WaitForSingleObject(handle: rawptr, ms: u32) -> u32;
+    fn CloseHandle(handle: rawptr) -> i32;
+}
+
+@[platform("posix")]
+extern "C" {
+    fn sysconf(name: i32) -> i64;
+    fn pthread_create(thread: rawptr, attr: rawptr, start: rawptr, arg: rawptr) -> i32;
+    fn pthread_join(thread: i64, retval: rawptr) -> i32;
+}
+
+var runtime_argc: i32 = 0;
+var runtime_argv: rawptr = null;
+var runtime_args_set: i32 = 0;
+var runtime_empty_storage: i64 = 0;
+var runtime_pointer_regions: rawptr = null;
+var runtime_pointer_allocations: rawptr = null;
+var runtime_pointer_registry_lock: i64 = 0;
+// Region dedup cache (see rt_region_cache_lookup).  `gen` pins every slot to
+// the state of the allocation registry; any register/unregister bumps it
+// because a registry change can change the span rt_registered_remaining
+// reports for a given base.
+var runtime_region_cache: rawptr = null;
+var runtime_region_cache_gen: i64 = 0;
+
+fn rt_empty() -> rawptr {
+    return to_rawptr(&runtime_empty_storage);
+}
+
+fn rt_read_u8(ptr: rawptr) -> u8 {
+    var out: u8 = 0 as u8;
+    if (ptr != null) { memcpy(to_rawptr(&out), ptr, 1); }
+    return out;
+}
+
+fn rt_write_u8(ptr: rawptr, value: u8) {
+    if (ptr == null) { return; }
+    var copy = value;
+    memcpy(ptr, to_rawptr(&copy), 1);
+}
+
+fn rt_read_i32(ptr: rawptr) -> i32 {
+    var out: i32 = 0;
+    if (ptr != null) { memcpy(to_rawptr(&out), ptr, 4); }
+    return out;
+}
+
+fn rt_write_i32(ptr: rawptr, value: i32) {
+    if (ptr == null) { return; }
+    var copy = value;
+    memcpy(ptr, to_rawptr(&copy), 4);
+}
+
+fn rt_read_u32(ptr: rawptr) -> u32 {
+    var out: u32 = 0 as u32;
+    if (ptr != null) { memcpy(to_rawptr(&out), ptr, 4); }
+    return out;
+}
+
+fn rt_write_u32(ptr: rawptr, value: u32) {
+    if (ptr == null) { return; }
+    var copy = value;
+    memcpy(ptr, to_rawptr(&copy), 4);
+}
+
+fn rt_read_i64(ptr: rawptr) -> i64 {
+    var out: i64 = 0;
+    if (ptr != null) { memcpy(to_rawptr(&out), ptr, 8); }
+    return out;
+}
+
+fn rt_write_i64(ptr: rawptr, value: i64) {
+    if (ptr == null) { return; }
+    var copy = value;
+    memcpy(ptr, to_rawptr(&copy), 8);
+}
+
+fn rt_read_u64(ptr: rawptr) -> u64 {
+    var out: u64 = 0 as u64;
+    if (ptr != null) { memcpy(to_rawptr(&out), ptr, 8); }
+    return out;
+}
+
+fn rt_write_u64(ptr: rawptr, value: u64) {
+    if (ptr == null) { return; }
+    var copy = value;
+    memcpy(ptr, to_rawptr(&copy), 8);
+}
+
+fn rt_read_ptr(ptr: rawptr) -> rawptr {
+    var out: rawptr = null;
+    if (ptr != null) { memcpy(to_rawptr(&out), ptr, 8); }
+    return out;
+}
+
+fn rt_write_ptr(ptr: rawptr, value: rawptr) {
+    if (ptr == null) { return; }
+    var copy = value;
+    memcpy(ptr, to_rawptr(&copy), 8);
+}
+
+fn rt_strlen(value: rawptr) -> i64 {
+    if (value == null) { return 0; }
+    return strlen(value) as i64;
+}
+
+fn rt_alloc_bytes(size: i64) -> rawptr {
+    if (size <= 0) { return null; }
+    return malloc(size as u64);
+}
+
+fn rt_alloc_copy(src: rawptr, len: i64) -> rawptr {
+    var safe_len = len;
+    if (safe_len < 0) { safe_len = 0; }
+    let out = rt_alloc_bytes(safe_len + 1);
+    if (out == null) { return null; }
+    if (src != null && safe_len > 0) {
+        memcpy(out, src, safe_len as u64);
+    }
+    rt_write_u8(out + safe_len, 0 as u8);
+    return out;
+}
+
+fn rt_u64_decimal_len(value: u64) -> i64 {
+    var v = value;
+    var len: i64 = 1;
+    while (v >= (10 as u64)) {
+        v = v / (10 as u64);
+        len = len + 1;
+    }
+    return len;
+}
+
+fn rt_i64_decimal_len(value: i64) -> i64 {
+    if (value >= 0) { return rt_u64_decimal_len(value as u64); }
+    return rt_u64_decimal_len((0 as u64) - (value as u64)) + 1;
+}
+
+fn rt_u64_to_chars(value: u64, out: rawptr) -> i64 {
+    if (out == null) { return 0; }
+    let len = rt_u64_decimal_len(value);
+    var v = value;
+    var pos = len;
+    while (pos > 0) {
+        pos = pos - 1;
+        let digit = v % (10 as u64);
+        rt_write_u8(out + pos, (48 + (digit as i32)) as u8);
+        v = v / (10 as u64);
+    }
+    rt_write_u8(out + len, 0 as u8);
+    return len;
+}
+
+fn rt_i64_to_chars(value: i64, out: rawptr) -> i64 {
+    if (out == null) { return 0; }
+    if (value >= 0) { return rt_u64_to_chars(value as u64, out); }
+    rt_write_u8(out, 45 as u8);
+    let inner = rt_u64_to_chars((0 as u64) - (value as u64), out + 1);
+    return inner + 1;
+}
+
+fn rt_ascii_space(value: u8) -> bool {
+    let c = value as i32;
+    return c == 32 || (c >= 9 && c <= 13);
+}
+
+fn rt_ascii_upper(value: u8) -> u8 {
+    let c = value as i32;
+    if (c >= 97 && c <= 122) { return (c - 32) as u8; }
+    return value;
+}
+
+fn rt_ascii_lower(value: u8) -> u8 {
+    let c = value as i32;
+    if (c >= 65 && c <= 90) { return (c + 32) as u8; }
+    return value;
+}
+
+fn rt_find_bytes(haystack: rawptr,
+                 haystack_len: i64,
+                 needle: rawptr,
+                 needle_len: i64,
+                 start: i64) -> i64 {
+    if (haystack == null || needle == null || needle_len <= 0
+        || haystack_len < needle_len || start < 0) {
+        return -1;
+    }
+    var i = start;
+    let last = haystack_len - needle_len;
+    while (i <= last) {
+        if (memcmp(haystack + i, needle, needle_len as u64) == 0) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn rt_builder_reserve(builder: rawptr, additional: i64) -> rawptr {
+    if (builder == null || additional < 0) { return null; }
+    let old_len = rt_read_i64(builder + 8);
+    let needed = old_len + additional + 1;
+    var cap = rt_read_i64(builder + 16);
+    if (cap < 63) { cap = 63; }
+    var data = rt_read_ptr(builder);
+    if (needed < cap) {
+        if (data != null) { return data; }
+        return builder + 24;
+    }
+    while (cap <= needed) {
+        if (cap > 4611686018427387903) { return null; }
+        cap = cap * 2 + 1;
+    }
+    if (data == null) {
+        data = rt_alloc_bytes(cap);
+        if (data == null) { return null; }
+        if (old_len > 0) { memcpy(data, builder + 24, old_len as u64); }
+    } else {
+        data = realloc(data, cap as u64);
+        if (data == null) { return null; }
+    }
+    rt_write_ptr(builder, data);
+    rt_write_i64(builder + 16, cap);
+    return data;
+}
+
+fn rt_print(value: rawptr, len: u64) {
+    var count = len as i64;
+    if (value == null) {
+        putchar(10);
+        return;
+    }
+    if (count == 0) { count = rt_strlen(value); }
+    var i: i64 = 0;
+    while (i < count) {
+        putchar(rt_read_u8(value + i) as i32);
+        i = i + 1;
+    }
+    putchar(10);
+}
+
+@[no_mangle] {
+    public fn vyx_rt_set_args(argc: i32, argv: rawptr) {
+        runtime_argc = argc;
+        if (runtime_argc < 0) { runtime_argc = 0; }
+        runtime_argv = argv;
+        runtime_args_set = 1;
+    }
+
+    public fn argCount() -> i32 {
+        if (runtime_args_set != 0) { return runtime_argc; }
+        return vyx_host_argc();
+    }
+
+    public fn getArg(index: i32) -> rawptr {
+        var argv: rawptr = runtime_argv;
+        var argc: i32 = runtime_argc;
+        if (runtime_args_set == 0) {
+            argv = vyx_host_argv();
+            argc = vyx_host_argc();
+        }
+        if (argv == null || index < 0 || index >= argc) {
+            return rt_empty();
+        }
+        let value = rt_read_ptr(argv + ((index as i64) * 8));
+        if (value == null) { return rt_empty(); }
+        return value;
+    }
+
+    public fn print(value: rawptr, len: u64) {
+        rt_print(value, len);
+    }
+
+    public fn println(value: rawptr, len: u64) {
+        rt_print(value, len);
+    }
+
+    public fn vyx_string_alloc_abi(capacity: i64) -> rawptr {
+        if (capacity <= 0) { return null; }
+        let out = rt_alloc_bytes(capacity);
+        if (out != null) { rt_write_u8(out, 0 as u8); }
+        return out;
+    }
+
+    public fn vyx_free_pooled_string(data: rawptr) {
+        if (data != null && data != rt_empty()) { free(data); }
+    }
+
+    public fn vyx_forget_string_len(value: rawptr) {
+        return;
+    }
+
+    /// Length of a NUL-terminated runtime string. Declared in the compiler's
+    /// runtime-memory ABI surface (see tests/cases/codegen_runtime_memory_attrs)
+    /// but never implemented here, which made any program touching the
+    /// attribute surface fail at link time.
+    public fn vyx_string_len(value: rawptr) -> i64 {
+        return rt_strlen(value);
+    }
+
+    /// Byte at `index` of a NUL-terminated runtime string; 0 when out of
+    /// range or on a null pointer.
+    public fn vyx_string_char_at(value: rawptr, index: i32) -> i32 {
+        if (value == null || index < 0) { return 0; }
+        let len = rt_strlen(value);
+        if (index >= len) { return 0; }
+        return rt_read_u8(value + index) as i32;
+    }
+
+    public fn vyx_free_runtime_string(value: rawptr) {
+        if (value != null && value != rt_empty()) { free(value); }
+    }
+
+    public fn vyx_atomic_load_i64(value: rawptr) -> i64 {
+        return __vyx_atomic_load_i64_intrinsic(value);
+    }
+
+    public fn vyx_atomic_fetch_add_i64(value: rawptr, delta: i64) -> i64 {
+        return __vyx_atomic_fetch_add_i64_intrinsic(value, delta);
+    }
+
+    public fn vyx_atomic_compare_exchange_i64(value: rawptr,
+                                               expected: i64,
+                                               desired: i64) -> i64 {
+        return __vyx_atomic_compare_exchange_i64_intrinsic(value, expected, desired);
+    }
+
+    public fn vyx_ref_alloc_abi(payload_size: i64, payload_alignment: i64) -> rawptr {
+        if (payload_size < 0 || payload_alignment <= 0
+            || (payload_alignment & (payload_alignment - 1)) != 0) {
+            return null;
+        }
+        var size = payload_size;
+        if (size == 0) { size = 1; }
+        if (size > 9223372036854775807 - 24 - (payload_alignment - 1)) {
+            return null;
+        }
+        let control = rt_alloc_bytes(24 + (payload_alignment - 1) + size);
+        if (control == null) { return null; }
+        let payload_bits = (((control as i64) + 24 + payload_alignment - 1)
+                            & (~(payload_alignment - 1)));
+        let payload = payload_bits as rawptr;
+        rt_write_i64(control, 1);
+        rt_write_i64(control + 8, 1);
+        rt_write_ptr(control + 16, payload);
+        return control;
+    }
+
+    public fn vyx_ref_free_abi(control: rawptr) {
+        if (control != null) { free(control); }
+    }
+
+    public fn vyx_aligned_alloc_abi(payload_size: i64, payload_alignment: i64) -> rawptr {
+        if (payload_size < 0 || payload_alignment <= 0
+            || (payload_alignment & (payload_alignment - 1)) != 0) {
+            return null;
+        }
+        var size = payload_size;
+        if (size == 0) { size = 1; }
+        if (size > 9223372036854775807 - 8 - (payload_alignment - 1)) {
+            return null;
+        }
+        let base = rt_alloc_bytes(8 + (payload_alignment - 1) + size);
+        if (base == null) { return null; }
+        let payload_bits = (((base as i64) + 8 + payload_alignment - 1)
+                            & (~(payload_alignment - 1)));
+        let payload = payload_bits as rawptr;
+        rt_write_ptr(payload - 8, base);
+        return payload;
+    }
+
+    public fn vyx_aligned_free_abi(payload: rawptr) {
+        if (payload == null) { return; }
+        let base = rt_read_ptr(payload - 8);
+        if (base != null) { free(base); }
+    }
+
+    public fn vyx_class_alloc_abi(size: i64) -> rawptr {
+        return rt_alloc_bytes(size);
+    }
+
+    public fn int_to_string(value: i64) -> rawptr {
+        let out = rt_alloc_bytes(rt_i64_decimal_len(value) + 1);
+        if (out == null) { return null; }
+        rt_i64_to_chars(value, out);
+        return out;
+    }
+
+    public fn uint_to_string(value: u64) -> rawptr {
+        let out = rt_alloc_bytes(rt_u64_decimal_len(value) + 1);
+        if (out == null) { return null; }
+        rt_u64_to_chars(value, out);
+        return out;
+    }
+
+    public fn int_to_string_len_abi(value: i64, out_len: rawptr) -> rawptr {
+        let len = rt_i64_decimal_len(value);
+        if (out_len != null) { rt_write_i64(out_len, len); }
+        let out = rt_alloc_bytes(len + 1);
+        if (out == null) { return null; }
+        rt_i64_to_chars(value, out);
+        return out;
+    }
+
+    public fn uint_to_string_len_abi(value: u64, out_len: rawptr) -> rawptr {
+        let len = rt_u64_decimal_len(value);
+        if (out_len != null) { rt_write_i64(out_len, len); }
+        let out = rt_alloc_bytes(len + 1);
+        if (out == null) { return null; }
+        rt_u64_to_chars(value, out);
+        return out;
+    }
+
+    public fn vyx_int_decimal_len_abi(value: i64) -> i64 {
+        return rt_i64_decimal_len(value);
+    }
+
+    public fn vyx_int_to_string_into_abi(value: i64, out: rawptr) -> i64 {
+        return rt_i64_to_chars(value, out);
+    }
+
+    public fn vyx_uint_decimal_len_abi(value: u64) -> i64 {
+        return rt_u64_decimal_len(value);
+    }
+
+    public fn vyx_uint_to_string_into_abi(value: u64, out: rawptr) -> i64 {
+        return rt_u64_to_chars(value, out);
+    }
+
+    public fn bool_to_string(value: i32) -> rawptr {
+        if (value != 0) {
+            let out = rt_alloc_bytes(5);
+            if (out == null) { return null; }
+            rt_write_u8(out, 116 as u8);
+            rt_write_u8(out + 1, 114 as u8);
+            rt_write_u8(out + 2, 117 as u8);
+            rt_write_u8(out + 3, 101 as u8);
+            rt_write_u8(out + 4, 0 as u8);
+            return out;
+        }
+        let out = rt_alloc_bytes(6);
+        if (out == null) { return null; }
+        rt_write_u8(out, 102 as u8);
+        rt_write_u8(out + 1, 97 as u8);
+        rt_write_u8(out + 2, 108 as u8);
+        rt_write_u8(out + 3, 115 as u8);
+        rt_write_u8(out + 4, 101 as u8);
+        rt_write_u8(out + 5, 0 as u8);
+        return out;
+    }
+
+    public fn from_cstr_view_len(value: rawptr, len: i64) -> rawptr {
+        if (value == null) { return rt_empty(); }
+        return value;
+    }
+
+    public fn from_cstr_len(value: rawptr, len: i64) -> rawptr {
+        var count = len;
+        if (count < 0) { count = rt_strlen(value); }
+        return rt_alloc_copy(value, count);
+    }
+
+    public fn from_cstr(value: rawptr) -> rawptr {
+        return rt_alloc_copy(value, rt_strlen(value));
+    }
+
+    public fn vyx_string_clone(value: rawptr) -> rawptr {
+        return rt_alloc_copy(value, rt_strlen(value));
+    }
+
+    public fn vyx_string_clone_len_abi(value: rawptr, len: i64) -> rawptr {
+        return rt_alloc_copy(value, len);
+    }
+
+    public fn vyx_string_concat(lhs: rawptr, rhs: rawptr) -> rawptr {
+        let lhs_len = rt_strlen(lhs);
+        let rhs_len = rt_strlen(rhs);
+        if (lhs_len + rhs_len == 0) { return rt_empty(); }
+        let out = rt_alloc_bytes(lhs_len + rhs_len + 1);
+        if (out == null) { return null; }
+        if (lhs_len > 0) { memcpy(out, lhs, lhs_len as u64); }
+        if (rhs_len > 0) { memcpy(out + lhs_len, rhs, rhs_len as u64); }
+        rt_write_u8(out + lhs_len + rhs_len, 0 as u8);
+        return out;
+    }
+
+    public fn vyx_string_trim(value: rawptr) -> rawptr {
+        if (value == null) { return rt_alloc_copy(null, 0); }
+        let len = rt_strlen(value);
+        var first: i64 = 0;
+        var last = len;
+        while (first < last && rt_ascii_space(rt_read_u8(value + first))) {
+            first = first + 1;
+        }
+        while (last > first && rt_ascii_space(rt_read_u8(value + last - 1))) {
+            last = last - 1;
+        }
+        return rt_alloc_copy(value + first, last - first);
+    }
+
+    /// Bulk ASCII case conversion: true SWAR — all 8 bytes converted in
+    /// parallel with pure bitwise ops, no inner per-byte loop.
+    fn rt_ascii_upper_bulk(out: rawptr, count: i64) {
+        var i: i64 = 0;
+        while (i + 8 <= count) {
+            // Classic SWAR uppercase. For each byte lane:
+            //   m1 = ((b|0x80) - 0x61) & 0x80 -> set iff b >= 'a'
+            //   m2 = ((b|0x80) - 0x7B) & 0x80 -> set iff b >  'z'
+            //   mask = (m1 & ~m2) >> 2        -> 0x20 exactly on a-z lanes
+            //   out = b & ~mask               -> clears bit5 only there
+            var x = rt_read_u64(out + i);
+            let HIGH: u64 = 0x8080808080808080 as u64;
+            let A: u64 = 0x6161616161616161 as u64;       // 'a'
+            let ZP1: u64 = 0x7B7B7B7B7B7B7B7B as u64;     // 'z' + 1
+            let xb = x | HIGH;
+            let m1 = (xb - A) & HIGH;                     // b >= 'a'
+            let m2 = (xb - ZP1) & HIGH;                   // b > 'z'
+            let mask = (m1 & ~m2) >> 2;                   // 0x20 where a-z
+            x = x & ~mask;
+            rt_write_u64(out + i, x);
+            i = i + 8;
+        }
+        while (i < count) {
+            rt_write_u8(out + i, rt_ascii_upper(rt_read_u8(out + i)));
+            i = i + 1;
+        }
+    }
+
+    public fn vyx_string_to_upper(value: rawptr) -> rawptr {
+        let len = rt_strlen(value);
+        let out = rt_alloc_copy(value, len);
+        if (out == null) { return null; }
+        rt_ascii_upper_bulk(out, len);
+        return out;
+    }
+
+    public fn vyx_string_to_lower(value: rawptr) -> rawptr {
+        let len = rt_strlen(value);
+        let out = rt_alloc_copy(value, len);
+        if (out == null) { return null; }
+        var i: i64 = 0;
+        while (i < len) {
+            rt_write_u8(out + i, rt_ascii_lower(rt_read_u8(out + i)));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn vyx_string_to_upper_len_abi(value: rawptr, len: i64) -> rawptr {
+        var count = len;
+        if (count < 0) { count = 0; }
+        let out = rt_alloc_copy(value, count);
+        if (out == null) { return null; }
+        rt_ascii_upper_bulk(out, count);
+        return out;
+    }
+
+    public fn vyx_string_to_lower_len_abi(value: rawptr, len: i64) -> rawptr {
+        var count = len;
+        if (count < 0) { count = 0; }
+        let out = rt_alloc_copy(value, count);
+        if (out == null) { return null; }
+        var i: i64 = 0;
+        while (i < count) {
+            rt_write_u8(out + i, rt_ascii_lower(rt_read_u8(out + i)));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn vyx_string_replace(value: rawptr, needle: rawptr, replacement: rawptr) -> rawptr {
+        let value_len = rt_strlen(value);
+        let needle_len = rt_strlen(needle);
+        let replacement_len = rt_strlen(replacement);
+        if (needle_len <= 0) { return rt_alloc_copy(value, value_len); }
+        var count: i64 = 0;
+        var scan: i64 = 0;
+        while (scan <= value_len - needle_len) {
+            let hit = rt_find_bytes(value, value_len, needle, needle_len, scan);
+            if (hit < 0) { break; }
+            count = count + 1;
+            scan = hit + needle_len;
+        }
+        if (count == 0) { return rt_alloc_copy(value, value_len); }
+        let out_len = value_len + count * (replacement_len - needle_len);
+        let out = rt_alloc_bytes(out_len + 1);
+        if (out == null) { return null; }
+        var src_pos: i64 = 0;
+        var dst_pos: i64 = 0;
+        while (src_pos < value_len) {
+            let hit = rt_find_bytes(value, value_len, needle, needle_len, src_pos);
+            if (hit < 0) { break; }
+            let prefix = hit - src_pos;
+            if (prefix > 0) {
+                memcpy(out + dst_pos, value + src_pos, prefix as u64);
+                dst_pos = dst_pos + prefix;
+            }
+            if (replacement_len > 0) {
+                memcpy(out + dst_pos, replacement, replacement_len as u64);
+                dst_pos = dst_pos + replacement_len;
+            }
+            src_pos = hit + needle_len;
+        }
+        let tail = value_len - src_pos;
+        if (tail > 0) {
+            memcpy(out + dst_pos, value + src_pos, tail as u64);
+            dst_pos = dst_pos + tail;
+        }
+        rt_write_u8(out + dst_pos, 0 as u8);
+        return out;
+    }
+
+    public fn vyx_string_append_assign_abi(base: rawptr,
+                                           base_len: i64,
+                                           base_cap: i64,
+                                           base_owned: i64,
+                                           suffix: rawptr,
+                                           suffix_len: i64,
+                                           out_len: rawptr,
+                                           out_cap: rawptr,
+                                           out_owned: rawptr) -> rawptr {
+        var old_len = base_len;
+        var add_len = suffix_len;
+        if (old_len < 0) { old_len = rt_strlen(base); }
+        if (add_len < 0) { add_len = rt_strlen(suffix); }
+        if (suffix == null || add_len <= 0) {
+            rt_write_i64(out_len, old_len);
+            rt_write_i64(out_cap, base_cap);
+            rt_write_i64(out_owned, base_owned);
+            if (base == null) { return rt_empty(); }
+            return base;
+        }
+        let total = old_len + add_len;
+        let needed = total + 1;
+        var cap = base_cap;
+        if (cap <= 0) { cap = old_len + 1; }
+        while (cap < needed) {
+            if (cap < 64) { cap = 64; }
+            else { cap = cap * 2 + 1; }
+        }
+        var suffix_copy: rawptr = null;
+        let base_bits = base as i64;
+        let suffix_bits = suffix as i64;
+        if (base != null && suffix_bits >= base_bits && suffix_bits < base_bits + old_len) {
+            suffix_copy = rt_alloc_copy(suffix, add_len);
+        }
+        var source = suffix;
+        if (suffix_copy != null) { source = suffix_copy; }
+        var data: rawptr = null;
+        var owned: i64 = 3;
+        if (base != null && base_owned == 1 && base_cap >= needed) {
+            data = base;
+            owned = 1;
+        } elif (base != null && base_owned == 3 && base_cap >= needed) {
+            data = base;
+        } elif (base != null && base_owned == 3) {
+            data = realloc(base, cap as u64);
+        } else {
+            data = rt_alloc_bytes(cap);
+            if (data != null && base != null && old_len > 0) {
+                memcpy(data, base, old_len as u64);
+            }
+        }
+        if (data == null) {
+            if (suffix_copy != null) { free(suffix_copy); }
+            return null;
+        }
+        memcpy(data + old_len, source, add_len as u64);
+        rt_write_u8(data + total, 0 as u8);
+        if (suffix_copy != null) { free(suffix_copy); }
+        if (base != null && base_owned == 1 && data != base) { free(base); }
+        rt_write_i64(out_len, total);
+        rt_write_i64(out_cap, cap);
+        rt_write_i64(out_owned, owned);
+        return data;
+    }
+
+    public fn vyx_string_builder_create_abi() -> rawptr {
+        let builder = rt_alloc_bytes(88);
+        if (builder == null) { return null; }
+        memset(builder, 0, 88);
+        rt_write_i64(builder + 16, 63);
+        return builder;
+    }
+
+    public fn vyx_string_builder_append_i64_abi(builder: rawptr, value: i64) {
+        if (builder == null) { return; }
+        let count = rt_i64_decimal_len(value);
+        let data = rt_builder_reserve(builder, count);
+        if (data == null) { return; }
+        let old_len = rt_read_i64(builder + 8);
+        rt_i64_to_chars(value, data + old_len);
+        rt_write_i64(builder + 8, old_len + count);
+    }
+
+    public fn vyx_string_builder_append_u64_abi(builder: rawptr, value: u64) {
+        if (builder == null) { return; }
+        let count = rt_u64_decimal_len(value);
+        let data = rt_builder_reserve(builder, count);
+        if (data == null) { return; }
+        let old_len = rt_read_i64(builder + 8);
+        rt_u64_to_chars(value, data + old_len);
+        rt_write_i64(builder + 8, old_len + count);
+    }
+}
+
+fn rt_string_record_compare(lhs: rawptr, rhs: rawptr) -> i32 {
+    let lhs_len = rt_read_i64(lhs + 8);
+    let rhs_len = rt_read_i64(rhs + 8);
+    var shared = lhs_len;
+    if (rhs_len < shared) { shared = rhs_len; }
+    if (shared > 0) {
+        let lhs_inline = rt_string_is_inline(lhs);
+        let rhs_inline = rt_string_is_inline(rhs);
+        if (!lhs_inline && !rhs_inline) {
+            let cmp = memcmp(rt_read_ptr(lhs), rt_read_ptr(rhs), shared as u64);
+            if (cmp < 0) { return -1; }
+            if (cmp > 0) { return 1; }
+        } else {
+            var index: i64 = 0;
+            while (index < shared) {
+                var lhs_byte: u8 = 0 as u8;
+                var rhs_byte: u8 = 0 as u8;
+                if (lhs_inline) {
+                    if (index < 8) { lhs_byte = rt_read_u8(lhs + index); }
+                    else { lhs_byte = rt_read_u8(lhs + 16 + index - 8); }
+                } else { lhs_byte = rt_read_u8(rt_read_ptr(lhs) + index); }
+                if (rhs_inline) {
+                    if (index < 8) { rhs_byte = rt_read_u8(rhs + index); }
+                    else { rhs_byte = rt_read_u8(rhs + 16 + index - 8); }
+                } else { rhs_byte = rt_read_u8(rt_read_ptr(rhs) + index); }
+                if (lhs_byte < rhs_byte) { return -1; }
+                if (lhs_byte > rhs_byte) { return 1; }
+                index = index + 1;
+            }
+        }
+    }
+    if (lhs_len < rhs_len) { return -1; }
+    if (lhs_len > rhs_len) { return 1; }
+    return 0;
+}
+
+fn rt_hash_i64(value: i64) -> u64 {
+    var hash = value as u64;
+    hash = hash ^ (hash >> (30 as u64));
+    hash = hash * ((-4658895280553007687 as i64) as u64);
+    hash = hash ^ (hash >> (27 as u64));
+    hash = hash * ((-7723592293110705685 as i64) as u64);
+    hash = hash ^ (hash >> (31 as u64));
+    return hash;
+}
+
+fn rt_rotate_left(value: u64, amount: u64) -> u64 {
+    return (value << amount) | (value >> ((64 as u64) - amount));
+}
+
+fn rt_hash_bytes(value: rawptr, len: i64) -> u64 {
+    var count = len;
+    if (count < 0) { count = 0; }
+    var hash = (count as u64) ^ ((-7046029254386353131 as i64) as u64);
+    hash = hash ^ (hash >> (30 as u64));
+    hash = hash * ((-4658895280553007687 as i64) as u64);
+    hash = hash ^ (hash >> (27 as u64));
+    hash = hash * ((-7723592293110705685 as i64) as u64);
+    hash = hash ^ (hash >> (31 as u64));
+    var offset: i64 = 0;
+    while (offset + 8 <= count) {
+        let chunk = rt_read_u64(value + offset);
+        hash = hash ^ chunk;
+        hash = hash ^ (hash >> (30 as u64));
+        hash = hash * ((-4658895280553007687 as i64) as u64);
+        hash = hash ^ (hash >> (27 as u64));
+        hash = hash * ((-7723592293110705685 as i64) as u64);
+        hash = hash ^ (hash >> (31 as u64));
+        offset = offset + 8;
+    }
+    var tail: u64 = 0 as u64;
+    var shift: u64 = 0 as u64;
+    while (offset < count) {
+        tail = tail | ((rt_read_u8(value + offset) as u64) << shift);
+        shift = shift + (8 as u64);
+        offset = offset + 1;
+    }
+    if (shift > (0 as u64)) {
+        hash = hash ^ tail;
+        hash = hash ^ (hash >> (30 as u64));
+        hash = hash * ((-4658895280553007687 as i64) as u64);
+        hash = hash ^ (hash >> (27 as u64));
+        hash = hash * ((-7723592293110705685 as i64) as u64);
+        hash = hash ^ (hash >> (31 as u64));
+    }
+    return hash;
+}
+
+fn rt_dict_control_bytes(capacity: i64) -> i64 {
+    return (capacity + 7) & (~7);
+}
+
+fn rt_dict_allocate(dict: rawptr, capacity: i64, key_size: i64) {
+    if (dict == null || capacity <= 0 || key_size <= 0) { return; }
+    let control_bytes = rt_dict_control_bytes(capacity);
+    let total = control_bytes + capacity * key_size + capacity * 8;
+    let data = rt_alloc_bytes(total);
+    if (data != null) { memset(data, 0, control_bytes as u64); }
+    rt_write_ptr(dict, data);
+    rt_write_i64(dict + 8, 0);
+    rt_write_i64(dict + 16, capacity);
+    rt_write_u8(dict + 32, 0 as u8);
+}
+
+fn rt_dict_i64_insert_rehash(dict: rawptr, key: i64, value: i64) {
+    let data = rt_read_ptr(dict);
+    let capacity = rt_read_i64(dict + 16);
+    let control_bytes = rt_dict_control_bytes(capacity);
+    let keys = data + control_bytes;
+    let values = keys + capacity * 8;
+    var index = (rt_hash_i64(key) & ((capacity - 1) as u64)) as i64;
+    while (rt_read_u8(data + index) == (1 as u8)) {
+        index = (index + 1) & (capacity - 1);
+    }
+    rt_write_u8(data + index, 1 as u8);
+    rt_write_i64(keys + index * 8, key);
+    rt_write_i64(values + index * 8, value);
+    rt_write_i64(dict + 8, rt_read_i64(dict + 8) + 1);
+}
+
+fn rt_dict_i64_grow(dict: rawptr) {
+    let old_capacity = rt_read_i64(dict + 16);
+    let old_data = rt_read_ptr(dict);
+    let old_control_bytes = rt_dict_control_bytes(old_capacity);
+    let old_keys = old_data + old_control_bytes;
+    let old_values = old_keys + old_capacity * 8;
+    var next_capacity: i64 = 64;
+    if (old_capacity > 0) { next_capacity = old_capacity * 2; }
+    rt_dict_allocate(dict, next_capacity, 8);
+    var index: i64 = 0;
+    while (index < old_capacity) {
+        if (rt_read_u8(old_data + index) == (1 as u8)) {
+            rt_dict_i64_insert_rehash(dict,
+                                      rt_read_i64(old_keys + index * 8),
+                                      rt_read_i64(old_values + index * 8));
+        }
+        index = index + 1;
+    }
+    if (old_data != null) { free(old_data); }
+    rt_write_i64(dict + 24, rt_read_i64(dict + 24) + 1);
+}
+
+fn rt_string_is_inline(record: rawptr) -> bool {
+    return rt_read_i64(record + 24) == -6222101432058523958;
+}
+
+fn rt_string_key_hash(record: rawptr) -> u64 {
+    let len = rt_read_i64(record + 8);
+    if (!rt_string_is_inline(record)) {
+        return rt_hash_bytes(rt_read_ptr(record), len);
+    }
+    let bytes = rt_alloc_bytes(16);
+    if (bytes == null) { return 0 as u64; }
+    memset(bytes, 0, 16);
+    var first = len;
+    if (first > 8) { first = 8; }
+    if (first > 0) { memcpy(bytes, record, first as u64); }
+    if (len > 8) { memcpy(bytes + 8, record + 16, (len - 8) as u64); }
+    let hash = rt_hash_bytes(bytes, len);
+    free(bytes);
+    return hash;
+}
+
+fn rt_string_key_equals(record: rawptr, key: rawptr, len: i64) -> bool {
+    if (rt_read_i64(record + 8) != len) { return false; }
+    if (len <= 0) { return true; }
+    if (!rt_string_is_inline(record)) {
+        let stored = rt_read_ptr(record);
+        if (stored == key) { return true; }
+        if (stored == null || key == null) { return false; }
+        return memcmp(stored, key, len as u64) == 0;
+    }
+    if (key == null) { return false; }
+    var index: i64 = 0;
+    while (index < len) {
+        var stored: u8 = 0 as u8;
+        if (index < 8) { stored = rt_read_u8(record + index); }
+        else { stored = rt_read_u8(record + 16 + index - 8); }
+        if (stored != rt_read_u8(key + index)) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+fn rt_string_key_write(record: rawptr,
+                       key: rawptr,
+                       len: i64,
+                       capacity: i64,
+                       owned: i64) {
+    memset(record, 0, 32);
+    rt_write_i64(record + 8, len);
+    if (key != null && len > 0 && len <= 16) {
+        let first = if (len > 8) { 8 } else { len };
+        memcpy(record, key, first as u64);
+        if (len > 8) { memcpy(record + 16, key + 8, (len - 8) as u64); }
+        rt_write_i64(record + 24, -6222101432058523958);
+        return;
+    }
+    rt_write_ptr(record, key);
+    rt_write_i64(record + 16, capacity);
+    rt_write_i64(record + 24, owned);
+}
+
+fn rt_dict_string_insert_rehash(dict: rawptr, key_record: rawptr, value: i64) {
+    let data = rt_read_ptr(dict);
+    let capacity = rt_read_i64(dict + 16);
+    let control_bytes = rt_dict_control_bytes(capacity);
+    let keys = data + control_bytes;
+    let values = keys + capacity * 32;
+    var index = (rt_string_key_hash(key_record) & ((capacity - 1) as u64)) as i64;
+    while (rt_read_u8(data + index) == (1 as u8)) {
+        index = (index + 1) & (capacity - 1);
+    }
+    rt_write_u8(data + index, 1 as u8);
+    memcpy(keys + index * 32, key_record, 32);
+    rt_write_i64(values + index * 8, value);
+    rt_write_i64(dict + 8, rt_read_i64(dict + 8) + 1);
+}
+
+fn rt_dict_string_grow(dict: rawptr) {
+    let old_capacity = rt_read_i64(dict + 16);
+    let old_data = rt_read_ptr(dict);
+    let old_control_bytes = rt_dict_control_bytes(old_capacity);
+    let old_keys = old_data + old_control_bytes;
+    let old_values = old_keys + old_capacity * 32;
+    var next_capacity: i64 = 64;
+    if (old_capacity > 0) { next_capacity = old_capacity * 2; }
+    rt_dict_allocate(dict, next_capacity, 32);
+    var index: i64 = 0;
+    while (index < old_capacity) {
+        if (rt_read_u8(old_data + index) == (1 as u8)) {
+            rt_dict_string_insert_rehash(dict,
+                                         old_keys + index * 32,
+                                         rt_read_i64(old_values + index * 8));
+        }
+        index = index + 1;
+    }
+    if (old_data != null) { free(old_data); }
+    rt_write_i64(dict + 24, rt_read_i64(dict + 24) + 1);
+}
+
+fn rt_registry_acquire() {
+    let lock = to_rawptr(&runtime_pointer_registry_lock);
+    while (__vyx_atomic_fetch_add_i64_intrinsic(lock, 1) != 0) {
+        __vyx_atomic_fetch_add_i64_intrinsic(lock, -1);
+    }
+}
+
+fn rt_registry_release() {
+    __vyx_atomic_fetch_add_i64_intrinsic(to_rawptr(&runtime_pointer_registry_lock), -1);
+}
+
+// ---------------------------------------------------------------------------
+// Region dedup cache.
+//
+// vyx_pointer_region_create used to take the full slow path on every call:
+// registry lock, rt_registered_remaining walk, malloc(56), memset and a
+// splice into runtime_pointer_regions -- about 60ns, and every one of those
+// descriptors leaked, because a borrowed region (capability 1 or 2) is never
+// passed to vyx_pointer_region_delete (that function aborts on those tags).
+// A borrow site inside a loop re-creates a region with identical arguments on
+// every iteration, so pointer-heavy loops ran an order of magnitude slower
+// than the equivalent C.
+//
+// A region is an immutable descriptor of (base, span, owned) whose only
+// mutable field is the refcount at +24 -- exactly what
+// vyx_pointer_region_delete and vyx_pointer_handle_alive observe.  Returning
+// the same descriptor for identical arguments and bumping that refcount keeps
+// the create/delete pairing intact: N creates are matched by N deletes, and
+// the descriptor is invalidated only when the last delete drives the count to
+// zero.  A handle that outlives its frame therefore still reports dead rather
+// than resurrecting a stale descriptor.
+//
+// Slot layout, 56 bytes: seq(0) base(8) bytes(16) owned(24) capability(32)
+// region(40) gen(48).  Keying on the *requested* bytes (not the clamped span)
+// is what makes the lookup hit; `gen` keeps that sound, since a matching gen
+// proves the registry is unchanged, so rt_registered_remaining would clamp to
+// the same span it clamped to when the slot was filled.
+//
+// Writes bump seq to odd before touching the payload and to even after, so a
+// concurrent reader that observes a changing seq discards the slot and falls
+// back to the (mutex protected) slow path instead of returning a half-updated
+// region.
+fn rt_region_cache_slot(index: i64) -> rawptr {
+    if (runtime_region_cache == null) { return null; }
+    return runtime_region_cache + index * 56;
+}
+
+fn rt_region_cache_index(base: rawptr) -> i64 {
+    let mixed = ((base as u64) >> 4) * (2654435761 as u64);
+    return ((mixed >> 12) & (511 as u64)) as i64;
+}
+
+fn rt_region_cache_lookup(base: rawptr,
+                          bytes: i64,
+                          owned: i32,
+                          capability: i32) -> rawptr {
+    let slot = rt_region_cache_slot(rt_region_cache_index(base));
+    if (slot == null) { return null; }
+    let seq = rt_read_i64(slot);
+    if ((seq & 1) != 0) { return null; }
+    if (rt_read_i64(slot + 48) != runtime_region_cache_gen) { return null; }
+    if (rt_read_ptr(slot + 8) != base) { return null; }
+    if (rt_read_i64(slot + 16) != bytes) { return null; }
+    if (rt_read_i64(slot + 24) != (owned as i64)) { return null; }
+    if (rt_read_i64(slot + 32) != (capability as i64)) { return null; }
+    let region = rt_read_ptr(slot + 40);
+    if (region == null) { return null; }
+    if (rt_read_i64(slot) != seq) { return null; }
+    if (capability >= 1) {
+        // A borrowed region can never be released: vyx_pointer_region_delete
+        // aborts on capability 1/2, so the compiler never emits a release for
+        // one and the refcount only ever grows.  Its sole role is the liveness
+        // bit vyx_pointer_handle_alive reads, so a plain (atomic) load is
+        // enough -- a lock xadd here cost ~6ns and dominated every hit.  The
+        // load still catches rt_invalidate_span zeroing the count.
+        if (__vyx_atomic_load_i64_intrinsic(region + 24) <= 0) { return null; }
+        return region;
+    }
+    let prior = __vyx_atomic_fetch_add_i64_intrinsic(region + 24, 1);
+    if (prior <= 0) {
+        // The descriptor was invalidated by its last release; drop the extra
+        // reference we just took and let the slow path build a fresh one.
+        __vyx_atomic_fetch_add_i64_intrinsic(region + 24, -1);
+        return null;
+    }
+    return region;
+}
+
+fn rt_region_cache_store(base: rawptr,
+                         bytes: i64,
+                         owned: i32,
+                         capability: i32,
+                         region: rawptr) {
+    if (runtime_region_cache == null) {
+        runtime_region_cache = rt_alloc_bytes(512 * 56);
+        if (runtime_region_cache == null) { return; }
+        memset(runtime_region_cache, 0, (512 * 56) as u64);
+    }
+    let slot = rt_region_cache_slot(rt_region_cache_index(base));
+    if (slot == null) { return; }
+    rt_write_i64(slot, rt_read_i64(slot) + 1);
+    rt_write_i64(slot + 48, runtime_region_cache_gen);
+    rt_write_ptr(slot + 8, base);
+    rt_write_i64(slot + 16, bytes);
+    rt_write_i64(slot + 24, owned as i64);
+    rt_write_i64(slot + 32, capability as i64);
+    rt_write_ptr(slot + 40, region);
+    rt_write_i64(slot, rt_read_i64(slot) + 1);
+}
+
+// A region that received an array shape (vyx_pointer_region_set_dimension)
+// must not be shared: two borrows of the same base with different shapes
+// would fight over the descriptor's dimension array, and the loser's handle
+// would end up describing the winner's shape.  Evicting on shape
+// configuration keeps sharing confined to shapeless (scalar/struct) regions,
+// which is exactly the case that matters -- the arrays live in setup code,
+// not in the measured loops.
+fn rt_region_cache_evict(region: rawptr) {
+    if (runtime_region_cache == null || region == null) { return; }
+    let base = rt_read_ptr(region);
+    if (base == null) { return; }
+    let slot = rt_region_cache_slot(rt_region_cache_index(base));
+    if (slot == null) { return; }
+    if (rt_read_ptr(slot + 40) != region) { return; }
+    rt_write_i64(slot, rt_read_i64(slot) + 1);
+    rt_write_ptr(slot + 40, null);
+    rt_write_i64(slot + 48, -1);
+    rt_write_i64(slot, rt_read_i64(slot) + 1);
+}
+
+// Any change to the allocation registry can change the span
+// rt_registered_remaining would report, so it invalidates every slot.
+fn rt_region_cache_bump_epoch() {
+    runtime_region_cache_gen = runtime_region_cache_gen + 1;
+}
+
+fn rt_atomic_store_zero(value: rawptr) {
+    var observed = __vyx_atomic_load_i64_intrinsic(value);
+    while (observed != 0) {
+        let prior = __vyx_atomic_compare_exchange_i64_intrinsic(value, observed, 0);
+        if (prior == observed) { return; }
+        observed = prior;
+    }
+}
+
+fn rt_pointer_region(metadata: rawptr) -> rawptr {
+    if (metadata == null) { return null; }
+    return (((metadata as u64) & (~(3 as u64))) as rawptr);
+}
+
+fn rt_pointer_capability(metadata: rawptr) -> i32 {
+    if (metadata == null) { return 0; }
+    return ((metadata as u64) & (3 as u64)) as i32;
+}
+
+fn rt_pointer_tag(region: rawptr, capability: i32) -> rawptr {
+    if (region == null) { return null; }
+    return (((region as u64) | (capability as u64)) as rawptr);
+}
+
+fn rt_address_in_span(address: rawptr, base: rawptr, bytes: i64) -> bool {
+    if (address == null || base == null || bytes <= 0) { return false; }
+    let current = address as u64;
+    let start = base as u64;
+    return current >= start && current - start < (bytes as u64);
+}
+
+fn rt_registered_remaining(address: rawptr) -> i64 {
+    if (address == null) { return 0; }
+    rt_registry_acquire();
+    var best: i64 = 0;
+    var current = runtime_pointer_allocations;
+    while (current != null) {
+        let base = rt_read_ptr(current);
+        let bytes = rt_read_i64(current + 8);
+        let alive = rt_read_i64(current + 16);
+        if (alive != 0 && rt_address_in_span(address, base, bytes)) {
+            let remaining = bytes - (((address as u64) - (base as u64)) as i64);
+            if (base == address) {
+                rt_registry_release();
+                return remaining;
+            }
+            if (best == 0 || remaining < best) { best = remaining; }
+        }
+        current = rt_read_ptr(current + 24);
+    }
+    rt_registry_release();
+    return best;
+}
+
+fn rt_invalidate_span(base: rawptr, bytes: i64) {
+    if (base == null || bytes <= 0) { return; }
+    rt_region_cache_bump_epoch();
+    rt_registry_acquire();
+    var allocation = runtime_pointer_allocations;
+    while (allocation != null) {
+        if (rt_read_i64(allocation + 16) != 0
+            && rt_address_in_span(rt_read_ptr(allocation), base, bytes)) {
+            rt_write_i64(allocation + 16, 0);
+        }
+        allocation = rt_read_ptr(allocation + 24);
+    }
+    var region = runtime_pointer_regions;
+    while (region != null) {
+        if (__vyx_atomic_load_i64_intrinsic(region + 24) != 0
+            && rt_address_in_span(rt_read_ptr(region), base, bytes)) {
+            rt_atomic_store_zero(region + 24);
+            rt_write_ptr(region, null);
+            rt_write_i64(region + 8, 0);
+        }
+        region = rt_read_ptr(region + 48);
+    }
+    rt_registry_release();
+}
+
+fn rt_pointer_checked_address(address: rawptr,
+                              metadata: rawptr,
+                              index: i64,
+                              element_size: i64,
+                              pointer_depth: i32) -> rawptr {
+    let region = rt_pointer_region(metadata);
+    // The liveness flag is deliberately NOT consulted here.  It is cleared by
+    // rt_invalidate_span()/vyx_pointer_region_delete() only after base and
+    // bytes have been zeroed, so any access through a dead region fails the
+    // span audit below (address < base == 0).  Dropping the atomic load lets
+    // LLVM hoist the remaining checks out of loops; the C++ backend's inline
+    // ptr_checked_address template never had this load to begin with.
+    if (address == null || region == null
+        || index < 0 || element_size <= 0) {
+        abort();
+        return null;
+    }
+    var access_size = element_size;
+    var stride = element_size;
+    var extent: i64 = 0;
+    var shaped = false;
+    let rank = rt_read_i64(region + 32);
+    let dimensions = rt_read_ptr(region + 40);
+    if (pointer_depth > 0 && rank >= (pointer_depth as i64) && dimensions != null) {
+        let level = rank - (pointer_depth as i64);
+        if (level >= 0 && level < rank) {
+            let dimension = dimensions + level * 16;
+            extent = rt_read_i64(dimension);
+            stride = rt_read_i64(dimension + 8);
+            if (extent > 0 && stride > 0) {
+                shaped = true;
+                access_size = stride;
+            }
+        }
+    }
+    if (shaped && index >= extent) {
+        abort();
+        return null;
+    }
+    if (index > 9223372036854775807 / stride) {
+        abort();
+        return null;
+    }
+    let base = rt_read_ptr(region);
+    let region_bytes = rt_read_i64(region + 8);
+    let base_bits = base as u64;
+    let current_bits = address as u64;
+    if (current_bits < base_bits) {
+        abort();
+        return null;
+    }
+    let raw_offset = current_bits - base_bits;
+    if (raw_offset > (region_bytes as u64)) {
+        abort();
+        return null;
+    }
+    let offset = raw_offset as i64;
+    let delta = index * stride;
+    if (delta > region_bytes || offset > region_bytes - delta
+        || access_size > region_bytes - offset - delta) {
+        abort();
+        return null;
+    }
+    return (current_bits + (delta as u64)) as rawptr;
+}
+
+fn rt_i64_at(data: rawptr, index: i64) -> i64 {
+    return rt_read_i64(data + index * 8);
+}
+
+fn rt_i64_put(data: rawptr, index: i64, value: i64) {
+    rt_write_i64(data + index * 8, value);
+}
+
+fn rt_sort_i64_swap(data: rawptr, left: i64, right: i64) {
+    if (left == right) { return; }
+    let value = rt_i64_at(data, left);
+    rt_i64_put(data, left, rt_i64_at(data, right));
+    rt_i64_put(data, right, value);
+}
+
+fn rt_sort_i64_insertion(data: rawptr, first: i64, last: i64) {
+    var index = first + 1;
+    while (index < last) {
+        let value = rt_i64_at(data, index);
+        var pos = index;
+        while (pos > first && rt_i64_at(data, pos - 1) > value) {
+            rt_i64_put(data, pos, rt_i64_at(data, pos - 1));
+            pos = pos - 1;
+        }
+        rt_i64_put(data, pos, value);
+        index = index + 1;
+    }
+}
+
+fn rt_sort_i64_sift(data: rawptr, first: i64, count: i64, root: i64) {
+    var hole = root;
+    let value = rt_i64_at(data, first + hole);
+    while (true) {
+        var child = hole * 2 + 1;
+        if (child >= count) { break; }
+        if (child + 1 < count
+            && rt_i64_at(data, first + child) < rt_i64_at(data, first + child + 1)) {
+            child = child + 1;
+        }
+        if (value >= rt_i64_at(data, first + child)) { break; }
+        rt_i64_put(data, first + hole, rt_i64_at(data, first + child));
+        hole = child;
+    }
+    rt_i64_put(data, first + hole, value);
+}
+
+fn rt_sort_i64_heap(data: rawptr, first: i64, last: i64) {
+    let count = last - first;
+    if (count < 2) { return; }
+    var index = count / 2;
+    while (index > 0) {
+        index = index - 1;
+        rt_sort_i64_sift(data, first, count, index);
+    }
+    var end = count;
+    while (end > 1) {
+        end = end - 1;
+        rt_sort_i64_swap(data, first, first + end);
+        rt_sort_i64_sift(data, first, end, 0);
+    }
+}
+
+fn rt_sort_i64_partition(data: rawptr, first: i64, last: i64) -> i64 {
+    let mid = first + (last - first) / 2;
+    let lastm = last - 1;
+    if (rt_i64_at(data, mid) < rt_i64_at(data, first)) {
+        rt_sort_i64_swap(data, first, mid);
+    }
+    if (rt_i64_at(data, lastm) < rt_i64_at(data, first)) {
+        rt_sort_i64_swap(data, first, lastm);
+    }
+    if (rt_i64_at(data, lastm) < rt_i64_at(data, mid)) {
+        rt_sort_i64_swap(data, mid, lastm);
+    }
+    rt_sort_i64_swap(data, first, mid);
+    let pivot = rt_i64_at(data, first);
+    var left = first + 1;
+    var right = lastm;
+    while (true) {
+        while (left <= right && rt_i64_at(data, left) < pivot) {
+            left = left + 1;
+        }
+        while (right >= left && rt_i64_at(data, right) > pivot) {
+            right = right - 1;
+        }
+        if (left >= right) { break; }
+        rt_sort_i64_swap(data, left, right);
+        left = left + 1;
+        right = right - 1;
+    }
+    rt_sort_i64_swap(data, first, right);
+    return right;
+}
+
+fn rt_sort_i64_intro(data: rawptr, first: i64, last: i64, depth: i64) {
+    var lo = first;
+    var hi = last;
+    var remaining = depth;
+    while (hi - lo > 32) {
+        if (remaining <= 0) {
+            rt_sort_i64_heap(data, lo, hi);
+            return;
+        }
+        remaining = remaining - 1;
+        let pivot = rt_sort_i64_partition(data, lo, hi);
+        if (pivot - lo < hi - (pivot + 1)) {
+            rt_sort_i64_intro(data, lo, pivot, remaining);
+            lo = pivot + 1;
+        } else {
+            rt_sort_i64_intro(data, pivot + 1, hi, remaining);
+            hi = pivot;
+        }
+    }
+    rt_sort_i64_insertion(data, lo, hi);
+}
+
+fn rt_sort_i64_std(data: rawptr, size: i64) {
+    if (size <= 1) { return; }
+    var depth: i64 = 0;
+    var cursor = size;
+    while (cursor > 1) {
+        cursor = cursor / 2;
+        depth = depth + 1;
+    }
+    rt_sort_i64_intro(data, 0, size, depth * 2);
+}
+
+fn rt_sort_i64_radix_job(arg: rawptr) {
+    let source = rt_read_ptr(arg);
+    let dest = rt_read_ptr(arg + 8);
+    let local = rt_read_ptr(arg + 16);
+    let begin = rt_read_i64(arg + 24);
+    let end = rt_read_i64(arg + 32);
+    let shift = rt_read_i64(arg + 40);
+    let phase = rt_read_i32(arg + 48);
+    let sign_bit: u64 = (1 as u64) << (63 as u64);
+    var index = begin;
+    while (index < end) {
+        let value = rt_read_i64(source + index * 8);
+        let key = (value as u64) ^ sign_bit;
+        let bucket = ((key >> (shift as u64)) & (65535 as u64)) as i64;
+        let slot = local + bucket * 4;
+        if (phase == 0) {
+            rt_write_u32(slot, ((rt_read_u32(slot) as u64) + (1 as u64)) as u32);
+        } else {
+            let pos = rt_read_u32(slot);
+            rt_write_i64(dest + (pos as i64) * 8, value);
+            rt_write_u32(slot, ((pos as u64) + (1 as u64)) as u32);
+        }
+        index = index + 1;
+    }
+}
+
+@[no_mangle]
+@[platform("windows")]
+public fn vyx_sort_radix_win(arg: rawptr) -> u32 {
+    rt_sort_i64_radix_job(arg);
+    return 0 as u32;
+}
+
+@[no_mangle]
+@[platform("posix")]
+public fn vyx_sort_radix_posix(arg: rawptr) -> rawptr {
+    rt_sort_i64_radix_job(arg);
+    return null;
+}
+
+@[platform("windows")]
+fn rt_sort_hw_concurrency() -> i64 {
+    let count = GetActiveProcessorCount(65535 as u32) as i64;
+    if (count < 1) { return 1; }
+    return count;
+}
+
+@[platform("linux")]
+fn rt_sort_hw_concurrency() -> i64 {
+    let count = sysconf(84);
+    if (count < 1) { return 1; }
+    return count;
+}
+
+@[platform("android")]
+fn rt_sort_hw_concurrency() -> i64 {
+    let count = sysconf(97);
+    if (count < 1) { return 1; }
+    return count;
+}
+
+@[platform("macos")]
+fn rt_sort_hw_concurrency() -> i64 {
+    let count = sysconf(58);
+    if (count < 1) { return 1; }
+    return count;
+}
+
+@[platform("windows")]
+fn rt_sort_thread_spawn(arg: rawptr) -> rawptr {
+    return CreateThread(null, 0 as u64, vyx_sort_radix_win as rawptr, arg, 0 as u32, null);
+}
+
+@[platform("posix")]
+fn rt_sort_thread_spawn(arg: rawptr) -> rawptr {
+    let handle = malloc(8);
+    if (handle == null) { return null; }
+    memset(handle, 0, 8);
+    if (pthread_create(handle, null, vyx_sort_radix_posix as rawptr, arg) != 0) {
+        free(handle);
+        return null;
+    }
+    return handle;
+}
+
+@[platform("windows")]
+fn rt_sort_thread_join(handle: rawptr) {
+    if (handle == null) { return; }
+    WaitForSingleObject(handle, 4294967295 as u32);
+    CloseHandle(handle);
+}
+
+@[platform("posix")]
+fn rt_sort_thread_join(handle: rawptr) {
+    if (handle == null) { return; }
+    var tid: i64 = 0;
+    memcpy(to_rawptr(&tid), handle, 8);
+    pthread_join(tid, null);
+    free(handle);
+}
+
+fn rt_sort_run_workers(jobs: rawptr, worker_count: i64) {
+    let handles = malloc((worker_count * 8) as u64);
+    if (handles == null) {
+        var fallback: i64 = 0;
+        while (fallback < worker_count) {
+            rt_sort_i64_radix_job(jobs + fallback * 64);
+            fallback = fallback + 1;
+        }
+        return;
+    }
+    var worker: i64 = 0;
+    while (worker < worker_count) {
+        let job = jobs + worker * 64;
+        let handle = rt_sort_thread_spawn(job);
+        if (handle == null) {
+            rt_sort_i64_radix_job(job);
+        }
+        rt_write_ptr(handles + worker * 8, handle);
+        worker = worker + 1;
+    }
+    worker = 0;
+    while (worker < worker_count) {
+        rt_sort_thread_join(rt_read_ptr(handles + worker * 8));
+        worker = worker + 1;
+    }
+    free(handles);
+}
+
+fn rt_sort_fill_job(job: rawptr,
+                    source: rawptr,
+                    dest: rawptr,
+                    local: rawptr,
+                    begin: i64,
+                    end: i64,
+                    shift: i64,
+                    phase: i32) {
+    rt_write_ptr(job, source);
+    rt_write_ptr(job + 8, dest);
+    rt_write_ptr(job + 16, local);
+    rt_write_i64(job + 24, begin);
+    rt_write_i64(job + 32, end);
+    rt_write_i64(job + 40, shift);
+    rt_write_i32(job + 48, phase);
+}
+
+fn rt_sort_worker_range(size: i64, worker: i64, worker_count: i64) -> i64 {
+    return (((size as u64) * (worker as u64)) / (worker_count as u64)) as i64;
+}
+
+fn rt_sort_worker_count(size: i64) -> i64 {
+    var available = rt_sort_hw_concurrency();
+    if (available < 1) { available = 1; }
+    var workers: i64 = 8;
+    let by_size = size / 262144;
+    if (available < workers) { workers = available; }
+    if (by_size < workers) { workers = by_size; }
+    if (workers < 1) { workers = 1; }
+    return workers;
+}
+
+fn rt_sort_i64_radix_compact(source0: rawptr,
+                             dest0: rawptr,
+                             size: i64,
+                             compact: rawptr,
+                             worker_count: i64) {
+    let jobs = malloc((worker_count * 64) as u64);
+    if (jobs == null) {
+        rt_sort_i64_std(source0, size);
+        return;
+    }
+    var source = source0;
+    var dest = dest0;
+    var shift: i64 = 0;
+    while (shift < 64) {
+        memset(compact, 0, ((worker_count * 65536) * 4) as u64);
+        var worker: i64 = 0;
+        while (worker < worker_count) {
+            rt_sort_fill_job(jobs + worker * 64,
+                             source,
+                             dest,
+                             compact + worker * 65536 * 4,
+                             rt_sort_worker_range(size, worker, worker_count),
+                             rt_sort_worker_range(size, worker + 1, worker_count),
+                             shift,
+                             0);
+            worker = worker + 1;
+        }
+        rt_sort_run_workers(jobs, worker_count);
+        var offset: u32 = 0 as u32;
+        var bucket: i64 = 0;
+        while (bucket < 65536) {
+            worker = 0;
+            while (worker < worker_count) {
+                let slot = compact + (worker * 65536 + bucket) * 4;
+                let width = rt_read_u32(slot);
+                rt_write_u32(slot, offset);
+                offset = ((offset as u64) + (width as u64)) as u32;
+                worker = worker + 1;
+            }
+            bucket = bucket + 1;
+        }
+        worker = 0;
+        while (worker < worker_count) {
+            rt_sort_fill_job(jobs + worker * 64,
+                             source,
+                             dest,
+                             compact + worker * 65536 * 4,
+                             rt_sort_worker_range(size, worker, worker_count),
+                             rt_sort_worker_range(size, worker + 1, worker_count),
+                             shift,
+                             1);
+            worker = worker + 1;
+        }
+        rt_sort_run_workers(jobs, worker_count);
+        let swapped = source;
+        source = dest;
+        dest = swapped;
+        shift = shift + 16;
+    }
+    free(jobs);
+}
+
+fn rt_sort_i64_radix_wide(source0: rawptr, dest0: rawptr, size: i64, wide: rawptr) {
+    var source = source0;
+    var dest = dest0;
+    let sign_bit: u64 = (1 as u64) << (63 as u64);
+    var shift: i64 = 0;
+    while (shift < 64) {
+        memset(wide, 0, (65536 * 8) as u64);
+        var index: i64 = 0;
+        while (index < size) {
+            let key = (rt_read_i64(source + index * 8) as u64) ^ sign_bit;
+            let slot = wide + (((key >> (shift as u64)) & (65535 as u64)) as i64) * 8;
+            rt_write_u64(slot, rt_read_u64(slot) + (1 as u64));
+            index = index + 1;
+        }
+        var offset: u64 = 0 as u64;
+        var bucket: i64 = 0;
+        while (bucket < 65536) {
+            let slot = wide + bucket * 8;
+            let width = rt_read_u64(slot);
+            rt_write_u64(slot, offset);
+            offset = offset + width;
+            bucket = bucket + 1;
+        }
+        index = 0;
+        while (index < size) {
+            let value = rt_read_i64(source + index * 8);
+            let key = (value as u64) ^ sign_bit;
+            let slot = wide + (((key >> (shift as u64)) & (65535 as u64)) as i64) * 8;
+            let pos = rt_read_u64(slot);
+            rt_write_i64(dest + (pos as i64) * 8, value);
+            rt_write_u64(slot, pos + (1 as u64));
+            index = index + 1;
+        }
+        let swapped = source;
+        source = dest;
+        dest = swapped;
+        shift = shift + 16;
+    }
+}
+
+fn rt_sort_i64_radix(data: rawptr, size: i64) {
+    let worker_count = rt_sort_worker_count(size);
+    let compact_counts = (size as u64) <= (4294967295 as u64);
+    var count_bytes = worker_count * 65536 * 8;
+    if (compact_counts) { count_bytes = worker_count * 65536 * 4; }
+    let temporary = malloc((size * 8) as u64);
+    let counts = malloc(count_bytes as u64);
+    if (temporary == null || counts == null) {
+        free(temporary);
+        free(counts);
+        rt_sort_i64_std(data, size);
+        return;
+    }
+    if (compact_counts) {
+        rt_sort_i64_radix_compact(data, temporary, size, counts, worker_count);
+    } else {
+        rt_sort_i64_radix_wide(data, temporary, size, counts);
+    }
+    free(counts);
+    free(temporary);
+}
+
+@[no_mangle] {
+    public fn vyx_sort_i64_abi(data: rawptr, len: i64) {
+        if (data == null || len <= 1) { return; }
+        if ((len as u64) > (((0 as u64) - (1 as u64)) / (8 as u64))) { return; }
+        if (len < 65536) {
+            rt_sort_i64_std(data, len);
+            return;
+        }
+        rt_sort_i64_radix(data, len);
+    }
+
+    public fn vyx_sort_string_abi(data: rawptr, len: i64) {
+        if (data == null || len <= 1) { return; }
+        if (len > 288230376151711743) { return; }
+        let temporary = rt_alloc_bytes(len * 32);
+        if (temporary == null) { return; }
+        var source = data;
+        var dest = temporary;
+        var width: i64 = 1;
+        while (width < len) {
+            var start: i64 = 0;
+            while (start < len) {
+                var middle = start + width;
+                if (middle > len) { middle = len; }
+                var end = middle + width;
+                if (end > len) { end = len; }
+                var left = start;
+                var right = middle;
+                var output = start;
+                while (left < middle && right < end) {
+                    if (rt_string_record_compare(source + left * 32, source + right * 32) <= 0) {
+                        memcpy(dest + output * 32, source + left * 32, 32);
+                        left = left + 1;
+                    } else {
+                        memcpy(dest + output * 32, source + right * 32, 32);
+                        right = right + 1;
+                    }
+                    output = output + 1;
+                }
+                while (left < middle) {
+                    memcpy(dest + output * 32, source + left * 32, 32);
+                    left = left + 1;
+                    output = output + 1;
+                }
+                while (right < end) {
+                    memcpy(dest + output * 32, source + right * 32, 32);
+                    right = right + 1;
+                    output = output + 1;
+                }
+                start = end;
+            }
+            let previous = source;
+            source = dest;
+            dest = previous;
+            if (width > len / 2) { break; }
+            width = width * 2;
+        }
+        if (source != data) { memcpy(data, source, (len * 32) as u64); }
+        free(temporary);
+    }
+
+    public fn vyx_dict_i64_i64_put(dict: rawptr, key: i64, value: i64) {
+        if (dict == null) { return; }
+        if (rt_read_ptr(dict) == null || rt_read_i64(dict + 16) <= 0) {
+            rt_dict_allocate(dict, 64, 8);
+        }
+        var capacity = rt_read_i64(dict + 16);
+        if (rt_read_i64(dict + 8) * 10 >= capacity * 7) {
+            rt_dict_i64_grow(dict);
+            capacity = rt_read_i64(dict + 16);
+        }
+        let data = rt_read_ptr(dict);
+        if (data == null) { return; }
+        let control_bytes = rt_dict_control_bytes(capacity);
+        let keys = data + control_bytes;
+        let values = keys + capacity * 8;
+        var index = (rt_hash_i64(key) & ((capacity - 1) as u64)) as i64;
+        var tombstone: i64 = -1;
+        var probes: i64 = 0;
+        while (probes < capacity) {
+            let control = rt_read_u8(data + index);
+            if (control == (0 as u8)) {
+                if (tombstone >= 0) { index = tombstone; }
+                rt_write_u8(data + index, 1 as u8);
+                rt_write_i64(keys + index * 8, key);
+                rt_write_i64(values + index * 8, value);
+                rt_write_i64(dict + 8, rt_read_i64(dict + 8) + 1);
+                rt_write_i64(dict + 24, rt_read_i64(dict + 24) + 1);
+                return;
+            }
+            if (control == (2 as u8)) {
+                if (tombstone < 0) { tombstone = index; }
+            } elif (rt_read_i64(keys + index * 8) == key) {
+                rt_write_i64(values + index * 8, value);
+                return;
+            }
+            index = (index + 1) & (capacity - 1);
+            probes = probes + 1;
+        }
+    }
+
+    public fn vyx_dict_i64_i64_try_get(dict: rawptr, key: i64, out: rawptr) -> i32 {
+        if (dict == null || rt_read_ptr(dict) == null || rt_read_i64(dict + 16) <= 0) {
+            return 0;
+        }
+        let data = rt_read_ptr(dict);
+        let capacity = rt_read_i64(dict + 16);
+        let control_bytes = rt_dict_control_bytes(capacity);
+        let keys = data + control_bytes;
+        let values = keys + capacity * 8;
+        var index = (rt_hash_i64(key) & ((capacity - 1) as u64)) as i64;
+        var probes: i64 = 0;
+        while (probes < capacity) {
+            let control = rt_read_u8(data + index);
+            if (control == (0 as u8)) { return 0; }
+            if (control == (1 as u8) && rt_read_i64(keys + index * 8) == key) {
+                rt_write_i64(out, rt_read_i64(values + index * 8));
+                return 1;
+            }
+            index = (index + 1) & (capacity - 1);
+            probes = probes + 1;
+        }
+        return 0;
+    }
+
+    public fn vyx_dict_str_i64_put(dict: rawptr,
+                                    key: rawptr,
+                                    len: i64,
+                                    capacity_hint: i64,
+                                    owned: i64,
+                                    value: i64) {
+        if (dict == null) { return; }
+        if (rt_read_ptr(dict) == null || rt_read_i64(dict + 16) <= 0) {
+            rt_dict_allocate(dict, 64, 32);
+        }
+        var capacity = rt_read_i64(dict + 16);
+        if (rt_read_i64(dict + 8) * 10 >= capacity * 7) {
+            rt_dict_string_grow(dict);
+            capacity = rt_read_i64(dict + 16);
+        }
+        let data = rt_read_ptr(dict);
+        if (data == null) { return; }
+        let control_bytes = rt_dict_control_bytes(capacity);
+        let keys = data + control_bytes;
+        let values = keys + capacity * 32;
+        var index = (rt_hash_bytes(key, len) & ((capacity - 1) as u64)) as i64;
+        var tombstone: i64 = -1;
+        var probes: i64 = 0;
+        while (probes < capacity) {
+            let control = rt_read_u8(data + index);
+            if (control == (0 as u8)) {
+                if (tombstone >= 0) { index = tombstone; }
+                rt_write_u8(data + index, 1 as u8);
+                rt_string_key_write(keys + index * 32, key, len, capacity_hint, owned);
+                rt_write_i64(values + index * 8, value);
+                rt_write_i64(dict + 8, rt_read_i64(dict + 8) + 1);
+                rt_write_i64(dict + 24, rt_read_i64(dict + 24) + 1);
+                return;
+            }
+            if (control == (2 as u8)) {
+                if (tombstone < 0) { tombstone = index; }
+            } elif (rt_string_key_equals(keys + index * 32, key, len)) {
+                rt_write_i64(values + index * 8, value);
+                return;
+            }
+            index = (index + 1) & (capacity - 1);
+            probes = probes + 1;
+        }
+    }
+
+    public fn vyx_dict_str_i64_put_fast(dict: rawptr,
+                                         key: rawptr,
+                                         len: i64,
+                                         capacity_hint: i64,
+                                         owned: i64,
+                                         value: i64) {
+        vyx_dict_str_i64_put(dict, key, len, capacity_hint, owned, value);
+    }
+
+    public fn vyx_dict_str_i64_try_get(dict: rawptr,
+                                        key: rawptr,
+                                        len: i64,
+                                        out: rawptr) -> i32 {
+        if (dict == null || rt_read_ptr(dict) == null || rt_read_i64(dict + 16) <= 0) {
+            return 0;
+        }
+        let data = rt_read_ptr(dict);
+        let capacity = rt_read_i64(dict + 16);
+        let control_bytes = rt_dict_control_bytes(capacity);
+        let keys = data + control_bytes;
+        let values = keys + capacity * 32;
+        var index = (rt_hash_bytes(key, len) & ((capacity - 1) as u64)) as i64;
+        var probes: i64 = 0;
+        while (probes < capacity) {
+            let control = rt_read_u8(data + index);
+            if (control == (0 as u8)) { return 0; }
+            if (control == (1 as u8)
+                && rt_string_key_equals(keys + index * 32, key, len)) {
+                rt_write_i64(out, rt_read_i64(values + index * 8));
+                return 1;
+            }
+            index = (index + 1) & (capacity - 1);
+            probes = probes + 1;
+        }
+        return 0;
+    }
+
+    public fn vyx_dict_str_i64_try_get_fast(dict: rawptr,
+                                             key: rawptr,
+                                             len: i64,
+                                             out: rawptr) -> i32 {
+        return vyx_dict_str_i64_try_get(dict, key, len, out);
+    }
+
+    public fn vyx_pointer_region_create(base: rawptr,
+                                         bytes: i64,
+                                         owned: i32,
+                                         capability: i32) -> rawptr {
+        if (base == null) { return null; }
+        if (capability < 0 || capability > 2) {
+            abort();
+            return null;
+        }
+        if (bytes > 0) {
+            let cached = rt_region_cache_lookup(base, bytes, owned, capability);
+            if (cached != null) { return rt_pointer_tag(cached, capability); }
+        }
+        let registered = rt_registered_remaining(base);
+        var span = bytes;
+        if (registered > 0) { span = registered; }
+        if (span <= 0) { return null; }
+        let region = rt_alloc_bytes(56);
+        if (region == null) { return null; }
+        memset(region, 0, 56);
+        rt_write_ptr(region, base);
+        rt_write_i64(region + 8, span);
+        if (owned != 0) { rt_write_i64(region + 16, 1); }
+        rt_write_i64(region + 24, 1);
+        rt_registry_acquire();
+        rt_write_ptr(region + 48, runtime_pointer_regions);
+        runtime_pointer_regions = region;
+        rt_registry_release();
+        rt_region_cache_store(base, bytes, owned, capability, region);
+        return rt_pointer_tag(region, capability);
+    }
+
+    public fn vyx_pointer_allocation_register(base: rawptr, bytes: i64) -> rawptr {
+        if (base == null || bytes <= 0) { return base; }
+        rt_region_cache_bump_epoch();
+        rt_registry_acquire();
+        var allocation = runtime_pointer_allocations;
+        while (allocation != null) {
+            if (rt_read_ptr(allocation) == base) {
+                rt_write_i64(allocation + 8, bytes);
+                rt_write_i64(allocation + 16, 1);
+                rt_registry_release();
+                return base;
+            }
+            allocation = rt_read_ptr(allocation + 24);
+        }
+        allocation = rt_alloc_bytes(32);
+        if (allocation == null) {
+            rt_registry_release();
+            abort();
+            return null;
+        }
+        memset(allocation, 0, 32);
+        rt_write_ptr(allocation, base);
+        rt_write_i64(allocation + 8, bytes);
+        rt_write_i64(allocation + 16, 1);
+        rt_write_ptr(allocation + 24, runtime_pointer_allocations);
+        runtime_pointer_allocations = allocation;
+        rt_registry_release();
+        return base;
+    }
+
+    public fn vyx_pointer_allocation_unregister(base: rawptr) {
+        if (base == null) { return; }
+        var bytes: i64 = 1;
+        rt_registry_acquire();
+        var allocation = runtime_pointer_allocations;
+        while (allocation != null) {
+            if (rt_read_i64(allocation + 16) != 0 && rt_read_ptr(allocation) == base) {
+                bytes = rt_read_i64(allocation + 8);
+                break;
+            }
+            allocation = rt_read_ptr(allocation + 24);
+        }
+        rt_registry_release();
+        rt_invalidate_span(base, bytes);
+    }
+
+    public fn vyx_pointer_allocation_unregister_range(base: rawptr, bytes: i64) {
+        rt_invalidate_span(base, bytes);
+    }
+
+    public fn vyx_pointer_allocation_realloc(old_base: rawptr,
+                                             new_base: rawptr,
+                                             bytes: i64) -> rawptr {
+        if (new_base == null) { return null; }
+        if (old_base != null) { vyx_pointer_allocation_unregister(old_base); }
+        return vyx_pointer_allocation_register(new_base, bytes);
+    }
+
+    public fn vyx_pointer_region_retag(metadata: rawptr, capability: i32) -> rawptr {
+        if (metadata == null) { return null; }
+        if (capability < 0 || capability > 2) {
+            abort();
+            return null;
+        }
+        return rt_pointer_tag(rt_pointer_region(metadata), capability);
+    }
+
+    public fn vyx_pointer_region_set_dimension(metadata: rawptr,
+                                                rank: i32,
+                                                level: i32,
+                                                extent: i64,
+                                                stride: i64) {
+        let region = rt_pointer_region(metadata);
+        if (region == null || rank <= 0 || level < 0 || level >= rank
+            || extent <= 0 || stride <= 0) {
+            abort();
+            return;
+        }
+        rt_registry_acquire();
+        var dimensions = rt_read_ptr(region + 40);
+        if (rt_read_i64(region + 32) != (rank as i64) || dimensions == null) {
+            let replacement = rt_alloc_bytes((rank as i64) * 16);
+            if (replacement == null) {
+                rt_registry_release();
+                abort();
+                return;
+            }
+            memset(replacement, 0, ((rank as i64) * 16) as u64);
+            if (dimensions != null) { free(dimensions); }
+            dimensions = replacement;
+            rt_write_ptr(region + 40, dimensions);
+            rt_write_i64(region + 32, rank as i64);
+        }
+        rt_write_i64(dimensions + (level as i64) * 16, extent);
+        rt_write_i64(dimensions + (level as i64) * 16 + 8, stride);
+        rt_registry_release();
+        rt_region_cache_evict(region);
+    }
+
+    public fn vyx_pointer_handle_alive(address: rawptr, metadata: rawptr) -> i32 {
+        let region = rt_pointer_region(metadata);
+        if (address != null && region != null
+            && __vyx_atomic_load_i64_intrinsic(region + 24) != 0) {
+            return 1;
+        }
+        return 0;
+    }
+
+    public fn vyx_pointer_region_rank(metadata: rawptr) -> i32 {
+        let region = rt_pointer_region(metadata);
+        if (region == null) { return 0; }
+        return rt_read_i64(region + 32) as i32;
+    }
+
+    public fn vyx_pointer_checked_address(address: rawptr,
+                                           metadata: rawptr,
+                                           index: i64,
+                                           element_size: i64) -> rawptr {
+        return rt_pointer_checked_address(address, metadata, index, element_size, 0);
+    }
+
+    public fn vyx_pointer_checked_address_typed(address: rawptr,
+                                                 metadata: rawptr,
+                                                 index: i64,
+                                                 element_size: i64,
+                                                 pointer_depth: i32) -> rawptr {
+        return rt_pointer_checked_address(address,
+                                          metadata,
+                                          index,
+                                          element_size,
+                                          pointer_depth);
+    }
+
+    public fn vyx_pointer_region_delete(metadata: rawptr) -> rawptr {
+        let region = rt_pointer_region(metadata);
+        if (region == null) { return null; }
+        let capability = rt_pointer_capability(metadata);
+        if (capability == 1 || capability == 2) {
+            abort();
+            return null;
+        }
+        let prior = __vyx_atomic_fetch_add_i64_intrinsic(region + 24, -1);
+        if (prior != 1) {
+            __vyx_atomic_fetch_add_i64_intrinsic(region + 24, 1);
+            return null;
+        }
+        var released: rawptr = null;
+        if (rt_read_i64(region + 16) != 0) { released = rt_read_ptr(region); }
+        rt_write_ptr(region, null);
+        rt_write_i64(region + 8, 0);
+        return released;
+    }
+}

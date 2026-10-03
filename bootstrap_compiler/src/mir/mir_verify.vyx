@@ -1,0 +1,3296 @@
+module bootstrap.mir_verify;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+}
+
+fn mv_strict_cat_cfg() -> i32 { return 1; }
+fn mv_strict_cat_call() -> i32 { return 2; }
+fn mv_strict_cat_field() -> i32 { return 3; }
+fn mv_strict_cat_drop() -> i32 { return 4; }
+fn mv_strict_cat_layout() -> i32 { return 5; }
+fn mv_strict_cat_owner() -> i32 { return 6; }
+fn mv_strict_cat_text() -> i32 { return 7; }
+fn mv_strict_cat_canon() -> i32 { return 8; }
+
+fn mv_i32_arr_alloc(count: i32) -> rawptr {
+    var n = count;
+    if (n < 1) { n = 1; }
+    let bytes = ((n + 1) * 4) as u64;
+    let p = malloc(bytes);
+    if (p != null) { memset(p, 0, bytes); }
+    return p;
+}
+
+fn mv_i32_get(p: rawptr, idx: i32) -> i32 {
+    if (p == null || idx < 0) { return 0; }
+    return ast_read_i32(ptr_offset(p, idx * 4));
+}
+
+fn mv_i32_set(p: rawptr, idx: i32, value: i32) {
+    if (p == null || idx < 0) { return; }
+    ast_write_i32(ptr_offset(p, idx * 4), value);
+}
+
+// Streaming lowering may recursively materialize callees while a caller body
+// is still resident. These marks therefore delimit one exact body append
+// region; filtering by owner across the complete tables would still revisit
+// every ancestor body at each pass boundary.
+public class MirFunctionVerifyScope {
+    public function_id: i32
+    public block_mark: i32
+    public local_mark: i32
+    public place_mark: i32
+    public value_mark: i32
+    public instr_mark: i32
+    public case_mark: i32
+
+    public static fn create(function_id: i32,
+                            block_mark: i32,
+                            local_mark: i32,
+                            place_mark: i32,
+                            value_mark: i32,
+                            instr_mark: i32,
+                            case_mark: i32) -> MirFunctionVerifyScope {
+        return MirFunctionVerifyScope {
+            function_id: function_id,
+            block_mark: block_mark,
+            local_mark: local_mark,
+            place_mark: place_mark,
+            value_mark: value_mark,
+            instr_mark: instr_mark,
+            case_mark: case_mark
+        };
+    }
+
+    public fn block_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.block_mark && id <= m.block_count;
+    }
+
+    public fn place_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.place_mark && id <= m.place_count;
+    }
+
+    public fn value_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.value_mark && id <= m.value_count;
+    }
+
+    public fn instr_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.instr_mark && id <= m.instr_count;
+    }
+
+    public fn case_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.case_mark && id <= m.case_count;
+    }
+
+    public fn block_slot(self, m: MirUnit, id: i32) -> i32 {
+        if (!self.block_in_range(m, id)) { return mir_id_invalid(); }
+        return id - self.block_mark;
+    }
+}
+
+// The local table intentionally survives streamed body disposal because later
+// declarations still consume signature metadata. Map only this function's
+// local chain to dense slots so strict drop checks do not allocate by the
+// accumulated project-wide LocalId high-water mark.
+public class MirScopedLocalSlots {
+    public keys: rawptr
+    public slots: rawptr
+    public capacity: i32
+    public count: i32
+
+    public static fn create(hint: i32) -> MirScopedLocalSlots {
+        var want = hint;
+        if (want < 1) { want = 1; }
+        var cap: i32 = 8;
+        while (cap < want * 2) { cap = cap * 2; }
+        return MirScopedLocalSlots {
+            keys: mv_i32_arr_alloc(cap),
+            slots: mv_i32_arr_alloc(cap),
+            capacity: cap,
+            count: 0
+        };
+    }
+
+    public fn index_for(self, local_id: i32) -> i32 {
+        if (self.capacity <= 0 || local_id <= 0) { return -1; }
+        return local_id % self.capacity;
+    }
+
+    public fn put(self, local_id: i32, slot: i32) -> bool {
+        if (local_id <= 0 || slot < 0 || self.keys == null || self.slots == null) { return false; }
+        var idx = self.index_for(local_id);
+        var probes: i32 = 0;
+        while (idx >= 0 && probes < self.capacity) {
+            let prior = mv_i32_get(self.keys, idx);
+            if (prior == 0 || prior == local_id) {
+                if (prior == 0) { self.count = self.count + 1; }
+                mv_i32_set(self.keys, idx, local_id);
+                mv_i32_set(self.slots, idx, slot + 1);
+                return true;
+            }
+            idx = idx + 1;
+            if (idx >= self.capacity) { idx = 0; }
+            probes = probes + 1;
+        }
+        return false;
+    }
+
+    public fn get(self, local_id: i32) -> i32 {
+        if (local_id <= 0 || self.keys == null || self.slots == null) { return -1; }
+        var idx = self.index_for(local_id);
+        var probes: i32 = 0;
+        while (idx >= 0 && probes < self.capacity) {
+            let key = mv_i32_get(self.keys, idx);
+            if (key == 0) { return -1; }
+            if (key == local_id) { return mv_i32_get(self.slots, idx) - 1; }
+            idx = idx + 1;
+            if (idx >= self.capacity) { idx = 0; }
+            probes = probes + 1;
+        }
+        return -1;
+    }
+
+    public fn dispose(self) {
+        if (self.keys != null) { free(self.keys); self.keys = null; }
+        if (self.slots != null) { free(self.slots); self.slots = null; }
+        self.capacity = 0;
+        self.count = 0;
+    }
+}
+
+fn mv_legacy_string_primitive_text(text_in: string) -> bool {
+    let text = text_in.trim();
+    if (text == "string" || text == "__String") { return true; }
+    if (policy_generic_call_has_args(text.clone()) != 0) {
+        let raw_args = policy_generic_call_args(text.clone());
+        var i: i32 = 0;
+        while (i < 64) {
+            let arg = policy_generic_arg_at(raw_args, i).trim();
+            if (arg.len == 0) { return false; }
+            if (mv_legacy_string_primitive_text(arg)) { return true; }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+public class MirVerifier {
+    public errors: i32
+    public strict: bool
+    public strict_printed: i32
+    public strict_print_cap: i32
+    public strict_cfg_errors: i32
+    public strict_call_errors: i32
+    public strict_field_errors: i32
+    public strict_drop_errors: i32
+    public strict_layout_errors: i32
+    public strict_owner_errors: i32
+    public strict_text_errors: i32
+    public strict_canon_errors: i32
+    public print_summary: bool
+    public current_loc: rawptr
+
+    public static fn create() -> MirVerifier {
+        return MirVerifier {
+            errors: 0,
+            strict: false,
+            strict_printed: 0,
+            strict_print_cap: 200,
+            strict_cfg_errors: 0,
+            strict_call_errors: 0,
+            strict_field_errors: 0,
+            strict_drop_errors: 0,
+            strict_layout_errors: 0,
+            strict_owner_errors: 0,
+            strict_text_errors: 0,
+            strict_canon_errors: 0,
+            print_summary: true,
+            current_loc: null
+        };
+    }
+
+    public static fn create_strict() -> MirVerifier {
+        return MirVerifier {
+            errors: 0,
+            strict: true,
+            strict_printed: 0,
+            strict_print_cap: 200,
+            strict_cfg_errors: 0,
+            strict_call_errors: 0,
+            strict_field_errors: 0,
+            strict_drop_errors: 0,
+            strict_layout_errors: 0,
+            strict_owner_errors: 0,
+            strict_text_errors: 0,
+            strict_canon_errors: 0,
+            print_summary: true,
+            current_loc: null
+        };
+    }
+
+    public static fn create_silent() -> MirVerifier {
+        let verifier = MirVerifier.create();
+        verifier.print_summary = false;
+        return verifier;
+    }
+
+    public static fn create_strict_silent() -> MirVerifier {
+        let verifier = MirVerifier.create_strict();
+        verifier.print_summary = false;
+        return verifier;
+    }
+
+    public fn loc_for_value(self, m: MirUnit, value_id: i32) -> rawptr {
+        return mir_unit_diag_loc_for_value(&m,  value_id);
+    }
+
+    public fn focus_function(self, m: MirUnit, function_id: i32) {
+        let loc = mir_unit_diag_loc_for_function(&m,  function_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_block(self, m: MirUnit, block_id: i32) {
+        let loc = mir_unit_diag_loc_for_block(&m,  block_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_local(self, m: MirUnit, local_id: i32) {
+        let loc = mir_unit_diag_loc_for_local(&m,  local_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_place(self, m: MirUnit, place_id: i32) {
+        let loc = mir_unit_diag_loc_for_place(&m,  place_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_value(self, m: MirUnit, value_id: i32) {
+        let loc = mir_unit_diag_loc_for_value(&m,  value_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_instr(self, m: MirUnit, instr_id: i32) {
+        let loc = mir_unit_diag_loc_for_instr(&m,  instr_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_case(self, m: MirUnit, case_id: i32) {
+        let loc = mir_unit_diag_loc_for_case(&m,  case_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_type(self, m: MirUnit, type_id: i32) {
+        let loc = mir_unit_diag_loc_for_type(&m,  type_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_field(self, m: MirUnit, field_id: i32) {
+        let loc = mir_unit_diag_loc_for_field(&m,  field_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn record_error_at(self, loc: rawptr, msg: string) {
+        self.errors = self.errors + 1;
+        var anchor = loc;
+        if (anchor == null || ast_read_i32(anchor) <= 0) { anchor = self.current_loc; }
+        diag_emit_codegen_at(anchor, "MIR verification failed: " + msg);
+    }
+
+    public fn record_error(self, msg: string) {
+        self.record_error_at(null, msg);
+    }
+
+    public fn record_error_at_value(self, m: MirUnit, value_id: i32, msg: string) {
+        self.record_error_at(self.loc_for_value(m, value_id), msg);
+    }
+
+    public fn record_strict(self, cat: i32, msg: string) {
+        self.errors = self.errors + 1;
+        if (cat == mv_strict_cat_cfg()) { self.strict_cfg_errors = self.strict_cfg_errors + 1; }
+        if (cat == mv_strict_cat_call()) { self.strict_call_errors = self.strict_call_errors + 1; }
+        if (cat == mv_strict_cat_field()) { self.strict_field_errors = self.strict_field_errors + 1; }
+        if (cat == mv_strict_cat_drop()) { self.strict_drop_errors = self.strict_drop_errors + 1; }
+        if (cat == mv_strict_cat_layout()) { self.strict_layout_errors = self.strict_layout_errors + 1; }
+        if (cat == mv_strict_cat_owner()) { self.strict_owner_errors = self.strict_owner_errors + 1; }
+        if (cat == mv_strict_cat_text()) { self.strict_text_errors = self.strict_text_errors + 1; }
+        if (cat == mv_strict_cat_canon()) { self.strict_canon_errors = self.strict_canon_errors + 1; }
+        if (self.strict_printed < self.strict_print_cap) {
+            diag_emit_codegen_at(self.current_loc,
+                                 "MIR strict verification failed: " + msg);
+            self.strict_printed = self.strict_printed + 1;
+            if (self.strict_printed == self.strict_print_cap) {
+                diag_emit_codegen_note_at(self.current_loc,
+                                          "MIR strict verification print cap reached; further strict errors counted but not printed");
+            }
+        }
+    }
+
+    public fn id_text(self, id: i32) -> string {
+        return policy_i64_to_string(id as i64);
+    }
+
+    public fn valid_type(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty TypeId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.types.count || hir_type_table_record(m.types, id) == null) {
+            self.record_error(where_text + " references invalid TypeId " + self.id_text(id));
+            return false;
+        }
+        return true;
+    }
+
+    public fn valid_function(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty MirFunctionId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.function_count || m.function_record(id) == null) {
+            self.record_error(where_text + " references invalid MirFunctionId " + self.id_text(id));
+            return false;
+        }
+        return true;
+    }
+
+    public fn valid_block(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty MirBlockId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.block_count || m.block_record(id) == null) {
+            self.record_error(where_text + " references invalid MirBlockId " + self.id_text(id));
+            return false;
+        }
+        if (m.block_is_removed( id)) {
+            self.record_error(where_text + " references removed MirBlockId " + self.id_text(id));
+            return false;
+        }
+        return true;
+    }
+
+    public fn valid_local(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty MirLocalId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.local_count || m.local_record(id) == null) {
+            self.record_error(where_text + " references invalid MirLocalId " + self.id_text(id));
+            return false;
+        }
+        return true;
+    }
+
+    public fn valid_place(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty PlaceId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.place_count || m.place_record(id) == null) {
+            self.record_error(where_text + " references invalid PlaceId " + self.id_text(id));
+            return false;
+        }
+        return true;
+    }
+
+    public fn valid_value(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty ValueId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.value_count || m.value_record(id) == null) {
+            self.record_error(where_text + " references invalid ValueId " + self.id_text(id));
+            return false;
+        }
+        return true;
+    }
+
+    public fn valid_instr(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty InstrId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.instr_count || m.instr_record(id) == null) {
+            self.record_error(where_text + " references invalid InstrId " + self.id_text(id));
+            return false;
+        }
+        if (mir_unit_instr_owner_is_removed(&m,  id)) {
+            self.record_error(where_text + " references instruction in removed block " + self.id_text(id));
+            return false;
+        }
+        return true;
+    }
+
+    public fn valid_field_layout(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty FieldId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.field_count || m.field_record(id) == null) {
+            self.record_error(where_text + " references invalid FieldId " + self.id_text(id));
+            return false;
+        }
+        if (m.field_owner_type(id) == mir_id_invalid()) {
+            self.record_error(where_text + " field " + self.id_text(id) + " has empty owner TypeId");
+            return false;
+        }
+        if (!self.valid_type(m, m.field_owner_type(id), false, where_text + " field " + self.id_text(id) + " owner")) {
+            return false;
+        }
+        if (!self.valid_type(m, m.field_type(id), false, where_text + " field " + self.id_text(id) + " type")) {
+            return false;
+        }
+        if (m.field_index(id) < 0) {
+            self.record_error(where_text + " field " + self.id_text(id) + " has negative layout index");
+            return false;
+        }
+        if (m.field_name(id).len == 0) {
+            self.record_error(where_text + " field " + self.id_text(id) + " has empty name");
+            return false;
+        }
+        return true;
+    }
+
+    public fn valid_case(self, m: MirUnit, id: i32, allow_empty: bool, where_text: string) -> bool {
+        if (id == mir_id_invalid()) {
+            if (!allow_empty) { self.record_error(where_text + " references empty CaseId"); }
+            return allow_empty;
+        }
+        if (id < 1 || id > m.case_count || m.case_record(id) == null) {
+            self.record_error(where_text + " references invalid CaseId " + self.id_text(id));
+            return false;
+        }
+        if (!mir_unit_case_is_active(&m,  id)) {
+            self.record_error(where_text + " references inactive case " + self.id_text(id));
+            return false;
+        }
+        return true;
+    }
+
+    public fn place_kind_valid(self, k: i32) -> bool {
+        if (k == mir_place_local()) { return true; }
+        if (k == mir_place_field()) { return true; }
+        if (k == mir_place_deref()) { return true; }
+        if (k == mir_place_index()) { return true; }
+        if (k == mir_place_static()) { return true; }
+        return false;
+    }
+
+    public fn value_kind_valid(self, k: i32) -> bool {
+        if (k == mir_value_const_int()) { return true; }
+        if (k == mir_value_const_bool()) { return true; }
+        if (k == mir_value_const_str()) { return true; }
+        if (k == mir_value_const_char()) { return true; }
+        if (k == mir_value_null()) { return true; }
+        if (k == mir_value_read_place()) { return true; }
+        if (k == mir_value_address_of()) { return true; }
+        if (k == mir_value_unary()) { return true; }
+        if (k == mir_value_binary()) { return true; }
+        if (k == mir_value_call()) { return true; }
+        if (k == mir_value_target_ref()) { return true; }
+        if (k == mir_value_aggregate()) { return true; }
+        if (k == mir_value_cast()) { return true; }
+        if (k == mir_value_control_result()) { return true; }
+        if (k == mir_value_intrinsic()) { return true; }
+        if (k == mir_value_const_float()) { return true; }
+        if (k == mir_value_arg()) { return true; }
+        return false;
+    }
+
+    public fn instr_kind_valid(self, k: i32) -> bool {
+        if (k == mir_instr_eval()) { return true; }
+        if (k == mir_instr_assign()) { return true; }
+        if (k == mir_instr_storage_live()) { return true; }
+        if (k == mir_instr_static_assert()) { return true; }
+        if (k == mir_instr_defer()) { return true; }
+        if (k == mir_instr_foreach_bind()) { return true; }
+        if (k == mir_instr_match_arm()) { return true; }
+        if (k == mir_instr_drop()) { return true; }
+        if (k == mir_instr_storage_dead()) { return true; }
+        return false;
+    }
+
+    public fn term_kind_valid(self, k: i32) -> bool {
+        if (k == mir_term_return()) { return true; }
+        if (k == mir_term_goto()) { return true; }
+        if (k == mir_term_branch()) { return true; }
+        if (k == mir_term_match()) { return true; }
+        if (k == mir_term_foreach_next()) { return true; }
+        if (k == mir_term_unreachable()) { return true; }
+        if (k == mir_term_yield()) { return true; }
+        return false;
+    }
+
+    public fn static_init_kind_valid(self, k: i32) -> bool {
+        if (k == mir_static_init_none()) { return true; }
+        if (k == mir_static_init_int()) { return true; }
+        if (k == mir_static_init_bool()) { return true; }
+        if (k == mir_static_init_char()) { return true; }
+        if (k == mir_static_init_str()) { return true; }
+        if (k == mir_static_init_null()) { return true; }
+        if (k == mir_static_init_item_ref()) { return true; }
+        return false;
+    }
+
+    public fn target_valid(self, m: MirUnit, target_kind: i32, target_id: i32, where_text: string) {
+        if (target_kind == mir_target_none()) {
+            if (target_id != mir_id_invalid()) {
+                self.record_error(where_text + " has none target kind with non-empty target id");
+            }
+            return;
+        }
+        if (target_kind == mir_target_function()) {
+            if (self.valid_function(m, target_id, false, where_text + " function target")
+                && !self.function_allows_bodyless_target(m, target_id)) {
+                self.record_error(where_text
+                                  + " function target "
+                                  + self.id_text(target_id)
+                                  + " has no executable body");
+            }
+            return;
+        }
+        if (target_kind == mir_target_local()) {
+            self.valid_local(m, target_id, false, where_text + " local target");
+            return;
+        }
+        if (target_kind == mir_target_type()) {
+            self.valid_type(m, target_id, false, where_text + " type target");
+            return;
+        }
+        if (target_kind == mir_target_hir_item()
+            || target_kind == mir_target_hir_field()
+            || target_kind == mir_target_hir_variant()
+            || target_kind == mir_target_builtin()) {
+            if (target_id == mir_id_invalid()) {
+                self.record_error(where_text + " has empty resolved target id");
+            }
+            return;
+        }
+        self.record_error(where_text + " has invalid target kind " + self.id_text(target_kind));
+    }
+
+    public fn function_allows_bodyless_target(self, m: MirUnit, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (m.function_first_block(function_id) != mir_id_invalid()) { return true; }
+        if (m.function_item_kind(function_id) == hir_item_extern_function()) { return true; }
+        if ((m.function_flags( function_id) & hir_function_flag_declaration_only()) != 0) { return true; }
+        if ((m.function_flags( function_id) & hir_function_flag_imported_body()) != 0) { return true; }
+        if (m.function_owner_item_kind(function_id) == hir_item_interface()) { return true; }
+        // LLVM streaming lowering emits one function at a time and then
+        // releases its body tables. The marker is written only after that
+        // function's LLVM definition was emitted, so it is not a general
+        // exemption for an ordinary missing MIR body.
+        if (m.function_streamed_body_discarded(function_id)) { return true; }
+        return false;
+    }
+
+    public fn function_return_type_is_void(self, m: MirUnit, function_id: i32) -> bool {
+        let type_id = m.function_return_type(function_id);
+        if (type_id == mir_id_invalid()) { return false; }
+        return hir_type_table_kind(m.types, type_id) == ty_VOID();
+    }
+
+    public fn check_functions(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.function_count) {
+            self.focus_function(m, id);
+            self.valid_type(m, m.function_return_type(id), false, "function " + self.id_text(id) + " return");
+            self.valid_local(m, m.function_first_local(id), true, "function " + self.id_text(id) + " first local");
+            self.valid_block(m, m.function_first_block(id), true, "function " + self.id_text(id) + " first block");
+            if (m.function_name(id).len == 0) {
+                self.record_error("function " + self.id_text(id) + " has empty name");
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn check_blocks(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.block_count) {
+            self.focus_block(m, id);
+            if (m.block_is_removed( id)) {
+                id = id + 1;
+                continue;
+            }
+            self.valid_function(m, m.block_function(id), false, "block " + self.id_text(id) + " function");
+            self.valid_instr(m, m.block_first_instr(id), true, "block " + self.id_text(id) + " first instr");
+            self.valid_instr(m, m.block_last_instr(id), true, "block " + self.id_text(id) + " last instr");
+            let term = m.block_term_kind(id);
+            if (term == mir_id_invalid()) {
+                self.record_error("block " + self.id_text(id) + " has no terminator");
+            } else if (!self.term_kind_valid(term)) {
+                self.record_error("block " + self.id_text(id) + " has invalid terminator " + self.id_text(term));
+            }
+            if (term == mir_term_return()) {
+                let allow_empty_return = self.function_return_type_is_void(m, m.block_function(id));
+                self.valid_value(m, m.block_term_value(id), allow_empty_return, "block " + self.id_text(id) + " return value");
+            } else if (term == mir_term_goto()) {
+                self.valid_block(m, m.block_term_target(id), false, "block " + self.id_text(id) + " goto target");
+            } else if (term == mir_term_branch()) {
+                self.valid_value(m, m.block_term_value(id), false, "block " + self.id_text(id) + " branch cond");
+                self.valid_block(m, m.block_term_target(id), false, "block " + self.id_text(id) + " branch true");
+                self.valid_block(m, m.block_term_false(id), false, "block " + self.id_text(id) + " branch false");
+            } else if (term == mir_term_match()) {
+                self.valid_value(m, m.block_term_value(id), false, "block " + self.id_text(id) + " match subject");
+                self.valid_case(m, m.block_term_first_case(id), true, "block " + self.id_text(id) + " match first case");
+                self.valid_block(m, m.block_term_false(id), true, "block " + self.id_text(id) + " match fallback");
+            } else if (term == mir_term_foreach_next()) {
+                self.valid_value(m, m.block_term_value(id), false, "block " + self.id_text(id) + " foreach iterable");
+                self.valid_block(m, m.block_term_target(id), false, "block " + self.id_text(id) + " foreach body");
+                self.valid_block(m, m.block_term_false(id), false, "block " + self.id_text(id) + " foreach exit");
+            } else if (term == mir_term_yield()) {
+                self.valid_value(m, m.block_term_value(id), true, "block " + self.id_text(id) + " yield future");
+                self.valid_block(m, m.block_term_target(id), false, "block " + self.id_text(id) + " yield resume");
+            }
+            self.valid_block(m, m.block_next(id), true, "block " + self.id_text(id) + " next");
+            id = id + 1;
+        }
+    }
+
+    public fn check_locals(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.local_count) {
+            self.focus_local(m, id);
+            let flags = m.local_flags(id);
+            let owner_fn = m.local_function(id);
+            let owner_name = m.function_name(owner_fn);
+            self.valid_function(m, owner_fn, false, "local " + self.id_text(id) + " function");
+            self.valid_type(m,
+                            m.local_type(id),
+                            false,
+                            "local " + self.id_text(id) + " `" + m.local_name(id)
+                            + "` in function " + self.id_text(owner_fn)
+                            + " `" + owner_name + "` type");
+            var allow_empty_place = false;
+            if (owner_fn != mir_id_invalid()
+                && m.function_first_block(owner_fn) == mir_id_invalid()) {
+                allow_empty_place = true;
+            }
+            self.valid_place(m, m.local_place(id), allow_empty_place, "local " + self.id_text(id) + " place");
+            self.valid_local(m, m.local_next(id), true, "local " + self.id_text(id) + " next");
+            if (m.local_name(id).len == 0) {
+                self.record_error("local " + self.id_text(id) + " has empty name");
+            }
+            if ((flags & mir_local_flag_param()) != 0 && m.local_name(id) == "self"
+                && (flags & mir_local_flag_self_receiver()) == 0) {
+                self.record_error("local " + self.id_text(id)
+                                  + " is a self parameter but lacks receiver flag");
+            }
+            if ((flags & mir_local_flag_param()) != 0
+                && (flags & mir_local_flag_self_receiver()) != 0
+                && m.local_name(id) != "self") {
+                self.record_error("local " + self.id_text(id)
+                                  + " has receiver flag but parameter name is `"
+                                  + m.local_name(id)
+                                  + "`");
+            }
+            if ((flags & mir_local_flag_self_receiver()) != 0
+                && (flags & mir_local_flag_param()) == 0) {
+                self.record_error("local " + self.id_text(id)
+                                  + " has receiver flag but is not a parameter");
+            }
+            self.check_receiver_mode_flags(flags, id);
+            if ((flags & mir_local_flag_reference_capture()) != 0
+                && (flags & mir_local_flag_capture()) == 0) {
+                self.record_error("local " + self.id_text(id)
+                                  + " has reference-capture flag but is not a capture");
+            }
+            if ((flags & mir_local_flag_reference_capture()) != 0
+                && (flags & mir_local_flag_self_receiver()) != 0) {
+                self.record_error("local " + self.id_text(id)
+                                  + " cannot be both receiver parameter and reference capture");
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn check_receiver_mode_flags(self, flags: i32, local_id: i32) {
+        let receiver_modes = (((flags & mir_local_flag_self_compat()) != 0) as i32)
+            + (((flags & mir_local_flag_self_shared_ref()) != 0) as i32)
+            + (((flags & mir_local_flag_self_mut_ref()) != 0) as i32)
+            + (((flags & mir_local_flag_move_arg()) != 0) as i32);
+        if ((flags & mir_local_flag_self_receiver()) != 0 && receiver_modes != 1) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " receiver must carry exactly one ownership mode");
+        }
+        if ((flags & mir_local_flag_self_receiver()) == 0
+            && (flags & (mir_local_flag_self_compat()
+                | mir_local_flag_self_shared_ref()
+                | mir_local_flag_self_mut_ref())) != 0) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " has receiver ownership mode but is not a receiver");
+        }
+        if ((flags & mir_local_flag_self_receiver()) != 0
+            && (flags & mir_local_flag_auto_drop()) != 0
+            && (flags & mir_local_flag_move_arg()) == 0) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " borrowed/compat receiver cannot own drop glue");
+        }
+    }
+
+    public fn check_statics(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.static_count) {
+            self.focus_type(m, m.static_type(id));
+            if (m.static_exists(id)) {
+                self.valid_type(m, m.static_type(id), false, "static " + self.id_text(id) + " type");
+                let item_kind = m.static_item_kind(id);
+                if (item_kind != hir_item_const() && item_kind != hir_item_global()) {
+                    self.record_error("static " + self.id_text(id) + " has invalid HIR item kind " + self.id_text(item_kind));
+                }
+                let init_kind = m.static_init_kind(id);
+                if (!self.static_init_kind_valid(init_kind)) {
+                    self.record_error("static " + self.id_text(id) + " has invalid initializer kind " + self.id_text(init_kind));
+                }
+                if (init_kind == mir_static_init_item_ref()) {
+                    if (m.static_init_target_kind(id) != mir_target_hir_item()) {
+                        self.record_error("static " + self.id_text(id) + " item-ref initializer has invalid target kind "
+                                          + self.id_text(m.static_init_target_kind(id)));
+                    }
+                    if (!m.static_exists(m.static_init_target_id(id))) {
+                        self.record_error("static " + self.id_text(id) + " item-ref initializer references missing static #"
+                                          + self.id_text(m.static_init_target_id(id)));
+                    }
+                }
+                if (m.static_name(id).len == 0) {
+                    self.record_error("static " + self.id_text(id) + " has empty name");
+                }
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn check_places(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.place_count) {
+            self.focus_place(m, id);
+            let k = m.place_kind(id);
+            let owner_fn = m.place_function(id);
+            if (!self.place_kind_valid(k)) {
+                self.record_error("place " + self.id_text(id) + " has invalid kind " + self.id_text(k));
+            }
+            self.valid_function(m, owner_fn, false, "place " + self.id_text(id) + " function");
+            self.valid_type(m,
+                            m.place_type(id),
+                            false,
+                            "place " + self.id_text(id) + " `" + m.place_name(id)
+                            + "` in function " + self.id_text(owner_fn)
+                            + " `" + m.function_name(owner_fn) + "` type");
+            if (k == mir_place_local()) {
+                self.valid_local(m, m.place_local(id), false, "place " + self.id_text(id) + " local");
+            }
+            if (k == mir_place_field()) {
+                self.valid_place(m, m.place_base(id), false, "place " + self.id_text(id) + " field base");
+                if (self.valid_field_layout(m,
+                                            m.place_field(id),
+                                            false,
+                                            "place " + self.id_text(id) + " field")) {
+                    if (m.place_type(id) != m.field_type(m.place_field(id))) {
+                        self.record_error("place " + self.id_text(id)
+                                          + " field type "
+                                          + self.id_text(m.place_type(id))
+                                          + " does not match layout field type "
+                                          + self.id_text(m.field_type(m.place_field(id))));
+                    }
+                }
+            }
+            if (k == mir_place_index()) {
+                self.valid_place(m, m.place_base(id), true, "place " + self.id_text(id) + " index base");
+                self.valid_value(m, m.place_index_value(id), false, "place " + self.id_text(id) + " index value");
+            }
+            if (k == mir_place_deref()) {
+                self.valid_value(m, m.place_index_value(id), false, "place " + self.id_text(id) + " deref source");
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn call_target_kind_resolvable(self, target_kind: i32) -> bool {
+        if (target_kind == mir_target_function()) { return true; }
+        if (target_kind == mir_target_builtin()) { return true; }
+        if (target_kind == mir_target_hir_variant()) { return true; }
+        return false;
+    }
+
+    public fn value_type_is_fn(self, m: MirUnit, value_id: i32) -> bool {
+        if (value_id == mir_id_invalid()) { return false; }
+        let type_id = m.value_type(value_id);
+        if (type_id == mir_id_invalid()) { return false; }
+        let kind = hir_type_table_kind(m.types, type_id);
+        return kind == ty_FN() || kind == ty_CFN() || kind == ty_RAWPTR();
+    }
+
+    public fn check_call_value_callee(self, m: MirUnit, id: i32) {
+        if (self.call_target_kind_resolvable(m.value_target_kind(id))) { return; }
+        let callee = m.value_lhs(id);
+        if (callee != mir_id_invalid()) {
+            // Callee that is a resolved target reference (direct function,
+            // builtin or variant constructor) or a fn/cfn-typed value
+            // (function pointer / closure) can still be lowered.
+            if (m.value_kind(callee) == mir_value_target_ref()
+                && m.value_target_kind(callee) != mir_target_none()) {
+                return;
+            }
+            if (self.value_type_is_fn(m, callee)) { return; }
+        }
+        var label = m.value_name(id);
+        if (label.len == 0 && callee != mir_id_invalid()) { label = m.value_name(callee); }
+        if (label.len == 0) { label = "<unknown>"; }
+        var detail = m.value_text(id);
+        var msg = "unresolved call `" + label + "`";
+        if (detail.len > 0) {
+            msg = msg + " (" + detail + ")";
+        }
+        msg = msg + ": callee is not a function, builtin, variant constructor, or lowered method";
+        self.record_error_at_value(m, id, msg);
+    }
+
+    public fn check_values(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.value_count) {
+            self.focus_value(m, id);
+            let k = m.value_kind(id);
+            let owner_fn = m.value_function(id);
+            if (!self.value_kind_valid(k)) {
+                self.record_error("value " + self.id_text(id) + " has invalid kind " + self.id_text(k));
+            }
+            self.valid_function(m, owner_fn, false, "value " + self.id_text(id) + " function");
+            self.valid_type(m,
+                            m.value_type(id),
+                            false,
+                            "value " + self.id_text(id) + " `" + m.value_name(id)
+                            + "` in function " + self.id_text(owner_fn)
+                            + " `" + m.function_name(owner_fn) + "` type");
+            self.valid_place(m, m.value_place(id), true, "value " + self.id_text(id) + " place");
+            self.valid_value(m, m.value_lhs(id), true, "value " + self.id_text(id) + " lhs");
+            self.valid_value(m, m.value_rhs(id), true, "value " + self.id_text(id) + " rhs");
+            self.valid_value(m, m.value_aux(id), true, "value " + self.id_text(id) + " aux");
+            self.valid_value(m, m.value_first_arg(id), true, "value " + self.id_text(id) + " first arg");
+            self.valid_value(m, m.value_next_arg(id), true, "value " + self.id_text(id) + " next arg");
+            self.target_valid(m, m.value_target_kind(id), m.value_target_id(id), "value " + self.id_text(id));
+            if (k == mir_value_call()) {
+                self.check_call_value_callee(m, id);
+            }
+            if (m.value_aggregate_field(id) != mir_id_invalid()) {
+                self.valid_field_layout(m,
+                                        m.value_aggregate_field(id),
+                                        false,
+                                        "value " + self.id_text(id) + " aggregate field");
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn check_storage_dead_instr(self, m: MirUnit, instr_id: i32) {
+        let where_text = "storage_dead instr " + self.id_text(instr_id);
+        let place_id = m.instr_place(instr_id);
+        let local_id = m.instr_aux(instr_id);
+
+        if (m.instr_value(instr_id) != mir_id_invalid()) {
+            self.record_error(where_text + " must not have a value operand");
+        }
+        if (m.instr_lhs(instr_id) != mir_id_invalid()) {
+            self.record_error(where_text + " must not have an lhs operand");
+        }
+        if (m.instr_rhs(instr_id) != mir_id_invalid()) {
+            self.record_error(where_text + " must not have an rhs operand");
+        }
+        if (m.instr_target_kind(instr_id) != mir_target_none()
+            || m.instr_target_id(instr_id) != mir_id_invalid()) {
+            self.record_error(where_text + " must not have a target");
+        }
+
+        let local_is_valid = self.valid_local(m, local_id, false, where_text + " aux local");
+        let place_is_valid = self.valid_place(m, place_id, false, where_text + " place");
+        if (!local_is_valid || !place_is_valid) { return; }
+
+        if (m.place_kind(place_id) != mir_place_local()) {
+            self.record_error(where_text + " place must be a direct local place");
+            return;
+        }
+        if (m.place_local(place_id) != local_id) {
+            self.record_error(where_text + " place local does not match aux local");
+            return;
+        }
+        if (m.local_place(local_id) != place_id) {
+            self.record_error(where_text + " place is not the local's canonical place");
+        }
+        if (m.instr_type(instr_id) != m.local_type(local_id)) {
+            self.record_error(where_text + " type does not match aux local type");
+        }
+    }
+
+    public fn check_instrs(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.instr_count) {
+            self.focus_instr(m, id);
+            if (mir_unit_instr_owner_is_removed(&m,  id)) {
+                id = id + 1;
+                continue;
+            }
+            let k = m.instr_kind(id);
+            if (!self.instr_kind_valid(k)) {
+                self.record_error("instr " + self.id_text(id) + " has invalid kind " + self.id_text(k));
+            }
+            self.valid_function(m, m.instr_function(id), false, "instr " + self.id_text(id) + " function");
+            self.valid_block(m, m.instr_block(id), false, "instr " + self.id_text(id) + " block");
+            self.valid_type(m, m.instr_type(id), true, "instr " + self.id_text(id) + " type");
+            self.valid_place(m, m.instr_place(id), true, "instr " + self.id_text(id) + " place");
+            self.valid_value(m, m.instr_value(id), true, "instr " + self.id_text(id) + " value");
+            self.valid_value(m, m.instr_lhs(id), true, "instr " + self.id_text(id) + " lhs");
+            self.valid_value(m, m.instr_rhs(id), true, "instr " + self.id_text(id) + " rhs");
+            self.valid_instr(m, m.instr_next(id), true, "instr " + self.id_text(id) + " next");
+            self.target_valid(m, m.instr_target_kind(id), m.instr_target_id(id), "instr " + self.id_text(id));
+            if (k == mir_instr_storage_dead()) {
+                self.check_storage_dead_instr(m, id);
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn check_cases(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.case_count) {
+            self.focus_case(m, id);
+            if (!mir_unit_case_is_active(&m,  id)) {
+                id = id + 1;
+                continue;
+            }
+            self.valid_block(m, m.case_owner_block(id), false, "case " + self.id_text(id) + " owner block");
+            self.valid_value(m, m.case_pattern_value(id), true, "case " + self.id_text(id) + " pattern");
+            self.valid_value(m, m.case_guard_value(id), true, "case " + self.id_text(id) + " guard");
+            self.valid_block(m, m.case_target_block(id), false, "case " + self.id_text(id) + " target block");
+            self.valid_case(m, m.case_next(id), true, "case " + self.id_text(id) + " next");
+            id = id + 1;
+        }
+    }
+
+    // ── function-local verification for streaming pass boundaries ──────
+
+    public fn function_scope_marks_valid(self,
+                                         m: MirUnit,
+                                         scope: MirFunctionVerifyScope) -> bool {
+        var ok = true;
+        if (scope.block_mark < 0 || scope.block_mark > m.block_count) {
+            self.record_error("function strict scope has invalid block mark " + self.id_text(scope.block_mark));
+            ok = false;
+        }
+        if (scope.local_mark < 0 || scope.local_mark > m.local_count) {
+            self.record_error("function strict scope has invalid local mark " + self.id_text(scope.local_mark));
+            ok = false;
+        }
+        if (scope.place_mark < 0 || scope.place_mark > m.place_count) {
+            self.record_error("function strict scope has invalid place mark " + self.id_text(scope.place_mark));
+            ok = false;
+        }
+        if (scope.value_mark < 0 || scope.value_mark > m.value_count) {
+            self.record_error("function strict scope has invalid value mark " + self.id_text(scope.value_mark));
+            ok = false;
+        }
+        if (scope.instr_mark < 0 || scope.instr_mark > m.instr_count) {
+            self.record_error("function strict scope has invalid instr mark " + self.id_text(scope.instr_mark));
+            ok = false;
+        }
+        if (scope.case_mark < 0 || scope.case_mark > m.case_count) {
+            self.record_error("function strict scope has invalid case mark " + self.id_text(scope.case_mark));
+            ok = false;
+        }
+        return ok;
+    }
+
+    public fn check_function_scope_local_record(self,
+                                                m: MirUnit,
+                                                local_id: i32) {
+        let flags = m.local_flags(local_id);
+        let owner_fn = m.local_function(local_id);
+        let owner_name = m.function_name(owner_fn);
+        self.valid_function(m, owner_fn, false, "local " + self.id_text(local_id) + " function");
+        self.valid_type(m,
+                        m.local_type(local_id),
+                        false,
+                        "local " + self.id_text(local_id) + " in function "
+                        + self.id_text(owner_fn) + " `" + owner_name + "` type");
+        var allow_empty_place = false;
+        if (owner_fn != mir_id_invalid()
+            && m.function_first_block(owner_fn) == mir_id_invalid()) {
+            allow_empty_place = true;
+        }
+        self.valid_place(m, m.local_place(local_id), allow_empty_place,
+                         "local " + self.id_text(local_id) + " place");
+        self.valid_local(m, m.local_next(local_id), true,
+                         "local " + self.id_text(local_id) + " next");
+        if (m.local_name(local_id).len == 0) {
+            self.record_error("local " + self.id_text(local_id) + " has empty name");
+        }
+        if ((flags & mir_local_flag_param()) != 0 && m.local_name(local_id) == "self"
+            && (flags & mir_local_flag_self_receiver()) == 0) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " is a self parameter but lacks receiver flag");
+        }
+        if ((flags & mir_local_flag_param()) != 0
+            && (flags & mir_local_flag_self_receiver()) != 0
+            && m.local_name(local_id) != "self") {
+            self.record_error("local " + self.id_text(local_id)
+                              + " has receiver flag but parameter name is `"
+                              + m.local_name(local_id)
+                              + "`");
+        }
+        if ((flags & mir_local_flag_self_receiver()) != 0
+            && (flags & mir_local_flag_param()) == 0) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " has receiver flag but is not a parameter");
+        }
+        self.check_receiver_mode_flags(flags, local_id);
+        if ((flags & mir_local_flag_reference_capture()) != 0
+            && (flags & mir_local_flag_capture()) == 0) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " has reference-capture flag but is not a capture");
+        }
+        if ((flags & mir_local_flag_reference_capture()) != 0
+            && (flags & mir_local_flag_self_receiver()) != 0) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " cannot be both receiver parameter and reference capture");
+        }
+    }
+
+    public fn check_function_scope_locals(self,
+                                          m: MirUnit,
+                                          scope: MirFunctionVerifyScope) {
+        let function_id = scope.function_id;
+        let expected_count = m.function_local_count(function_id);
+        var local_id = m.function_first_local(function_id);
+        var count: i32 = 0;
+        while (local_id != mir_id_invalid()) {
+            if (local_id < 1 || local_id > m.local_count || m.local_record(local_id) == null) {
+                self.record_error("function " + self.id_text(function_id)
+                                  + " references invalid local " + self.id_text(local_id));
+                return;
+            }
+            if (m.local_function(local_id) != function_id) {
+                self.record_error("local " + self.id_text(local_id)
+                                  + " is linked from function " + self.id_text(function_id)
+                                  + " but owned by function " + self.id_text(m.local_function(local_id)));
+            }
+            self.check_function_scope_local_record(m, local_id);
+            count = count + 1;
+            if (count > m.local_count + 1) {
+                self.record_error("local chain for function " + self.id_text(function_id)
+                                  + " contains a cycle");
+                return;
+            }
+            local_id = m.local_next(local_id);
+        }
+        if (count != expected_count) {
+            self.record_error("function " + self.id_text(function_id)
+                              + " local count is " + self.id_text(expected_count)
+                              + " but chain contains " + self.id_text(count));
+        }
+    }
+
+    public fn check_function_scope_block_record(self,
+                                                m: MirUnit,
+                                                block_id: i32) {
+        self.valid_function(m, m.block_function(block_id), false,
+                            "block " + self.id_text(block_id) + " function");
+        self.valid_instr(m, m.block_first_instr(block_id), true,
+                         "block " + self.id_text(block_id) + " first instr");
+        self.valid_instr(m, m.block_last_instr(block_id), true,
+                         "block " + self.id_text(block_id) + " last instr");
+        let term = m.block_term_kind(block_id);
+        if (term == mir_id_invalid()) {
+            self.record_error("block " + self.id_text(block_id) + " has no terminator");
+        } else if (!self.term_kind_valid(term)) {
+            self.record_error("block " + self.id_text(block_id)
+                              + " has invalid terminator " + self.id_text(term));
+        }
+        if (term == mir_term_return()) {
+            let allow_empty_return = self.function_return_type_is_void(m, m.block_function(block_id));
+            self.valid_value(m, m.block_term_value(block_id), allow_empty_return,
+                             "block " + self.id_text(block_id) + " return value");
+        } else if (term == mir_term_goto()) {
+            self.valid_block(m, m.block_term_target(block_id), false,
+                             "block " + self.id_text(block_id) + " goto target");
+        } else if (term == mir_term_branch()) {
+            self.valid_value(m, m.block_term_value(block_id), false,
+                             "block " + self.id_text(block_id) + " branch cond");
+            self.valid_block(m, m.block_term_target(block_id), false,
+                             "block " + self.id_text(block_id) + " branch true");
+            self.valid_block(m, m.block_term_false(block_id), false,
+                             "block " + self.id_text(block_id) + " branch false");
+        } else if (term == mir_term_match()) {
+            self.valid_value(m, m.block_term_value(block_id), false,
+                             "block " + self.id_text(block_id) + " match subject");
+            self.valid_case(m, m.block_term_first_case(block_id), true,
+                            "block " + self.id_text(block_id) + " match first case");
+            self.valid_block(m, m.block_term_false(block_id), true,
+                             "block " + self.id_text(block_id) + " match fallback");
+        } else if (term == mir_term_foreach_next()) {
+            self.valid_value(m, m.block_term_value(block_id), false,
+                             "block " + self.id_text(block_id) + " foreach iterable");
+            self.valid_block(m, m.block_term_target(block_id), false,
+                             "block " + self.id_text(block_id) + " foreach body");
+            self.valid_block(m, m.block_term_false(block_id), false,
+                             "block " + self.id_text(block_id) + " foreach exit");
+        } else if (term == mir_term_yield()) {
+            self.valid_value(m, m.block_term_value(block_id), true,
+                             "block " + self.id_text(block_id) + " yield future");
+            self.valid_block(m, m.block_term_target(block_id), false,
+                             "block " + self.id_text(block_id) + " yield resume");
+        }
+        self.valid_block(m, m.block_next(block_id), true,
+                         "block " + self.id_text(block_id) + " next");
+    }
+
+    public fn check_function_scope_blocks(self,
+                                          m: MirUnit,
+                                          scope: MirFunctionVerifyScope) {
+        let function_id = scope.function_id;
+        var active_in_range: i32 = 0;
+        var block_id = scope.block_mark + 1;
+        while (block_id <= m.block_count) {
+            self.focus_block(m, block_id);
+            if (m.block_record(block_id) == null) {
+                self.record_error("function strict scope references missing block #" + self.id_text(block_id));
+            } else {
+                if (m.block_function(block_id) != function_id) {
+                    self.record_error("function strict scope block #" + self.id_text(block_id)
+                                      + " belongs to function #" + self.id_text(m.block_function(block_id))
+                                      + " instead of #" + self.id_text(function_id));
+                }
+                if (!m.block_is_removed( block_id)) {
+                    active_in_range = active_in_range + 1;
+                    self.check_function_scope_block_record(m, block_id);
+                }
+            }
+            block_id = block_id + 1;
+        }
+        let expected_count = m.function_block_count(function_id);
+        var chain_count: i32 = 0;
+        block_id = m.function_first_block(function_id);
+        while (block_id != mir_id_invalid()) {
+            if (!scope.block_in_range(m, block_id)) {
+                self.record_error("function " + self.id_text(function_id)
+                                  + " block chain escapes its streaming body scope at #"
+                                  + self.id_text(block_id));
+                return;
+            }
+            if (m.block_record(block_id) == null) {
+                self.record_error("function " + self.id_text(function_id)
+                                  + " references missing block #" + self.id_text(block_id));
+                return;
+            }
+            if (m.block_function(block_id) != function_id) {
+                self.record_error("block #" + self.id_text(block_id)
+                                  + " is linked from function #" + self.id_text(function_id)
+                                  + " but owned by function #" + self.id_text(m.block_function(block_id)));
+            }
+            if (m.block_is_removed( block_id)) {
+                self.record_error("function " + self.id_text(function_id)
+                                  + " active block chain contains removed block #" + self.id_text(block_id));
+            }
+            chain_count = chain_count + 1;
+            if (chain_count > m.block_count + 1) {
+                self.record_error("block chain for function " + self.id_text(function_id)
+                                  + " contains a cycle");
+                return;
+            }
+            block_id = m.block_next(block_id);
+        }
+        if (chain_count != expected_count) {
+            self.record_error("function " + self.id_text(function_id)
+                              + " block count is " + self.id_text(expected_count)
+                              + " but chain contains " + self.id_text(chain_count));
+        }
+        if (active_in_range != expected_count) {
+            self.record_error("function " + self.id_text(function_id)
+                              + " active block range count is " + self.id_text(active_in_range)
+                              + " but function records " + self.id_text(expected_count));
+        }
+    }
+
+    public fn check_function_scope_place_record(self,
+                                                m: MirUnit,
+                                                place_id: i32) {
+        let k = m.place_kind(place_id);
+        let owner_fn = m.place_function(place_id);
+        if (!self.place_kind_valid(k)) {
+            self.record_error("place " + self.id_text(place_id)
+                              + " has invalid kind " + self.id_text(k));
+        }
+        self.valid_function(m, owner_fn, false,
+                            "place " + self.id_text(place_id) + " function");
+        self.valid_type(m,
+                        m.place_type(place_id),
+                        false,
+                        "place " + self.id_text(place_id) + " in function "
+                        + self.id_text(owner_fn) + " `" + m.function_name(owner_fn) + "` type");
+        if (k == mir_place_local()) {
+            self.valid_local(m, m.place_local(place_id), false,
+                             "place " + self.id_text(place_id) + " local");
+        }
+        if (k == mir_place_field()) {
+            self.valid_place(m, m.place_base(place_id), false,
+                             "place " + self.id_text(place_id) + " field base");
+            if (self.valid_field_layout(m,
+                                        m.place_field(place_id),
+                                        false,
+                                        "place " + self.id_text(place_id) + " field")) {
+                if (m.place_type(place_id) != m.field_type(m.place_field(place_id))) {
+                    self.record_error("place " + self.id_text(place_id)
+                                      + " field type " + self.id_text(m.place_type(place_id))
+                                      + " does not match layout field type "
+                                      + self.id_text(m.field_type(m.place_field(place_id))));
+                }
+            }
+        }
+        if (k == mir_place_index()) {
+            self.valid_place(m, m.place_base(place_id), true,
+                             "place " + self.id_text(place_id) + " index base");
+            self.valid_value(m, m.place_index_value(place_id), false,
+                             "place " + self.id_text(place_id) + " index value");
+        }
+        if (k == mir_place_deref()) {
+            self.valid_value(m, m.place_index_value(place_id), false,
+                             "place " + self.id_text(place_id) + " deref source");
+        }
+    }
+
+    public fn check_function_scope_places(self,
+                                          m: MirUnit,
+                                          scope: MirFunctionVerifyScope) {
+        var place_id = scope.place_mark + 1;
+        while (place_id <= m.place_count) {
+            if (m.place_record(place_id) == null
+                || m.place_function(place_id) != scope.function_id) {
+                self.record_error("function strict scope place #" + self.id_text(place_id)
+                                  + " does not belong to function #" + self.id_text(scope.function_id));
+            } else {
+                self.check_function_scope_place_record(m, place_id);
+            }
+            place_id = place_id + 1;
+        }
+    }
+
+    public fn check_function_scope_value_record(self,
+                                                m: MirUnit,
+                                                value_id: i32) {
+        let k = m.value_kind(value_id);
+        let owner_fn = m.value_function(value_id);
+        if (!self.value_kind_valid(k)) {
+            self.record_error("value " + self.id_text(value_id)
+                              + " has invalid kind " + self.id_text(k));
+        }
+        self.valid_function(m, owner_fn, false,
+                            "value " + self.id_text(value_id) + " function");
+        self.valid_type(m,
+                        m.value_type(value_id),
+                        false,
+                        "value " + self.id_text(value_id) + " in function "
+                        + self.id_text(owner_fn) + " `" + m.function_name(owner_fn) + "` type");
+        self.valid_place(m, m.value_place(value_id), true,
+                         "value " + self.id_text(value_id) + " place");
+        self.valid_value(m, m.value_lhs(value_id), true,
+                         "value " + self.id_text(value_id) + " lhs");
+        self.valid_value(m, m.value_rhs(value_id), true,
+                         "value " + self.id_text(value_id) + " rhs");
+        self.valid_value(m, m.value_aux(value_id), true,
+                         "value " + self.id_text(value_id) + " aux");
+        self.valid_value(m, m.value_first_arg(value_id), true,
+                         "value " + self.id_text(value_id) + " first arg");
+        self.valid_value(m, m.value_next_arg(value_id), true,
+                         "value " + self.id_text(value_id) + " next arg");
+        self.target_valid(m, m.value_target_kind(value_id), m.value_target_id(value_id),
+                          "value " + self.id_text(value_id));
+        if (k == mir_value_call()) { self.check_call_value_callee(m, value_id); }
+        if (m.value_aggregate_field(value_id) != mir_id_invalid()) {
+            self.valid_field_layout(m,
+                                    m.value_aggregate_field(value_id),
+                                    false,
+                                    "value " + self.id_text(value_id) + " aggregate field");
+        }
+    }
+
+    public fn check_function_scope_values(self,
+                                          m: MirUnit,
+                                          scope: MirFunctionVerifyScope) {
+        var value_id = scope.value_mark + 1;
+        while (value_id <= m.value_count) {
+            self.focus_value(m, value_id);
+            if (m.value_record(value_id) == null
+                || m.value_function(value_id) != scope.function_id) {
+                self.record_error("function strict scope value #" + self.id_text(value_id)
+                                  + " does not belong to function #" + self.id_text(scope.function_id));
+            } else {
+                self.check_function_scope_value_record(m, value_id);
+            }
+            value_id = value_id + 1;
+        }
+    }
+
+    public fn check_function_scope_instr_record(self,
+                                                m: MirUnit,
+                                                instr_id: i32) {
+        let k = m.instr_kind(instr_id);
+        if (!self.instr_kind_valid(k)) {
+            self.record_error("instr " + self.id_text(instr_id)
+                              + " has invalid kind " + self.id_text(k));
+        }
+        self.valid_function(m, m.instr_function(instr_id), false,
+                            "instr " + self.id_text(instr_id) + " function");
+        self.valid_block(m, m.instr_block(instr_id), false,
+                         "instr " + self.id_text(instr_id) + " block");
+        self.valid_type(m, m.instr_type(instr_id), true,
+                        "instr " + self.id_text(instr_id) + " type");
+        self.valid_place(m, m.instr_place(instr_id), true,
+                         "instr " + self.id_text(instr_id) + " place");
+        self.valid_value(m, m.instr_value(instr_id), true,
+                         "instr " + self.id_text(instr_id) + " value");
+        self.valid_value(m, m.instr_lhs(instr_id), true,
+                         "instr " + self.id_text(instr_id) + " lhs");
+        self.valid_value(m, m.instr_rhs(instr_id), true,
+                         "instr " + self.id_text(instr_id) + " rhs");
+        self.valid_instr(m, m.instr_next(instr_id), true,
+                         "instr " + self.id_text(instr_id) + " next");
+        self.target_valid(m, m.instr_target_kind(instr_id), m.instr_target_id(instr_id),
+                          "instr " + self.id_text(instr_id));
+        if (k == mir_instr_storage_dead()) { self.check_storage_dead_instr(m, instr_id); }
+    }
+
+    public fn check_function_scope_instrs(self,
+                                          m: MirUnit,
+                                          scope: MirFunctionVerifyScope) {
+        var instr_id = scope.instr_mark + 1;
+        while (instr_id <= m.instr_count) {
+            if (m.instr_record(instr_id) == null
+                || m.instr_function(instr_id) != scope.function_id) {
+                self.record_error("function strict scope instr #" + self.id_text(instr_id)
+                                  + " does not belong to function #" + self.id_text(scope.function_id));
+            } else if (!mir_unit_instr_owner_is_removed(&m,  instr_id)) {
+                self.check_function_scope_instr_record(m, instr_id);
+            }
+            instr_id = instr_id + 1;
+        }
+    }
+
+    public fn check_function_scope_cases(self,
+                                         m: MirUnit,
+                                         scope: MirFunctionVerifyScope) {
+        var case_id = scope.case_mark + 1;
+        while (case_id <= m.case_count) {
+            if (m.case_record(case_id) == null) {
+                self.record_error("function strict scope references missing case #" + self.id_text(case_id));
+            } else if (mir_unit_case_is_active(&m,  case_id)) {
+                let owner_block = m.case_owner_block(case_id);
+                if (!scope.block_in_range(m, owner_block)
+                    || m.block_function(owner_block) != scope.function_id) {
+                    self.record_error("function strict scope case #" + self.id_text(case_id)
+                                      + " is not owned by function #" + self.id_text(scope.function_id));
+                }
+                self.valid_block(m, owner_block, false,
+                                 "case " + self.id_text(case_id) + " owner block");
+                self.valid_value(m, m.case_pattern_value(case_id), true,
+                                 "case " + self.id_text(case_id) + " pattern");
+                self.valid_value(m, m.case_guard_value(case_id), true,
+                                 "case " + self.id_text(case_id) + " guard");
+                self.valid_block(m, m.case_target_block(case_id), false,
+                                 "case " + self.id_text(case_id) + " target block");
+                self.valid_case(m, m.case_next(case_id), true,
+                                "case " + self.id_text(case_id) + " next");
+            }
+            case_id = case_id + 1;
+        }
+    }
+
+    public fn check_function_scope(self,
+                                   m: MirUnit,
+                                   scope: MirFunctionVerifyScope) {
+        self.focus_function(m, scope.function_id);
+        if (m.function_buf == null || m.block_buf == null || m.local_buf == null
+            || m.place_buf == null || m.value_buf == null || m.instr_buf == null
+            || m.case_buf == null || m.static_buf == null || m.types.buf == null) {
+            self.record_error("MIR unit has an unallocated core table");
+            return;
+        }
+        if (!self.function_scope_marks_valid(m, scope)) { return; }
+        if (!self.valid_function(m, scope.function_id, false, "function strict scope")) { return; }
+        self.valid_type(m,
+                        m.function_return_type(scope.function_id),
+                        false,
+                        "function " + self.id_text(scope.function_id) + " return");
+        if (m.function_name(scope.function_id).len == 0) {
+            self.record_error("function " + self.id_text(scope.function_id) + " has empty name");
+        }
+        self.check_function_scope_locals(m, scope);
+        self.check_function_scope_blocks(m, scope);
+        self.check_function_scope_places(m, scope);
+        self.check_function_scope_values(m, scope);
+        self.check_function_scope_instrs(m, scope);
+        self.check_function_scope_cases(m, scope);
+    }
+
+    // ── strict closure checks (--mir-verify-strict) ─────────────────────
+    // All helpers below are additive: they never run unless self.strict.
+
+    public fn strict_type_kind(self, m: MirUnit, type_id: i32) -> i32 {
+        if (type_id == mir_id_invalid()) { return 0; }
+        return hir_type_table_kind(m.types, type_id);
+    }
+
+    public fn strict_types_same_text(self, m: MirUnit, lhs: i32, rhs: i32) -> bool {
+        return hir_type_table_text(m.types, lhs) == hir_type_table_text(m.types, rhs);
+    }
+
+    // 0 = identical TypeId, 1 = same text but different id (non-canonical),
+    // 2 = different types.
+    public fn strict_type_relation(self, m: MirUnit, expected: i32, actual: i32) -> i32 {
+        if (expected == actual) { return 0; }
+        if (expected == mir_id_invalid() || actual == mir_id_invalid()) { return 2; }
+        if (self.strict_types_same_text(m, expected, actual)) { return 1; }
+        return 2;
+    }
+
+    public fn strict_type_pair_text(self, m: MirUnit, expected: i32, actual: i32) -> string {
+        return "expected #" + self.id_text(expected) + ":" + hir_type_table_text(m.types, expected)
+             + " vs actual #" + self.id_text(actual) + ":" + hir_type_table_text(m.types, actual);
+    }
+
+    public fn strict_report_type_relation(self, m: MirUnit, cat: i32, expected: i32, actual: i32, where_text: string) {
+        let rel = self.strict_type_relation(m, expected, actual);
+        if (rel == 0) { return; }
+        if (rel == 1) {
+            self.record_strict(mv_strict_cat_canon(),
+                               where_text + " uses non-canonical TypeId ("
+                               + self.strict_type_pair_text(m, expected, actual) + ")");
+            return;
+        }
+        self.record_strict(cat,
+                           where_text + " type mismatch ("
+                           + self.strict_type_pair_text(m, expected, actual) + ")");
+    }
+
+    // ── S1: CFG closure ──────────────────────────────────────────────
+
+    public fn strict_block_succ_total(self, m: MirUnit, block_id: i32) -> i32 {
+        let term = m.block_term_kind(block_id);
+        if (term == mir_term_goto()) { return 1; }
+        if (term == mir_term_yield()) { return 1; }
+        if (term == mir_term_branch()) { return 2; }
+        if (term == mir_term_foreach_next()) { return 2; }
+        if (term == mir_term_match()) {
+            var n: i32 = 0;
+            var c = m.block_term_first_case(block_id);
+            while (c != mir_id_invalid() && n < 100000) {
+                n = n + 1;
+                c = m.case_next(c);
+            }
+            if (m.block_term_false(block_id) != mir_id_invalid()) { n = n + 1; }
+            return n;
+        }
+        return 0;
+    }
+
+    public fn strict_block_succ_at(self, m: MirUnit, block_id: i32, ordinal: i32) -> i32 {
+        let term = m.block_term_kind(block_id);
+        if (term == mir_term_goto() || term == mir_term_yield()) {
+            if (ordinal == 0) { return m.block_term_target(block_id); }
+            return mir_id_invalid();
+        }
+        if (term == mir_term_branch() || term == mir_term_foreach_next()) {
+            if (ordinal == 0) { return m.block_term_target(block_id); }
+            if (ordinal == 1) { return m.block_term_false(block_id); }
+            return mir_id_invalid();
+        }
+        if (term == mir_term_match()) {
+            var idx: i32 = 0;
+            var c = m.block_term_first_case(block_id);
+            while (c != mir_id_invalid()) {
+                if (idx == ordinal) { return m.case_target_block(c); }
+                idx = idx + 1;
+                c = m.case_next(c);
+            }
+            if (idx == ordinal) { return m.block_term_false(block_id); }
+            return mir_id_invalid();
+        }
+        return mir_id_invalid();
+    }
+
+    public fn strict_check_cfg(self, m: MirUnit) {
+        let visited = mv_i32_arr_alloc(m.block_count);
+        let queue = mv_i32_arr_alloc(m.block_count);
+        var fid: i32 = 1;
+        while (fid <= m.function_count) {
+            self.focus_function(m, fid);
+            let entry = m.function_first_block(fid);
+            if (entry != mir_id_invalid()) {
+                var head: i32 = 0;
+                var tail: i32 = 0;
+                mv_i32_set(visited, entry, fid);
+                mv_i32_set(queue, tail, entry);
+                tail = tail + 1;
+                while (head < tail) {
+                    let b = mv_i32_get(queue, head);
+                    head = head + 1;
+                    let n = self.strict_block_succ_total(m, b);
+                    var o: i32 = 0;
+                    while (o < n) {
+                        let s = self.strict_block_succ_at(m, b, o);
+                        if (s != mir_id_invalid() && s >= 1 && s <= m.block_count) {
+                            if (!m.block_is_removed( s)
+                                && m.block_function(s) == fid
+                                && mv_i32_get(visited, s) != fid) {
+                                mv_i32_set(visited, s, fid);
+                                mv_i32_set(queue, tail, s);
+                                tail = tail + 1;
+                            }
+                        }
+                        o = o + 1;
+                    }
+                }
+            }
+            fid = fid + 1;
+        }
+        var b: i32 = 1;
+        while (b <= m.block_count) {
+            self.focus_block(m, b);
+            if (m.block_is_removed( b)) {
+                b = b + 1;
+                continue;
+            }
+            let owner = m.block_function(b);
+            let n = self.strict_block_succ_total(m, b);
+            var o: i32 = 0;
+            while (o < n) {
+                let s = self.strict_block_succ_at(m, b, o);
+                if (s != mir_id_invalid() && s >= 1 && s <= m.block_count) {
+                    if (m.block_function(s) != owner) {
+                        self.record_strict(mv_strict_cat_cfg(),
+                                           "block #" + self.id_text(b)
+                                           + " of function #" + self.id_text(owner)
+                                           + " jumps into block #" + self.id_text(s)
+                                           + " owned by function #" + self.id_text(m.block_function(s)));
+                    }
+                }
+                o = o + 1;
+            }
+            if (m.block_term_kind(b) == mir_term_match()) {
+                var c = m.block_term_first_case(b);
+                while (c != mir_id_invalid()) {
+                    if (m.case_owner_block(c) != b) {
+                        self.record_strict(mv_strict_cat_cfg(),
+                                           "case #" + self.id_text(c)
+                                           + " attached to block #" + self.id_text(b)
+                                           + " but records owner block #" + self.id_text(m.case_owner_block(c)));
+                    }
+                    c = m.case_next(c);
+                }
+            }
+            b = b + 1;
+        }
+    }
+
+    // ── S2: call signature closure ───────────────────────────────────
+
+    public fn strict_local_is_param(self, m: MirUnit, local_id: i32) -> bool {
+        if (local_id == mir_id_invalid()) { return false; }
+        return (m.local_flags(local_id) & mir_local_flag_param()) != 0;
+    }
+
+    public fn strict_local_is_receiver_param(self, m: MirUnit, local_id: i32) -> bool {
+        if (!self.strict_local_is_param(m, local_id)) { return false; }
+        return (m.local_flags(local_id) & mir_local_flag_self_receiver()) != 0;
+    }
+
+    public fn strict_first_param(self, m: MirUnit, function_id: i32) -> i32 {
+        var cur = m.function_first_local(function_id);
+        while (cur != mir_id_invalid()) {
+            if (self.strict_local_is_param(m, cur)) { return cur; }
+            cur = m.local_next(cur);
+        }
+        return mir_id_invalid();
+    }
+
+    public fn strict_next_param(self, m: MirUnit, local_id: i32) -> i32 {
+        var cur = m.local_next(local_id);
+        while (cur != mir_id_invalid()) {
+            if (self.strict_local_is_param(m, cur)) { return cur; }
+            cur = m.local_next(cur);
+        }
+        return mir_id_invalid();
+    }
+
+    public fn strict_first_user_param(self, m: MirUnit, function_id: i32) -> i32 {
+        var p = self.strict_first_param(m, function_id);
+        if (self.strict_local_is_receiver_param(m, p)) {
+            p = self.strict_next_param(m, p);
+        }
+        return p;
+    }
+
+    public fn strict_param_count_from(self, m: MirUnit, first_param: i32) -> i32 {
+        var n: i32 = 0;
+        var p = first_param;
+        while (p != mir_id_invalid()) {
+            n = n + 1;
+            p = self.strict_next_param(m, p);
+        }
+        return n;
+    }
+
+    public fn strict_call_arg_count(self, m: MirUnit, value_id: i32) -> i32 {
+        var n: i32 = 0;
+        var a = m.value_first_arg(value_id);
+        while (a != mir_id_invalid()) {
+            n = n + 1;
+            a = m.value_next_arg(a);
+        }
+        return n;
+    }
+
+    public fn strict_check_calls(self, m: MirUnit) {
+        var vid: i32 = 1;
+        while (vid <= m.value_count) {
+            self.focus_value(m, vid);
+            if (m.value_kind(vid) == mir_value_call()
+                && m.value_target_kind(vid) == mir_target_function()) {
+                let target = m.value_target_id(vid);
+                if (target >= 1 && target <= m.function_count) {
+                    let where_text = "call value #" + self.id_text(vid)
+                        + " -> function #" + self.id_text(target)
+                        + " (" + m.function_name(target) + ")";
+                    let first_param = self.strict_first_user_param(m, target);
+                    let pcount = self.strict_param_count_from(m, first_param);
+                    let acount = self.strict_call_arg_count(m, vid);
+                    let is_extern = m.function_item_kind(target) == hir_item_extern_function();
+                    if (is_extern) {
+                        if (acount < pcount) {
+                            self.record_strict(mv_strict_cat_call(),
+                                               where_text + " arity mismatch: extern expects at least "
+                                               + self.id_text(pcount) + " args, got " + self.id_text(acount));
+                        }
+                    } else if (acount != pcount) {
+                        self.record_strict(mv_strict_cat_call(),
+                                           where_text + " arity mismatch: expects "
+                                           + self.id_text(pcount) + " args, got " + self.id_text(acount));
+                    }
+                    var p = first_param;
+                    var a = m.value_first_arg(vid);
+                    var idx: i32 = 0;
+                    while (p != mir_id_invalid() && a != mir_id_invalid()) {
+                        self.strict_report_type_relation(m,
+                                                         mv_strict_cat_call(),
+                                                         m.local_type(p),
+                                                         m.value_type(a),
+                                                         where_text + " arg " + self.id_text(idx));
+                        p = self.strict_next_param(m, p);
+                        a = m.value_next_arg(a);
+                        idx = idx + 1;
+                    }
+                    self.strict_report_type_relation(m,
+                                                     mv_strict_cat_call(),
+                                                     m.function_return_type(target),
+                                                     m.value_type(vid),
+                                                     where_text + " result");
+                }
+            }
+            vid = vid + 1;
+        }
+    }
+
+    // ── S3: field place closure ──────────────────────────────────────
+
+    public fn strict_check_field_places(self, m: MirUnit) {
+        var pid: i32 = 1;
+        while (pid <= m.place_count) {
+            self.focus_place(m, pid);
+            if (m.place_kind(pid) == mir_place_field()) {
+                let base = m.place_base(pid);
+                let field = m.place_field(pid);
+                if (base >= 1 && base <= m.place_count
+                    && field >= 1 && field <= m.field_count) {
+                    self.strict_report_type_relation(m,
+                                                     mv_strict_cat_field(),
+                                                     m.field_owner_type(field),
+                                                     m.place_type(base),
+                                                     "field place #" + self.id_text(pid)
+                                                     + " (field " + m.field_name(field) + ") base");
+                }
+            }
+            pid = pid + 1;
+        }
+    }
+
+    // ── S4: drop closure ─────────────────────────────────────────────
+
+    public fn strict_drop_local_of_instr(self, m: MirUnit, instr_id: i32) -> i32 {
+        let place = m.instr_place(instr_id);
+        if (place < 1 || place > m.place_count) { return mir_id_invalid(); }
+        if (m.place_kind(place) != mir_place_local()) { return mir_id_invalid(); }
+        return m.place_local(place);
+    }
+
+    public fn strict_block_contains_drop_of(self, m: MirUnit, block_id: i32, local_id: i32) -> bool {
+        var i = m.block_first_instr(block_id);
+        while (i != mir_id_invalid()) {
+            if (m.instr_kind(i) == mir_instr_drop()
+                && self.strict_drop_local_of_instr(m, i) == local_id) {
+                return true;
+            }
+            i = m.instr_next(i);
+        }
+        return false;
+    }
+
+    public fn strict_place_local(self, m: MirUnit, place_id: i32) -> i32 {
+        if (place_id == mir_id_invalid()) { return mir_id_invalid(); }
+        if (m.place_kind(place_id) == mir_place_local()) { return m.place_local(place_id); }
+        let base = m.place_base(place_id);
+        if (base != mir_id_invalid()) { return self.strict_place_local(m, base); }
+        return mir_id_invalid();
+    }
+
+    public fn strict_value_consumes_local(self, m: MirUnit, value_id: i32, local_id: i32, depth: i32) -> bool {
+        if (value_id == mir_id_invalid() || local_id == mir_id_invalid() || depth > 32) { return false; }
+        if (m.value_kind(value_id) == mir_value_read_place()
+            && (m.value_flags(value_id) & mir_value_flag_move_arg()) != 0
+            && self.strict_place_local(m, m.value_place(value_id)) == local_id) {
+            return true;
+        }
+        if (self.strict_value_consumes_local(m, m.value_lhs(value_id), local_id, depth + 1)) { return true; }
+        if (self.strict_value_consumes_local(m, m.value_rhs(value_id), local_id, depth + 1)) { return true; }
+        if (self.strict_value_consumes_local(m, m.value_aux(value_id), local_id, depth + 1)) { return true; }
+        var arg = m.value_first_arg(value_id);
+        var guard: i32 = 0;
+        while (arg != mir_id_invalid() && guard <= m.value_count) {
+            if (self.strict_value_consumes_local(m, arg, local_id, depth + 1)) { return true; }
+            arg = m.value_next_arg(arg);
+            guard = guard + 1;
+        }
+        return false;
+    }
+
+    public fn strict_block_contains_move_of(self, m: MirUnit, block_id: i32, local_id: i32) -> bool {
+        var i = m.block_first_instr(block_id);
+        while (i != mir_id_invalid()) {
+            if (self.strict_value_consumes_local(m, m.instr_value(i), local_id, 0)
+                || self.strict_value_consumes_local(m, m.instr_lhs(i), local_id, 0)
+                || self.strict_value_consumes_local(m, m.instr_rhs(i), local_id, 0)) {
+                return true;
+            }
+            i = m.instr_next(i);
+        }
+        return self.strict_value_consumes_local(m, m.block_term_value(block_id), local_id, 0);
+    }
+
+    public fn strict_block_closes_local(self, m: MirUnit, block_id: i32, local_id: i32) -> bool {
+        if (self.strict_block_contains_drop_of(m, block_id, local_id)) { return true; }
+        return self.strict_block_contains_move_of(m, block_id, local_id);
+    }
+
+    public fn strict_block_contains_storage_live_of(self, m: MirUnit, block_id: i32, local_id: i32) -> bool {
+        var i = m.block_first_instr(block_id);
+        while (i != mir_id_invalid()) {
+            if (m.instr_kind(i) == mir_instr_storage_live()
+                && self.strict_drop_local_of_instr(m, i) == local_id) {
+                return true;
+            }
+            i = m.instr_next(i);
+        }
+        return false;
+    }
+
+    // True when some path from `block_id` reaches a return terminator
+    // without passing any block that drops `local_id`.
+    public fn strict_drop_escape(self,
+                                 m: MirUnit,
+                                 fid: i32,
+                                 block_id: i32,
+                                 local_id: i32,
+                                 stamp: i32,
+                                 memo_val: rawptr,
+                                 memo_stamp: rawptr) -> bool {
+        if (block_id == mir_id_invalid() || block_id < 1 || block_id > m.block_count) { return false; }
+        if (m.block_function(block_id) != fid) { return false; }
+        if (mv_i32_get(memo_stamp, block_id) == stamp) {
+            return mv_i32_get(memo_val, block_id) == 2;
+        }
+        mv_i32_set(memo_stamp, block_id, stamp);
+        mv_i32_set(memo_val, block_id, 1);
+        if (self.strict_block_closes_local(m, block_id, local_id)) { return false; }
+        let term = m.block_term_kind(block_id);
+        if (term == mir_term_return()) {
+            mv_i32_set(memo_val, block_id, 2);
+            return true;
+        }
+        if (term == mir_term_unreachable()) { return false; }
+        let n = self.strict_block_succ_total(m, block_id);
+        var o: i32 = 0;
+        while (o < n) {
+            let s = self.strict_block_succ_at(m, block_id, o);
+            if (self.strict_drop_escape(m, fid, s, local_id, stamp, memo_val, memo_stamp)) {
+                mv_i32_set(memo_val, block_id, 2);
+                return true;
+            }
+            o = o + 1;
+        }
+        return false;
+    }
+
+    public fn strict_check_drops(self, m: MirUnit) {
+        // structural closure of each drop instruction
+        var iid: i32 = 1;
+        while (iid <= m.instr_count) {
+            self.focus_instr(m, iid);
+            if (mir_unit_instr_owner_is_removed(&m,  iid)) {
+                iid = iid + 1;
+                continue;
+            }
+            if (m.instr_kind(iid) == mir_instr_drop()) {
+                let where_text = "drop instr #" + self.id_text(iid)
+                    + " in function #" + self.id_text(m.instr_function(iid));
+                let local_id = self.strict_drop_local_of_instr(m, iid);
+                if (local_id == mir_id_invalid()) {
+                    self.record_strict(mv_strict_cat_drop(),
+                                       where_text + " has no local place operand");
+                } else if (m.instr_target_kind(iid) == mir_target_none()
+                           && m.instr_target_id(iid) == mir_id_invalid()) {
+                    // DCI stub-owned C++ objects lower to __dci_stub_destroy_Type
+                    // from the place type instead of a MIR function target.
+                } else if (m.instr_target_kind(iid) != mir_target_function()) {
+                    self.record_strict(mv_strict_cat_drop(),
+                                       where_text + " target is not a function (kind "
+                                       + self.id_text(m.instr_target_kind(iid)) + ")");
+                } else {
+                    let target = m.instr_target_id(iid);
+                    if (target >= 1 && target <= m.function_count) {
+                        let first_param = self.strict_first_param(m, target);
+                        let pcount = self.strict_param_count_from(m, first_param);
+                        if (pcount != 1) {
+                            self.record_strict(mv_strict_cat_drop(),
+                                               where_text + " target " + m.function_name(target)
+                                               + " is not unary fn(T): param count "
+                                               + self.id_text(pcount));
+                        } else {
+                            self.strict_report_type_relation(m,
+                                                             mv_strict_cat_drop(),
+                                                             m.local_type(first_param),
+                                                             m.local_type(local_id),
+                                                             where_text + " dropped local "
+                                                             + m.local_name(local_id));
+                        }
+                    }
+                }
+            }
+            iid = iid + 1;
+        }
+        // per-block double-drop without an intervening re-assignment
+        let dropped_stamp = mv_i32_arr_alloc(m.local_count);
+        var block_stamp: i32 = 0;
+        var b: i32 = 1;
+        while (b <= m.block_count) {
+            self.focus_block(m, b);
+            if (m.block_is_removed( b)) {
+                b = b + 1;
+                continue;
+            }
+            block_stamp = block_stamp + 1;
+            var i = m.block_first_instr(b);
+            while (i != mir_id_invalid()) {
+                let k = m.instr_kind(i);
+                if (k == mir_instr_drop()) {
+                    let l = self.strict_drop_local_of_instr(m, i);
+                    if (l != mir_id_invalid()) {
+                        if (mv_i32_get(dropped_stamp, l) == block_stamp) {
+                            self.record_strict(mv_strict_cat_drop(),
+                                               "block #" + self.id_text(b)
+                                               + " drops local " + m.local_name(l)
+                                               + " (#" + self.id_text(l) + ") twice without re-assignment");
+                        }
+                        mv_i32_set(dropped_stamp, l, block_stamp);
+                    }
+                } else if (k == mir_instr_assign() || k == mir_instr_foreach_bind()) {
+                    let place = m.instr_place(i);
+                    if (place >= 1 && place <= m.place_count
+                        && m.place_kind(place) == mir_place_local()) {
+                        let l2 = m.place_local(place);
+                        if (l2 != mir_id_invalid() && mv_i32_get(dropped_stamp, l2) == block_stamp) {
+                            mv_i32_set(dropped_stamp, l2, 0);
+                        }
+                    }
+                }
+                i = m.instr_next(i);
+            }
+            b = b + 1;
+        }
+        // exit coverage: every local that is dropped somewhere must be
+        // dropped on every path that reaches a return
+        let local_checked = mv_i32_arr_alloc(m.local_count);
+        let memo_val = mv_i32_arr_alloc(m.block_count);
+        let memo_stamp = mv_i32_arr_alloc(m.block_count);
+        var stamp: i32 = 0;
+        iid = 1;
+        while (iid <= m.instr_count) {
+            self.focus_instr(m, iid);
+            if (mir_unit_instr_owner_is_removed(&m,  iid)) {
+                iid = iid + 1;
+                continue;
+            }
+            if (m.instr_kind(iid) == mir_instr_drop()) {
+                let l = self.strict_drop_local_of_instr(m, iid);
+                if (l != mir_id_invalid() && mv_i32_get(local_checked, l) == 0) {
+                    mv_i32_set(local_checked, l, 1);
+                    let fid = m.instr_function(iid);
+                    var saw_live = false;
+                    var live_block: i32 = 1;
+                    while (live_block <= m.block_count) {
+                        if (!m.block_is_removed( live_block)
+                            && m.block_function(live_block) == fid
+                            && self.strict_block_contains_storage_live_of(m, live_block, l)) {
+                            saw_live = true;
+                            stamp = stamp + 1;
+                            if (self.strict_drop_escape(m, fid, live_block, l, stamp, memo_val, memo_stamp)) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "function #" + self.id_text(fid)
+                                                   + " (" + m.function_name(fid)
+                                                   + ") has a return path from local storage_live that never drops local "
+                                                   + m.local_name(l) + " (#" + self.id_text(l) + ")");
+                            }
+                        }
+                        live_block = live_block + 1;
+                    }
+                    if (!saw_live) {
+                        let entry = m.function_first_block(fid);
+                        if (entry != mir_id_invalid()) {
+                            stamp = stamp + 1;
+                            if (self.strict_drop_escape(m, fid, entry, l, stamp, memo_val, memo_stamp)) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "function #" + self.id_text(fid)
+                                                   + " (" + m.function_name(fid)
+                                                   + ") has a return path that never drops local "
+                                                   + m.local_name(l) + " (#" + self.id_text(l) + ")");
+                            }
+                        }
+                    }
+                }
+            }
+            iid = iid + 1;
+        }
+    }
+
+    // ── S5: layout closure ───────────────────────────────────────────
+
+    public fn strict_check_layouts(self, m: MirUnit) {
+        let seen_field_owner = mv_i32_arr_alloc(m.types.count);
+        var fid: i32 = 1;
+        while (fid <= m.field_count) {
+            self.focus_field(m, fid);
+            let owner = m.field_owner_type(fid);
+            if (owner >= 1 && owner <= m.types.count && mv_i32_get(seen_field_owner, owner) == 0) {
+                mv_i32_set(seen_field_owner, owner, 1);
+                let n = m.field_count_for_type(owner);
+                var cnt: i32 = 0;
+                var scan: i32 = 1;
+                while (scan <= m.field_count) {
+                    if (m.field_owner_type(scan) == owner) { cnt = cnt + 1; }
+                    scan = scan + 1;
+                }
+                let owner_text = hir_type_table_text(m.types, owner);
+                if (cnt != n) {
+                    self.record_strict(mv_strict_cat_layout(),
+                                       "type #" + self.id_text(owner) + " (" + owner_text
+                                       + ") field layout not closed: " + self.id_text(cnt)
+                                       + " fields but max index implies " + self.id_text(n));
+                }
+                var idx: i32 = 0;
+                while (idx < n) {
+                    if (m.field_id_for_type_index(owner, idx) == mir_id_invalid()) {
+                        self.record_strict(mv_strict_cat_layout(),
+                                           "type #" + self.id_text(owner) + " (" + owner_text
+                                           + ") missing field at layout index " + self.id_text(idx));
+                    }
+                    idx = idx + 1;
+                }
+            }
+            fid = fid + 1;
+        }
+        let seen_variant_owner = mv_i32_arr_alloc(m.types.count);
+        var vid: i32 = 1;
+        while (vid <= m.variant_count) {
+            self.focus_type(m, m.variant_owner_type(vid));
+            let owner = m.variant_owner_type(vid);
+            if (owner >= 1 && owner <= m.types.count && mv_i32_get(seen_variant_owner, owner) == 0) {
+                mv_i32_set(seen_variant_owner, owner, 1);
+                let k = m.variant_count_for_type(owner);
+                let owner_text = hir_type_table_text(m.types, owner);
+                var tag: i32 = 0;
+                while (tag < k) {
+                    var found = false;
+                    var scan2: i32 = 1;
+                    while (scan2 <= m.variant_count && !found) {
+                        if (m.variant_owner_type(scan2) == owner && m.variant_tag(scan2) == tag) {
+                            found = true;
+                        }
+                        scan2 = scan2 + 1;
+                    }
+                    if (!found) {
+                        self.record_strict(mv_strict_cat_layout(),
+                                           "enum type #" + self.id_text(owner) + " (" + owner_text
+                                           + ") variant tags not contiguous: missing tag " + self.id_text(tag)
+                                           + " of " + self.id_text(k));
+                    }
+                    tag = tag + 1;
+                }
+            }
+            vid = vid + 1;
+        }
+        // aggregate values of class layout must carry a FieldId on every arg
+        var agg: i32 = 1;
+        while (agg <= m.value_count) {
+            self.focus_value(m, agg);
+            if (m.value_kind(agg) == mir_value_aggregate()
+                && self.strict_type_kind(m, m.value_type(agg)) == ty_CLASS()) {
+                var a = m.value_first_arg(agg);
+                var idx2: i32 = 0;
+                while (a != mir_id_invalid()) {
+                    let f = m.value_aggregate_field(a);
+                    if (f == mir_id_invalid()) {
+                        self.record_strict(mv_strict_cat_text(),
+                                           "aggregate value #" + self.id_text(agg)
+                                           + " arg " + self.id_text(idx2)
+                                           + " has no FieldId (would fall back to positional/name guessing)");
+                    } else if (f >= 1 && f <= m.field_count) {
+                        self.strict_report_type_relation(m,
+                                                         mv_strict_cat_layout(),
+                                                         m.field_owner_type(f),
+                                                         m.value_type(agg),
+                                                         "aggregate value #" + self.id_text(agg)
+                                                         + " arg " + self.id_text(idx2)
+                                                         + " (field " + m.field_name(f) + ") owner");
+                    }
+                    a = m.value_next_arg(a);
+                    idx2 = idx2 + 1;
+                }
+            }
+            agg = agg + 1;
+        }
+    }
+
+    // ── S6: function-ownership closure ───────────────────────────────
+
+    public fn strict_owner_mismatch(self, m: MirUnit, expect_fid: i32, actual_fid: i32, where_text: string) {
+        if (expect_fid == mir_id_invalid() || actual_fid == mir_id_invalid()) { return; }
+        if (expect_fid == actual_fid) { return; }
+        self.record_strict(mv_strict_cat_owner(),
+                           where_text + " crosses functions: owner #" + self.id_text(expect_fid)
+                           + " vs referenced #" + self.id_text(actual_fid));
+    }
+
+    public fn strict_check_ownership(self, m: MirUnit) {
+        var vid: i32 = 1;
+        while (vid <= m.value_count) {
+            self.focus_value(m, vid);
+            let f = m.value_function(vid);
+            let where_text = "value #" + self.id_text(vid);
+            if (m.value_lhs(vid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.value_lhs(vid)), where_text + " lhs");
+            }
+            if (m.value_rhs(vid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.value_rhs(vid)), where_text + " rhs");
+            }
+            if (m.value_aux(vid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.value_aux(vid)), where_text + " aux");
+            }
+            if (m.value_first_arg(vid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.value_first_arg(vid)), where_text + " first arg");
+            }
+            if (m.value_place(vid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.place_function(m.value_place(vid)), where_text + " place");
+            }
+            vid = vid + 1;
+        }
+        var pid: i32 = 1;
+        while (pid <= m.place_count) {
+            let f = m.place_function(pid);
+            let where_text = "place #" + self.id_text(pid);
+            if (m.place_kind(pid) == mir_place_local() && m.place_local(pid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.local_function(m.place_local(pid)), where_text + " local");
+            }
+            if (m.place_kind(pid) != mir_place_static() && m.place_base(pid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.place_function(m.place_base(pid)), where_text + " base");
+            }
+            if (m.place_index_value(pid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.place_index_value(pid)), where_text + " index value");
+            }
+            pid = pid + 1;
+        }
+        var iid: i32 = 1;
+        while (iid <= m.instr_count) {
+            if (mir_unit_instr_owner_is_removed(&m,  iid)) {
+                iid = iid + 1;
+                continue;
+            }
+            let f = m.instr_function(iid);
+            let where_text = "instr #" + self.id_text(iid);
+            self.strict_owner_mismatch(m, f, m.block_function(m.instr_block(iid)), where_text + " block");
+            if (m.instr_place(iid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.place_function(m.instr_place(iid)), where_text + " place");
+            }
+            if (m.instr_value(iid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.instr_value(iid)), where_text + " value");
+            }
+            if (m.instr_lhs(iid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.instr_lhs(iid)), where_text + " lhs");
+            }
+            if (m.instr_rhs(iid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.instr_rhs(iid)), where_text + " rhs");
+            }
+            iid = iid + 1;
+        }
+        var bid: i32 = 1;
+        while (bid <= m.block_count) {
+            if (m.block_is_removed( bid)) {
+                bid = bid + 1;
+                continue;
+            }
+            if (m.block_term_value(bid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m,
+                                           m.block_function(bid),
+                                           m.value_function(m.block_term_value(bid)),
+                                           "block #" + self.id_text(bid) + " terminator value");
+            }
+            bid = bid + 1;
+        }
+        var cid: i32 = 1;
+        while (cid <= m.case_count) {
+            if (!mir_unit_case_is_active(&m,  cid)) {
+                cid = cid + 1;
+                continue;
+            }
+            let ob = m.case_owner_block(cid);
+            let f = m.block_function(ob);
+            let where_text = "case #" + self.id_text(cid);
+            if (m.case_pattern_value(cid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.case_pattern_value(cid)), where_text + " pattern");
+            }
+            if (m.case_guard_value(cid) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, f, m.value_function(m.case_guard_value(cid)), where_text + " guard");
+            }
+            self.strict_owner_mismatch(m, f, m.block_function(m.case_target_block(cid)), where_text + " target block");
+            cid = cid + 1;
+        }
+    }
+
+    // ── S7: zero-text closure (void by TypeId, no name/text inference) ─
+
+    public fn strict_check_canonical_string_text(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.types.count) {
+            self.focus_type(m, id);
+            if (hir_type_table_record(m.types, id) != null) {
+                let kind = hir_type_table_kind(m.types, id);
+                let text = hir_type_table_text(m.types, id);
+                if (kind == ty_STRING()) {
+                    if (text != "str") {
+                        self.record_strict(mv_strict_cat_text(),
+                                           "type #" + self.id_text(id)
+                                           + " is str ABI TypeId but text is `"
+                                           + text
+                                           + "`; expected `str` to match old codegen string ABI");
+                    }
+                } else {
+                    if (text == "str" || mv_legacy_string_primitive_text(text)) {
+                        self.record_strict(mv_strict_cat_text(),
+                                           "type #" + self.id_text(id)
+                                           + " has string primitive text `"
+                                           + text
+                                           + "` but kind is "
+                                           + self.id_text(kind)
+                                           + "; str ABI must be represented by ty_STRING");
+                    }
+                }
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn strict_check_void_and_text(self, m: MirUnit) {
+        self.strict_check_canonical_string_text(m);
+        var fid: i32 = 1;
+        while (fid <= m.function_count) {
+            self.focus_function(m, fid);
+            let ret = m.function_return_type(fid);
+            if (ret != mir_id_invalid()) {
+                let kind = self.strict_type_kind(m, ret);
+                let text = hir_type_table_text(m.types, ret);
+                if (text == "void" && kind != ty_VOID()) {
+                    self.record_strict(mv_strict_cat_text(),
+                                       "function #" + self.id_text(fid) + " (" + m.function_name(fid)
+                                       + ") return TypeId #" + self.id_text(ret)
+                                       + " prints as void but kind is " + self.id_text(kind)
+                                       + " (void decided by text, not TypeId)");
+                }
+                if (kind == ty_VOID() && text != "void") {
+                    self.record_strict(mv_strict_cat_text(),
+                                       "function #" + self.id_text(fid) + " (" + m.function_name(fid)
+                                       + ") return TypeId #" + self.id_text(ret)
+                                       + " has void kind but text `" + text + "`");
+                }
+            }
+            fid = fid + 1;
+        }
+        var bid: i32 = 1;
+        while (bid <= m.block_count) {
+            self.focus_block(m, bid);
+            if (m.block_is_removed( bid)) {
+                bid = bid + 1;
+                continue;
+            }
+            if (m.block_term_kind(bid) == mir_term_return()) {
+                let owner = m.block_function(bid);
+                let ret = m.function_return_type(owner);
+                let kind = self.strict_type_kind(m, ret);
+                let term_value = m.block_term_value(bid);
+                if (term_value == mir_id_invalid() && kind != ty_VOID()) {
+                    self.record_strict(mv_strict_cat_text(),
+                                       "block #" + self.id_text(bid)
+                                       + " returns empty value but function #" + self.id_text(owner)
+                                       + " (" + m.function_name(owner) + ") return kind is "
+                                       + self.id_text(kind) + " not void");
+                }
+                if (term_value != mir_id_invalid() && kind == ty_VOID()) {
+                    self.record_strict(mv_strict_cat_text(),
+                                       "block #" + self.id_text(bid)
+                                       + " returns value #" + self.id_text(term_value)
+                                       + " but function #" + self.id_text(owner)
+                                       + " (" + m.function_name(owner) + ") is void by TypeId");
+                }
+            }
+            bid = bid + 1;
+        }
+    }
+
+    // The strict checks below deliberately use only a streaming body scope.
+    // Global type/layout/static closure is checked once after the final drain.
+
+    public fn strict_check_cfg_scope(self,
+                                     m: MirUnit,
+                                     scope: MirFunctionVerifyScope) {
+        var block_id = scope.block_mark + 1;
+        while (block_id <= m.block_count) {
+            if (!m.block_is_removed( block_id)
+                && m.block_function(block_id) == scope.function_id) {
+                let n = self.strict_block_succ_total(m, block_id);
+                var ordinal: i32 = 0;
+                while (ordinal < n) {
+                    let successor = self.strict_block_succ_at(m, block_id, ordinal);
+                    if (successor != mir_id_invalid()
+                        && successor >= 1 && successor <= m.block_count
+                        && m.block_record(successor) != null
+                        && m.block_function(successor) != scope.function_id) {
+                        self.record_strict(mv_strict_cat_cfg(),
+                                           "block #" + self.id_text(block_id)
+                                           + " of function #" + self.id_text(scope.function_id)
+                                           + " jumps into block #" + self.id_text(successor)
+                                           + " owned by function #"
+                                           + self.id_text(m.block_function(successor)));
+                    }
+                    ordinal = ordinal + 1;
+                }
+                if (m.block_term_kind(block_id) == mir_term_match()) {
+                    var case_id = m.block_term_first_case(block_id);
+                    var case_guard: i32 = 0;
+                    while (case_id != mir_id_invalid() && case_guard <= m.case_count) {
+                        if (m.case_owner_block(case_id) != block_id) {
+                            self.record_strict(mv_strict_cat_cfg(),
+                                               "case #" + self.id_text(case_id)
+                                               + " attached to block #" + self.id_text(block_id)
+                                               + " but records owner block #"
+                                               + self.id_text(m.case_owner_block(case_id)));
+                        }
+                        case_id = m.case_next(case_id);
+                        case_guard = case_guard + 1;
+                    }
+                }
+            }
+            block_id = block_id + 1;
+        }
+    }
+
+    public fn strict_check_calls_scope(self,
+                                       m: MirUnit,
+                                       scope: MirFunctionVerifyScope) {
+        var value_id = scope.value_mark + 1;
+        while (value_id <= m.value_count) {
+            if (m.value_function(value_id) == scope.function_id
+                && m.value_kind(value_id) == mir_value_call()
+                && m.value_target_kind(value_id) == mir_target_function()) {
+                let target = m.value_target_id(value_id);
+                if (target >= 1 && target <= m.function_count) {
+                    let where_text = "call value #" + self.id_text(value_id)
+                        + " -> function #" + self.id_text(target)
+                        + " (" + m.function_name(target) + ")";
+                    let first_param = self.strict_first_user_param(m, target);
+                    let param_count = self.strict_param_count_from(m, first_param);
+                    let arg_count = self.strict_call_arg_count(m, value_id);
+                    let is_extern = m.function_item_kind(target) == hir_item_extern_function();
+                    if (is_extern) {
+                        if (arg_count < param_count) {
+                            self.record_strict(mv_strict_cat_call(),
+                                               where_text + " arity mismatch: extern expects at least "
+                                               + self.id_text(param_count) + " args, got "
+                                               + self.id_text(arg_count));
+                        }
+                    } else if (arg_count != param_count) {
+                        self.record_strict(mv_strict_cat_call(),
+                                           where_text + " arity mismatch: expects "
+                                           + self.id_text(param_count) + " args, got "
+                                           + self.id_text(arg_count));
+                    }
+                    var param = first_param;
+                    var arg = m.value_first_arg(value_id);
+                    var arg_index: i32 = 0;
+                    while (param != mir_id_invalid() && arg != mir_id_invalid()) {
+                        self.strict_report_type_relation(m,
+                                                         mv_strict_cat_call(),
+                                                         m.local_type(param),
+                                                         m.value_type(arg),
+                                                         where_text + " arg " + self.id_text(arg_index));
+                        param = self.strict_next_param(m, param);
+                        arg = m.value_next_arg(arg);
+                        arg_index = arg_index + 1;
+                    }
+                    self.strict_report_type_relation(m,
+                                                     mv_strict_cat_call(),
+                                                     m.function_return_type(target),
+                                                     m.value_type(value_id),
+                                                     where_text + " result");
+                }
+            }
+            value_id = value_id + 1;
+        }
+    }
+
+    public fn strict_check_field_places_scope(self,
+                                              m: MirUnit,
+                                              scope: MirFunctionVerifyScope) {
+        var place_id = scope.place_mark + 1;
+        while (place_id <= m.place_count) {
+            self.focus_place(m, place_id);
+            if (m.place_function(place_id) == scope.function_id
+                && m.place_kind(place_id) == mir_place_field()) {
+                let base = m.place_base(place_id);
+                let field = m.place_field(place_id);
+                if (base >= 1 && base <= m.place_count
+                    && field >= 1 && field <= m.field_count) {
+                    self.strict_report_type_relation(m,
+                                                     mv_strict_cat_field(),
+                                                     m.field_owner_type(field),
+                                                     m.place_type(base),
+                                                     "field place #" + self.id_text(place_id)
+                                                     + " (field " + m.field_name(field) + ") base");
+                }
+            }
+            place_id = place_id + 1;
+        }
+    }
+
+    public fn strict_collect_scope_local_slots(self,
+                                               m: MirUnit,
+                                               scope: MirFunctionVerifyScope,
+                                               slots: MirScopedLocalSlots) -> i32 {
+        var local_id = m.function_first_local(scope.function_id);
+        var slot: i32 = 0;
+        while (local_id != mir_id_invalid()) {
+            self.focus_local(m, local_id);
+            if (local_id < 1 || local_id > m.local_count || m.local_record(local_id) == null) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "function #" + self.id_text(scope.function_id)
+                                   + " local chain references invalid local #" + self.id_text(local_id));
+                return slot;
+            }
+            if (m.local_function(local_id) != scope.function_id) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "local #" + self.id_text(local_id)
+                                   + " is linked from function #" + self.id_text(scope.function_id)
+                                   + " but owned by function #" + self.id_text(m.local_function(local_id)));
+                return slot;
+            }
+            if (!slots.put(local_id, slot)) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "cannot allocate strict local slot for local #" + self.id_text(local_id));
+                return slot;
+            }
+            slot = slot + 1;
+            if (slot > m.local_count + 1) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "local chain for function #" + self.id_text(scope.function_id)
+                                   + " contains a cycle");
+                return slot;
+            }
+            local_id = m.local_next(local_id);
+        }
+        return slot;
+    }
+
+    public fn strict_drop_escape_scope(self,
+                                       m: MirUnit,
+                                       scope: MirFunctionVerifyScope,
+                                       block_id: i32,
+                                       local_id: i32,
+                                       stamp: i32,
+                                       memo_value: rawptr,
+                                       memo_stamp: rawptr) -> bool {
+        let block_slot = scope.block_slot(m, block_id);
+        if (block_slot == mir_id_invalid()
+            || m.block_function(block_id) != scope.function_id) {
+            return false;
+        }
+        if (mv_i32_get(memo_stamp, block_slot) == stamp) {
+            return mv_i32_get(memo_value, block_slot) == 2;
+        }
+        mv_i32_set(memo_stamp, block_slot, stamp);
+        mv_i32_set(memo_value, block_slot, 1);
+        if (self.strict_block_closes_local(m, block_id, local_id)) { return false; }
+        let term = m.block_term_kind(block_id);
+        if (term == mir_term_return()) {
+            mv_i32_set(memo_value, block_slot, 2);
+            return true;
+        }
+        if (term == mir_term_unreachable()) { return false; }
+        let successor_count = self.strict_block_succ_total(m, block_id);
+        var ordinal: i32 = 0;
+        while (ordinal < successor_count) {
+            let successor = self.strict_block_succ_at(m, block_id, ordinal);
+            if (self.strict_drop_escape_scope(m,
+                                              scope,
+                                              successor,
+                                              local_id,
+                                              stamp,
+                                              memo_value,
+                                              memo_stamp)) {
+                mv_i32_set(memo_value, block_slot, 2);
+                return true;
+            }
+            ordinal = ordinal + 1;
+        }
+        return false;
+    }
+
+    public fn strict_scope_local_slot(self,
+                                      m: MirUnit,
+                                      scope: MirFunctionVerifyScope,
+                                      slots: MirScopedLocalSlots,
+                                      instr_id: i32,
+                                      where_text: string) -> i32 {
+        let local_id = self.strict_drop_local_of_instr(m, instr_id);
+        if (local_id == mir_id_invalid()) {
+            self.record_strict(mv_strict_cat_drop(), where_text + " has no local place operand");
+            return -1;
+        }
+        let slot = slots.get(local_id);
+        if (slot < 0) {
+            self.record_strict(mv_strict_cat_owner(),
+                               where_text + " local #" + self.id_text(local_id)
+                               + " is not in function #" + self.id_text(scope.function_id)
+                               + " local chain");
+        }
+        return slot;
+    }
+
+    public fn strict_check_drops_scope(self,
+                                       m: MirUnit,
+                                       scope: MirFunctionVerifyScope) {
+        let slots = MirScopedLocalSlots.create(m.function_local_count(scope.function_id));
+        let local_count = self.strict_collect_scope_local_slots(m, scope, slots);
+        let dropped_stamp = mv_i32_arr_alloc(local_count);
+        let checked = mv_i32_arr_alloc(local_count);
+        let block_span = m.block_count - scope.block_mark;
+        let memo_value = mv_i32_arr_alloc(block_span);
+        let memo_stamp = mv_i32_arr_alloc(block_span);
+
+        // Structural closure of every active drop in this body range.
+        var instr_id = scope.instr_mark + 1;
+        while (instr_id <= m.instr_count) {
+            self.focus_instr(m, instr_id);
+            if (!mir_unit_instr_owner_is_removed(&m,  instr_id)
+                && m.instr_function(instr_id) == scope.function_id
+                && m.instr_kind(instr_id) == mir_instr_drop()) {
+                let where_text = "drop instr #" + self.id_text(instr_id)
+                    + " in function #" + self.id_text(scope.function_id);
+                let local_id = self.strict_drop_local_of_instr(m, instr_id);
+                self.strict_scope_local_slot(m, scope, slots, instr_id, where_text);
+                if (local_id != mir_id_invalid()) {
+                    if (m.instr_target_kind(instr_id) == mir_target_none()
+                        && m.instr_target_id(instr_id) == mir_id_invalid()) {
+                        // DCI stub-owned C++ objects lower through the type's
+                        // destroy stub rather than a MIR function target.
+                    } else if (m.instr_target_kind(instr_id) != mir_target_function()) {
+                        self.record_strict(mv_strict_cat_drop(),
+                                           where_text + " target is not a function (kind "
+                                           + self.id_text(m.instr_target_kind(instr_id)) + ")");
+                    } else {
+                        let target = m.instr_target_id(instr_id);
+                        if (target >= 1 && target <= m.function_count) {
+                            let first_param = self.strict_first_param(m, target);
+                            let param_count = self.strict_param_count_from(m, first_param);
+                            if (param_count != 1) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   where_text + " target " + m.function_name(target)
+                                                   + " is not unary fn(T): param count "
+                                                   + self.id_text(param_count));
+                            } else {
+                                self.strict_report_type_relation(m,
+                                                                 mv_strict_cat_drop(),
+                                                                 m.local_type(first_param),
+                                                                 m.local_type(local_id),
+                                                                 where_text + " dropped local "
+                                                                 + m.local_name(local_id));
+                            }
+                        }
+                    }
+                }
+            }
+            instr_id = instr_id + 1;
+        }
+
+        // Per-block double-drop without a direct re-assignment. The stamp
+        // arrays are indexed by dense scope-local slots, never global IDs.
+        var block_stamp: i32 = 0;
+        var block_id = m.function_first_block(scope.function_id);
+        var block_guard: i32 = 0;
+        while (block_id != mir_id_invalid() && block_guard <= block_span + 1) {
+            self.focus_block(m, block_id);
+            if (!scope.block_in_range(m, block_id)) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "function #" + self.id_text(scope.function_id)
+                                   + " block chain escapes strict body scope at #" + self.id_text(block_id));
+                break;
+            }
+            if (!m.block_is_removed( block_id)) {
+                block_stamp = block_stamp + 1;
+                var current_instr = m.block_first_instr(block_id);
+                while (current_instr != mir_id_invalid()) {
+                    let kind = m.instr_kind(current_instr);
+                    if (kind == mir_instr_drop()) {
+                        let slot = self.strict_scope_local_slot(m,
+                                                                 scope,
+                                                                 slots,
+                                                                 current_instr,
+                                                                 "drop instr #" + self.id_text(current_instr));
+                        if (slot >= 0) {
+                            if (mv_i32_get(dropped_stamp, slot) == block_stamp) {
+                                let local_id = self.strict_drop_local_of_instr(m, current_instr);
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "block #" + self.id_text(block_id)
+                                                   + " drops local " + m.local_name(local_id)
+                                                   + " (#" + self.id_text(local_id)
+                                                   + ") twice without re-assignment");
+                            }
+                            mv_i32_set(dropped_stamp, slot, block_stamp);
+                        }
+                    } else if (kind == mir_instr_assign() || kind == mir_instr_foreach_bind()) {
+                        let place_id = m.instr_place(current_instr);
+                        if (place_id >= 1 && place_id <= m.place_count
+                            && m.place_kind(place_id) == mir_place_local()) {
+                            let slot2 = slots.get(m.place_local(place_id));
+                            if (slot2 >= 0 && mv_i32_get(dropped_stamp, slot2) == block_stamp) {
+                                mv_i32_set(dropped_stamp, slot2, 0);
+                            }
+                        }
+                    }
+                    current_instr = m.instr_next(current_instr);
+                }
+            }
+            block_id = m.block_next(block_id);
+            block_guard = block_guard + 1;
+        }
+
+        // Every local that has an explicit drop must close on every return
+        // path from its storage-live point (or the entry if none exists).
+        var stamp: i32 = 0;
+        instr_id = scope.instr_mark + 1;
+        while (instr_id <= m.instr_count) {
+            self.focus_instr(m, instr_id);
+            if (!mir_unit_instr_owner_is_removed(&m,  instr_id)
+                && m.instr_function(instr_id) == scope.function_id
+                && m.instr_kind(instr_id) == mir_instr_drop()) {
+                let local_id = self.strict_drop_local_of_instr(m, instr_id);
+                let slot = self.strict_scope_local_slot(m,
+                                                         scope,
+                                                         slots,
+                                                         instr_id,
+                                                         "drop instr #" + self.id_text(instr_id));
+                if (slot >= 0 && mv_i32_get(checked, slot) == 0) {
+                    mv_i32_set(checked, slot, 1);
+                    var saw_live = false;
+                    block_id = m.function_first_block(scope.function_id);
+                    block_guard = 0;
+                    while (block_id != mir_id_invalid() && block_guard <= block_span + 1) {
+                        if (!scope.block_in_range(m, block_id)) { break; }
+                        if (!m.block_is_removed( block_id)
+                            && self.strict_block_contains_storage_live_of(m, block_id, local_id)) {
+                            saw_live = true;
+                            stamp = stamp + 1;
+                            if (self.strict_drop_escape_scope(m,
+                                                              scope,
+                                                              block_id,
+                                                              local_id,
+                                                              stamp,
+                                                              memo_value,
+                                                              memo_stamp)) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "function #" + self.id_text(scope.function_id)
+                                                   + " (" + m.function_name(scope.function_id)
+                                                   + ") has a return path from local storage_live that never drops local "
+                                                   + m.local_name(local_id) + " (#"
+                                                   + self.id_text(local_id) + ")");
+                            }
+                        }
+                        block_id = m.block_next(block_id);
+                        block_guard = block_guard + 1;
+                    }
+                    if (!saw_live) {
+                        let entry = m.function_first_block(scope.function_id);
+                        if (entry != mir_id_invalid()) {
+                            stamp = stamp + 1;
+                            if (self.strict_drop_escape_scope(m,
+                                                              scope,
+                                                              entry,
+                                                              local_id,
+                                                              stamp,
+                                                              memo_value,
+                                                              memo_stamp)) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "function #" + self.id_text(scope.function_id)
+                                                   + " (" + m.function_name(scope.function_id)
+                                                   + ") has a return path that never drops local "
+                                                   + m.local_name(local_id) + " (#"
+                                                   + self.id_text(local_id) + ")");
+                            }
+                        }
+                    }
+                }
+            }
+            instr_id = instr_id + 1;
+        }
+
+        if (dropped_stamp != null) { free(dropped_stamp); }
+        if (checked != null) { free(checked); }
+        if (memo_value != null) { free(memo_value); }
+        if (memo_stamp != null) { free(memo_stamp); }
+        slots.dispose();
+    }
+
+    public fn strict_check_aggregate_layouts_scope(self,
+                                                    m: MirUnit,
+                                                    scope: MirFunctionVerifyScope) {
+        var aggregate_id = scope.value_mark + 1;
+        while (aggregate_id <= m.value_count) {
+            self.focus_value(m, aggregate_id);
+            if (m.value_function(aggregate_id) == scope.function_id
+                && m.value_kind(aggregate_id) == mir_value_aggregate()
+                && self.strict_type_kind(m, m.value_type(aggregate_id)) == ty_CLASS()) {
+                var arg = m.value_first_arg(aggregate_id);
+                var arg_index: i32 = 0;
+                while (arg != mir_id_invalid()) {
+                    let field_id = m.value_aggregate_field(arg);
+                    if (field_id == mir_id_invalid()) {
+                        self.record_strict(mv_strict_cat_text(),
+                                           "aggregate value #" + self.id_text(aggregate_id)
+                                           + " arg " + self.id_text(arg_index)
+                                           + " has no FieldId (would fall back to positional/name guessing)");
+                    } else if (field_id >= 1 && field_id <= m.field_count) {
+                        self.strict_report_type_relation(m,
+                                                         mv_strict_cat_layout(),
+                                                         m.field_owner_type(field_id),
+                                                         m.value_type(aggregate_id),
+                                                         "aggregate value #" + self.id_text(aggregate_id)
+                                                         + " arg " + self.id_text(arg_index)
+                                                         + " (field " + m.field_name(field_id) + ") owner");
+                    }
+                    arg = m.value_next_arg(arg);
+                    arg_index = arg_index + 1;
+                }
+            }
+            aggregate_id = aggregate_id + 1;
+        }
+    }
+
+    public fn strict_check_ownership_scope(self,
+                                            m: MirUnit,
+                                            scope: MirFunctionVerifyScope) {
+        var value_id = scope.value_mark + 1;
+        while (value_id <= m.value_count) {
+            self.focus_value(m, value_id);
+            let where_text = "value #" + self.id_text(value_id);
+            let function_id = m.value_function(value_id);
+            if (function_id != scope.function_id) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   where_text + " belongs to function #" + self.id_text(function_id)
+                                   + " outside function #" + self.id_text(scope.function_id) + " body scope");
+            }
+            if (m.value_lhs(value_id) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, function_id, m.value_function(m.value_lhs(value_id)), where_text + " lhs");
+            }
+            if (m.value_rhs(value_id) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, function_id, m.value_function(m.value_rhs(value_id)), where_text + " rhs");
+            }
+            if (m.value_aux(value_id) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, function_id, m.value_function(m.value_aux(value_id)), where_text + " aux");
+            }
+            if (m.value_first_arg(value_id) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, function_id, m.value_function(m.value_first_arg(value_id)), where_text + " first arg");
+            }
+            if (m.value_place(value_id) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, function_id, m.place_function(m.value_place(value_id)), where_text + " place");
+            }
+            value_id = value_id + 1;
+        }
+        var place_id = scope.place_mark + 1;
+        while (place_id <= m.place_count) {
+            self.focus_place(m, place_id);
+            let function_id = m.place_function(place_id);
+            let where_text = "place #" + self.id_text(place_id);
+            if (function_id != scope.function_id) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   where_text + " belongs to function #" + self.id_text(function_id)
+                                   + " outside function #" + self.id_text(scope.function_id) + " body scope");
+            }
+            if (m.place_kind(place_id) == mir_place_local()
+                && m.place_local(place_id) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, function_id, m.local_function(m.place_local(place_id)), where_text + " local");
+            }
+            if (m.place_kind(place_id) != mir_place_static()
+                && m.place_base(place_id) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, function_id, m.place_function(m.place_base(place_id)), where_text + " base");
+            }
+            if (m.place_index_value(place_id) != mir_id_invalid()) {
+                self.strict_owner_mismatch(m, function_id, m.value_function(m.place_index_value(place_id)), where_text + " index value");
+            }
+            place_id = place_id + 1;
+        }
+        var instr_id = scope.instr_mark + 1;
+        while (instr_id <= m.instr_count) {
+            self.focus_instr(m, instr_id);
+            if (!mir_unit_instr_owner_is_removed(&m,  instr_id)) {
+                let function_id = m.instr_function(instr_id);
+                let where_text = "instr #" + self.id_text(instr_id);
+                if (function_id != scope.function_id) {
+                    self.record_strict(mv_strict_cat_owner(),
+                                       where_text + " belongs to function #" + self.id_text(function_id)
+                                       + " outside function #" + self.id_text(scope.function_id) + " body scope");
+                }
+                self.strict_owner_mismatch(m, function_id, m.block_function(m.instr_block(instr_id)), where_text + " block");
+                if (m.instr_place(instr_id) != mir_id_invalid()) {
+                    self.strict_owner_mismatch(m, function_id, m.place_function(m.instr_place(instr_id)), where_text + " place");
+                }
+                if (m.instr_value(instr_id) != mir_id_invalid()) {
+                    self.strict_owner_mismatch(m, function_id, m.value_function(m.instr_value(instr_id)), where_text + " value");
+                }
+                if (m.instr_lhs(instr_id) != mir_id_invalid()) {
+                    self.strict_owner_mismatch(m, function_id, m.value_function(m.instr_lhs(instr_id)), where_text + " lhs");
+                }
+                if (m.instr_rhs(instr_id) != mir_id_invalid()) {
+                    self.strict_owner_mismatch(m, function_id, m.value_function(m.instr_rhs(instr_id)), where_text + " rhs");
+                }
+            }
+            instr_id = instr_id + 1;
+        }
+        var block_id = scope.block_mark + 1;
+        while (block_id <= m.block_count) {
+            self.focus_block(m, block_id);
+            if (!m.block_is_removed( block_id)) {
+                let function_id = m.block_function(block_id);
+                if (function_id != scope.function_id) {
+                    self.record_strict(mv_strict_cat_owner(),
+                                       "block #" + self.id_text(block_id)
+                                       + " belongs to function #" + self.id_text(function_id)
+                                       + " outside function #" + self.id_text(scope.function_id) + " body scope");
+                }
+                if (m.block_term_value(block_id) != mir_id_invalid()) {
+                    self.strict_owner_mismatch(m,
+                                               function_id,
+                                               m.value_function(m.block_term_value(block_id)),
+                                               "block #" + self.id_text(block_id) + " terminator value");
+                }
+            }
+            block_id = block_id + 1;
+        }
+        var case_id = scope.case_mark + 1;
+        while (case_id <= m.case_count) {
+            self.focus_case(m, case_id);
+            if (mir_unit_case_is_active(&m,  case_id)) {
+                let owner_block = m.case_owner_block(case_id);
+                let function_id = m.block_function(owner_block);
+                let where_text = "case #" + self.id_text(case_id);
+                if (function_id != scope.function_id) {
+                    self.record_strict(mv_strict_cat_owner(),
+                                       where_text + " belongs to function #" + self.id_text(function_id)
+                                       + " outside function #" + self.id_text(scope.function_id) + " body scope");
+                }
+                if (m.case_pattern_value(case_id) != mir_id_invalid()) {
+                    self.strict_owner_mismatch(m, function_id, m.value_function(m.case_pattern_value(case_id)), where_text + " pattern");
+                }
+                if (m.case_guard_value(case_id) != mir_id_invalid()) {
+                    self.strict_owner_mismatch(m, function_id, m.value_function(m.case_guard_value(case_id)), where_text + " guard");
+                }
+                self.strict_owner_mismatch(m, function_id, m.block_function(m.case_target_block(case_id)), where_text + " target block");
+            }
+            case_id = case_id + 1;
+        }
+    }
+
+    public fn strict_check_void_scope(self,
+                                      m: MirUnit,
+                                      scope: MirFunctionVerifyScope) {
+        let return_type = m.function_return_type(scope.function_id);
+        let return_kind = self.strict_type_kind(m, return_type);
+        let return_text = hir_type_table_text(m.types, return_type);
+        if (return_text == "void" && return_kind != ty_VOID()) {
+            self.record_strict(mv_strict_cat_text(),
+                               "function #" + self.id_text(scope.function_id) + " ("
+                               + m.function_name(scope.function_id) + ") return TypeId #"
+                               + self.id_text(return_type) + " prints as void but kind is "
+                               + self.id_text(return_kind) + " (void decided by text, not TypeId)");
+        }
+        if (return_kind == ty_VOID() && return_text != "void") {
+            self.record_strict(mv_strict_cat_text(),
+                               "function #" + self.id_text(scope.function_id) + " ("
+                               + m.function_name(scope.function_id) + ") return TypeId #"
+                               + self.id_text(return_type) + " has void kind but text `"
+                               + return_text + "`");
+        }
+        var block_id = scope.block_mark + 1;
+        while (block_id <= m.block_count) {
+            self.focus_block(m, block_id);
+            if (!m.block_is_removed( block_id)
+                && m.block_function(block_id) == scope.function_id
+                && m.block_term_kind(block_id) == mir_term_return()) {
+                let term_value = m.block_term_value(block_id);
+                if (term_value == mir_id_invalid() && return_kind != ty_VOID()) {
+                    self.record_strict(mv_strict_cat_text(),
+                                       "block #" + self.id_text(block_id)
+                                       + " returns empty value but function #"
+                                       + self.id_text(scope.function_id) + " ("
+                                       + m.function_name(scope.function_id)
+                                       + ") return kind is " + self.id_text(return_kind)
+                                       + " not void");
+                }
+                if (term_value != mir_id_invalid() && return_kind == ty_VOID()) {
+                    self.record_strict(mv_strict_cat_text(),
+                                       "block #" + self.id_text(block_id)
+                                       + " returns value #" + self.id_text(term_value)
+                                       + " but function #" + self.id_text(scope.function_id)
+                                       + " (" + m.function_name(scope.function_id)
+                                       + ") is void by TypeId");
+                }
+            }
+            block_id = block_id + 1;
+        }
+    }
+
+    public fn run_function_strict(self,
+                                  m: MirUnit,
+                                  scope: MirFunctionVerifyScope) -> i32 {
+        self.check_function_scope(m, scope);
+        if (self.errors == 0) {
+            self.strict_check_cfg_scope(m, scope);
+            self.strict_check_calls_scope(m, scope);
+            self.strict_check_field_places_scope(m, scope);
+            self.strict_check_drops_scope(m, scope);
+            self.strict_check_aggregate_layouts_scope(m, scope);
+            self.strict_check_ownership_scope(m, scope);
+            self.strict_check_void_scope(m, scope);
+        }
+        if (self.print_summary) {
+            print("[mir2-verify:function-strict] function=" + self.id_text(scope.function_id)
+                  + " blocks=" + self.id_text(m.block_count - scope.block_mark)
+                  + " locals=" + self.id_text(m.function_local_count(scope.function_id))
+                  + " places=" + self.id_text(m.place_count - scope.place_mark)
+                  + " values=" + self.id_text(m.value_count - scope.value_mark)
+                  + " instrs=" + self.id_text(m.instr_count - scope.instr_mark)
+                  + " cases=" + self.id_text(m.case_count - scope.case_mark)
+                  + " errors=" + self.id_text(self.errors));
+        }
+        return self.errors;
+    }
+
+    public fn run_strict(self, m: MirUnit) {
+        self.current_loc = mir_unit_diag_first_loc(&m);
+        self.strict_check_cfg(m);
+        self.strict_check_calls(m);
+        self.strict_check_field_places(m);
+        self.strict_check_drops(m);
+        self.strict_check_layouts(m);
+        self.strict_check_ownership(m);
+        self.strict_check_void_and_text(m);
+        if (self.print_summary) {
+            print("[mir2-verify:strict] summary"
+                  + " cfg=" + policy_i64_to_string(self.strict_cfg_errors as i64)
+                  + " call=" + policy_i64_to_string(self.strict_call_errors as i64)
+                  + " field=" + policy_i64_to_string(self.strict_field_errors as i64)
+                  + " drop=" + policy_i64_to_string(self.strict_drop_errors as i64)
+                  + " layout=" + policy_i64_to_string(self.strict_layout_errors as i64)
+                  + " owner=" + policy_i64_to_string(self.strict_owner_errors as i64)
+                  + " text=" + policy_i64_to_string(self.strict_text_errors as i64)
+                  + " noncanonical_type=" + policy_i64_to_string(self.strict_canon_errors as i64));
+        }
+    }
+
+    public fn run(self, m: MirUnit) -> i32 {
+        self.current_loc = mir_unit_diag_first_loc(&m);
+        if (m.function_buf == null || m.block_buf == null || m.local_buf == null
+            || m.place_buf == null || m.value_buf == null || m.instr_buf == null
+            || m.case_buf == null || m.static_buf == null || m.types.buf == null) {
+            self.record_error("MIR unit has an unallocated core table");
+        }
+        self.check_functions(m);
+        self.check_blocks(m);
+        self.check_locals(m);
+        self.check_statics(m);
+        self.check_places(m);
+        self.check_values(m);
+        self.check_instrs(m);
+        self.check_cases(m);
+        if (self.strict) {
+            self.run_strict(m);
+        }
+        if (self.print_summary) {
+            var discarded_bodies: i32 = 0;
+            var fid: i32 = 1;
+            while (fid <= m.function_count) {
+                if (m.function_streamed_body_discarded(fid)) {
+                    discarded_bodies = discarded_bodies + 1;
+                }
+                fid = fid + 1;
+            }
+            // function_count includes records whose bodies were already
+            // verified in mir_pass_verify_stage and then discarded.
+            print("verified functions=" + policy_i64_to_string(m.function_count as i64));
+            print("verified discarded_bodies=" + policy_i64_to_string(discarded_bodies as i64));
+            print("[mir2-verify] functions=" + policy_i64_to_string(m.function_count as i64)
+                  + " blocks=" + policy_i64_to_string(m.block_count as i64)
+                  + " locals=" + policy_i64_to_string(m.local_count as i64)
+                  + " places=" + policy_i64_to_string(m.place_count as i64)
+                  + " values=" + policy_i64_to_string(m.value_count as i64)
+                  + " instrs=" + policy_i64_to_string(m.instr_count as i64)
+                  + " cases=" + policy_i64_to_string(m.case_count as i64)
+                  + " statics=" + policy_i64_to_string(m.static_count as i64)
+                  + " errors=" + policy_i64_to_string(self.errors as i64));
+        }
+        return self.errors;
+    }
+}
+
+public fn mir_verify_unit(m: MirUnit) -> i32 {
+    let verifier = MirVerifier.create();
+    return verifier.run(m);
+}
+
+public fn mir_verify_unit_strict(m: MirUnit) -> i32 {
+    let verifier = MirVerifier.create_strict();
+    return verifier.run(m);
+}
+
+public fn mir_verify_unit_silent(m: MirUnit) -> i32 {
+    let verifier = MirVerifier.create_silent();
+    return verifier.run(m);
+}
+
+public fn mir_verify_unit_strict_silent(m: MirUnit) -> i32 {
+    let verifier = MirVerifier.create_strict_silent();
+    return verifier.run(m);
+}
+
+public fn mir_verify_function_strict(m: MirUnit,
+                                     function_id: i32,
+                                     block_mark: i32,
+                                     local_mark: i32,
+                                     place_mark: i32,
+                                     value_mark: i32,
+                                     instr_mark: i32,
+                                     case_mark: i32) -> i32 {
+    let verifier = MirVerifier.create_strict();
+    let scope = MirFunctionVerifyScope.create(function_id,
+                                               block_mark,
+                                               local_mark,
+                                               place_mark,
+                                               value_mark,
+                                               instr_mark,
+                                               case_mark);
+    return verifier.run_function_strict(m, scope);
+}
+
+public fn mir_verify_function_strict_silent(m: MirUnit,
+                                            function_id: i32,
+                                            block_mark: i32,
+                                            local_mark: i32,
+                                            place_mark: i32,
+                                            value_mark: i32,
+                                            instr_mark: i32,
+                                            case_mark: i32) -> i32 {
+    let verifier = MirVerifier.create_strict_silent();
+    let scope = MirFunctionVerifyScope.create(function_id,
+                                               block_mark,
+                                               local_mark,
+                                               place_mark,
+                                               value_mark,
+                                               instr_mark,
+                                               case_mark);
+    return verifier.run_function_strict(m, scope);
+}
+
+fn mv_dci_call_target_function_id(m: MirUnit, value_id: i32) -> i32 {
+    if (value_id < 1 || value_id > m.value_count
+        || m.value_kind(value_id) != mir_value_call()) {
+        return mir_id_invalid();
+    }
+    if (m.value_target_kind(value_id) == mir_target_function()) {
+        let direct = m.value_target_id(value_id);
+        if (direct > 0 && direct <= m.function_count) { return direct; }
+        return mir_id_invalid();
+    }
+    let callee = m.value_lhs(value_id);
+    if (callee > 0 && callee <= m.value_count
+        && m.value_target_kind(callee) == mir_target_function()) {
+        let indirect = m.value_target_id(callee);
+        if (indirect > 0 && indirect <= m.function_count) { return indirect; }
+    }
+    return mir_id_invalid();
+}
+
+fn mv_dci_unwrap_assignment_call(m: MirUnit, value_id: i32) -> i32 {
+    var current = value_id;
+    var guard: i32 = 0;
+    while (current > 0 && current <= m.value_count && guard <= m.value_count) {
+        let kind = m.value_kind(current);
+        if (kind == mir_value_call()) { return current; }
+        if (kind != mir_value_cast() && kind != mir_value_arg()) {
+            return mir_id_invalid();
+        }
+        current = m.value_lhs(current);
+        guard = guard + 1;
+    }
+    return mir_id_invalid();
+}
+
+fn mv_dci_stub_spec_field(line: string, wanted: i32) -> string {
+    var start: i32 = 0;
+    var field: i32 = 0;
+    var i: i32 = 0;
+    while (i <= line.len) {
+        if (i == line.len || line.charAt(i) == 9) {
+            if (field == wanted) { return line.substring(start, i).trim(); }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn mv_dci_type_name_canonical(name: string) -> string {
+    return policy_generic_call_base(name.clone()).replace("::", ".");
+}
+
+fn mv_dci_last_path_segment(name: string) -> string {
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i < name.len) {
+        if (name.charAt(i) == 46) { start = i + 1; }
+        i = i + 1;
+    }
+    if (start == 0) { return name; }
+    return name.substring(start, name.len as i32);
+}
+
+fn mv_dci_type_names_match(a: string, b: string) -> bool {
+    let canonical_a = mv_dci_type_name_canonical(a);
+    let canonical_b = mv_dci_type_name_canonical(b);
+    if (canonical_a == canonical_b) { return true; }
+    if (canonical_a.contains(".") && canonical_b.contains(".")) { return false; }
+    let last_a = mv_dci_last_path_segment(canonical_a);
+    let last_b = mv_dci_last_path_segment(canonical_b);
+    return last_a.len > 0 && last_b.len > 0 && last_a == last_b;
+}
+
+fn mv_dci_stub_base_for_type_text(m: MirUnit, derived: string) -> string {
+    let rows = mir_unit_dci_stub_specs(&m);
+    let canonical_derived = mv_dci_type_name_canonical(derived);
+    var exact_base = "";
+    var exact_count: i32 = 0;
+    var fallback_base = "";
+    var fallback_count: i32 = 0;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= rows.len) {
+        if (i == rows.len || rows.charAt(i) == 10) {
+            let line = rows.substring(start, i).trim();
+            if (mv_dci_stub_spec_field(line, 0) == "class") {
+                let candidate = mv_dci_stub_spec_field(line, 1);
+                let base = mv_dci_stub_spec_field(line, 2);
+                if (mv_dci_type_name_canonical(candidate) == canonical_derived) {
+                    exact_base = base;
+                    exact_count = exact_count + 1;
+                } elif (mv_dci_type_names_match(candidate, derived)) {
+                    fallback_base = base;
+                    fallback_count = fallback_count + 1;
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (exact_count == 1) { return exact_base; }
+    if (exact_count == 0 && fallback_count == 1) { return fallback_base; }
+    return "";
+}
+
+fn mv_dci_type_is_stub_class(m: MirUnit, type_id: i32) -> bool {
+    if (type_id < 1 || type_id > m.types.count
+        || hir_type_table_kind(m.types, type_id) != ty_CLASS()) {
+        return false;
+    }
+    return mv_dci_stub_base_for_type_text(
+               m, hir_type_table_text(m.types, type_id)).len > 0;
+}
+
+fn mv_dci_function_is_vyx_constructor(m: MirUnit, function_id: i32) -> bool {
+    if (function_id < 1 || function_id > m.function_count
+        || mir_unit_function_is_foreign_dci_ctor(&m,  function_id)) {
+        return false;
+    }
+    return m.function_name(function_id) == "constructor"
+        && m.function_owner_type(function_id).len > 0;
+}
+
+fn mv_dci_assignment_count_for_call(m: MirUnit,
+                                    function_id: i32,
+                                    instr_mark: i32,
+                                    call_value: i32,
+                                    storage_type: i32) -> i32 {
+    var count: i32 = 0;
+    var instr_id = instr_mark + 1;
+    while (instr_id <= m.instr_count) {
+        if (!mir_unit_instr_owner_is_removed(&m,  instr_id)
+            && m.instr_function(instr_id) == function_id
+            && m.instr_kind(instr_id) == mir_instr_assign()) {
+            let place_id = m.instr_place(instr_id);
+            if (place_id > 0 && place_id <= m.place_count
+                && mv_dci_unwrap_assignment_call(m, m.instr_value(instr_id)) == call_value
+                && mv_dci_type_names_match(
+                    hir_type_table_text(m.types, m.place_type(place_id)),
+                    hir_type_table_text(m.types, storage_type))) {
+                count = count + 1;
+            }
+        }
+        instr_id = instr_id + 1;
+    }
+    return count;
+}
+
+fn mv_dci_assignment_source_supported(m: MirUnit,
+                                      value_id: i32,
+                                      storage_type: i32) -> bool {
+    let call_value = mv_dci_unwrap_assignment_call(m, value_id);
+    let target = mv_dci_call_target_function_id(m, call_value);
+    if (target == mir_id_invalid()) { return false; }
+    var result_type = m.function_return_type(target);
+    if (mir_unit_function_is_foreign_dci_ctor(&m,  target)) {
+        let owner_type = mir_unit_foreign_dci_owner_type_id(&m,  target);
+        if (owner_type != mir_id_invalid()) { result_type = owner_type; }
+    } elif (!mir_unit_function_is_foreign_dci(&m,  target)) {
+        return false;
+    }
+    if (result_type < 1 || result_type > m.types.count) { return false; }
+    return mv_dci_type_names_match(hir_type_table_text(m.types, result_type),
+                                   hir_type_table_text(m.types, storage_type));
+}
+
+fn mv_verify_dci_storage_contract_scope(m: MirUnit,
+                                        function_id: i32,
+                                        value_mark: i32,
+                                        instr_mark: i32) -> i32 {
+    let verifier = MirVerifier.create_silent();
+    var value_id = value_mark + 1;
+    while (value_id <= m.value_count) {
+        if ((function_id == mir_id_invalid() || m.value_function(value_id) == function_id)
+            && m.value_kind(value_id) == mir_value_call()) {
+            let target = mv_dci_call_target_function_id(m, value_id);
+            if (mir_unit_function_is_foreign_dci_ctor(&m,  target)) {
+                let owner_type = mir_unit_foreign_dci_owner_type_id(&m,  target);
+                if (owner_type == mir_id_invalid()
+                    || mv_dci_assignment_count_for_call(m,
+                                                        m.value_function(value_id),
+                                                        instr_mark,
+                                                        value_id,
+                                                        owner_type) != 1) {
+                    verifier.record_error_at_value(
+                        m,
+                        value_id,
+                        "DCI constructor `" + m.function_name(target)
+                        + "` must initialize a final storage place directly");
+                    return verifier.errors;
+                }
+            } elif (mv_dci_function_is_vyx_constructor(m, target)) {
+                let self_type = mir_unit_function_param_type_at(&m,  target, 0);
+                if (mv_dci_type_is_stub_class(m, self_type)
+                    && mv_dci_assignment_count_for_call(m,
+                                                        m.value_function(value_id),
+                                                        instr_mark,
+                                                        value_id,
+                                                        self_type) != 1) {
+                    verifier.record_error_at_value(
+                        m,
+                        value_id,
+                        "DCI stub constructor must initialize exactly one final owning place");
+                    return verifier.errors;
+                }
+            }
+        }
+        value_id = value_id + 1;
+    }
+
+    var instr_id = instr_mark + 1;
+    while (instr_id <= m.instr_count) {
+        if (!mir_unit_instr_owner_is_removed(&m,  instr_id)
+            && (function_id == mir_id_invalid() || m.instr_function(instr_id) == function_id)
+            && m.instr_kind(instr_id) == mir_instr_assign()) {
+            let place_id = m.instr_place(instr_id);
+            if (place_id > 0 && place_id <= m.place_count
+                && mir_unit_type_is_foreign_dci(&m,  m.place_type(place_id))
+                && !mv_dci_assignment_source_supported(
+                    m, m.instr_value(instr_id), m.place_type(place_id))) {
+                verifier.record_error_at(
+                    mir_unit_diag_loc_for_instr(&m,  instr_id),
+                    "DCI object assignment requires a direct constructor into final storage");
+                return verifier.errors;
+            }
+        }
+        instr_id = instr_id + 1;
+    }
+    return verifier.errors;
+}
+
+public fn mir_verify_dci_storage_contract_function(m: MirUnit,
+                                                   function_id: i32,
+                                                   value_mark: i32,
+                                                   instr_mark: i32) -> i32 {
+    return mv_verify_dci_storage_contract_scope(m,
+                                                function_id,
+                                                value_mark,
+                                                instr_mark);
+}
+
+public fn mir_verify_dci_storage_contract_unit(m: MirUnit) -> i32 {
+    return mv_verify_dci_storage_contract_scope(m, mir_id_invalid(), 0, 0);
+}

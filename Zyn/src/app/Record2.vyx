@@ -1,0 +1,771 @@
+module Zyn.App;
+
+use std.collections;
+use std.encoding;
+use std.fs;
+
+// ---------------------------------------------------------------------------
+// ZC-16 Record / Reply v2
+//
+// v1 (in `Timeline.vyx`) recorded one thing: the order in which the command
+// queue was consumed. That is enough to replay a button press and not enough to
+// replay a session, because a session also contains input, effects, the clock
+// and the random seed - and any of those changing between runs makes the
+// replay diverge for a reason that has nothing to do with the code under test.
+//
+// v2 therefore records a *stream* rather than a list of commands:
+//
+//   * every record carries its kind, a monotonic sequence and the frame it was
+//     observed on, so a divergence can be located exactly;
+//   * the seed and the time source are part of the header, so a replay is
+//     deterministic by construction rather than by luck;
+//   * an effect result can be *injected* selectively, which is what lets a test
+//     assert "when the network answers 503, the screen shows a retry" without a
+//     network;
+//   * concurrent tasks commit in sequence order (`AppCommitOrder`), so a replay
+//     of a multi-task session is stable even though the real scheduling is not.
+//
+// The format is line oriented and hex encoded exactly like v1, for the same two
+// reasons: it survives a text-mode checkout, and a corrupt record is reported
+// with the line number that produced it.
+// ---------------------------------------------------------------------------
+
+public fn appRecordAction() -> i32 { return 1; }
+public fn appRecordInput() -> i32 { return 2; }
+public fn appRecordEffectRequest() -> i32 { return 3; }
+public fn appRecordEffectResult() -> i32 { return 4; }
+public fn appRecordClock() -> i32 { return 5; }
+public fn appRecordSeed() -> i32 { return 6; }
+public fn appRecordCommit() -> i32 { return 7; }
+public fn appRecordCheckpoint() -> i32 { return 8; }
+
+// A flat entry: the union of every record's fields. A flat shape is deliberate -
+// it keeps one record type to serialise, one to validate, and no nested
+// ownership to reason about when a recording is copied.
+public class AppRecordEntry {
+    public kind: i32;
+    public sequence: i32;
+    public frame: u64;
+    public a: string;
+    public b: string;
+    public c: string;
+    public n1: i64;
+    public n2: i64;
+
+    public static fn create(kind: i32, sequence: i32, frame: u64, a: string, b: string, c: string, n1: i64, n2: i64) -> AppRecordEntry {
+        return AppRecordEntry {
+            kind: kind, sequence: sequence, frame: frame,
+            a: a, b: b, c: c, n1: n1, n2: n2
+        };
+    }
+
+    public fn dup(&self) -> AppRecordEntry {
+        return AppRecordEntry.create(self.kind, self.sequence, self.frame, self.a, self.b, self.c, self.n1, self.n2);
+    }
+
+    public fn label(&self) -> string {
+        if (self.kind == appRecordAction()) { return "action"; }
+        if (self.kind == appRecordInput()) { return "input"; }
+        if (self.kind == appRecordEffectRequest()) { return "effect-request"; }
+        if (self.kind == appRecordEffectResult()) { return "effect-result"; }
+        if (self.kind == appRecordClock()) { return "clock"; }
+        if (self.kind == appRecordSeed()) { return "seed"; }
+        if (self.kind == appRecordCommit()) { return "commit"; }
+        if (self.kind == appRecordCheckpoint()) { return "checkpoint"; }
+        return "unknown";
+    }
+}
+
+public class AppRecordV2 {
+    public initial_state: string;
+    public total_frames: i32;
+    public seed: i64;
+    public time_source: string;
+    private entries: Vec<AppRecordEntry>;
+
+    public static fn empty() -> AppRecordV2 {
+        return AppRecordV2 {
+            initial_state: "", total_frames: 0, seed: 0, time_source: "frames",
+            entries: Vec::<AppRecordEntry>.new()
+        };
+    }
+
+    @[borrow_args]
+    public static fn start(world: AppWorld) -> AppRecordV2 {
+        return AppRecordV2 {
+            initial_state: world.snapshotResources(),
+            total_frames: 0,
+            seed: 0,
+            time_source: "frames",
+            entries: Vec::<AppRecordEntry>.new()
+        };
+    }
+
+    public fn count(&self) -> i32 {
+        return self.entries.len as i32;
+    }
+
+    // A checkpoint without a world, used by the v1 migration in
+    // AppRecordMigration.fromV1: the migrated recording stays assertable at
+    // every step, not only at the end.
+    public fn checkpointEntry(mut self, frame: u64, label: string, state: string) -> AppRecordV2 {
+        self.entries.push(AppRecordEntry.create(
+            appRecordCheckpoint(), self.count(), frame, label, state, "", 0, 0));
+        return self;
+    }
+
+    public fn entryAt(&self, index: i32) -> AppRecordEntry {
+        if (index < 0 || index >= self.count()) {
+            return AppRecordEntry.create(0, -1, 0 as u64, "", "", "", 0, 0);
+        }
+        return self.entries.get(index as i64).dup();
+    }
+
+    public fn append(mut self, entry: AppRecordEntry) -> AppRecordV2 {
+        self.entries.push(entry);
+        return self;
+    }
+
+    // Each `record*` helper is one line, so a new record kind is cheap to add
+    // and impossible to forget to sequence.
+    public fn recordAction(mut self, frame: u64, name: string, source: string, payload: string) -> AppRecordV2 {
+        self.entries.push(AppRecordEntry.create(
+            appRecordAction(), self.count(), frame, name, source, payload, 0, 0));
+        return self;
+    }
+
+    public fn recordInput(mut self, frame: u64, target_id: string, action_name: string, payload: string) -> AppRecordV2 {
+        self.entries.push(AppRecordEntry.create(
+            appRecordInput(), self.count(), frame, target_id, action_name, payload, 0, 0));
+        return self;
+    }
+
+    public fn recordEffectRequest(mut self, frame: u64, kind: i32, owner_id: string, tag: string, payload: string, deadline: u64) -> AppRecordV2 {
+        self.entries.push(AppRecordEntry.create(
+            appRecordEffectRequest(), self.count(), frame, owner_id, tag, payload, kind as i64, deadline as i64));
+        return self;
+    }
+
+    public fn recordEffectResult(mut self, frame: u64, owner_id: string, tag: string, status: i32, payload: string) -> AppRecordV2 {
+        self.entries.push(AppRecordEntry.create(
+            appRecordEffectResult(), self.count(), frame, owner_id, tag, payload, status as i64, 0));
+        return self;
+    }
+
+    public fn recordClock(mut self, frame: u64, clock: u64) -> AppRecordV2 {
+        self.entries.push(AppRecordEntry.create(
+            appRecordClock(), self.count(), frame, "", "", "", clock as i64, 0));
+        return self;
+    }
+
+    public fn recordSeed(mut self, frame: u64, seed: i64) -> AppRecordV2 {
+        self.seed = seed;
+        self.entries.push(AppRecordEntry.create(
+            appRecordSeed(), self.count(), frame, "", "", "", seed, 0));
+        return self;
+    }
+
+    public fn recordCommit(mut self, frame: u64, task_id: string, sequence: i64, payload: string) -> AppRecordV2 {
+        self.entries.push(AppRecordEntry.create(
+            appRecordCommit(), self.count(), frame, task_id, payload, "", sequence, 0));
+        return self;
+    }
+
+    // A checkpoint pins a full state snapshot to a label, which is what turns a
+    // long recording into something a test can assert against at a chosen point
+    // instead of only at the end.
+    @[borrow_args]
+    public fn checkpoint(mut self, frame: u64, label: string, world: AppWorld) -> AppRecordV2 {
+        self.entries.push(AppRecordEntry.create(
+            appRecordCheckpoint(), self.count(), frame, label, world.snapshotResources(), "", 0, 0));
+        return self;
+    }
+
+    public fn checkpointState(label: string) -> string {
+        var i: i32 = 0;
+        while (i < self.count()) {
+            let entry = self.entryAt(i);
+            if (entry.kind == appRecordCheckpoint() && entry.a == label) { return entry.b; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public fn countOf(kind: i32) -> i32 {
+        var total: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entryAt(i).kind == kind) { total = total + 1; }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    public fn dup(&self) -> AppRecordV2 {
+        var out = AppRecordV2.empty();
+        out.initial_state = self.initial_state;
+        out.total_frames = self.total_frames;
+        out.seed = self.seed;
+        out.time_source = self.time_source;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out.entries.push(self.entryAt(i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(&mut self) {
+        self.entries.destroy();
+    }
+
+    public fn serialize(&self) -> string {
+        var out = "ZYNS|2\n";
+        out = out + "M|" + format("%d", self.seed) + "|" + hex_encode(self.time_source)
+            + "|" + format("%d", self.total_frames as i64) + "\n";
+        out = out + "I|" + hex_encode(self.initial_state) + "\n";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            let entry = self.entryAt(i);
+            out = out + "R|" + format("%d", entry.kind as i64)
+                + "|" + format("%d", entry.sequence as i64)
+                + "|" + format("%d", entry.frame as i64)
+                + "|" + hex_encode(entry.a)
+                + "|" + hex_encode(entry.b)
+                + "|" + hex_encode(entry.c)
+                + "|" + format("%d", entry.n1)
+                + "|" + format("%d", entry.n2) + "\n";
+            i = i + 1;
+        }
+        out = out + "F|" + format("%d", self.count() as i64) + "\n";
+        return out;
+    }
+
+    public fn exportTo(&self, path: string) -> Result<bool, AppError> {
+        if (path.len == 0) { return Err(AppError.create(90, "record path is empty")); }
+        if (writeFile(path, self.serialize()) != 0) {
+            return Err(AppError.create(91, "cannot write record: " + path));
+        }
+        return Ok(true);
+    }
+
+    public static fn load(path: string) -> Result<AppRecordV2, AppError> {
+        if (path.len == 0 || !fileExists(path)) { return Err(AppError.create(92, "record not found: " + path)); }
+        return AppRecordV2.loadText(readFile(path));
+    }
+
+    // Validation is deliberately strict about the two things a replay cannot
+    // tolerate: a sequence gap and a footer that disagrees with the body. Both
+    // mean the file was edited or truncated, and both would otherwise show up as
+    // a mysterious divergence much later.
+    public static fn loadText(contents: string) -> Result<AppRecordV2, AppError> {
+        let lines = contents.split("\n");
+        if (lines.len < 3 || lines.get(0) != "ZYNS|2") {
+            return Err(AppError.create(93, "unsupported record format"));
+        }
+        let header = lines.get(1).split("|");
+        if (header.len != 4 || header.get(0) != "M" || !timelineHexValid(header.get(2))) {
+            return Err(AppError.create(94, "invalid record header"));
+        }
+        let seed = AppRecordV2.parseI64(header.get(1), 0);
+        let frames = app_parse_i32_or(header.get(3), -1);
+        if (frames < 0 || header.get(3) != format("%d", frames as i64)) {
+            return Err(AppError.create(94, "invalid frame count in header"));
+        }
+        let initial = lines.get(2).split("|");
+        if (initial.len != 2 || initial.get(0) != "I" || !timelineHexValid(initial.get(1))) {
+            return Err(AppError.create(94, "invalid initial state record"));
+        }
+        var out = AppRecordV2.empty();
+        out.seed = seed;
+        out.time_source = hex_decode(header.get(2));
+        out.total_frames = frames;
+        out.initial_state = hex_decode(initial.get(1));
+        var i: i32 = 3;
+        var footer_seen: bool = false;
+        while (i < (lines.len as i32)) {
+            let line = lines.get(i as i64);
+            if (line.len == 0 && i == (lines.len as i32) - 1) { break; }
+            let fields = line.split("|");
+            if (fields.len == 2 && fields.get(0) == "F" && !footer_seen) {
+                let total = app_parse_i32_or(fields.get(1), -1);
+                if (total < 0 || total != out.count()) {
+                    out.destroy();
+                    return Err(AppError.create(95, "record count mismatch"));
+                }
+                footer_seen = true;
+                i = i + 1;
+                continue;
+            }
+            if (footer_seen) {
+                out.destroy();
+                return Err(AppError.create(95, "record after footer"));
+            }
+            if (fields.len != 9 || fields.get(0) != "R") {
+                out.destroy();
+                return Err(AppError.create(95, "invalid record at line " + format("%d", (i + 1) as i64)));
+            }
+            let sequence = app_parse_i32_or(fields.get(2), -1);
+            let frame = AppRecordV2.parseI64(fields.get(3), -1);
+            if (sequence != out.count() || frame < 0) {
+                out.destroy();
+                return Err(AppError.create(95, "sequence gap at line " + format("%d", (i + 1) as i64)));
+            }
+            if (!timelineHexValid(fields.get(4)) || !timelineHexValid(fields.get(5)) || !timelineHexValid(fields.get(6))) {
+                out.destroy();
+                return Err(AppError.create(95, "invalid payload at line " + format("%d", (i + 1) as i64)));
+            }
+            out.entries.push(AppRecordEntry.create(
+                app_parse_i32_or(fields.get(1), 0),
+                sequence,
+                frame as u64,
+                hex_decode(fields.get(4)),
+                hex_decode(fields.get(5)),
+                hex_decode(fields.get(6)),
+                AppRecordV2.parseI64(fields.get(7), 0),
+                AppRecordV2.parseI64(fields.get(8), 0)));
+            i = i + 1;
+        }
+        if (!footer_seen) {
+            out.destroy();
+            return Err(AppError.create(95, "record footer missing"));
+        }
+        return Ok(out);
+    }
+
+    public static fn parseI64(text: string, fallback: i64) -> i64 {
+        if (text.len == 0) { return fallback; }
+        var negative: bool = false;
+        var i: i32 = 0;
+        if (text.charAt(0) == 45) { negative = true; i = 1; }
+        if (i >= (text.len as i32)) { return fallback; }
+        var value: i64 = 0;
+        while (i < (text.len as i32)) {
+            let code = text.charAt(i as i64);
+            if (code < 48 || code > 57) { return fallback; }
+            value = value * 10 + (code - 48) as i64;
+            i = i + 1;
+        }
+        if (negative) { value = 0 - value; }
+        return value;
+    }
+}
+
+// Substring search. `string` exposes `len` / `charAt` / `substring` and nothing
+// else, so every "does this contain that" in the App layer goes through here
+// instead of being re-derived with a separator trick.
+public class AppTextSearch {
+    public static fn indexOf(haystack: string, needle: string, from: i32) -> i32 {
+        if (needle.len == 0) { return -1; }
+        let hay_len = haystack.len as i32;
+        let needle_len = needle.len as i32;
+        var i = from;
+        if (i < 0) { i = 0; }
+        while (i + needle_len <= hay_len) {
+            if (haystack.substring(i as i64, (i + needle_len) as i64) == needle) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public static fn contains(haystack: string, needle: string) -> bool {
+        return AppTextSearch.indexOf(haystack, needle, 0) >= 0;
+    }
+
+    public static fn countOccurrences(haystack: string, needle: string) -> i32 {
+        if (needle.len == 0) { return 0; }
+        var total: i32 = 0;
+        var i: i32 = 0;
+        while (i < (haystack.len as i32)) {
+            let found = AppTextSearch.indexOf(haystack, needle, i);
+            if (found < 0) { return total; }
+            total = total + 1;
+            i = found + 1;
+        }
+        return total;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Format migration
+// ---------------------------------------------------------------------------
+
+// v1 recordings still exist on disk, and a framework that cannot read its own
+// previous format is a framework that breaks its users' test suites. The
+// migration is a pure function: v1 in, v2 out.
+public class AppRecordMigration {
+    public static fn detect(text: string) -> i32 {
+        if (text.len == 0) { return 0; }
+        let newline = AppDocumentEnvelope.indexOf(text, 10, 0);
+        var first = text;
+        if (newline >= 0) { first = text.substring(0, newline as i64); }
+        if (first == "ZYNS|2") { return 2; }
+        if (first == "ZYNS|1") { return 1; }
+        return 0;
+    }
+
+    public static fn fromV1(timeline: AppTimeline) -> AppRecordV2 {
+        var out = AppRecordV2.empty();
+        out.initial_state = timeline.initial_state;
+        out.total_frames = timeline.total_frames;
+        out.time_source = "frames";
+        let count = timeline.count();
+        var i: i32 = 0;
+        while (i < count) {
+            let step = timeline.stepAt(i);
+            out = out.recordAction(step.execution_frame, step.action.name, step.action.source, step.action.payload);
+            // v1 recorded the state before and after each command. v2 keeps the
+            // "before" as a checkpoint so that a migrated recording is still
+            // assertable at every step, not only at the end.
+            out = out.checkpointEntry(step.execution_frame, "before-" + format("%d", step.sequence as i64), step.state_before);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn migrate(text: string) -> Result<AppRecordV2, AppError> {
+        let format = AppRecordMigration.detect(text);
+        if (format == 2) { return AppRecordV2.loadText(text); }
+        if (format == 1) {
+            match (AppTimeline.loadText(text)) {
+                case Ok(timeline) => { return Ok(AppRecordMigration.fromV1(timeline)); }
+                case Err(e) => { return Err(e); }
+            }
+        }
+        return Err(AppError.create(93, "unsupported record format"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Redaction
+// ---------------------------------------------------------------------------
+
+// A recording contains everything the application put into a payload, which is
+// exactly where a token or an email address ends up. Redaction is applied on
+// export, and it is a copy: the in-memory recording a test is still driving is
+// untouched.
+public class AppRecordRedaction {
+    public static fn apply(record: AppRecordV2, secrets: string) -> AppRecordV2 {
+        if (secrets.len == 0) { return record.dup(); }
+        var out = AppRecordV2.empty();
+        out.initial_state = AppCredentialRedactor.redact(record.initial_state, secrets);
+        out.total_frames = record.total_frames;
+        out.seed = record.seed;
+        out.time_source = record.time_source;
+        var i: i32 = 0;
+        while (i < record.count()) {
+            let entry = record.entryAt(i);
+            var redacted = entry.dup();
+            redacted.a = AppCredentialRedactor.redact(entry.a, secrets);
+            redacted.b = AppCredentialRedactor.redact(entry.b, secrets);
+            redacted.c = AppCredentialRedactor.redact(entry.c, secrets);
+            out.entries.push(redacted);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn exportRedacted(record: AppRecordV2, secrets: string, path: string) -> Result<bool, AppError> {
+        let redacted = AppRecordRedaction.apply(record, secrets);
+        return redacted.exportTo(path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commit order
+// ---------------------------------------------------------------------------
+
+// Concurrent tasks do not finish in a fixed order, so a replay cannot depend on
+// the order they happened to complete in. Each task stamps its commit with a
+// sequence; the replay reads them in sequence order, which is stable even when
+// the real execution was not.
+public class AppCommitOrder {
+    public static fn taskListKey(owner: string) -> string { return "commit:" + owner + ":task"; }
+    public static fn seqListKey(owner: string) -> string { return "commit:" + owner + ":seq"; }
+    public static fn payloadListKey(owner: string) -> string { return "commit:" + owner + ":payload"; }
+    public static fn orderListKey(owner: string) -> string { return "commit:" + owner + ":order"; }
+    public static fn nextKey(owner: string) -> string { return "commit:" + owner + ":next"; }
+
+    public static fn declare(world: AppWorld, owner: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        var out = AppRowStore.clearList(world, AppCommitOrder.taskListKey(owner));
+        out = AppRowStore.clearList(out, AppCommitOrder.seqListKey(owner));
+        out = AppRowStore.clearList(out, AppCommitOrder.payloadListKey(owner));
+        out = AppRowStore.clearList(out, AppCommitOrder.orderListKey(owner));
+        return out.setIntResource(AppCommitOrder.nextKey(owner), 0);
+    }
+
+    // A task that does not supply a sequence gets the next one, which makes the
+    // single-task case a one-argument call and keeps the concurrent case
+    // explicit.
+    public static fn commit(world: AppWorld, owner: string, task_id: string, payload: string) -> AppWorld {
+        let sequence = world.intResource(AppCommitOrder.nextKey(owner), 0);
+        return AppCommitOrder.commitAt(world, owner, task_id, sequence as i64, payload);
+    }
+
+    public static fn commitAt(world: AppWorld, owner: string, task_id: string, sequence: i64, payload: string) -> AppWorld {
+        if (owner.len == 0 || task_id.len == 0) { return world; }
+        var out = world.appendStringListResource(AppCommitOrder.taskListKey(owner), task_id);
+        out = out.appendStringListResource(AppCommitOrder.seqListKey(owner), format("%d", sequence));
+        out = out.appendStringListResource(AppCommitOrder.payloadListKey(owner), payload);
+        let next = out.intResource(AppCommitOrder.nextKey(owner), 0);
+        if (sequence >= next as i64) { out = out.setIntResource(AppCommitOrder.nextKey(owner), (sequence + 1) as i32); }
+        return AppCommitOrder.rebuildOrder(out, owner);
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        return world.stringListResourceCount(AppCommitOrder.taskListKey(owner));
+    }
+
+    // Selection sort over the sequence list, written out to `order`. The commit
+    // count is small (one per task per frame at most), so an O(n^2) rebuild is
+    // the right trade against maintaining a heap.
+    public static fn rebuildOrder(world: AppWorld, owner: string) -> AppWorld {
+        let count = AppCommitOrder.count(world, owner);
+        var out = AppRowStore.clearList(world, AppCommitOrder.orderListKey(owner));
+        var used = "";
+        var step: i32 = 0;
+        while (step < count) {
+            var best: i32 = -1;
+            var best_seq: i64 = 0;
+            var i: i32 = 0;
+            while (i < count) {
+                if (!AppCommitOrder.isUsed(used, i)) {
+                    let seq = AppRecordV2.parseI64(out.stringListResourceAt(AppCommitOrder.seqListKey(owner), i), 0);
+                    if (best < 0 || seq < best_seq) { best = i; best_seq = seq; }
+                }
+                i = i + 1;
+            }
+            if (best < 0) { break; }
+            used = used + format("%d", best as i64) + ",";
+            out = out.appendStringListResource(AppCommitOrder.orderListKey(owner), format("%d", best as i64));
+            step = step + 1;
+        }
+        return out;
+    }
+
+    public static fn isUsed(used: string, index: i32) -> bool {
+        return AppTextSearch.contains(used, format("%d", index as i64) + ",");
+    }
+
+    public static fn orderedIndexAt(world: AppWorld, owner: string, position: i32) -> i32 {
+        return app_parse_i32_or(world.stringListResourceAt(AppCommitOrder.orderListKey(owner), position), -1);
+    }
+
+    public static fn orderedTaskAt(world: AppWorld, owner: string, position: i32) -> string {
+        let index = AppCommitOrder.orderedIndexAt(world, owner, position);
+        if (index < 0) { return ""; }
+        return world.stringListResourceAt(AppCommitOrder.taskListKey(owner), index);
+    }
+
+    public static fn orderedPayloadAt(world: AppWorld, owner: string, position: i32) -> string {
+        let index = AppCommitOrder.orderedIndexAt(world, owner, position);
+        if (index < 0) { return ""; }
+        return world.stringListResourceAt(AppCommitOrder.payloadListKey(owner), index);
+    }
+
+    public static fn orderedSequenceAt(world: AppWorld, owner: string, position: i32) -> i64 {
+        let index = AppCommitOrder.orderedIndexAt(world, owner, position);
+        if (index < 0) { return -1; }
+        return AppRecordV2.parseI64(world.stringListResourceAt(AppCommitOrder.seqListKey(owner), index), -1);
+    }
+
+    // True when the ordered view is non-decreasing, which is what a replay
+    // assumes.
+    public static fn orderIsConsistent(world: AppWorld, owner: string) -> bool {
+        let count = AppCommitOrder.count(world, owner);
+        var previous: i64 = -1;
+        var i: i32 = 0;
+        while (i < count) {
+            let seq = AppCommitOrder.orderedSequenceAt(world, owner, i);
+            if (seq < previous) { return false; }
+            previous = seq;
+            i = i + 1;
+        }
+        return true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Selective injection
+// ---------------------------------------------------------------------------
+
+// A replay normally re-runs the real effect. Injection replaces one effect's
+// result, which is how a test reaches a branch (a 503, a timeout, a cancelled
+// upload) without owning the transport.
+public class AppSelectiveInjection {
+    public static fn indexListKey(owner: string) -> string { return "inject:" + owner + ":index"; }
+    public static fn payloadListKey(owner: string) -> string { return "inject:" + owner + ":payload"; }
+
+    public static fn declare(world: AppWorld, owner: string) -> AppWorld {
+        var out = AppRowStore.clearList(world, AppSelectiveInjection.indexListKey(owner));
+        return AppRowStore.clearList(out, AppSelectiveInjection.payloadListKey(owner));
+    }
+
+    public static fn inject(world: AppWorld, owner: string, effect_index: i32, payload: string) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        let existing = AppSelectiveInjection.indexOf(world, owner, effect_index);
+        if (existing >= 0) {
+            var replaced = AppSelectiveInjection.replaceAt(world, owner, existing, payload);
+            return replaced;
+        }
+        var out = world.appendStringListResource(AppSelectiveInjection.indexListKey(owner), format("%d", effect_index as i64));
+        out = out.appendStringListResource(AppSelectiveInjection.payloadListKey(owner), payload);
+        return out;
+    }
+
+    public static fn replaceAt(world: AppWorld, owner: string, position: i32, payload: string) -> AppWorld {
+        var joined = "";
+        let count = world.stringListResourceCount(AppSelectiveInjection.payloadListKey(owner));
+        var i: i32 = 0;
+        while (i < count) {
+            if (i > 0) { joined = joined + "\n"; }
+            if (i == position) { joined = joined + payload; }
+            else { joined = joined + world.stringListResourceAt(AppSelectiveInjection.payloadListKey(owner), i); }
+            i = i + 1;
+        }
+        return AppWindowRegistry.writeList(world, AppSelectiveInjection.payloadListKey(owner), joined);
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        return world.stringListResourceCount(AppSelectiveInjection.indexListKey(owner));
+    }
+
+    public static fn indexAt(world: AppWorld, owner: string, position: i32) -> i32 {
+        return app_parse_i32_or(world.stringListResourceAt(AppSelectiveInjection.indexListKey(owner), position), -1);
+    }
+
+    public static fn payloadAt(world: AppWorld, owner: string, position: i32) -> string {
+        return world.stringListResourceAt(AppSelectiveInjection.payloadListKey(owner), position);
+    }
+
+    public static fn indexOf(world: AppWorld, owner: string, effect_index: i32) -> i32 {
+        let count = AppSelectiveInjection.count(world, owner);
+        var i: i32 = 0;
+        while (i < count) {
+            if (AppSelectiveInjection.indexAt(world, owner, i) == effect_index) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public static fn has(world: AppWorld, owner: string, effect_index: i32) -> bool {
+        return AppSelectiveInjection.indexOf(world, owner, effect_index) >= 0;
+    }
+
+    public static fn payloadFor(world: AppWorld, owner: string, effect_index: i32) -> string {
+        let position = AppSelectiveInjection.indexOf(world, owner, effect_index);
+        if (position < 0) { return ""; }
+        return AppSelectiveInjection.payloadAt(world, owner, position);
+    }
+
+    public static fn clear(world: AppWorld, owner: string) -> AppWorld {
+        return AppSelectiveInjection.declare(world, owner);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Replay assertions
+// ---------------------------------------------------------------------------
+
+public class AppReplayReport {
+    public ok: bool;
+    public checks: i32;
+    public failures: i32;
+    public first_divergence: i32;
+    public message: string;
+
+    public static fn create() -> AppReplayReport {
+        return AppReplayReport { ok: true, checks: 0, failures: 0, first_divergence: -1, message: "" };
+    }
+
+    public fn pass(mut self, label: string) -> AppReplayReport {
+        self.checks = self.checks + 1;
+        return self;
+    }
+
+    public fn failAt(mut self, index: i32, label: string, detail: string) -> AppReplayReport {
+        self.checks = self.checks + 1;
+        self.failures = self.failures + 1;
+        self.ok = false;
+        if (self.first_divergence < 0) {
+            self.first_divergence = index;
+            self.message = label + ": " + detail;
+        }
+        return self;
+    }
+
+    public fn summary(&self) -> string {
+        if (self.ok) { return "ok (" + format("%d", self.checks as i64) + " checks)"; }
+        return "failed at " + format("%d", self.first_divergence as i64)
+            + " (" + format("%d", self.failures as i64) + "/" + format("%d", self.checks as i64) + "): " + self.message;
+    }
+}
+
+// The two assertion surfaces the roadmap asks for. Headless asserts the world's
+// state; visual asserts the semantic tree and, when the host can produce one, a
+// screenshot hash - which is the closest a headless test can get to "it looks
+// right" without being brittle about anti-aliasing.
+public class AppReplayHarness {
+    @[borrow_args]
+    public static fn assertState(world: AppWorld, expected: string, label: string) -> AppReplayReport {
+        var report = AppReplayReport.create();
+        let actual = world.snapshotResources();
+        if (actual == expected) { return report.pass(label); }
+        return report.failAt(0, label, "state differs");
+    }
+
+    @[borrow_args]
+    public static fn assertCheckpoint(record: AppRecordV2, label: string, world: AppWorld) -> AppReplayReport {
+        var report = AppReplayReport.create();
+        let expected = record.checkpointState(label);
+        if (expected.len == 0) { return report.failAt(0, label, "no checkpoint with that label"); }
+        let actual = world.snapshotResources();
+        if (actual == expected) { return report.pass(label); }
+        return report.failAt(0, label, "checkpoint state differs");
+    }
+
+    @[borrow_args]
+    public static fn assertResource(world: AppWorld, key: string, expected: string, label: string) -> AppReplayReport {
+        var report = AppReplayReport.create();
+        let actual = world.stringResource(key, "");
+        if (actual == expected) { return report.pass(label); }
+        return report.failAt(0, label, "resource " + key + " is '" + actual + "', expected '" + expected + "'");
+    }
+
+    @[borrow_args]
+    public static fn assertIntResource(world: AppWorld, key: string, expected: i32, label: string) -> AppReplayReport {
+        var report = AppReplayReport.create();
+        let actual = world.intResource(key, 0);
+        if (actual == expected) { return report.pass(label); }
+        return report.failAt(0, label, "resource " + key + " is " + format("%d", actual as i64)
+            + ", expected " + format("%d", expected as i64));
+    }
+
+    // The semantic tree, not the pixels: a label, a role or a focus target
+    // changing is a real regression, while a one-pixel shift is not.
+    @[borrow_args]
+    public static fn assertSemanticTree(world: AppWorld, expected: string, label: string) -> AppReplayReport {
+        var report = AppReplayReport.create();
+        let actual = world.accessibilitySnapshotText();
+        if (actual == expected) { return report.pass(label); }
+        return report.failAt(0, label, "semantic tree differs");
+    }
+
+    public static fn assertScreenshotHash(actual_hash: string, expected_hash: string, label: string) -> AppReplayReport {
+        var report = AppReplayReport.create();
+        if (actual_hash == expected_hash) { return report.pass(label); }
+        return report.failAt(0, label, "screenshot hash " + actual_hash + " != " + expected_hash);
+    }
+
+    // A structural assertion over the semantic tree: does the tree contain a
+    // node with this role and label? This is the assertion a test should prefer,
+    // because it survives a layout change that does not change meaning.
+    @[borrow_args]
+    public static fn semanticTreeContains(world: AppWorld, needle: string, label: string) -> AppReplayReport {
+        var report = AppReplayReport.create();
+        let tree = world.accessibilitySnapshotText();
+        if (AppTextSearch.contains(tree, needle)) { return report.pass(label); }
+        return report.failAt(0, label, "semantic tree does not contain '" + needle + "'");
+    }
+}

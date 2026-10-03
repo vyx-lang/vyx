@@ -1,0 +1,2280 @@
+module Zyn.App;
+
+use std.collections;
+use std.encoding;
+use std.fs;
+use Publish = Zyn.Toolchain.Publish;
+
+// ---------------------------------------------------------------------------
+// ZC-20 developer experience and compatibility
+//
+// The gap this closes is not "more features" - it is the gap between a feature
+// existing and a developer being able to *find* it, *try* it, and *know when it
+// is safe to keep using it*:
+//
+//   * project templates. A new application should start from a tree that
+//     already builds, not from a blank file. The template is data (a list of
+//     path/role/contents records) rather than a directory in the repo, so a
+//     test can assert on it and a tool can emit it without shelling out.
+//   * component catalog. The public surface is enumerable. A catalog entry
+//     records where a control lives, what category it is for, and which
+//     version introduced it - which is what makes "is this documented" and
+//     "is this still supported" answerable without grepping the source.
+//   * API samples. Every documented symbol should have at least one sample
+//     that names it. A sample that references a symbol nobody can resolve is
+//     a documentation bug, so the library verifies symbol coverage instead of
+//     trusting the prose.
+//   * visual semantic tree. `AppWorld.accessibilitySnapshotText()` is the
+//     assertion surface for headless tests; this module parses that same text
+//     into a navigable tree so the developer inspector can show structure
+//     (indentation, focus path, interactive count) rather than a flat log.
+//   * deprecation cycle. Nothing is removed without a stated replacement and
+//     a version by which it goes away. The registry refuses a removal entry
+//     with no replacement, and refuses a window that has already closed.
+//   * version compatibility. The public API surface is snapshotted and
+//     diffed. A removed symbol is breaking; an added one is not; a changed
+//     arity is breaking. That is the mechanical half of a semver promise.
+//
+// Everything here is a *boundary*: it observes the app framework, it does not
+// own application behaviour. The one thing it writes is files, and only when
+// a caller explicitly asks a template to materialise.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Vocabulary
+// ---------------------------------------------------------------------------
+
+public fn appTemplateApplication() -> i32 { return 1; }
+public fn appTemplateLibrary() -> i32 { return 2; }
+public fn appTemplateTestHarness() -> i32 { return 3; }
+
+public fn appTemplateKindName(kind: i32) -> string {
+    if (kind == appTemplateApplication()) { return "application"; }
+    if (kind == appTemplateLibrary()) { return "library"; }
+    if (kind == appTemplateTestHarness()) { return "test-harness"; }
+    return "unknown";
+}
+
+public fn appTemplateKindOf(text: string) -> i32 {
+    if (text == "application") { return appTemplateApplication(); }
+    if (text == "library") { return appTemplateLibrary(); }
+    if (text == "test-harness") { return appTemplateTestHarness(); }
+    return appTemplateApplication();
+}
+
+// File roles inside a template. They exist so a scaffold tool can place a file
+// without understanding its contents, and so validation can insist on a source
+// file and a manifest even when the template author forgot.
+public fn appTemplateFileSource() -> string { return "source"; }
+public fn appTemplateFileManifest() -> string { return "manifest"; }
+public fn appTemplateFileTest() -> string { return "test"; }
+public fn appTemplateFileDocs() -> string { return "docs"; }
+public fn appTemplateFileAsset() -> string { return "asset"; }
+
+// ---------------------------------------------------------------------------
+// Local path helpers
+//
+// The published SDK std does not ship `path_join`, `path_dirname`, or
+// `makeDirAll`, and a template writer must run against the SDK rather than
+// against the development std tree. These build on the smallest common
+// denominator (`path_separator`, `makeDir`, `isDir`, `writeFile`) instead.
+// ---------------------------------------------------------------------------
+
+public fn appDevKitPathJoin(root: string, rel: string) -> string {
+    if (rel.len == 0) { return root; }
+    if (root.len == 0) { return rel; }
+    let sep = path_separator();
+    let last = root.charAt((root.len - 1) as i64);
+    if (last == sep || last == 47) { return root + rel; }
+    return root + format("%c", sep) + rel;
+}
+
+public fn appDevKitPathDirname(path: string) -> string {
+    var cut: i32 = -1;
+    var i: i32 = 0;
+    while (i < (path.len as i32)) {
+        let code = path.charAt(i as i64);
+        if (code == path_separator() || code == 47) { cut = i; }
+        i = i + 1;
+    }
+    if (cut <= 0) { return ""; }
+    return path.substring(0, cut as i64);
+}
+
+public fn appDevKitMakeDirAll(path: string) -> i32 {
+    if (path.len == 0) { return 1; }
+    if (isDir(path)) { return 0; }
+    // Create every prefix in turn. A prefix that already exists, or a failed
+    // create of a drive-like component, is tolerated: the verdict is whether
+    // the full path is a directory by the end.
+    var i: i32 = 0;
+    while (i < (path.len as i32)) {
+        let code = path.charAt(i as i64);
+        if (code == path_separator() || code == 47) {
+            let prefix = path.substring(0, i as i64);
+            if (prefix.len > 0 && !isDir(prefix)) { makeDir(prefix); }
+        }
+        i = i + 1;
+    }
+    if (!isDir(path)) { makeDir(path); }
+    if (isDir(path)) { return 0; }
+    return 1;
+}
+
+
+public fn appComponentCore() -> i32 { return 1; }
+public fn appComponentInput() -> i32 { return 2; }
+public fn appComponentLayout() -> i32 { return 3; }
+public fn appComponentDisplay() -> i32 { return 4; }
+public fn appComponentFeedback() -> i32 { return 5; }
+public fn appComponentNavigation() -> i32 { return 6; }
+public fn appComponentData() -> i32 { return 7; }
+// The development-tooling surface is catalogued too. A scaffold, an inspector
+// and a compatibility checker are part of what an application depends on, so
+// leaving them out of the catalog would make the "is this documented" question
+// unanswerable exactly where it matters most.
+public fn appComponentTooling() -> i32 { return 8; }
+
+public fn appComponentCategoryName(category: i32) -> string {
+    if (category == appComponentCore()) { return "core"; }
+    if (category == appComponentInput()) { return "input"; }
+    if (category == appComponentLayout()) { return "layout"; }
+    if (category == appComponentDisplay()) { return "display"; }
+    if (category == appComponentFeedback()) { return "feedback"; }
+    if (category == appComponentNavigation()) { return "navigation"; }
+    if (category == appComponentData()) { return "data"; }
+    if (category == appComponentTooling()) { return "tooling"; }
+    return "unknown";
+}
+
+public fn appComponentCategoryOf(text: string) -> i32 {
+    if (text == "core") { return appComponentCore(); }
+    if (text == "input") { return appComponentInput(); }
+    if (text == "layout") { return appComponentLayout(); }
+    if (text == "display") { return appComponentDisplay(); }
+    if (text == "feedback") { return appComponentFeedback(); }
+    if (text == "navigation") { return appComponentNavigation(); }
+    if (text == "data") { return appComponentData(); }
+    if (text == "tooling") { return appComponentTooling(); }
+    return appComponentCore();
+}
+
+// The deprecation ladder. `advisory` is "there is a better way"; `warning` is
+// "this will go away"; `removal` is "the window has closed and the symbol must
+// be gone". A release gate fails on `removal` entries that are still present,
+// which is what turns a deprecation policy into something enforceable.
+public fn appDeprecationAdvisory() -> i32 { return 1; }
+public fn appDeprecationWarning() -> i32 { return 2; }
+public fn appDeprecationRemoval() -> i32 { return 3; }
+
+public fn appDeprecationStageName(stage: i32) -> string {
+    if (stage == appDeprecationAdvisory()) { return "advisory"; }
+    if (stage == appDeprecationWarning()) { return "warning"; }
+    if (stage == appDeprecationRemoval()) { return "removal"; }
+    return "unknown";
+}
+
+public fn appDeprecationStageOf(text: string) -> i32 {
+    if (text == "advisory") { return appDeprecationAdvisory(); }
+    if (text == "warning") { return appDeprecationWarning(); }
+    if (text == "removal") { return appDeprecationRemoval(); }
+    return appDeprecationAdvisory();
+}
+
+// Compatibility verdicts for a single symbol between two surface snapshots.
+public fn appCompatUnchanged() -> i32 { return 0; }
+public fn appCompatAdded() -> i32 { return 1; }
+public fn appCompatRemoved() -> i32 { return 2; }
+public fn appCompatChanged() -> i32 { return 3; }
+
+public fn appCompatVerdictName(verdict: i32) -> string {
+    if (verdict == appCompatUnchanged()) { return "unchanged"; }
+    if (verdict == appCompatAdded()) { return "added"; }
+    if (verdict == appCompatRemoved()) { return "removed"; }
+    if (verdict == appCompatChanged()) { return "changed"; }
+    return "unknown";
+}
+
+// Development-tooling diagnostics reuse the ZC-17 numbering space so a
+// developer sees one code family, not two.
+public fn appDevKitCodeMissingSample() -> i32 { return 9100; }
+public fn appDevKitCodeUnknownComponent() -> i32 { return 9101; }
+public fn appDevKitCodeExpiredDeprecation() -> i32 { return 9102; }
+public fn appDevKitCodeBreakingChange() -> i32 { return 9103; }
+public fn appDevKitCodeMissingTemplateFile() -> i32 { return 9104; }
+public fn appDevKitCodeEmptySemanticTree() -> i32 { return 9105; }
+public fn appDevKitCodeDuplicateSymbol() -> i32 { return 9106; }
+
+// A catalog is only useful if it is stable, so the version at which the
+// catalog itself was last reviewed is recorded alongside the entries.
+public fn appCatalogBaselineVersion() -> string { return "0.9.0"; }
+
+// ---------------------------------------------------------------------------
+// Project templates
+// ---------------------------------------------------------------------------
+
+// One file in a template. Contents are carried as text rather than as a path
+// so a template is self-contained and a test can assert on the exact bytes a
+// scaffold would write.
+public class AppTemplateFile {
+    public path: string;
+    public role: string;
+    public contents: string;
+
+    public static fn create(path: string, role: string, contents: string) -> AppTemplateFile {
+        return AppTemplateFile { path: path, role: role, contents: contents };
+    }
+
+    public fn dup(&self) -> AppTemplateFile {
+        return AppTemplateFile { path: self.path, role: self.role, contents: self.contents };
+    }
+
+    public fn isEmpty(&self) -> bool { return self.path.len == 0; }
+
+    public fn byteCount(&self) -> i64 { return self.contents.len as i64; }
+
+    public fn lineCount(&self) -> i32 {
+        if (self.contents.len == 0) { return 0; }
+        return AppDiagText.lineCount(self.contents);
+    }
+
+    public fn isSource(&self) -> bool { return self.role == appTemplateFileSource(); }
+    public fn isManifest(&self) -> bool { return self.role == appTemplateFileManifest(); }
+
+    public fn matchesPath(&self, value: string) -> bool { return self.path == value; }
+
+    // `F|hex(path)|role|hex(contents)`. The path is hex-encoded even though it
+    // rarely needs it: a template may legitimately carry a Windows path with a
+    // backslash, and one escaping rule for every free-text field is cheaper to
+    // audit than two.
+    public fn serialize(&self) -> string {
+        return "F|" + hex_encode(self.path)
+            + "|" + self.role
+            + "|" + hex_encode(self.contents);
+    }
+
+    public static fn parse(text: string) -> AppTemplateFile {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "F") { return AppTemplateFile.create("", "", ""); }
+        return AppTemplateFile.create(
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 1)),
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 2),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3)));
+    }
+
+    public fn summary(&self) -> string {
+        return self.role + " " + self.path + " (" + format("%d", self.lineCount() as i64) + " lines)";
+    }
+}
+
+// A whole project skeleton. `files` is a flat list of string-only records, so
+// there is no nested allocation to free twice.
+public class AppProjectTemplate {
+    public name: string;
+    public kind: i32;
+    public description: string;
+    public target_platform: i32;
+    public package_kind: i32;
+    private files: Vec<AppTemplateFile>;
+
+    public static fn empty() -> AppProjectTemplate {
+        return AppProjectTemplate {
+            name: "",
+            kind: appTemplateApplication(),
+            description: "",
+            target_platform: 0,
+            package_kind: 0,
+            files: Vec::<AppTemplateFile>.new()
+        };
+    }
+
+    public static fn create(name: string, kind: i32) -> AppProjectTemplate {
+        var out = AppProjectTemplate.empty();
+        out.name = name;
+        out.kind = kind;
+        return out;
+    }
+
+    public fn withDescription(mut self, value: string) -> AppProjectTemplate {
+        self.description = value;
+        return self;
+    }
+
+    public fn withTarget(mut self, platform: i32, package_kind: i32) -> AppProjectTemplate {
+        self.target_platform = platform;
+        self.package_kind = package_kind;
+        return self;
+    }
+
+    public fn addFile(mut self, path: string, role: string, contents: string) -> AppProjectTemplate {
+        self.files.push(AppTemplateFile.create(path, role, contents));
+        return self;
+    }
+
+    public fn fileCount(&self) -> i32 { return self.files.len as i32; }
+
+    public fn fileAt(&self, index: i32) -> AppTemplateFile {
+        if (index < 0 || index >= self.fileCount()) { return AppTemplateFile.create("", "", ""); }
+        return self.files.get(index as i64).dup();
+    }
+
+    public fn fileIndex(&self, path: string) -> i32 {
+        var i: i32 = 0;
+        while (i < self.fileCount()) {
+            if (self.files.get(i as i64).matchesPath(path)) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn hasFile(&self, path: string) -> bool { return self.fileIndex(path) >= 0; }
+
+    public fn countByRole(&self, role: string) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.fileCount()) {
+            if (self.files.get(i as i64).role == role) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn totalBytes(&self) -> i64 {
+        var out: i64 = 0;
+        var i: i32 = 0;
+        while (i < self.fileCount()) {
+            out = out + self.files.get(i as i64).byteCount();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // A template that cannot produce a buildable project is not a template.
+    // The two required roles are the ones the toolchain itself needs; a test
+    // file is optional because a library template may ship none.
+    public fn validate(&self) -> Result<bool, AppError> {
+        if (self.name.len == 0) {
+            return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "template has no name"));
+        }
+        if (self.fileCount() == 0) {
+            return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "template has no files"));
+        }
+        if (self.countByRole(appTemplateFileSource()) == 0) {
+            return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "template has no source file"));
+        }
+        if (self.countByRole(appTemplateFileManifest()) == 0) {
+            return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "template has no manifest"));
+        }
+        var i: i32 = 0;
+        while (i < self.fileCount()) {
+            let f = self.files.get(i as i64);
+            if (f.path.len == 0) {
+                return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "template has a file with no path"));
+            }
+            if (f.contents.len == 0) {
+                return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "template file is empty: " + f.path));
+            }
+            i = i + 1;
+        }
+        return Ok(true);
+    }
+
+    // `T|name|kind|platform|package|hex(description)` then one `F|...` per file.
+    public fn serialize(&self) -> string {
+        var out = "T|" + self.name
+            + "|" + format("%d", self.kind as i64)
+            + "|" + format("%d", self.target_platform as i64)
+            + "|" + format("%d", self.package_kind as i64)
+            + "|" + hex_encode(self.description);
+        var i: i32 = 0;
+        while (i < self.fileCount()) {
+            out = out + "\n" + self.files.get(i as i64).serialize();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn parse(text: string) -> AppProjectTemplate {
+        var out = AppProjectTemplate.empty();
+        let lines = AppDiagText.lineCount(text);
+        if (lines == 0) { return out; }
+        let header = AppDiagText.lineAt(text, 0);
+        if (AppDiagText.fieldAt(header, AppDiagText.pipe(), 0) != "T") { return out; }
+        out.name = AppDiagText.fieldAt(header, AppDiagText.pipe(), 1);
+        out.kind = appDiagParseI32(AppDiagText.fieldAt(header, AppDiagText.pipe(), 2), 1 as u64);
+        out.target_platform = appDiagParseI32(AppDiagText.fieldAt(header, AppDiagText.pipe(), 3), 0 as u64);
+        out.package_kind = appDiagParseI32(AppDiagText.fieldAt(header, AppDiagText.pipe(), 4), 0 as u64);
+        out.description = hex_decode(AppDiagText.fieldAt(header, AppDiagText.pipe(), 5));
+        var i: i32 = 1;
+        while (i < lines) {
+            let f = AppTemplateFile.parse(AppDiagText.lineAt(text, i));
+            if (!f.isEmpty()) { out.files.push(f); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // The dry run a scaffold tool prints before it touches the disk.
+    public fn planText(&self) -> string {
+        var out = appTemplateKindName(self.kind) + " template '" + self.name + "'"
+            + " -> " + Publish.publishPlatformName(self.target_platform)
+            + " / " + Publish.publishPackageName(self.package_kind)
+            + " (" + format("%d", self.fileCount() as i64) + " files, "
+            + format("%d", self.totalBytes()) + " bytes)";
+        var i: i32 = 0;
+        while (i < self.fileCount()) {
+            out = out + "\n  " + self.files.get(i as i64).summary();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Writes the tree under `root`. Refuses to run on an invalid template so a
+    // half-written project cannot be produced by a typo in the template.
+    public fn materialize(&self, root: string) -> Result<i32, AppError> {
+        if (root.len == 0) {
+            return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "materialize needs a root directory"));
+        }
+        match (self.validate()) {
+            case Ok(_ok) => { }
+            case Err(e) => { return Err(e); }
+        }
+        if (appDevKitMakeDirAll(root) != 0) {
+            return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "cannot create root: " + root));
+        }
+        var written: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.fileCount()) {
+            let f = self.files.get(i as i64);
+            let full = appDevKitPathJoin(root, f.path);
+            let dir = appDevKitPathDirname(full);
+            if (dir.len > 0 && dir != root) {
+                if (appDevKitMakeDirAll(dir) != 0) {
+                    return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "cannot create dir: " + dir));
+                }
+            }
+            if (writeFile(full, f.contents) != 0) {
+                return Err(AppError.create(appDevKitCodeMissingTemplateFile(), "cannot write: " + full));
+            }
+            written = written + 1;
+            i = i + 1;
+        }
+        return Ok(written);
+    }
+
+    public fn dup(&self) -> AppProjectTemplate {
+        var out = AppProjectTemplate.empty();
+        out.name = self.name;
+        out.kind = self.kind;
+        out.description = self.description;
+        out.target_platform = self.target_platform;
+        out.package_kind = self.package_kind;
+        var i: i32 = 0;
+        while (i < self.fileCount()) {
+            out.files.push(self.files.get(i as i64).dup());
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(mut self) {
+        self.files.destroy();
+    }
+
+    // The three shipped templates. They are deliberately small: a template is
+    // a starting point, and every line in it is a line a developer has to
+    // understand before they can delete it.
+    public static fn application(name: string) -> AppProjectTemplate {
+        var out = AppProjectTemplate.create(name, appTemplateApplication());
+        out = out.withDescription("desktop application with a single window and a root component");
+        out = out.withTarget(Publish.publishPlatformWindows(), Publish.publishPackageZip());
+        out = out.addFile("Vyx.toml", appTemplateFileManifest(),
+            "name = \"" + name + "\"\nkind = \"application\"\n");
+        out = out.addFile("src/main.vyx", appTemplateFileSource(),
+            "module " + name + ";\n\nuse Zyn.App;\n\npublic class Root : Component {\n"
+            + "    public fn view(&self, world: AppWorld) -> View {\n"
+            + "        return Text.title(\"" + name + "\");\n"
+            + "    }\n}\n");
+        out = out.addFile("README.md", appTemplateFileDocs(),
+            "# " + name + "\n\nRun with `zyn run`.\n");
+        return out;
+    }
+
+    public static fn library(name: string) -> AppProjectTemplate {
+        var out = AppProjectTemplate.create(name, appTemplateLibrary());
+        out = out.withDescription("reusable component library with a test target");
+        out = out.withTarget(Publish.publishPlatformWindows(), Publish.publishPackageDirectory());
+        out = out.addFile("Vyx.toml", appTemplateFileManifest(),
+            "name = \"" + name + "\"\nkind = \"library\"\n");
+        out = out.addFile("src/lib.vyx", appTemplateFileSource(),
+            "module " + name + ";\n\nuse Zyn.App;\n\npublic fn greeting() -> string {\n    return \"" + name + "\";\n}\n");
+        out = out.addFile("tests/smoke.vyx", appTemplateFileTest(),
+            "module " + name + ".Tests;\n\nuse Zyn.App;\n\npublic fn smoke() -> i32 {\n    return 0;\n}\n");
+        return out;
+    }
+
+    public static fn testHarness(name: string) -> AppProjectTemplate {
+        var out = AppProjectTemplate.create(name, appTemplateTestHarness());
+        out = out.withDescription("headless test harness over a recorded timeline");
+        out = out.withTarget(Publish.publishPlatformWindows(), Publish.publishPackageDirectory());
+        out = out.addFile("Vyx.toml", appTemplateFileManifest(),
+            "name = \"" + name + "\"\nkind = \"test-harness\"\n");
+        out = out.addFile("tests/replay.vyx", appTemplateFileSource(),
+            "module " + name + ".Replay;\n\nuse Zyn.App;\n\n"
+            + "public fn replay(world: AppWorld, timeline: AppTimeline) -> AppReplayReport {\n"
+            + "    return AppReplayHarness.replay(world, timeline);\n}\n");
+        out = out.addFile("tests/fixtures.toml", appTemplateFileManifest(),
+            "fixture = \"" + name + "\"\n");
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Component catalog
+// ---------------------------------------------------------------------------
+
+// One public control or type, as the catalog knows it. Counts are recorded
+// rather than derived because the catalog is built by hand: if the counts and
+// the real type disagree, that disagreement is itself the signal that the
+// entry has gone stale.
+public class AppComponentEntry {
+    public name: string;
+    public module_name: string;
+    public category: i32;
+    public description: string;
+    public since_version: string;
+    public deprecated_stage: i32;
+    public replacement: string;
+    public tags: string;
+    public property_count: i32;
+    public static_count: i32;
+    public instance_count: i32;
+
+    public static fn create(name: string, module_name: string, category: i32, since_version: string, description: string) -> AppComponentEntry {
+        return AppComponentEntry {
+            name: name,
+            module_name: module_name,
+            category: category,
+            description: description,
+            since_version: since_version,
+            deprecated_stage: 0,
+            replacement: "",
+            tags: "",
+            property_count: 0,
+            static_count: 0,
+            instance_count: 0
+        };
+    }
+
+    public fn dup(&self) -> AppComponentEntry {
+        return AppComponentEntry {
+            name: self.name,
+            module_name: self.module_name,
+            category: self.category,
+            description: self.description,
+            since_version: self.since_version,
+            deprecated_stage: self.deprecated_stage,
+            replacement: self.replacement,
+            tags: self.tags,
+            property_count: self.property_count,
+            static_count: self.static_count,
+            instance_count: self.instance_count
+        };
+    }
+
+    public fn withCounts(mut self, properties: i32, statics: i32, instances: i32) -> AppComponentEntry {
+        self.property_count = properties;
+        self.static_count = statics;
+        self.instance_count = instances;
+        return self;
+    }
+
+    public fn withTags(mut self, value: string) -> AppComponentEntry {
+        self.tags = value;
+        return self;
+    }
+
+    public fn withDeprecation(mut self, stage: i32, replacement: string) -> AppComponentEntry {
+        self.deprecated_stage = stage;
+        self.replacement = replacement;
+        return self;
+    }
+
+    public fn isDeprecated(&self) -> bool { return self.deprecated_stage != 0; }
+
+    public fn isDocumented(&self) -> bool { return self.description.len > 0; }
+
+    public fn isEmpty(&self) -> bool { return self.name.len == 0; }
+
+    public fn hasTag(&self, value: string) -> bool {
+        if (value.len == 0 || self.tags.len == 0) { return false; }
+        return self.tags == value
+            || self.tags.startsWith(value + ",")
+            || self.tags.endsWith("," + value)
+            || self.tags.contains("," + value + ",");
+    }
+
+    public fn memberCount(&self) -> i32 {
+        return self.property_count + self.static_count + self.instance_count;
+    }
+
+    public fn qualifiedName(&self) -> string {
+        if (self.module_name.len == 0) { return self.name; }
+        return self.module_name + "." + self.name;
+    }
+
+    // `E|name|module|category|since|stage|props|statics|instances|tags|hex(desc)|hex(replacement)`
+    public fn serialize(&self) -> string {
+        return "E|" + self.name
+            + "|" + self.module_name
+            + "|" + format("%d", self.category as i64)
+            + "|" + self.since_version
+            + "|" + format("%d", self.deprecated_stage as i64)
+            + "|" + format("%d", self.property_count as i64)
+            + "|" + format("%d", self.static_count as i64)
+            + "|" + format("%d", self.instance_count as i64)
+            + "|" + self.tags
+            + "|" + hex_encode(self.description)
+            + "|" + hex_encode(self.replacement);
+    }
+
+    public static fn parse(text: string) -> AppComponentEntry {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "E") {
+            return AppComponentEntry.create("", "", appComponentCore(), "", "");
+        }
+        var out = AppComponentEntry.create(
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 1),
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 2),
+            appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3), 1 as u64),
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 4),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 11)));
+        out.deprecated_stage = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 5), 0 as u64);
+        out.property_count = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 6), 0 as u64);
+        out.static_count = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 7), 0 as u64);
+        out.instance_count = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 8), 0 as u64);
+        out.tags = AppDiagText.fieldAt(text, AppDiagText.pipe(), 9);
+        out.replacement = hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 12));
+        return out;
+    }
+
+    public fn summary(&self) -> string {
+        var out = self.qualifiedName() + " [" + appComponentCategoryName(self.category) + "]"
+            + " since " + self.since_version
+            + " (" + format("%d", self.memberCount() as i64) + " members)";
+        if (self.isDeprecated()) {
+            out = out + " DEPRECATED " + appDeprecationStageName(self.deprecated_stage)
+                + " -> " + self.replacement;
+        }
+        return out;
+    }
+}
+
+// The enumerable public surface. Insertion order is preserved because a
+// catalog is read as a list, and a developer scanning for a control should
+// find it where it was added rather than wherever a hash landed.
+public class AppComponentCatalog {
+    private entries: Vec<AppComponentEntry>;
+
+    public static fn empty() -> AppComponentCatalog {
+        return AppComponentCatalog { entries: Vec::<AppComponentEntry>.new() };
+    }
+
+    public fn count(&self) -> i32 { return self.entries.len as i32; }
+
+    public fn at(&self, index: i32) -> AppComponentEntry {
+        if (index < 0 || index >= self.count()) {
+            return AppComponentEntry.create("", "", appComponentCore(), "", "");
+        }
+        return self.entries.get(index as i64).dup();
+    }
+
+    public fn indexOf(&self, name: string) -> i32 {
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entries.get(i as i64).name == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn has(&self, name: string) -> bool { return self.indexOf(name) >= 0; }
+
+    // Returns false on a duplicate instead of silently replacing: a catalog
+    // with two entries for one control is worse than a catalog missing it,
+    // because the reader cannot tell which one is current.
+    public fn register(&mut self, entry: AppComponentEntry) -> bool {
+        if (entry.isEmpty()) { return false; }
+        if (self.has(entry.name)) { return false; }
+        self.entries.push(entry);
+        return true;
+    }
+
+    public fn registerOrFail(&mut self, entry: AppComponentEntry) -> Result<bool, AppError> {
+        if (!self.register(entry)) {
+            return Err(AppError.create(appDevKitCodeDuplicateSymbol(), "duplicate catalog entry: " + entry.name));
+        }
+        return Ok(true);
+    }
+
+    public fn categoryCount(&self, category: i32) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entries.get(i as i64).category == category) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn deprecatedCount(&self) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entries.get(i as i64).isDeprecated()) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn undocumentedCount(&self) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (!self.entries.get(i as i64).isDocumented()) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn taggedCount(&self, tag: string) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entries.get(i as i64).hasTag(tag)) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    // A catalog that is missing its descriptions is not documentation, so the
+    // gate is a ratio rather than a hard zero: new entries may land first and
+    // be documented in the same change, but the backlog may not grow.
+    public fn documentedRatioMilli(&self) -> i32 {
+        if (self.count() == 0) { return 0; }
+        let documented = self.count() - self.undocumentedCount();
+        return ((documented * 1000) / self.count());
+    }
+
+    // The catalog's own identity: what the coverage gate compares against.
+    public fn digest(&self) -> string {
+        var out = "";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out = out + self.entries.get(i as i64).serialize() + "\n";
+            i = i + 1;
+        }
+        return AppChecksum.of(out);
+    }
+
+    public fn toText(&self) -> string {
+        var out = "component catalog (" + format("%d", self.count() as i64) + " entries, digest "
+            + self.digest() + ")";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out = out + "\n" + self.entries.get(i as i64).summary();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn serialize(&self) -> string {
+        var out = "";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (i > 0) { out = out + "\n"; }
+            out = out + self.entries.get(i as i64).serialize();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn parse(text: string) -> AppComponentCatalog {
+        var out = AppComponentCatalog.empty();
+        let lines = AppDiagText.lineCount(text);
+        var i: i32 = 0;
+        while (i < lines) {
+            let e = AppComponentEntry.parse(AppDiagText.lineAt(text, i));
+            if (!e.isEmpty()) { out.entries.push(e); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn dup(&self) -> AppComponentCatalog {
+        var out = AppComponentCatalog.empty();
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out.entries.push(self.entries.get(i as i64).dup());
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(mut self) {
+        self.entries.destroy();
+    }
+
+    // The shipped catalog. Every name here is a real public type in
+    // `Zyn/src/app`; the counts are the member counts as of the baseline
+    // version, which is what lets a stale entry be spotted mechanically.
+    private static fn entry(name: string, module_name: string, category: i32, since_version: string, description: string) -> AppComponentEntry {
+        return AppComponentEntry.create(name, module_name, category, since_version, description);
+    }
+
+    public static fn defaultCatalog() -> AppComponentCatalog {
+        var out = AppComponentCatalog.empty();
+
+        // core
+        out.entries.push(AppComponentCatalog.entry("View", "Zyn.App", appComponentCore(), "0.1.0",
+            "the layout and styling primitive every screen is built from").withTags("core,layout"));
+        out.entries.push(AppComponentCatalog.entry("Text", "Zyn.App", appComponentCore(), "0.1.0",
+            "typed text constructors: title, body and muted").withTags("core,text"));
+        out.entries.push(AppComponentCatalog.entry("AccessibilityNode", "Zyn.App", appComponentCore(), "0.1.0",
+            "the platform-neutral node the accessibility bridge consumes").withTags("core,a11y"));
+        out.entries.push(AppComponentCatalog.entry("ComponentStateScope", "Zyn.App", appComponentCore(), "0.5.0",
+            "scopes a resource to one component so a page change can release it").withTags("core,state"));
+
+        // layout
+        out.entries.push(AppComponentCatalog.entry("VirtualList", "Zyn.App", appComponentLayout(), "0.9.0",
+            "windowed list that only builds the rows on screen").withTags("layout,virtual"));
+        out.entries.push(AppComponentCatalog.entry("AppVirtualWindow", "Zyn.App", appComponentLayout(), "0.9.0",
+            "the visible range calculation a virtual list is driven by").withTags("layout,virtual"));
+        out.entries.push(AppComponentCatalog.entry("TreeView", "Zyn.App", appComponentLayout(), "0.5.0",
+            "expandable tree bound to a tree store").withTags("layout,tree"));
+        out.entries.push(AppComponentCatalog.entry("DataGridHeader", "Zyn.App", appComponentLayout(), "0.5.0",
+            "sortable header row for a data grid").withTags("layout,grid"));
+
+        // input
+        out.entries.push(AppComponentCatalog.entry("TextField", "Zyn.App", appComponentInput(), "0.1.0",
+            "single line text entry bound to a string resource").withTags("input,text"));
+        out.entries.push(AppComponentCatalog.entry("ComboBox", "Zyn.App", appComponentInput(), "0.5.0",
+            "collapsed choice list for a small fixed option set").withTags("input,choice"));
+        out.entries.push(AppComponentCatalog.entry("RadioGroup", "Zyn.App", appComponentInput(), "0.5.0",
+            "single selection from a visible group").withTags("input,choice"));
+        out.entries.push(AppComponentCatalog.entry("NumberInput", "Zyn.App", appComponentInput(), "0.5.0",
+            "numeric entry with range clamping").withTags("input,number"));
+        out.entries.push(AppComponentCatalog.entry("DatePicker", "Zyn.App", appComponentInput(), "0.5.0",
+            "calendar selection writing an AppDate").withTags("input,date"));
+        out.entries.push(AppComponentCatalog.entry("TimePicker", "Zyn.App", appComponentInput(), "0.5.0",
+            "clock selection writing an AppTime").withTags("input,date"));
+        out.entries.push(AppComponentCatalog.entry("FileField", "Zyn.App", appComponentInput(), "0.5.0",
+            "file selection that routes through the platform dialog").withTags("input,file"));
+        out.entries.push(AppComponentCatalog.entry("SearchBar", "Zyn.App", appComponentInput(), "0.9.0",
+            "query entry that drives a filter spec").withTags("input,search"));
+        out.entries.push(AppComponentCatalog.entry("ChoiceGroup", "Zyn.App", appComponentInput(), "0.9.0",
+            "inline segmented choice with keyboard support").withTags("input,choice"));
+
+        // display
+        out.entries.push(AppComponentCatalog.entry("ImageView", "Zyn.App", appComponentDisplay(), "0.5.0",
+            "draws an asset from the asset store with a fit mode").withTags("display,media"));
+        out.entries.push(AppComponentCatalog.entry("IconView", "Zyn.App", appComponentDisplay(), "0.5.0",
+            "single glyph from the icon set").withTags("display,media"));
+        out.entries.push(AppComponentCatalog.entry("ProgressView", "Zyn.App", appComponentDisplay(), "0.5.0",
+            "determinate or indeterminate progress bar").withTags("display,feedback"));
+        out.entries.push(AppComponentCatalog.entry("EmptyState", "Zyn.App", appComponentDisplay(), "0.9.0",
+            "placeholder shown when a collection has no rows").withTags("display,empty"));
+        out.entries.push(AppComponentCatalog.entry("Disclosure", "Zyn.App", appComponentDisplay(), "0.9.0",
+            "collapsible section with an accessible expanded state").withTags("display,layout"));
+        out.entries.push(AppComponentCatalog.entry("FormField", "Zyn.App", appComponentDisplay(), "0.9.0",
+            "label, control and error text for one form row").withTags("display,form"));
+
+        // feedback
+        out.entries.push(AppComponentCatalog.entry("ToastView", "Zyn.App", appComponentFeedback(), "0.5.0",
+            "transient message rendered from a toast store").withTags("feedback,toast"));
+        out.entries.push(AppComponentCatalog.entry("AppToastStore", "Zyn.App", appComponentFeedback(), "0.5.0",
+            "queue of toasts with expiry and deduplication").withTags("feedback,toast"));
+        out.entries.push(AppComponentCatalog.entry("AppTooltipStore", "Zyn.App", appComponentFeedback(), "0.5.0",
+            "hover text with a delay so it does not flicker").withTags("feedback,tooltip"));
+        out.entries.push(AppComponentCatalog.entry("AppPopover", "Zyn.App", appComponentFeedback(), "0.5.0",
+            "anchored floating surface with dismissal rules").withTags("feedback,overlay"));
+        out.entries.push(AppComponentCatalog.entry("AppProgress", "Zyn.App", appComponentFeedback(), "0.5.0",
+            "long running operation state shown to the user").withTags("feedback,progress"));
+        out.entries.push(AppComponentCatalog.entry("DataStatusView", "Zyn.App", appComponentFeedback(), "0.5.0",
+            "loading, empty and error states for a data view").withTags("feedback,data"));
+
+        // navigation
+        out.entries.push(AppComponentCatalog.entry("Navigator", "Zyn.App", appComponentNavigation(), "0.1.0",
+            "the route stack and its transitions").withTags("navigation,route"));
+        out.entries.push(AppComponentCatalog.entry("AppRoute", "Zyn.App", appComponentNavigation(), "0.1.0",
+            "a route pattern with typed parameters").withTags("navigation,route"));
+        out.entries.push(AppComponentCatalog.entry("NavigationEvent", "Zyn.App", appComponentNavigation(), "0.1.0",
+            "one push, pop or replace recorded on the timeline").withTags("navigation,route"));
+        out.entries.push(AppComponentCatalog.entry("SceneRecord", "Zyn.App", appComponentNavigation(), "0.1.0",
+            "saved page state used to restore a scene").withTags("navigation,lifecycle"));
+        out.entries.push(AppComponentCatalog.entry("PresentationMode", "Zyn.App", appComponentNavigation(), "0.1.0",
+            "whether a page is pushed, modal or presented full screen").withTags("navigation,lifecycle"));
+
+        // data
+        out.entries.push(AppComponentCatalog.entry("AppRowStore", "Zyn.App", appComponentData(), "0.5.0",
+            "resource-backed row collection shared by every table control").withTags("data,rows"));
+        out.entries.push(AppComponentCatalog.entry("AppTreeStore", "Zyn.App", appComponentData(), "0.5.0",
+            "resource-backed tree collection with expansion state").withTags("data,tree"));
+        out.entries.push(AppComponentCatalog.entry("AppSelection", "Zyn.App", appComponentData(), "0.5.0",
+            "single, multiple and range selection over a row store").withTags("data,selection"));
+        out.entries.push(AppComponentCatalog.entry("AppDataState", "Zyn.App", appComponentData(), "0.5.0",
+            "loading, ready, empty and failed states for a data view").withTags("data,state"));
+        out.entries.push(AppComponentCatalog.entry("AppSortSpec", "Zyn.App", appComponentData(), "0.5.0",
+            "sort key and direction applied to a row store").withTags("data,sort"));
+        out.entries.push(AppComponentCatalog.entry("AppFilterSpec", "Zyn.App", appComponentData(), "0.5.0",
+            "predicate applied to a row store before display").withTags("data,filter"));
+
+        // tooling (ZC-20). Catalogued for the same reason as the controls: a
+        // public surface that cannot be enumerated cannot be audited.
+        out.entries.push(AppComponentCatalog.entry("AppComponentCatalog", "Zyn.App", appComponentTooling(), "0.9.0",
+            "the enumerable list of public components this catalog is made of").withTags("tooling,catalog"));
+        out.entries.push(AppComponentCatalog.entry("AppSampleLibrary", "Zyn.App", appComponentTooling(), "0.9.0",
+            "per-symbol API samples with a two-way coverage check").withTags("tooling,catalog,docs"));
+        out.entries.push(AppComponentCatalog.entry("AppProjectTemplate", "Zyn.App", appComponentTooling(), "0.9.0",
+            "a project skeleton as data, with a dry run and a materialise step").withTags("tooling,scaffold"));
+        out.entries.push(AppComponentCatalog.entry("AppSemanticTree", "Zyn.App", appComponentTooling(), "0.9.0",
+            "the accessibility snapshot parsed into a navigable tree").withTags("tooling,a11y,inspector"));
+        out.entries.push(AppComponentCatalog.entry("AppDeprecationRegistry", "Zyn.App", appComponentTooling(), "0.9.0",
+            "declared deprecations and the gate that enforces their removal window").withTags("tooling,compat"));
+        out.entries.push(AppComponentCatalog.entry("AppCompatChecker", "Zyn.App", appComponentTooling(), "0.9.0",
+            "diffs two API surface snapshots and classifies each change").withTags("tooling,compat"));
+
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// API samples
+// ---------------------------------------------------------------------------
+
+// A sample is a claim that a symbol is usable. It carries the call it makes
+// and the result it expects, so a docs test can run it rather than read it.
+public class AppApiSample {
+    public symbol: string;
+    public title: string;
+    public source: string;
+    public expected: string;
+    public tags: string;
+
+    public static fn create(symbol: string, title: string, source: string) -> AppApiSample {
+        return AppApiSample { symbol: symbol, title: title, source: source, expected: "", tags: "" };
+    }
+
+    public fn dup(&self) -> AppApiSample {
+        return AppApiSample {
+            symbol: self.symbol,
+            title: self.title,
+            source: self.source,
+            expected: self.expected,
+            tags: self.tags
+        };
+    }
+
+    public fn withExpected(mut self, value: string) -> AppApiSample {
+        self.expected = value;
+        return self;
+    }
+
+    public fn withTags(mut self, value: string) -> AppApiSample {
+        self.tags = value;
+        return self;
+    }
+
+    public fn isEmpty(&self) -> bool { return self.symbol.len == 0; }
+
+    public fn lineCount(&self) -> i32 {
+        if (self.source.len == 0) { return 0; }
+        return AppDiagText.lineCount(self.source);
+    }
+
+    // A sample that does not name the symbol it documents is a mis-filed
+    // sample; catching it here is cheaper than catching it in a reader's head.
+    public fn mentionsSymbol(&self) -> bool {
+        if (self.symbol.len == 0) { return false; }
+        return self.source.contains(self.symbol);
+    }
+
+    public fn serialize(&self) -> string {
+        return "S|" + self.symbol
+            + "|" + hex_encode(self.title)
+            + "|" + hex_encode(self.source)
+            + "|" + hex_encode(self.expected)
+            + "|" + self.tags;
+    }
+
+    public static fn parse(text: string) -> AppApiSample {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "S") {
+            return AppApiSample.create("", "", "");
+        }
+        var out = AppApiSample.create(
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 1),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 2)),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3)));
+        out.expected = hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 4));
+        out.tags = AppDiagText.fieldAt(text, AppDiagText.pipe(), 5);
+        return out;
+    }
+
+    public fn summary(&self) -> string {
+        return self.symbol + " - " + self.title
+            + " (" + format("%d", self.lineCount() as i64) + " lines)";
+    }
+}
+
+// The sample library. Its job is coverage: every catalog entry should have at
+// least one sample, and every sample should name a catalog entry. Both halves
+// are checked, because each half catches a different kind of drift.
+public class AppSampleLibrary {
+    private samples: Vec<AppApiSample>;
+
+    public static fn empty() -> AppSampleLibrary {
+        return AppSampleLibrary { samples: Vec::<AppApiSample>.new() };
+    }
+
+    public fn count(&self) -> i32 { return self.samples.len as i32; }
+
+    public fn at(&self, index: i32) -> AppApiSample {
+        if (index < 0 || index >= self.count()) { return AppApiSample.create("", "", ""); }
+        return self.samples.get(index as i64).dup();
+    }
+
+    public fn register(&mut self, sample: AppApiSample) -> bool {
+        if (sample.isEmpty()) { return false; }
+        self.samples.push(sample);
+        return true;
+    }
+
+    public fn registerOrFail(&mut self, sample: AppApiSample) -> Result<bool, AppError> {
+        if (!self.register(sample)) {
+            return Err(AppError.create(appDevKitCodeMissingSample(), "empty sample"));
+        }
+        return Ok(true);
+    }
+
+    public fn sampleCountFor(&self, symbol: string) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.samples.get(i as i64).symbol == symbol) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn hasSampleFor(&self, symbol: string) -> bool { return self.sampleCountFor(symbol) > 0; }
+
+    public fn indexFor(&self, symbol: string) -> i32 {
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.samples.get(i as i64).symbol == symbol) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // Catalog entries with no sample at all.
+    public fn uncoveredCount(&self, catalog: AppComponentCatalog) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < catalog.count()) {
+            if (!self.hasSampleFor(catalog.at(i).name)) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn coverageRatioMilli(&self, catalog: AppComponentCatalog) -> i32 {
+        if (catalog.count() == 0) { return 0; }
+        let covered = catalog.count() - self.uncoveredCount(catalog);
+        return ((covered * 1000) / catalog.count());
+    }
+
+    // The first catalog entry that has no sample, or "" when coverage is full.
+    // Returning the name rather than a boolean is what makes the failure
+    // message actionable without a second lookup.
+    public fn firstUncovered(&self, catalog: AppComponentCatalog) -> string {
+        var i: i32 = 0;
+        while (i < catalog.count()) {
+            let name = catalog.at(i).name;
+            if (!self.hasSampleFor(name)) { return name; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // Both directions of the coverage claim, plus the self-consistency check
+    // that a sample actually mentions its own symbol.
+    public fn verify(&self, catalog: AppComponentCatalog) -> Result<i32, AppError> {
+        var i: i32 = 0;
+        while (i < self.count()) {
+            let s = self.samples.get(i as i64);
+            if (!catalog.has(s.symbol)) {
+                return Err(AppError.create(appDevKitCodeUnknownComponent(),
+                    "sample references an unknown component: " + s.symbol));
+            }
+            if (!s.mentionsSymbol()) {
+                return Err(AppError.create(appDevKitCodeMissingSample(),
+                    "sample does not mention its symbol: " + s.symbol));
+            }
+            i = i + 1;
+        }
+        let uncovered = self.firstUncovered(catalog);
+        if (uncovered.len > 0) {
+            return Err(AppError.create(appDevKitCodeMissingSample(),
+                "no sample for component: " + uncovered));
+        }
+        return Ok(self.count());
+    }
+
+    public fn reportText(&self, catalog: AppComponentCatalog) -> string {
+        return "api samples: " + format("%d", self.count() as i64)
+            + " samples / " + format("%d", catalog.count() as i64) + " components"
+            + " (" + format("%d", self.coverageRatioMilli(catalog) / 10) + "% covered)"
+            + ", first uncovered: " + self.firstUncovered(catalog);
+    }
+
+    public fn serialize(&self) -> string {
+        var out = "";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (i > 0) { out = out + "\n"; }
+            out = out + self.samples.get(i as i64).serialize();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn parse(text: string) -> AppSampleLibrary {
+        var out = AppSampleLibrary.empty();
+        let lines = AppDiagText.lineCount(text);
+        var i: i32 = 0;
+        while (i < lines) {
+            let s = AppApiSample.parse(AppDiagText.lineAt(text, i));
+            if (!s.isEmpty()) { out.samples.push(s); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(mut self) {
+        self.samples.destroy();
+    }
+
+    // The shipped samples cover the core vocabulary a developer meets first.
+    // They are intentionally short: a sample that needs a paragraph is a
+    // design problem in the API, not in the documentation.
+    public static fn defaultLibrary() -> AppSampleLibrary {
+        var out = AppSampleLibrary.empty();
+
+        out.samples.push(AppApiSample.create("View", "build a column with a gap",
+            "return View.column().gap(8.0).padding(16.0).children(rows);").withTags("layout"));
+        out.samples.push(AppApiSample.create("Text", "three text weights",
+            "let title = Text.title(\"Orders\");\nlet body = Text.body(\"12 open\");\nlet hint = Text.muted(\"updated 2m ago\");")
+            .withTags("text"));
+        out.samples.push(AppApiSample.create("AccessibilityNode", "describe a button for the bridge",
+            "let node = AccessibilityNode.create(\"save\", \"button\", \"Save\", \"\").withActions(\"click\");")
+            .withTags("a11y"));
+        out.samples.push(AppApiSample.create("Navigator", "push a route onto the stack",
+            "let scene = SceneRecord.create(\"OrderDetail\", \"Order 42\");\nnavigator.push(scene);").withTags("navigation"));
+        out.samples.push(AppApiSample.create("AppRowStore", "declare rows and read the count",
+            "world = AppRowStore.declareRows(world, \"orders\", keys);\nlet count = AppRowStore.rowCount(world, \"orders\");")
+            .withTags("data"));
+        out.samples.push(AppApiSample.create("AppSelection", "toggle a row selection",
+            "world = AppSelection.toggle(world, \"orders\", \"42\");").withTags("data,selection"));
+        out.samples.push(AppApiSample.create("AppDataState", "show the empty state",
+            "let state = AppDataState.empty();\nreturn DataStatusView.create(\"orders\", state, \"orders.reload\");")
+            .withTags("data,state"));
+        out.samples.push(AppApiSample.create("AppSortSpec", "sort by a column",
+            "let spec = AppSortSpec.byColumn(2, appSortAscending());\nworld = AppDataGrid.apply(world, \"orders\", spec, AppFilterSpec.none());")
+            .withTags("data,sort"));
+        out.samples.push(AppApiSample.create("AppFilterSpec", "filter every column by a query",
+            "world = AppDataGrid.apply(world, \"orders\", AppSortSpec.none(), AppFilterSpec.allColumns(\"open\"));")
+            .withTags("data,filter"));
+        out.samples.push(AppApiSample.create("TextField", "bind a text field to a resource",
+            "return View.textField(\"Search\").bindText(\"orders.query\");").withTags("input"));
+        out.samples.push(AppApiSample.create("AppProgress", "show an indeterminate operation",
+            "let bar = AppProgress.indeterminate();\nreturn ProgressView.create(\"sync\", \"Syncing\", bar, 0);")
+            .withTags("feedback"));
+        out.samples.push(AppApiSample.create("AppToastStore", "post a toast with an action",
+            "world = AppToastStore.show(world, \"app\", \"saved\", appToastSuccess(), \"Saved\", \"Undo\", \"orders.undo\", 180 as u64);")
+            .withTags("feedback"));
+        out.samples.push(AppApiSample.create("AppPopover", "anchor a popover under a toolbar button",
+            "world = AppPopover.recordAnchor(world, \"menu\", \"toolbar.more\", AppPopover.placementBottom());")
+            .withTags("feedback,overlay"));
+        out.samples.push(AppApiSample.create("AppRoute", "declare a route with a parameter",
+            "let route = AppRoute.create(\"/orders/:id\", \"OrderDetail\");").withTags("navigation"));
+        out.samples.push(AppApiSample.create("ComponentStateScope", "scope state to one component",
+            "let scope = ComponentStateScope.create(\"OrderDetail\");").withTags("core,state"));
+        out.samples.push(AppApiSample.create("AppComponentCatalog", "enumerate the public surface",
+            "let catalog = AppComponentCatalog.defaultCatalog();\nlet count = catalog.count();")
+            .withTags("tooling"));
+        out.samples.push(AppApiSample.create("AppSampleLibrary", "check that every component has a sample",
+            "match (library.verify(catalog)) { case Ok(n) => { } case Err(e) => { } }").withTags("tooling,docs"));
+        out.samples.push(AppApiSample.create("AppProjectTemplate", "scaffold a new application",
+            "let t = AppProjectTemplate.application(\"Orders\");\nmatch (t.materialize(\"build/Orders\")) { case Ok(n) => { } case Err(e) => { } }")
+            .withTags("tooling"));
+        out.samples.push(AppApiSample.create("AppSemanticTree", "assert on structure, not pixels",
+            "AppSemanticTree.capture(world, \"detail\");\nlet outline = AppSemanticTree.outlineText(world, \"detail\");")
+            .withTags("tooling,a11y"));
+        out.samples.push(AppApiSample.create("AppDeprecationRegistry", "declare a deprecation",
+            "registry.declare(AppDeprecation.create(\"AppOldThing\", \"0.9.0\", \"1.0.0\", \"AppNewThing\"));")
+            .withTags("tooling,compat"));
+        out.samples.push(AppApiSample.create("AppCompatChecker", "diff two api surfaces",
+            "let report = AppCompatChecker.compare(baseline, current);\nlet verdict = report.verdict();")
+            .withTags("tooling,compat"));
+
+        return out;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Visual semantic tree
+// ---------------------------------------------------------------------------
+
+// The parsed form of one `AccessibilityNode.descriptor()` line. The descriptor
+// is the assertion surface headless tests already use, so parsing that same
+// text - rather than inventing a second serialisation - means a tree the
+// developer sees and a tree a test asserts on cannot drift apart.
+public class AppSemanticNode {
+    public id: string;
+    public role: string;
+    public label: string;
+    public state: string;
+    public value: string;
+    public actions: string;
+    public parent_id: string;
+    public level: i32;
+    public focused: bool;
+
+    public static fn empty() -> AppSemanticNode {
+        return AppSemanticNode {
+            id: "",
+            role: "",
+            label: "",
+            state: "",
+            value: "",
+            actions: "",
+            parent_id: "",
+            level: 0,
+            focused: false
+        };
+    }
+
+    public fn dup(&self) -> AppSemanticNode {
+        return AppSemanticNode {
+            id: self.id,
+            role: self.role,
+            label: self.label,
+            state: self.state,
+            value: self.value,
+            actions: self.actions,
+            parent_id: self.parent_id,
+            level: self.level,
+            focused: self.focused
+        };
+    }
+
+    public fn isEmpty(&self) -> bool { return self.id.len == 0 && self.role.len == 0; }
+
+    public fn isInteractive(&self) -> bool {
+        return self.role == "button" || self.role == "textbox" || self.role == "switch"
+            || self.role == "slider" || self.role == "checkbox";
+    }
+
+    public fn hasAction(&self, action_name: string) -> bool {
+        if (action_name.len == 0 || self.actions.len == 0) { return false; }
+        return self.actions == action_name
+            || self.actions.startsWith(action_name + ",")
+            || self.actions.endsWith("," + action_name)
+            || self.actions.contains("," + action_name + ",");
+    }
+
+    // Mirrors `AccessibilityNode.descriptor()` field for field. Keeping the two
+    // in step is what makes a round trip through the tree lossless.
+    public fn descriptor(&self) -> string {
+        var out = self.role + " " + self.id;
+        if (self.label.len > 0) { out = out + " \"" + self.label + "\""; }
+        if (self.state.len > 0) { out = out + " state=" + self.state; }
+        if (self.value.len > 0) { out = out + " value=" + self.value; }
+        if (self.actions.len > 0) { out = out + " actions=" + self.actions; }
+        if (self.parent_id.len > 0) { out = out + " parent=" + self.parent_id; }
+        if (self.level != 0) { out = out + " level=" + format("%d", self.level as i64); }
+        if (self.focused) { out = out + " focused"; }
+        return out;
+    }
+
+    // The outline form adds indentation, which is the whole point of the
+    // visual tree: structure the flat descriptor deliberately omits.
+    public fn outlineLine(&self, indent_width: i32) -> string {
+        var pad = "";
+        var i: i32 = 0;
+        var width = self.level * indent_width;
+        if (width < 0) { width = 0; }
+        while (i < width) {
+            pad = pad + " ";
+            i = i + 1;
+        }
+        return pad + self.descriptor();
+    }
+
+    // `N|id|role|state|value|actions|parent|level|focused|hex(label)`
+    public fn serialize(&self) -> string {
+        return "N|" + self.id
+            + "|" + self.role
+            + "|" + self.state
+            + "|" + self.value
+            + "|" + self.actions
+            + "|" + self.parent_id
+            + "|" + format("%d", self.level as i64)
+            + "|" + appDiagBoolText(self.focused)
+            + "|" + hex_encode(self.label);
+    }
+
+    public static fn parse(text: string) -> AppSemanticNode {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "N") { return AppSemanticNode.empty(); }
+        var out = AppSemanticNode.empty();
+        out.id = AppDiagText.fieldAt(text, AppDiagText.pipe(), 1);
+        out.role = AppDiagText.fieldAt(text, AppDiagText.pipe(), 2);
+        out.state = AppDiagText.fieldAt(text, AppDiagText.pipe(), 3);
+        out.value = AppDiagText.fieldAt(text, AppDiagText.pipe(), 4);
+        out.actions = AppDiagText.fieldAt(text, AppDiagText.pipe(), 5);
+        out.parent_id = AppDiagText.fieldAt(text, AppDiagText.pipe(), 6);
+        out.level = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 7), 0 as u64);
+        out.focused = AppDiagText.fieldAt(text, AppDiagText.pipe(), 8) == "1";
+        out.label = hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 9));
+        return out;
+    }
+}
+
+// Captures `AppWorld.accessibilitySnapshotText()` into a resource-backed tree
+// and offers the views a developer inspector needs: an indented outline, a
+// focus path and an interactive-node census.
+//
+// The tree lives in string-list resources rather than in a `Vec` field so a
+// capture can be re-run every frame without allocating, and so the tree
+// survives with the world that produced it.
+public class AppSemanticTree {
+    public static fn nodeKey(owner: string) -> string { return "sem:" + owner + ":node"; }
+    public static fn countKey(owner: string) -> string { return "sem:" + owner + ":count"; }
+    public static fn revisionKey(owner: string) -> string { return "sem:" + owner + ":revision"; }
+    public static fn focusKey(owner: string) -> string { return "sem:" + owner + ":focus"; }
+
+    // Re-reads the world's accessibility snapshot. Returns the node count, or
+    // -1 if the owner is unnamed. Idempotent: capturing twice with an unchanged
+    // world produces the same tree and the same revision.
+    public static fn capture(world: AppWorld, owner: string) -> i32 {
+        if (owner.len == 0) { return -1; }
+        var out = AppRowStore.clearList(world, AppSemanticTree.nodeKey(owner));
+        let text = out.accessibilitySnapshotText();
+        let lines = AppDiagText.lineCount(text);
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < lines) {
+            let node = AppSemanticTree.parseLine(AppDiagText.lineAt(text, i));
+            if (!node.isEmpty()) {
+                out = out.appendStringListResource(AppSemanticTree.nodeKey(owner), node.serialize());
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        out = out.setIntResource(AppSemanticTree.countKey(owner), count);
+        out = out.setStringResource(AppSemanticTree.revisionKey(owner),
+            AppChecksum.of(out.accessibilitySnapshotText()));
+        return count;
+    }
+
+    public static fn nodeCount(world: AppWorld, owner: string) -> i32 {
+        return world.intResource(AppSemanticTree.countKey(owner), 0);
+    }
+
+    public static fn nodeAt(world: AppWorld, owner: string, index: i32) -> AppSemanticNode {
+        if (index < 0 || index >= AppSemanticTree.nodeCount(world, owner)) { return AppSemanticNode.empty(); }
+        return AppSemanticNode.parse(world.stringListResourceAt(AppSemanticTree.nodeKey(owner), index));
+    }
+
+    public static fn revision(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppSemanticTree.revisionKey(owner), "");
+    }
+
+    public static fn indexOfId(world: AppWorld, owner: string, id: string) -> i32 {
+        var i: i32 = 0;
+        while (i < AppSemanticTree.nodeCount(world, owner)) {
+            if (world.stringListResourceAt(AppSemanticTree.nodeKey(owner), i).len > 0
+                && AppSemanticTree.nodeAt(world, owner, i).id == id) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public static fn findById(world: AppWorld, owner: string, id: string) -> AppSemanticNode {
+        let index = AppSemanticTree.indexOfId(world, owner, id);
+        if (index < 0) { return AppSemanticNode.empty(); }
+        return AppSemanticTree.nodeAt(world, owner, index);
+    }
+
+    public static fn hasId(world: AppWorld, owner: string, id: string) -> bool {
+        return AppSemanticTree.indexOfId(world, owner, id) >= 0;
+    }
+
+    public static fn interactiveCount(world: AppWorld, owner: string) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < AppSemanticTree.nodeCount(world, owner)) {
+            if (AppSemanticTree.nodeAt(world, owner, i).isInteractive()) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public static fn maxLevel(world: AppWorld, owner: string) -> i32 {
+        var out: i32 = 0;
+        var i: i32 = 0;
+        while (i < AppSemanticTree.nodeCount(world, owner)) {
+            let level = AppSemanticTree.nodeAt(world, owner, i).level;
+            if (level > out) { out = level; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // The indented outline. `indent_width` is a parameter rather than a
+    // constant because the inspector wants two spaces and a test snapshot
+    // often wants a single tab's worth.
+    public static fn outlineText(world: AppWorld, owner: string) -> string {
+        return AppSemanticTree.outlineWith(world, owner, 2);
+    }
+
+    public static fn outlineWith(world: AppWorld, owner: string, indent_width: i32) -> string {
+        var out = "";
+        var i: i32 = 0;
+        while (i < AppSemanticTree.nodeCount(world, owner)) {
+            out = out + AppSemanticTree.nodeAt(world, owner, i).outlineLine(indent_width) + "\n";
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // The path from the root to whatever currently holds focus, joined with
+    // " > ". An empty string means nothing in this tree is focused - which is
+    // itself worth showing, because it is the usual cause of "the keyboard
+    // does nothing".
+    public static fn focusPath(world: AppWorld, owner: string) -> string {
+        var index: i32 = -1;
+        var i: i32 = 0;
+        while (i < AppSemanticTree.nodeCount(world, owner)) {
+            if (AppSemanticTree.nodeAt(world, owner, i).focused) { index = i; break; }
+            i = i + 1;
+        }
+        if (index < 0) { return ""; }
+        var out = AppSemanticTree.nodeAt(world, owner, index).id;
+        var cursor = index;
+        var depth: i32 = 0;
+        while (depth < 64) {
+            let parent_id = AppSemanticTree.nodeAt(world, owner, cursor).parent_id;
+            if (parent_id.len == 0) { break; }
+            let parent_index = AppSemanticTree.indexOfId(world, owner, parent_id);
+            if (parent_index < 0) { break; }
+            out = parent_id + " > " + out;
+            cursor = parent_index;
+            depth = depth + 1;
+        }
+        return out;
+    }
+
+    public static fn focusedId(world: AppWorld, owner: string) -> string {
+        var i: i32 = 0;
+        while (i < AppSemanticTree.nodeCount(world, owner)) {
+            let node = AppSemanticTree.nodeAt(world, owner, i);
+            if (node.focused) { return node.id; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public static fn summary(world: AppWorld, owner: string) -> string {
+        return "semantic tree '" + owner + "': "
+            + format("%d", AppSemanticTree.nodeCount(world, owner) as i64) + " nodes, "
+            + format("%d", AppSemanticTree.interactiveCount(world, owner) as i64) + " interactive, "
+            + "depth " + format("%d", AppSemanticTree.maxLevel(world, owner) as i64)
+            + ", focus " + AppSemanticTree.focusPath(world, owner);
+    }
+
+    // A capture that produced nothing is not a passing capture: it usually
+    // means the view tree was never registered with the accessibility layer,
+    // and a silent empty tree would let that ship.
+    public static fn requireNonEmpty(world: AppWorld, owner: string) -> Result<i32, AppError> {
+        let count = AppSemanticTree.capture(world, owner);
+        if (count <= 0) {
+            return Err(AppError.create(appDevKitCodeEmptySemanticTree(),
+                "accessibility snapshot is empty for owner: " + owner));
+        }
+        return Ok(count);
+    }
+
+    public static fn contains(world: AppWorld, owner: string, needle: string) -> bool {
+        return AppSemanticTree.outlineText(world, owner).contains(needle);
+    }
+
+    // The inspector panel. It is a `View` so it can be dropped into a debug
+    // screen, and it is built from the tree rather than from the world so what
+    // is shown is exactly what a test would assert on.
+    public static fn panel(world: AppWorld, owner: string) -> View {
+        var parts = Vec::<View>.new();
+        parts.push(Text.title("Semantic tree"));
+        parts.push(Text.muted(AppSemanticTree.summary(world, owner)));
+        var i: i32 = 0;
+        while (i < AppSemanticTree.nodeCount(world, owner)) {
+            let node = AppSemanticTree.nodeAt(world, owner, i);
+            var line = node.role + "  " + node.id;
+            if (node.label.len > 0) { line = line + "  \"" + node.label + "\""; }
+            if (node.state.len > 0) { line = line + "  [" + node.state + "]"; }
+            if (node.focused) { line = line + "  <- focus"; }
+            if (node.isInteractive()) {
+                parts.push(Text.body(line));
+            } else {
+                parts.push(Text.muted(line));
+            }
+            i = i + 1;
+        }
+        if (parts.len == 2) {
+            parts.push(Text.muted("(no nodes registered)"));
+        }
+        return View.column().id("semantic-tree:" + owner).gap(2.0).padding(8.0).children(parts);
+    }
+
+    // --- descriptor parsing -------------------------------------------------
+    //
+    // `AccessibilityNode.descriptor()` is `role id ["label"] [key=value]...
+    // [focused]`, space separated. The label is the only field that may itself
+    // contain a space, so it is read as a quoted run rather than by splitting
+    // on whitespace - which is why this is a hand-written scan and not a call
+    // to the field helper the record formats use.
+
+    public static fn spaceCode() -> i32 { return 32; }
+    public static fn quoteCode() -> i32 { return 34; }
+    public static fn equalsCode() -> i32 { return 61; }
+
+    // Character-class predicates, so the scan below reads as "skip spaces"
+    // rather than "skip bytes equal to 32".
+    public static fn isSpace(code: i32) -> bool { return code == AppSemanticTree.spaceCode(); }
+    public static fn isQuote(code: i32) -> bool { return code == AppSemanticTree.quoteCode(); }
+    public static fn isEquals(code: i32) -> bool { return code == AppSemanticTree.equalsCode(); }
+
+    public static fn parseLine(line: string) -> AppSemanticNode {
+        var out = AppSemanticNode.empty();
+        if (line.len == 0) { return out; }
+        let n = line.len as i32;
+        var i: i32 = 0;
+        var index: i32 = 0;
+        while (i < n) {
+            while (i < n && AppSemanticTree.isSpace(line.charAt(i as i64))) { i = i + 1; }
+            if (i >= n) { break; }
+            if (AppSemanticTree.isQuote(line.charAt(i as i64))) {
+                i = i + 1;
+                let start = i;
+                while (i < n && !AppSemanticTree.isQuote(line.charAt(i as i64))) { i = i + 1; }
+                out.label = line.substring(start as i64, i as i64);
+                if (i < n) { i = i + 1; }
+                index = index + 1;
+                continue;
+            }
+            let start = i;
+            while (i < n && !AppSemanticTree.isSpace(line.charAt(i as i64))) { i = i + 1; }
+            let token = line.substring(start as i64, i as i64);
+            if (index == 0) {
+                out.role = token;
+            } else if (index == 1) {
+                out.id = token;
+            } else if (token == "focused") {
+                out.focused = true;
+            } else {
+                let eq = AppSemanticTree.indexIn(token, AppSemanticTree.equalsCode());
+                if (eq >= 0) {
+                    let key = token.substring(0 as i64, eq as i64);
+                    let value = token.substring((eq + 1) as i64, token.len as i64);
+                    if (key == "state") { out.state = value; }
+                    else if (key == "value") { out.value = value; }
+                    else if (key == "actions") { out.actions = value; }
+                    else if (key == "parent") { out.parent_id = value; }
+                    else if (key == "level") { out.level = appDiagParseI32(value, 0 as u64); }
+                }
+            }
+            index = index + 1;
+        }
+        return out;
+    }
+
+    public static fn indexIn(text: string, code: i32) -> i32 {
+        var i: i32 = 0;
+        while (i < (text.len as i32)) {
+            if (text.charAt(i as i64) == code) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deprecation cycle
+// ---------------------------------------------------------------------------
+
+// One declared deprecation. `replacement` is mandatory: a deprecation without
+// a named replacement is an instruction to stop using something with no
+// instruction about what to use instead, which is not a policy a team can
+// follow.
+public class AppDeprecation {
+    public symbol: string;
+    public since_version: string;
+    public remove_after_version: string;
+    public replacement: string;
+    public reason: string;
+    public stage: i32;
+
+    public static fn create(symbol: string, since_version: string, remove_after_version: string, replacement: string) -> AppDeprecation {
+        return AppDeprecation {
+            symbol: symbol,
+            since_version: since_version,
+            remove_after_version: remove_after_version,
+            replacement: replacement,
+            reason: "",
+            stage: appDeprecationAdvisory()
+        };
+    }
+
+    public fn withReason(mut self, value: string) -> AppDeprecation {
+        self.reason = value;
+        return self;
+    }
+
+    public fn withStage(mut self, value: i32) -> AppDeprecation {
+        self.stage = value;
+        return self;
+    }
+
+    public fn dup(&self) -> AppDeprecation {
+        return AppDeprecation {
+            symbol: self.symbol,
+            since_version: self.since_version,
+            remove_after_version: self.remove_after_version,
+            replacement: self.replacement,
+            reason: self.reason,
+            stage: self.stage
+        };
+    }
+
+    public fn isEmpty(&self) -> bool { return self.symbol.len == 0; }
+
+    public fn isComplete(&self) -> bool {
+        return self.symbol.len > 0 && self.replacement.len > 0 && self.remove_after_version.len > 0;
+    }
+
+    // The window has closed when the removal version is not newer than the
+    // version being built: at that point the symbol must be gone, not merely
+    // discouraged.
+    public fn isExpiredAt(&self, version: AppVersion) -> bool {
+        if (self.remove_after_version.len == 0) { return false; }
+        return !AppVersion.parse(self.remove_after_version).isNewerThan(version);
+    }
+
+    public fn describe(&self) -> string {
+        var out = self.symbol + " deprecated since " + self.since_version
+            + ", remove by " + self.remove_after_version
+            + " (" + appDeprecationStageName(self.stage) + ") -> " + self.replacement;
+        if (self.reason.len > 0) { out = out + ": " + self.reason; }
+        return out;
+    }
+
+    // `D|symbol|since|remove_after|stage|hex(replacement)|hex(reason)`
+    public fn serialize(&self) -> string {
+        return "D|" + self.symbol
+            + "|" + self.since_version
+            + "|" + self.remove_after_version
+            + "|" + format("%d", self.stage as i64)
+            + "|" + hex_encode(self.replacement)
+            + "|" + hex_encode(self.reason);
+    }
+
+    public static fn parse(text: string) -> AppDeprecation {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "D") {
+            return AppDeprecation.create("", "", "", "");
+        }
+        var out = AppDeprecation.create(
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 1),
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 2),
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 3),
+            hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 6)));
+        out.stage = appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 4), 1 as u64);
+        out.reason = hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 7));
+        return out;
+    }
+}
+
+public class AppDeprecationRegistry {
+    private entries: Vec<AppDeprecation>;
+
+    public static fn empty() -> AppDeprecationRegistry {
+        return AppDeprecationRegistry { entries: Vec::<AppDeprecation>.new() };
+    }
+
+    public fn count(&self) -> i32 { return self.entries.len as i32; }
+
+    public fn at(&self, index: i32) -> AppDeprecation {
+        if (index < 0 || index >= self.count()) { return AppDeprecation.create("", "", "", ""); }
+        return self.entries.get(index as i64).dup();
+    }
+
+    public fn indexOf(&self, symbol: string) -> i32 {
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entries.get(i as i64).symbol == symbol) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn has(&self, symbol: string) -> bool { return self.indexOf(symbol) >= 0; }
+
+    // An incomplete declaration is rejected rather than stored, because a
+    // registry that accepts one has no way to distinguish "not yet filled in"
+    // from "deliberately open ended".
+    public fn declare(&mut self, entry: AppDeprecation) -> Result<bool, AppError> {
+        if (!entry.isComplete()) {
+            return Err(AppError.create(appDevKitCodeExpiredDeprecation(),
+                "deprecation needs a symbol, a replacement and a removal version: " + entry.symbol));
+        }
+        if (self.has(entry.symbol)) {
+            return Err(AppError.create(appDevKitCodeDuplicateSymbol(),
+                "already deprecated: " + entry.symbol));
+        }
+        self.entries.push(entry);
+        return Ok(true);
+    }
+
+    public fn stageCount(&self, stage: i32) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entries.get(i as i64).stage == stage) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn expiredCount(&self, version: AppVersion) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entries.get(i as i64).isExpiredAt(version)) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn firstExpired(&self, version: AppVersion) -> string {
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.entries.get(i as i64).isExpiredAt(version)) { return self.entries.get(i as i64).symbol; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public fn activeCount(&self, version: AppVersion) -> i32 {
+        return self.count() - self.expiredCount(version);
+    }
+
+    // The release gate. A deprecation whose window has closed and which is
+    // still declared means the removal did not happen, so the release is
+    // blocked rather than warned about.
+    public fn gate(&self, version: AppVersion) -> Result<i32, AppError> {
+        let overdue = self.firstExpired(version);
+        if (overdue.len > 0) {
+            return Err(AppError.create(appDevKitCodeExpiredDeprecation(),
+                "deprecation window closed but symbol is still present: " + overdue));
+        }
+        return Ok(self.activeCount(version));
+    }
+
+    public fn warningsText(&self, version: AppVersion) -> string {
+        var out = "deprecations: " + format("%d", self.activeCount(version) as i64) + " active, "
+            + format("%d", self.expiredCount(version) as i64) + " overdue";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out = out + "\n  " + self.entries.get(i as i64).describe();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn serialize(&self) -> string {
+        var out = "";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (i > 0) { out = out + "\n"; }
+            out = out + self.entries.get(i as i64).serialize();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn parse(text: string) -> AppDeprecationRegistry {
+        var out = AppDeprecationRegistry.empty();
+        let lines = AppDiagText.lineCount(text);
+        var i: i32 = 0;
+        while (i < lines) {
+            let d = AppDeprecation.parse(AppDiagText.lineAt(text, i));
+            if (!d.isEmpty()) { out.entries.push(d); }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(mut self) {
+        self.entries.destroy();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Version compatibility
+// ---------------------------------------------------------------------------
+
+// A snapshot of the public API. Each entry is `key|detail`, where `key` is the
+// stable identity of a symbol and `detail` is whatever part of it a consumer
+// could depend on - the member count of a component, the arity of a function.
+// Two entries with the same key and different details are the interesting
+// case: the name still resolves but the call site may not.
+public class AppApiSurface {
+    public version: string;
+    public platform: i32;
+    public package_kind: i32;
+    private entries: Vec<string>;
+
+    public static fn empty() -> AppApiSurface {
+        return AppApiSurface {
+            version: "",
+            platform: 0,
+            package_kind: 0,
+            entries: Vec::<string>.new()
+        };
+    }
+
+    public static fn create(version: string) -> AppApiSurface {
+        var out = AppApiSurface.empty();
+        out.version = version;
+        return out;
+    }
+
+    public fn withTarget(mut self, platform: i32, package_kind: i32) -> AppApiSurface {
+        self.platform = platform;
+        self.package_kind = package_kind;
+        return self;
+    }
+
+    public fn count(&self) -> i32 { return self.entries.len as i32; }
+
+    public fn entryAt(&self, index: i32) -> string {
+        if (index < 0 || index >= self.count()) { return ""; }
+        return self.entries.get(index as i64);
+    }
+
+    public fn keyAt(&self, index: i32) -> string {
+        return AppApiSurface.keyOf(self.entryAt(index));
+    }
+
+    public fn detailAt(&self, index: i32) -> string {
+        return AppApiSurface.detailOf(self.entryAt(index));
+    }
+
+    public fn indexOfKey(&self, key: string) -> i32 {
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.keyAt(i) == key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn hasKey(&self, key: string) -> bool { return self.indexOfKey(key) >= 0; }
+
+    public fn add(mut self, key: string, detail: string) -> AppApiSurface {
+        if (key.len == 0) { return self; }
+        if (self.hasKey(key)) { return self; }
+        self.entries.push(key + "|" + detail);
+        return self;
+    }
+
+    public fn addMember(mut self, type_name: string, member: string, arity: i32) -> AppApiSurface {
+        return self.add(type_name + "." + member, "arity=" + format("%d", arity as i64));
+    }
+
+    // One key per catalogued component, with its member count as the detail.
+    // This is the snapshot a release tool takes without having to parse the
+    // source: the catalog already records what the surface claims to be.
+    public static fn fromCatalog(catalog: AppComponentCatalog) -> AppApiSurface {
+        var out = AppApiSurface.create(appCatalogBaselineVersion());
+        var i: i32 = 0;
+        while (i < catalog.count()) {
+            let e = catalog.at(i);
+            out = out.add(e.qualifiedName(), "members=" + format("%d", e.memberCount() as i64));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    // Insertion order is the caller's business, but a digest is only
+    // reproducible if the order is fixed, so the entries are emitted in
+    // sorted order. `Vec.sort()` cannot be used here: for a wide element it
+    // compares raw bytes, which for a string means comparing pointers - and
+    // that would make the digest differ between two runs of the same build.
+    public fn sortedText(&self) -> string {
+        var taken = Vec::<bool>.new();
+        var i: i32 = 0;
+        while (i < self.count()) {
+            taken.push(false);
+            i = i + 1;
+        }
+        var out = "";
+        var placed: i32 = 0;
+        while (placed < self.count()) {
+            var best: i32 = -1;
+            var k: i32 = 0;
+            while (k < self.count()) {
+                if (!taken.get(k as i64)) {
+                    if (best < 0 || AppApiSurface.compareText(self.entryAt(k), self.entryAt(best)) < 0) {
+                        best = k;
+                    }
+                }
+                k = k + 1;
+            }
+            if (best < 0) { break; }
+            taken.set(best as i64, true);
+            if (placed > 0) { out = out + "\n"; }
+            out = out + self.entryAt(best);
+            placed = placed + 1;
+        }
+        taken.destroy();
+        return out;
+    }
+
+    public fn digest(&self) -> string {
+        return AppChecksum.of(self.sortedText());
+    }
+
+    public static fn compareText(a: string, b: string) -> i32 {
+        var n: i32 = a.len as i32;
+        if ((b.len as i32) < n) { n = b.len as i32; }
+        var i: i32 = 0;
+        while (i < n) {
+            let ca = a.charAt(i as i64);
+            let cb = b.charAt(i as i64);
+            if (ca < cb) { return -1; }
+            if (ca > cb) { return 1; }
+            i = i + 1;
+        }
+        if (a.len < b.len) { return -1; }
+        if (a.len > b.len) { return 1; }
+        return 0;
+    }
+
+    public static fn keyOf(entry: string) -> string {
+        let bar = AppSemanticTree.indexIn(entry, AppDiagText.pipe());
+        if (bar < 0) { return entry; }
+        return entry.substring(0 as i64, bar as i64);
+    }
+
+    public static fn detailOf(entry: string) -> string {
+        let bar = AppSemanticTree.indexIn(entry, AppDiagText.pipe());
+        if (bar < 0) { return ""; }
+        return entry.substring((bar + 1) as i64, entry.len as i64);
+    }
+
+    public fn serialize(&self) -> string {
+        var out = "V|" + self.version
+            + "|" + format("%d", self.platform as i64)
+            + "|" + format("%d", self.package_kind as i64);
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out = out + "\n" + self.entryAt(i);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public static fn parse(text: string) -> AppApiSurface {
+        var out = AppApiSurface.empty();
+        let lines = AppDiagText.lineCount(text);
+        if (lines == 0) { return out; }
+        let header = AppDiagText.lineAt(text, 0);
+        if (AppDiagText.fieldAt(header, AppDiagText.pipe(), 0) != "V") { return out; }
+        out.version = AppDiagText.fieldAt(header, AppDiagText.pipe(), 1);
+        out.platform = appDiagParseI32(AppDiagText.fieldAt(header, AppDiagText.pipe(), 2), 0 as u64);
+        out.package_kind = appDiagParseI32(AppDiagText.fieldAt(header, AppDiagText.pipe(), 3), 0 as u64);
+        var i: i32 = 1;
+        while (i < lines) {
+            let line = AppDiagText.lineAt(text, i);
+            if (line.len > 0) {
+                out = out.add(AppApiSurface.keyOf(line), AppApiSurface.detailOf(line));
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn dup(&self) -> AppApiSurface {
+        var out = AppApiSurface.empty();
+        out.version = self.version;
+        out.platform = self.platform;
+        out.package_kind = self.package_kind;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out.entries.push(self.entryAt(i));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(mut self) {
+        self.entries.destroy();
+    }
+}
+
+// One classified difference between two surfaces.
+public class AppCompatChange {
+    public symbol: string;
+    public verdict: i32;
+    public old_detail: string;
+    public new_detail: string;
+
+    public static fn create(symbol: string, verdict: i32) -> AppCompatChange {
+        return AppCompatChange { symbol: symbol, verdict: verdict, old_detail: "", new_detail: "" };
+    }
+
+    public fn dup(&self) -> AppCompatChange {
+        return AppCompatChange {
+            symbol: self.symbol,
+            verdict: self.verdict,
+            old_detail: self.old_detail,
+            new_detail: self.new_detail
+        };
+    }
+
+    public fn isEmpty(&self) -> bool { return self.symbol.len == 0; }
+
+    public fn isBreaking(&self) -> bool {
+        return self.verdict == appCompatRemoved() || self.verdict == appCompatChanged();
+    }
+
+    public fn describe(&self) -> string {
+        if (self.verdict == appCompatChanged()) {
+            return "changed " + self.symbol + ": " + self.old_detail + " -> " + self.new_detail;
+        }
+        if (self.verdict == appCompatRemoved()) {
+            return "removed " + self.symbol + " (" + self.old_detail + ")";
+        }
+        return "added " + self.symbol + " (" + self.new_detail + ")";
+    }
+
+    public fn serialize(&self) -> string {
+        return "C|" + format("%d", self.verdict as i64)
+            + "|" + self.symbol
+            + "|" + hex_encode(self.old_detail)
+            + "|" + hex_encode(self.new_detail);
+    }
+
+    public static fn parse(text: string) -> AppCompatChange {
+        if (AppDiagText.fieldAt(text, AppDiagText.pipe(), 0) != "C") {
+            return AppCompatChange.create("", appCompatUnchanged());
+        }
+        var out = AppCompatChange.create(
+            AppDiagText.fieldAt(text, AppDiagText.pipe(), 2),
+            appDiagParseI32(AppDiagText.fieldAt(text, AppDiagText.pipe(), 1), 0 as u64));
+        out.old_detail = hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 3));
+        out.new_detail = hex_decode(AppDiagText.fieldAt(text, AppDiagText.pipe(), 4));
+        return out;
+    }
+}
+
+public class AppCompatReport {
+    public baseline_version: string;
+    public current_version: string;
+    private changes: Vec<AppCompatChange>;
+
+    public static fn empty() -> AppCompatReport {
+        return AppCompatReport {
+            baseline_version: "",
+            current_version: "",
+            changes: Vec::<AppCompatChange>.new()
+        };
+    }
+
+    public fn count(&self) -> i32 { return self.changes.len as i32; }
+
+    public fn at(&self, index: i32) -> AppCompatChange {
+        if (index < 0 || index >= self.count()) { return AppCompatChange.create("", appCompatUnchanged()); }
+        return self.changes.get(index as i64).dup();
+    }
+
+    public fn verdictCount(&self, verdict: i32) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.changes.get(i as i64).verdict == verdict) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn addedCount(&self) -> i32 { return self.verdictCount(appCompatAdded()); }
+    public fn removedCount(&self) -> i32 { return self.verdictCount(appCompatRemoved()); }
+    public fn changedCount(&self) -> i32 { return self.verdictCount(appCompatChanged()); }
+
+    public fn breakingCount(&self) -> i32 {
+        var count: i32 = 0;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.changes.get(i as i64).isBreaking()) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn isBreaking(&self) -> bool { return self.breakingCount() > 0; }
+
+    public fn isNoop(&self) -> bool { return self.count() == 0; }
+
+    // The roll-up verdict. Removal outranks a signature change because a
+    // removal cannot be fixed by recompiling, and either outranks an addition
+    // because an addition never breaks a caller.
+    public fn verdict(&self) -> i32 {
+        if (self.removedCount() > 0) { return appCompatRemoved(); }
+        if (self.changedCount() > 0) { return appCompatChanged(); }
+        if (self.addedCount() > 0) { return appCompatAdded(); }
+        return appCompatUnchanged();
+    }
+
+    public fn firstBreaking(&self) -> string {
+        var i: i32 = 0;
+        while (i < self.count()) {
+            if (self.changes.get(i as i64).isBreaking()) { return self.changes.get(i as i64).symbol; }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    // A breaking change is allowed only when the major version moved. That is
+    // the mechanical half of a semver promise, and it is checked here rather
+    // than left to a reviewer's memory.
+    public fn gate(&self, baseline_version: string, current_version: string) -> Result<i32, AppError> {
+        if (!self.isBreaking()) { return Ok(self.count()); }
+        let old_version = AppVersion.parse(baseline_version);
+        let new_version = AppVersion.parse(current_version);
+        if (new_version.major == old_version.major) {
+            return Err(AppError.create(appDevKitCodeBreakingChange(),
+                "breaking api change without a major bump (" + baseline_version + " -> "
+                + current_version + "): " + self.firstBreaking()));
+        }
+        return Ok(self.count());
+    }
+
+    public fn toText(&self) -> string {
+        var out = "compat " + self.baseline_version + " -> " + self.current_version
+            + ": " + appCompatVerdictName(self.verdict())
+            + " (+" + format("%d", self.addedCount() as i64)
+            + " -" + format("%d", self.removedCount() as i64)
+            + " ~" + format("%d", self.changedCount() as i64) + ")";
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out = out + "\n  " + self.changes.get(i as i64).describe();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn serialize(&self) -> string {
+        var out = "R|" + self.baseline_version + "|" + self.current_version;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out = out + "\n" + self.changes.get(i as i64).serialize();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn dup(&self) -> AppCompatReport {
+        var out = AppCompatReport.empty();
+        out.baseline_version = self.baseline_version;
+        out.current_version = self.current_version;
+        var i: i32 = 0;
+        while (i < self.count()) {
+            out.changes.push(self.changes.get(i as i64).dup());
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn destroy(mut self) {
+        self.changes.destroy();
+    }
+}
+
+public class AppCompatChecker {
+    // Keys in both surfaces with the same detail are unchanged and are *not*
+    // recorded: a report that lists every symbol is unreadable, and a reviewer
+    // who cannot read the report will not act on it.
+    public static fn compare(baseline: AppApiSurface, current: AppApiSurface) -> AppCompatReport {
+        var out = AppCompatReport.empty();
+        out.baseline_version = baseline.version;
+        out.current_version = current.version;
+
+        var i: i32 = 0;
+        while (i < baseline.count()) {
+            let key = baseline.keyAt(i);
+            let old_detail = baseline.detailAt(i);
+            let j = current.indexOfKey(key);
+            if (j < 0) {
+                var c = AppCompatChange.create(key, appCompatRemoved());
+                c.old_detail = old_detail;
+                out.changes.push(c);
+            } else {
+                let new_detail = current.detailAt(j);
+                if (new_detail != old_detail) {
+                    var c = AppCompatChange.create(key, appCompatChanged());
+                    c.old_detail = old_detail;
+                    c.new_detail = new_detail;
+                    out.changes.push(c);
+                }
+            }
+            i = i + 1;
+        }
+
+        var k: i32 = 0;
+        while (k < current.count()) {
+            let key = current.keyAt(k);
+            if (!baseline.hasKey(key)) {
+                var c = AppCompatChange.create(key, appCompatAdded());
+                c.new_detail = current.detailAt(k);
+                out.changes.push(c);
+            }
+            k = k + 1;
+        }
+        return out;
+    }
+
+    // A one-line answer for a CI log: the version pair, the verdict and the
+    // digest of each side, so a run can be compared against a stored baseline
+    // without keeping either surface around.
+    public static fn summaryText(baseline: AppApiSurface, current: AppApiSurface) -> string {
+        return "api " + baseline.version + " (" + baseline.digest() + ")"
+            + " -> " + current.version + " (" + current.digest() + ")";
+    }
+
+    public static fn gate(baseline: AppApiSurface, current: AppApiSurface) -> Result<i32, AppError> {
+        var report = AppCompatChecker.compare(baseline, current);
+        return report.gate(baseline.version, current.version);
+    }
+}
+
+

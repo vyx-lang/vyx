@@ -1,0 +1,4566 @@
+module bootstrap.lsp_main;
+
+/// Independent Language Server Protocol binary for the Vyx bootstrap toolchain.
+/// Delivers `vyxc-lsp` over stdio with Content-Length framing.
+///
+/// Index: workspace `.vyx` source + `.vyi` text + `.dcib` interfaces.
+/// Open buffers: lexer/parser plus Sema (`analyze_unit`) so hover and
+/// `textDocument/publishDiagnostics` cover parse errors and Sema types.
+/// Methods: initialize/initialized/shutdown/exit,
+///   textDocument/didOpen|didChange|didClose,
+///   textDocument/completion (symbols + `use`/`import` package registry,
+///     prefix match, `isIncomplete` differential on `.`), hover, definition,
+///     documentSymbol, documentHighlight,
+///   textDocument/signatureHelp|semanticTokens/full,
+///   textDocument/formatting|rangeFormatting|codeAction,
+///   textDocument/references|prepareRename|rename|foldingRange,
+///   workspace/symbol,
+///   textDocument/publishDiagnostics (notification),
+///   textDocument/diagnostic (pull diagnostics for JetBrains 2025+).
+
+use std.fs;
+use std.string;
+use std.collections;
+use bootstrap.ast;
+use bootstrap.lexer;
+use bootstrap.parser;
+use bootstrap.policy;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.sema;
+
+extern "C" {
+    fn getchar() -> i32;
+    fn putchar(c: i32) -> i32;
+    fn fflush(stream: rawptr) -> i32;
+    fn malloc(size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn calloc(count: i64, size: i64) -> rawptr;
+    fn getenv(name: rawptr) -> rawptr;
+    fn cJSON_Delete(item: rawptr);
+}
+
+@[platform("windows")]
+extern "C" {
+    fn FindFirstFileA(pattern: rawptr, data: rawptr) -> rawptr;
+    fn FindNextFileA(handle: rawptr, data: rawptr) -> i32;
+    fn FindClose(handle: rawptr) -> i32;
+}
+
+@[platform("posix")]
+extern "C" {
+    fn opendir(name: rawptr) -> rawptr;
+    fn readdir(dirp: rawptr) -> rawptr;
+    fn closedir(dirp: rawptr) -> i32;
+}
+
+public fn lsp_kind_text() -> i32 { return 1; }
+public fn lsp_kind_method() -> i32 { return 2; }
+public fn lsp_kind_function() -> i32 { return 3; }
+public fn lsp_kind_field() -> i32 { return 5; }
+public fn lsp_kind_variable() -> i32 { return 6; }
+public fn lsp_kind_class() -> i32 { return 7; }
+public fn lsp_kind_interface() -> i32 { return 8; }
+public fn lsp_kind_module() -> i32 { return 9; }
+public fn lsp_kind_enum() -> i32 { return 13; }
+public fn lsp_kind_keyword() -> i32 { return 14; }
+public fn lsp_kind_enum_member() -> i32 { return 20; }
+public fn lsp_kind_struct() -> i32 { return 22; }
+
+fn lsp_symbol_limit() -> i64 { return 32768; }
+
+class LspSymbol {
+    public name: string;
+    public kind: i32;
+    public detail: string;
+    public owner: string;
+    public type_name: string;
+    public uri: string;
+    public line: i32;
+    public col: i32;
+    public end_line: i32;
+    public end_col: i32;
+    public scope_start_line: i32;
+    public scope_end_line: i32;
+    public semantic_type: i32;
+    public is_static: bool;
+}
+
+class LspScanState {
+    public in_block: bool;
+    public in_string: bool;
+    public in_char: bool;
+}
+
+class LspUsePath {
+    public active: bool;
+    public path: string;
+    public start_col: i32;
+    public colon_style: bool;
+}
+
+class LspServer {
+    public document_uris: Vec<string>;
+    public document_texts: Vec<string>;
+    public symbols: Vec<LspSymbol>;
+    public packages: Vec<string>;
+    public diag_uris: Vec<string>;
+    public diag_codes: Vec<string>;
+    public diag_msgs: Vec<string>;
+    public diag_lines: Vec<i32>;
+    public diag_cols: Vec<i32>;
+    public diag_jsons: Vec<string>;
+    public workspace_root: string;
+    public exe_dir: string;
+    public initialized: bool;
+    public shutdown_requested: bool;
+
+    public static fn create() -> LspServer {
+        return LspServer {
+            document_uris: Vec::<string>.new(),
+            document_texts: Vec::<string>.new(),
+            symbols: Vec::<LspSymbol>.new(),
+            packages: Vec::<string>.new(),
+            diag_uris: Vec::<string>.new(),
+            diag_codes: Vec::<string>.new(),
+            diag_msgs: Vec::<string>.new(),
+            diag_lines: Vec::<i32>.new(),
+            diag_cols: Vec::<i32>.new(),
+            diag_jsons: Vec::<string>.new(),
+            workspace_root: "",
+            exe_dir: "",
+            initialized: false,
+            shutdown_requested: false
+        };
+    }
+}
+
+fn lsp_write_raw(text: string) {
+    var i: i64 = 0;
+    while (i < text.len) {
+        putchar(text.charAt(i));
+        i = i + 1;
+    }
+}
+
+fn lsp_flush() {
+    fflush(null);
+}
+
+// Windows CRT stdout is in text mode, so writing an explicit CRLF through
+// putchar would become CR-CR-LF.  Emit LF there and let the CRT translate it;
+// POSIX needs the protocol's explicit CRLF bytes.
+@[platform("windows")]
+fn lsp_header_separator() -> string { return "\n\n"; }
+
+@[platform("posix")]
+fn lsp_header_separator() -> string { return "\r\n\r\n"; }
+
+fn lsp_send_message(body: string) {
+    let header = "Content-Length: " + policy_i64_to_string(body.len) + lsp_header_separator();
+    lsp_write_raw(header);
+    lsp_write_raw(body);
+    lsp_flush();
+}
+
+// LSP framing is a trust boundary: validate the declared size before allocating
+// the payload so a peer cannot force an unbounded read or allocation.
+fn lsp_max_message_bytes() -> i64 { return 16 * 1024 * 1024; }
+fn lsp_max_header_bytes() -> i64 { return 16 * 1024; }
+
+fn lsp_read_line_crlf() -> string {
+    var cap: i64 = 128;
+    var len: i64 = 0;
+    var buf = malloc(cap + 1);
+    if (buf == null) { return ""; }
+    while (true) {
+        let c = getchar();
+        if (c < 0) { break; }
+        let ch = c & 255;
+        if (ch == 10) { break; }
+        if (ch == 13) { continue; }
+        if (len >= lsp_max_header_bytes()) { free(buf); return ""; }
+        if (len + 1 >= cap) {
+            let ncap = cap * 2;
+            let nbuf = malloc(ncap + 1);
+            if (nbuf == null) { free(buf); return ""; }
+            memcpy(nbuf, buf, len);
+            free(buf);
+            buf = nbuf;
+            cap = ncap;
+        }
+        var byteVal: i32 = ch;
+        memcpy(buf + len, to_rawptr(&byteVal), 1);
+        len = len + 1;
+    }
+    var zero: i32 = 0;
+    memcpy(buf + len, to_rawptr(&zero), 1);
+    let s = from_cstr_len(buf, len);
+    free(buf);
+    return s;
+}
+
+fn lsp_read_exact(n: i64) -> string {
+    if (n <= 0 || n > lsp_max_message_bytes()) { return ""; }
+    var buf = malloc(n + 1);
+    if (buf == null) { return ""; }
+    var got: i64 = 0;
+    while (got < n) {
+        let c = getchar();
+        if (c < 0) { break; }
+        var byteVal: i32 = c & 255;
+        memcpy(buf + got, to_rawptr(&byteVal), 1);
+        got = got + 1;
+    }
+    var zero: i32 = 0;
+    memcpy(buf + got, to_rawptr(&zero), 1);
+    let s = from_cstr_len(buf, got);
+    free(buf);
+    if (got != n) { return ""; }
+    return s;
+}
+
+fn lsp_read_message() -> string {
+    var content_length: i64 = 0;
+    var saw_content_length = false;
+    while (true) {
+        let line = lsp_read_line_crlf();
+        if (line.len == 0) { break; }
+        let lower_line = line.toLower();
+        if (lower_line.startsWith("content-length:")) {
+            var i: i64 = 15;
+            while (i < line.len && (line.charAt(i) == 32 || line.charAt(i) == 9)) {
+                i = i + 1;
+            }
+            var n: i64 = 0;
+            var digits: i64 = 0;
+            while (i < line.len) {
+                let c = line.charAt(i);
+                if (c < 48 || c > 57) { break; }
+                if (n > (lsp_max_message_bytes() - (c - 48)) / 10) { return ""; }
+                n = n * 10 + (c - 48);
+                digits = digits + 1;
+                i = i + 1;
+            }
+            while (i < line.len && (line.charAt(i) == 32 || line.charAt(i) == 9)) {
+                i = i + 1;
+            }
+            if (digits == 0 || i != line.len || n <= 0 || n > lsp_max_message_bytes()) {
+                return "";
+            }
+            if (saw_content_length && content_length != n) { return ""; }
+            content_length = n;
+            saw_content_length = true;
+        }
+    }
+    if (!saw_content_length || content_length <= 0) { return ""; }
+    return lsp_read_exact(content_length);
+}
+
+fn json_escape(s: string) -> string {
+    var out = "\"";
+    var i: i64 = 0;
+    while (i < s.len) {
+        let c = s.charAt(i);
+        if (c == 34) { out = out + "\\\""; }
+        else if (c == 92) { out = out + "\\\\"; }
+        else if (c == 10) { out = out + "\\n"; }
+        else if (c == 13) { out = out + "\\r"; }
+        else if (c == 9) { out = out + "\\t"; }
+        else if (c >= 32) { out = out + s.substring(i, i + 1); }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+fn json_i32(n: i32) -> string {
+    return policy_i64_to_string(n as i64);
+}
+
+fn lsp_response_null(id_json: string) -> string {
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":null}";
+}
+
+// Lightweight JSON extractors (same approach as host LSPServer.cpp).
+// Avoid std.json Result/Json types so vyxc-lsp stays self-contained.
+fn json_find_key(json: string, key: string) -> i64 {
+    return json_find_key_from(json, key, 0, json.len);
+}
+
+fn json_find_key_from(json: string, key: string, from: i64, to: i64) -> i64 {
+    let needle = "\"" + key + "\"";
+    var i = from;
+    if (i < 0) { i = 0; }
+    var end = to;
+    if (end < 0 || end > json.len) { end = json.len; }
+    while (i + needle.len <= end) {
+        if (json.substring(i, i + needle.len) == needle) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn json_extract_string(json: string, key: string) -> string {
+    return json_extract_string_from(json, key, 0, json.len);
+}
+
+fn json_extract_string_from(json: string, key: string, from: i64, to: i64) -> string {
+    let pos = json_find_key_from(json, key, from, to);
+    if (pos < 0) { return ""; }
+    var i = pos + key.len + 2; // past "key"
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; } // :
+    if (i >= json.len) { return ""; }
+    i = i + 1;
+    while (i < json.len && (json.charAt(i) == 32 || json.charAt(i) == 9 || json.charAt(i) == 10 || json.charAt(i) == 13)) {
+        i = i + 1;
+    }
+    if (i >= json.len || json.charAt(i) != 34) { return ""; }
+    i = i + 1;
+    var out = "";
+    while (i < json.len) {
+        let c = json.charAt(i);
+        if (c == 34) { break; }
+        if (c == 92 && i + 1 < json.len) {
+            let n = json.charAt(i + 1);
+            if (n == 110) { out = out + "\n"; }
+            else if (n == 114) { out = out + "\r"; }
+            else if (n == 116) { out = out + "\t"; }
+            else if (n == 34) { out = out + "\""; }
+            else if (n == 92) { out = out + "\\"; }
+            else { out = out + json.substring(i + 1, i + 2); }
+            i = i + 2;
+        } else {
+            out = out + json.substring(i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn json_extract_int(json: string, key: string) -> i64 {
+    let pos = json_find_key(json, key);
+    if (pos < 0) { return -1; }
+    var i = pos + key.len + 2;
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+    if (i >= json.len) { return -1; }
+    i = i + 1;
+    while (i < json.len && (json.charAt(i) == 32 || json.charAt(i) == 9
+        || json.charAt(i) == 10 || json.charAt(i) == 13)) {
+        i = i + 1;
+    }
+    var neg = false;
+    if (i < json.len && json.charAt(i) == 45) { neg = true; i = i + 1; }
+    if (i >= json.len || json.charAt(i) < 48 || json.charAt(i) > 57) { return -1; }
+    var n: i64 = 0;
+    while (i < json.len) {
+        let c = json.charAt(i);
+        if (c < 48 || c > 57) { break; }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) { n = 0 - n; }
+    return n;
+}
+
+fn json_skip_ws(json: string, i: i64) -> i64 {
+    while (i < json.len) {
+        let c = json.charAt(i);
+        if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn json_skip_string(json: string, i: i64) -> i64 {
+    if (i >= json.len || json.charAt(i) != 34) { return i; }
+    i = i + 1;
+    var escaped = false;
+    while (i < json.len) {
+        let c = json.charAt(i);
+        if (escaped) { escaped = false; }
+        else if (c == 92) { escaped = true; }
+        else if (c == 34) { return i + 1; }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn json_skip_value(json: string, i: i64) -> i64 {
+    i = json_skip_ws(json, i);
+    if (i >= json.len) { return i; }
+    let c = json.charAt(i);
+    if (c == 34) { return json_skip_string(json, i); }
+    if (c == 123 || c == 91) {
+        var depth: i32 = 0;
+        while (i < json.len) {
+            let d = json.charAt(i);
+            if (d == 34) {
+                i = json_skip_string(json, i);
+                continue;
+            }
+            if (d == 123 || d == 91) { depth = depth + 1; }
+            else if (d == 125 || d == 93) {
+                depth = depth - 1;
+                i = i + 1;
+                if (depth <= 0) { return i; }
+                continue;
+            }
+            i = i + 1;
+        }
+        return i;
+    }
+    while (i < json.len) {
+        let d = json.charAt(i);
+        if (d == 44 || d == 125 || d == 93 || d == 32 || d == 9 || d == 10 || d == 13) { break; }
+        i = i + 1;
+    }
+    return i;
+}
+
+fn json_extract_int_from(json: string, key: string, from: i64, to: i64) -> i64 {
+    let pos = json_find_key_from(json, key, from, to);
+    if (pos < 0) { return -1; }
+    var i = pos + key.len + 2;
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+    if (i >= json.len) { return -1; }
+    i = i + 1;
+    while (i < json.len && (json.charAt(i) == 32 || json.charAt(i) == 9
+        || json.charAt(i) == 10 || json.charAt(i) == 13)) {
+        i = i + 1;
+    }
+    var neg = false;
+    if (i < json.len && json.charAt(i) == 45) { neg = true; i = i + 1; }
+    if (i >= json.len || json.charAt(i) < 48 || json.charAt(i) > 57) { return -1; }
+    var n: i64 = 0;
+    while (i < json.len) {
+        let c = json.charAt(i);
+        if (c < 48 || c > 57) { break; }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    if (neg) { n = 0 - n; }
+    return n;
+}
+
+fn json_extract_nested_int(json: string, outer: string, inner: string) -> i64 {
+    return json_extract_nested_int_from(json, outer, inner, 0, json.len);
+}
+
+fn json_extract_nested_int_from(json: string, outer: string, inner: string, from: i64, to: i64) -> i64 {
+    let pos = json_find_key_from(json, outer, from, to);
+    if (pos < 0) { return -1; }
+    var i = pos + outer.len + 2;
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+    if (i >= json.len) { return -1; }
+    i = json_skip_ws(json, i + 1);
+    if (i >= json.len) { return -1; }
+    let ve = json_skip_value(json, i);
+    var end = ve;
+    if (to >= 0 && to < end) { end = to; }
+    return json_extract_int_from(json, inner, i, end);
+}
+
+fn json_has_key(json: string, key: string) -> bool {
+    return json_find_key(json, key) >= 0;
+}
+
+fn json_key_value_start(json: string, key: string, from: i64, to: i64) -> i64 {
+    let pos = json_find_key_from(json, key, from, to);
+    if (pos < 0) { return -1; }
+    var i = pos + key.len + 2;
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+    if (i >= json.len) { return -1; }
+    return json_skip_ws(json, i + 1);
+}
+
+fn json_has_key_from(json: string, key: string, from: i64, to: i64) -> bool {
+    return json_find_key_from(json, key, from, to) >= 0;
+}
+
+// JSON-RPC permits both numeric and string request IDs.  LSP4J (and thus
+// CLion 2026.2) emits string IDs such as `"id":"1"`.  Keep the original JSON
+// representation so every response returns exactly the same ID type instead
+// of collapsing string IDs to -1 and making the IDE discard the response.
+fn json_extract_id_json(json: string) -> string {
+    let pos = json_find_key(json, "id");
+    if (pos < 0) { return ""; }
+    var i = pos + 4; // past "id"
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+    if (i >= json.len) { return ""; }
+    i = i + 1;
+    while (i < json.len && (json.charAt(i) == 32 || json.charAt(i) == 9
+        || json.charAt(i) == 10 || json.charAt(i) == 13)) {
+        i = i + 1;
+    }
+    if (i >= json.len) { return ""; }
+    let start = i;
+    if (json.charAt(i) == 34) {
+        i = i + 1;
+        var escaped = false;
+        while (i < json.len) {
+            let c = json.charAt(i);
+            if (escaped) { escaped = false; }
+            else if (c == 92) { escaped = true; }
+            else if (c == 34) { return json.substring(start, i + 1).clone(); }
+            i = i + 1;
+        }
+        return "";
+    }
+    if (json.charAt(i) == 45) { i = i + 1; }
+    let digits = i;
+    while (i < json.len && json.charAt(i) >= 48 && json.charAt(i) <= 57) {
+        i = i + 1;
+    }
+    if (i == digits) { return ""; }
+    return json.substring(start, i).clone();
+}
+
+fn json_position(json: string) -> i64 {
+    var line = json_extract_int(json, "line");
+    var character = json_extract_int(json, "character");
+    if (line < 0) { line = 0; }
+    if (character < 0) { character = 0; }
+    return line * 1000000 + character;
+}
+
+fn lsp_replace_all(s: string, old: string, neu: string) -> string {
+    if (old.len == 0) { return s; }
+    var out = "";
+    var i: i64 = 0;
+    while (i < s.len) {
+        if (i + old.len <= s.len && s.substring(i, i + old.len) == old) {
+            out = out + neu;
+            i = i + old.len;
+        } else {
+            out = out + s.substring(i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn lsp_hex_digit(c: i32) -> i32 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 65 + 10; }
+    if (c >= 97 && c <= 102) { return c - 97 + 10; }
+    return -1;
+}
+
+fn lsp_single_byte_text(value: i32) -> string {
+    let buffer = calloc(2, 1);
+    if (buffer == null) { return ""; }
+    var byte_value = value & 255;
+    memcpy(buffer, to_rawptr(&byte_value), 1);
+    let out = from_cstr_len(buffer, 1);
+    free(buffer);
+    return out;
+}
+
+fn lsp_uri_percent_decode(value: string) -> string {
+    var out = "";
+    var i: i64 = 0;
+    while (i < value.len) {
+        if (value.charAt(i) == 37 && i + 2 < value.len) {
+            let hi = lsp_hex_digit(value.charAt(i + 1));
+            let lo = lsp_hex_digit(value.charAt(i + 2));
+            if (hi >= 0 && lo >= 0) {
+                out = out + lsp_single_byte_text((hi << 4) | lo);
+                i = i + 3;
+                continue;
+            }
+        }
+        out = out + value.substring(i, i + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn lsp_uri_path_encode(value: string) -> string {
+    let hex = "0123456789ABCDEF";
+    var out = "";
+    var i: i64 = 0;
+    while (i < value.len) {
+        let raw = value.charAt(i) & 255;
+        let keep = (raw >= 65 && raw <= 90) || (raw >= 97 && raw <= 122)
+            || (raw >= 48 && raw <= 57) || raw == 45 || raw == 46 || raw == 95
+            || raw == 126 || raw == 47 || raw == 58;
+        if (keep) {
+            out = out + value.substring(i, i + 1);
+        } else {
+            let hi = (raw >> 4) & 15;
+            let lo = raw & 15;
+            out = out + "%" + hex.substring(hi as i64, (hi + 1) as i64)
+                + hex.substring(lo as i64, (lo + 1) as i64);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn lsp_ascii_lower_char(c: i32) -> i32 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+fn lsp_uri_key(uri: string) -> string {
+    var path = lsp_replace_all(uri_path_clean(uri), "\\", "/");
+    if (path.len >= 2 && path.charAt(1) == 58) {
+        var out = lsp_single_byte_text(lsp_ascii_lower_char(path.charAt(0))) + ":";
+        var i: i64 = 2;
+        while (i < path.len) {
+            let c = path.charAt(i);
+            if (c == 92) { out = out + "/"; }
+            else { out = out + path.substring(i, i + 1); }
+            i = i + 1;
+        }
+        return out;
+    }
+    return path;
+}
+
+fn lsp_same_uri(a: string, b: string) -> bool {
+    return lsp_uri_key(a) == lsp_uri_key(b);
+}
+
+fn uri_path_clean(uri: string) -> string {
+    var path = uri;
+    if (path.startsWith("file:///")) {
+        path = path.substring(8, path.len);
+    } else if (path.startsWith("file://")) {
+        path = path.substring(7, path.len);
+    }
+    if (path.len >= 3 && path.charAt(0) == 47
+        && ((path.charAt(1) >= 65 && path.charAt(1) <= 90)
+            || (path.charAt(1) >= 97 && path.charAt(1) <= 122))
+        && path.charAt(2) == 58) {
+        path = path.substring(1, path.len);
+    }
+    path = lsp_uri_percent_decode(path);
+    return path.clone();
+}
+
+fn lsp_path_to_uri(path: string) -> string {
+    var p = lsp_replace_all(path, "\\", "/");
+    p = lsp_uri_path_encode(p);
+    if (p.len >= 2 && p.charAt(1) == 58) {
+        return "file:///" + p;
+    }
+    if (p.startsWith("/")) {
+        return "file://" + p;
+    }
+    return "file:///" + p;
+}
+
+fn lsp_join_path(dir: string, name: string) -> string {
+    if (dir.len == 0) { return name; }
+    let last = dir.charAt(dir.len - 1);
+    if (last == 47 || last == 92) { return dir + name; }
+    return dir + "/" + name;
+}
+
+fn lsp_ends_with(name: string, ext: string) -> bool {
+    if (ext.len > name.len) { return false; }
+    return name.substring(name.len - ext.len, name.len) == ext;
+}
+
+@[platform("windows")]
+fn lsp_win_find_name(data: rawptr) -> string {
+    return str_dup(from_cstr(ptr_offset(data, 44)));
+}
+
+@[platform("windows")]
+fn lsp_win_is_dir(data: rawptr) -> bool {
+    var attrs: i32 = 0;
+    memcpy(to_rawptr(&attrs), data, 4);
+    return (attrs & 16) != 0;
+}
+
+@[platform("windows")]
+fn lsp_list_dir_files(dir: string) -> Vec<string> {
+    var out_files = Vec::<string>.new();
+    let pattern = lsp_join_path(dir, "*");
+    let cpattern = calloc(pattern.len + 1, 1);
+    if (cpattern == null) { return out_files; }
+    if (pattern.len > 0) { memcpy(cpattern, pattern.c_str(), pattern.len); }
+    let data = calloc(592, 1);
+    if (data == null) { free(cpattern); return out_files; }
+    let handle = FindFirstFileA(cpattern, data);
+    free(cpattern);
+    if (handle == null || handle as i64 == -1) { free(data); return out_files; }
+    var keep = true;
+    while (keep) {
+        let name = lsp_win_find_name(data);
+        if (name != "." && name != "..") {
+            if (!lsp_win_is_dir(data)) {
+                out_files.push(name);
+            }
+        }
+        keep = FindNextFileA(handle, data) != 0;
+    }
+    FindClose(handle);
+    free(data);
+    return out_files;
+}
+
+@[platform("windows")]
+fn lsp_list_dir_dirs(dir: string) -> Vec<string> {
+    var out_dirs = Vec::<string>.new();
+    let pattern = lsp_join_path(dir, "*");
+    let cpattern = calloc(pattern.len + 1, 1);
+    if (cpattern == null) { return out_dirs; }
+    if (pattern.len > 0) { memcpy(cpattern, pattern.c_str(), pattern.len); }
+    let data = calloc(592, 1);
+    if (data == null) { free(cpattern); return out_dirs; }
+    let handle = FindFirstFileA(cpattern, data);
+    free(cpattern);
+    if (handle == null || handle as i64 == -1) { free(data); return out_dirs; }
+    var keep = true;
+    while (keep) {
+        let name = lsp_win_find_name(data);
+        if (name != "." && name != "..") {
+            if (lsp_win_is_dir(data)) {
+                out_dirs.push(name);
+            }
+        }
+        keep = FindNextFileA(handle, data) != 0;
+    }
+    FindClose(handle);
+    free(data);
+    return out_dirs;
+}
+
+@[platform("posix")]
+fn lsp_posix_dirent_name(entry: rawptr) -> string {
+    return str_dup(from_cstr(ptr_offset(entry, 19)));
+}
+
+@[platform("posix")]
+fn lsp_list_dir_files(dir: string) -> Vec<string> {
+    var out_files = Vec::<string>.new();
+    let cdir = calloc(dir.len + 1, 1);
+    if (cdir == null) { return out_files; }
+    if (dir.len > 0) { memcpy(cdir, dir.c_str(), dir.len); }
+    let d = opendir(cdir);
+    free(cdir);
+    if (d == null) { return out_files; }
+    var entry = readdir(d);
+    while (entry != null) {
+        let name = lsp_posix_dirent_name(entry);
+        if (name != "." && name != "..") {
+            let full = lsp_join_path(dir, name);
+            if (!isDir(full)) {
+                out_files.push(name);
+            }
+        }
+        entry = readdir(d);
+    }
+    closedir(d);
+    return out_files;
+}
+
+@[platform("posix")]
+fn lsp_list_dir_dirs(dir: string) -> Vec<string> {
+    var out_dirs = Vec::<string>.new();
+    let cdir = calloc(dir.len + 1, 1);
+    if (cdir == null) { return out_dirs; }
+    if (dir.len > 0) { memcpy(cdir, dir.c_str(), dir.len); }
+    let d = opendir(cdir);
+    free(cdir);
+    if (d == null) { return out_dirs; }
+    var entry = readdir(d);
+    while (entry != null) {
+        let name = lsp_posix_dirent_name(entry);
+        if (name != "." && name != "..") {
+            let full = lsp_join_path(dir, name);
+            if (isDir(full)) {
+                out_dirs.push(name);
+            }
+        }
+        entry = readdir(d);
+    }
+    closedir(d);
+    return out_dirs;
+}
+
+fn lsp_skip_ws_idx(line: string, i: i64) -> i64 {
+    var p = i;
+    while (p < line.len) {
+        let c = line.charAt(p);
+        if (c == 32 || c == 9) { p = p + 1; }
+        else { break; }
+    }
+    return p;
+}
+
+fn lsp_read_ident(line: string, i: i64) -> string {
+    var p = i;
+    if (p >= line.len) { return ""; }
+    let c0 = line.charAt(p);
+    if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95)) {
+        return "";
+    }
+    p = p + 1;
+    while (p < line.len) {
+        let c = line.charAt(p);
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+            || (c >= 48 && c <= 57) || c == 95) {
+            p = p + 1;
+        } else { break; }
+    }
+    return line.substring(i, p).clone();
+}
+
+fn lsp_read_qualified_ident(line: string, i: i64) -> string {
+    var p = i;
+    while (p < line.len) {
+        let c = line.charAt(p);
+        if (lsp_is_ident_char(c) || c == 46) { p = p + 1; }
+        else { break; }
+    }
+    if (p <= i) { return ""; }
+    return line.substring(i, p).clone();
+}
+
+fn lsp_vyi_return_type(line: string) -> string {
+    var arrow: i64 = -1;
+    var i: i64 = 0;
+    while (i + 1 < line.len) {
+        if (line.charAt(i) == 45 && line.charAt(i + 1) == 62) { arrow = i; }
+        i = i + 1;
+    }
+    if (arrow < 0) { return "void"; }
+    var start = lsp_skip_ws_idx(line, arrow + 2);
+    var end = start;
+    while (end < line.len && line.charAt(end) != 59 && line.charAt(end) != 123) {
+        end = end + 1;
+    }
+    return lsp_trim(line.substring(start, end));
+}
+
+fn lsp_find_ident_col(line: string, name: string, fallback: i32) -> i32 {
+    if (name.len == 0 || name.len > line.len) { return fallback; }
+    var i: i64 = 0;
+    while (i + name.len <= line.len) {
+        if (line.substring(i, i + name.len) == name) {
+            let left_ok = i == 0 || !lsp_is_ident_char(line.charAt(i - 1));
+            let right = i + name.len;
+            let right_ok = right >= line.len || !lsp_is_ident_char(line.charAt(right));
+            if (left_ok && right_ok) { return i as i32; }
+        }
+        i = i + 1;
+    }
+    return fallback;
+}
+
+fn lsp_strip_line_comment(line: string) -> string {
+    var i: i64 = 0;
+    var in_str = false;
+    while (i < line.len) {
+        let c = line.charAt(i);
+        if (c == 34) { in_str = !in_str; }
+        else if (!in_str && c == 47 && i + 1 < line.len && line.charAt(i + 1) == 47) {
+            return line.substring(0, i);
+        }
+        i = i + 1;
+    }
+    return line.clone();
+}
+
+fn lsp_empty_symbol() -> LspSymbol {
+    return LspSymbol {
+        name: "", kind: 0, detail: "", owner: "", type_name: "", uri: "",
+        line: 0, col: 0, end_line: 0, end_col: 0,
+        scope_start_line: -1, scope_end_line: 2147483647,
+        semantic_type: 8, is_static: false
+    };
+}
+
+fn lsp_push_typed_symbol(server: &mut LspServer, name: string, kind: i32, detail: string,
+                         owner: string, type_name: string, uri: string,
+                         line: i32, col: i32, end_line: i32, end_col: i32,
+                         scope_start_line: i32, scope_end_line: i32,
+                         semantic_type: i32, is_static: bool) {
+    if (name.len == 0) { return; }
+    if (kind == lsp_kind_module()) { lsp_register_package(server, name); }
+    if (server.symbols.len >= lsp_symbol_limit()) { return; }
+    var actual_end_line = end_line;
+    var actual_end_col = end_col;
+    if (actual_end_line < line || (actual_end_line == line && actual_end_col <= col)) {
+        actual_end_line = line;
+        actual_end_col = col + (name.len as i32);
+    }
+    let sym = LspSymbol {
+        name: name.clone(),
+        kind: kind,
+        detail: detail.clone(),
+        owner: owner.clone(),
+        type_name: type_name.clone(),
+        uri: uri.clone(),
+        line: line,
+        col: col,
+        end_line: actual_end_line,
+        end_col: actual_end_col,
+        scope_start_line: scope_start_line,
+        scope_end_line: scope_end_line,
+        semantic_type: semantic_type,
+        is_static: is_static
+    };
+    server.symbols.push(sym);
+}
+
+fn lsp_push_symbol(server: &mut LspServer, name: string, kind: i32, detail: string,
+                   uri: string, line: i32, col: i32) {
+    lsp_push_typed_symbol(server, name, kind, detail, "", "", uri,
+                          line, col, line, col + (name.len as i32),
+                          -1, 2147483647, 8, false);
+}
+
+fn lsp_index_vyi_text(server: &mut LspServer, uri: string, text: string) {
+    var line_no: i32 = 0;
+    var i: i64 = 0;
+    var line_start: i64 = 0;
+    var current_owner = "";
+    var owner_depth: i32 = -1;
+    var brace_depth: i32 = 0;
+    while (i <= text.len) {
+        let at_end = i == text.len;
+        let is_nl = (!at_end) && text.charAt(i) == 10;
+        if (at_end || is_nl) {
+            var line = text.substring(line_start, i);
+            if (line.len > 0 && line.charAt(line.len - 1) == 13) {
+                line = line.substring(0, line.len - 1);
+            }
+            line = lsp_strip_line_comment(line);
+            let decl_start = lsp_skip_ws_idx(line, 0);
+            let decl_text = line.substring(decl_start, line.len);
+            var p = decl_start;
+            var is_public = false;
+            var is_static = false;
+            if (p + 6 <= line.len && line.substring(p, p + 6) == "public") {
+                let after = p + 6;
+                if (after >= line.len || line.charAt(after) == 32 || line.charAt(after) == 9) {
+                    is_public = true;
+                    p = lsp_skip_ws_idx(line, after);
+                }
+            }
+            if (p + 6 <= line.len && line.substring(p, p + 6) == "static") {
+                let static_after = p + 6;
+                if (static_after >= line.len || line.charAt(static_after) == 32
+                    || line.charAt(static_after) == 9) {
+                    is_static = true;
+                    p = lsp_skip_ws_idx(line, static_after);
+                }
+            }
+            while (p < line.len && line.charAt(p) == 64) {
+                while (p < line.len && line.charAt(p) != 32 && line.charAt(p) != 9) {
+                    p = p + 1;
+                }
+                p = lsp_skip_ws_idx(line, p);
+            }
+            if (p + 2 <= line.len && line.substring(p, p + 2) == "fn") {
+                let after = p + 2;
+                if (after >= line.len || line.charAt(after) == 32 || line.charAt(after) == 9) {
+                    p = lsp_skip_ws_idx(line, after);
+                    let name = lsp_read_ident(line, p);
+                    var detail = decl_text;
+                    if (detail.len == 0) { detail = "fn " + name + "()"; }
+                    let return_type = lsp_vyi_return_type(line);
+                    var completion_kind = lsp_kind_function();
+                    var semantic_type: i32 = 11;
+                    if (current_owner.len > 0) {
+                        completion_kind = lsp_kind_method();
+                        semantic_type = 12;
+                    }
+                    lsp_push_typed_symbol(server, name, completion_kind, detail,
+                                          current_owner, return_type, uri,
+                                          line_no, p as i32, line_no,
+                                          (p + name.len) as i32, -1, 2147483647,
+                                          semantic_type, is_static);
+                }
+            } else if (p + 5 <= line.len && line.substring(p, p + 5) == "class") {
+                let after = p + 5;
+                if (after >= line.len || line.charAt(after) == 32 || line.charAt(after) == 9) {
+                    p = lsp_skip_ws_idx(line, after);
+                    let name = lsp_read_qualified_ident(line, p);
+                    lsp_push_typed_symbol(server, name, lsp_kind_class(), "class " + name,
+                                          "", name, uri, line_no, p as i32,
+                                          line_no, (p + name.len) as i32,
+                                          -1, 2147483647, 2, false);
+                    current_owner = name.clone();
+                    owner_depth = brace_depth + 1;
+                }
+            } else if (p + 6 <= line.len && line.substring(p, p + 6) == "struct") {
+                let after = p + 6;
+                if (after >= line.len || line.charAt(after) == 32 || line.charAt(after) == 9) {
+                    p = lsp_skip_ws_idx(line, after);
+                    let name = lsp_read_qualified_ident(line, p);
+                    lsp_push_typed_symbol(server, name, lsp_kind_struct(), "struct " + name,
+                                          "", name, uri, line_no, p as i32,
+                                          line_no, (p + name.len) as i32,
+                                          -1, 2147483647, 5, false);
+                    current_owner = name.clone();
+                    owner_depth = brace_depth + 1;
+                }
+            } else if (p + 4 <= line.len && line.substring(p, p + 4) == "enum") {
+                let after = p + 4;
+                if (after >= line.len || line.charAt(after) == 32 || line.charAt(after) == 9) {
+                    p = lsp_skip_ws_idx(line, after);
+                    let name = lsp_read_qualified_ident(line, p);
+                    lsp_push_typed_symbol(server, name, lsp_kind_enum(), "enum " + name,
+                                          "", name, uri, line_no, p as i32,
+                                          line_no, (p + name.len) as i32,
+                                          -1, 2147483647, 3, false);
+                    current_owner = name.clone();
+                    owner_depth = brace_depth + 1;
+                }
+            } else if (p + 6 <= line.len && line.substring(p, p + 6) == "module") {
+                let after = p + 6;
+                if (after >= line.len || line.charAt(after) == 32 || line.charAt(after) == 9) {
+                    p = lsp_skip_ws_idx(line, after);
+                    var end = p;
+                    while (end < line.len) {
+                        let c = line.charAt(end);
+                        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                            || (c >= 48 && c <= 57) || c == 95 || c == 46) {
+                            end = end + 1;
+                        } else { break; }
+                    }
+                    if (end > p) {
+                        let name = line.substring(p, end);
+                        lsp_push_symbol(server, name, lsp_kind_module(), "module (vyi)", uri, line_no, p as i32);
+                    }
+                }
+            } else if (current_owner.len > 0) {
+                var field_start = p;
+                if (p + 3 <= line.len && line.substring(p, p + 3) == "var") {
+                    field_start = lsp_skip_ws_idx(line, p + 3);
+                } else if (p + 3 <= line.len && line.substring(p, p + 3) == "let") {
+                    field_start = lsp_skip_ws_idx(line, p + 3);
+                } else if (p + 5 <= line.len && line.substring(p, p + 5) == "const") {
+                    field_start = lsp_skip_ws_idx(line, p + 5);
+                }
+                let field_name = lsp_read_ident(line, field_start);
+                var colon = field_start + field_name.len;
+                colon = lsp_skip_ws_idx(line, colon);
+                if (field_name.len > 0 && colon < line.len && line.charAt(colon) == 58) {
+                    let type_start = lsp_skip_ws_idx(line, colon + 1);
+                    var type_end = type_start;
+                    while (type_end < line.len && line.charAt(type_end) != 59) { type_end = type_end + 1; }
+                    let field_type = lsp_trim(line.substring(type_start, type_end));
+                    lsp_push_typed_symbol(server, field_name, lsp_kind_field(),
+                                          "field " + field_name + ": " + field_type,
+                                          current_owner, field_type, uri,
+                                          line_no, field_start as i32, line_no,
+                                          (field_start + field_name.len) as i32,
+                                          -1, 2147483647, 9, is_static);
+                }
+            } else if (p + 5 <= line.len && line.substring(p, p + 5) == "const") {
+                let after = p + 5;
+                if (after >= line.len || line.charAt(after) == 32 || line.charAt(after) == 9) {
+                    p = lsp_skip_ws_idx(line, after);
+                    let name = lsp_read_ident(line, p);
+                    lsp_push_symbol(server, name, lsp_kind_variable(), "const (vyi)", uri, line_no, p as i32);
+                }
+            }
+            var bi: i64 = 0;
+            while (bi < line.len) {
+                if (line.charAt(bi) == 123) { brace_depth = brace_depth + 1; }
+                else if (line.charAt(bi) == 125) { brace_depth = brace_depth - 1; }
+                bi = bi + 1;
+            }
+            if (owner_depth >= 0 && brace_depth < owner_depth) {
+                current_owner = "";
+                owner_depth = -1;
+            }
+            line_no = line_no + 1;
+            i = i + 1;
+            line_start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+fn lsp_index_vyi_file(server: &mut LspServer, path: string) {
+    lsp_trace("index-vyi " + path);
+    if (!fileExists(path)) { return; }
+    let text = readFile(path);
+    if (text.len == 0) { return; }
+    let uri = lsp_path_to_uri(path);
+    lsp_index_vyi_text(server, uri, text);
+}
+
+fn lsp_index_dcib_file(server: &mut LspServer, path: string) {
+    let parsed = dci_dcib_parse_file(path);
+    if (parsed.root == null) { return; }
+    cJSON_Delete(parsed.root);
+    let uri = lsp_path_to_uri(path);
+    var base = path;
+    var slash: i64 = -1;
+    var i: i64 = 0;
+    while (i < path.len) {
+        let c = path.charAt(i);
+        if (c == 47 || c == 92) { slash = i; }
+        i = i + 1;
+    }
+    if (slash >= 0) { base = path.substring(slash + 1, path.len); }
+    var name = base;
+    if (lsp_ends_with(base, ".dcib")) {
+        name = base.substring(0, base.len - 5);
+    }
+    lsp_push_symbol(server, name, lsp_kind_module(), "dcib interface", uri, 0, 0);
+}
+
+fn lsp_index_vyx_file(server: &mut LspServer, path: string) {
+    if (!fileExists(path)) { return; }
+    let text = readFile(path);
+    if (text.len == 0) { return; }
+    lsp_analyze_buffer(server, lsp_path_to_uri(path), text);
+}
+
+fn lsp_should_skip_dirname(name: string) -> bool {
+    if (name == ".git") { return true; }
+    if (name == ".cache") { return true; }
+    if (name == "node_modules") { return true; }
+    if (name == "cmake-build-debug") { return true; }
+    if (name == "cmake-build-release") { return true; }
+    if (name == "target") { return true; }
+    if (name == ".idea") { return true; }
+    if (name == ".vs") { return true; }
+    if (name == "probes") { return true; }
+    if (name == "out") { return true; }
+    return false;
+}
+
+fn lsp_should_skip_package_dirname(name: string) -> bool {
+    if (lsp_should_skip_dirname(name)) { return true; }
+    if (name == "vendor") { return true; }
+    if (name == "out") { return true; }
+    return false;
+}
+
+fn lsp_dirname(path: string) -> string {
+    var last: i64 = -1;
+    var i: i64 = 0;
+    while (i < path.len) {
+        let c = path.charAt(i);
+        if (c == 47 || c == 92) { last = i; }
+        i = i + 1;
+    }
+    if (last < 0) { return "."; }
+    if (last == 0) { return path.substring(0, 1); }
+    return path.substring(0, last);
+}
+
+fn lsp_env_value(name: string) -> string {
+    let p = getenv(name.c_str());
+    if (p == null) { return ""; }
+    return from_cstr(p);
+}
+
+fn lsp_register_package(server: &mut LspServer, name: string) {
+    if (name.len == 0) { return; }
+    if (name.startsWith("__")) { return; }
+    var at: i64 = -1;
+    var i: i64 = 0;
+    while (i < name.len) {
+        if (name.charAt(i) == 64) { at = i; break; }
+        i = i + 1;
+    }
+    var pkg = name;
+    if (at >= 0) { pkg = name.substring(0, at); }
+    if (pkg.len == 0) { return; }
+    var j: i64 = 0;
+    while (j < server.packages.len) {
+        if (server.packages.get(j) == pkg) { return; }
+        j = j + 1;
+    }
+    server.packages.push(pkg.clone());
+}
+
+fn lsp_module_name_from_text(content: string) -> string {
+    if (content.len == 0) { return ""; }
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while (i <= content.len) {
+        if (i == content.len || content.charAt(i) == 10) {
+            var line_end = i;
+            if (line_end > start && content.charAt(line_end - 1) == 13) {
+                line_end = line_end - 1;
+            }
+            var p = start;
+            while (p < line_end) {
+                let c = content.charAt(p);
+                if (c != 32 && c != 9) { break; }
+                p = p + 1;
+            }
+            if (p < line_end) {
+                if (p + 1 < line_end && content.charAt(p) == 47 && content.charAt(p + 1) == 47) {
+                    start = i + 1;
+                    i = i + 1;
+                    continue;
+                }
+                if (content.charAt(p) == 64) {
+                    start = i + 1;
+                    i = i + 1;
+                    continue;
+                }
+                if (p + 7 <= line_end && content.substring(p, p + 6) == "module"
+                    && (content.charAt(p + 6) == 32 || content.charAt(p + 6) == 9)) {
+                    var name_start = p + 6;
+                    while (name_start < line_end) {
+                        let nc = content.charAt(name_start);
+                        if (nc != 32 && nc != 9) { break; }
+                        name_start = name_start + 1;
+                    }
+                    var name_end = name_start;
+                    while (name_end < line_end) {
+                        let mc = content.charAt(name_end);
+                        if (mc == 59 || mc == 123 || mc == 32 || mc == 9 || mc == 64) { break; }
+                        if (!((mc >= 65 && mc <= 90) || (mc >= 97 && mc <= 122)
+                            || (mc >= 48 && mc <= 57) || mc == 95 || mc == 46)) {
+                            break;
+                        }
+                        name_end = name_end + 1;
+                    }
+                    if (name_end > name_start) {
+                        return content.substring(name_start, name_end).clone();
+                    }
+                    return "";
+                }
+                return "";
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn lsp_index_package_file(server: &mut LspServer, path: string) {
+    if (!fileExists(path)) { return; }
+    let name = lsp_module_name_from_text(readFile(path));
+    lsp_register_package(server, name);
+}
+
+fn lsp_scan_package_tree(server: &mut LspServer, root: string) {
+    if (root.len == 0) { return; }
+    if (!isDir(root) && !fileExists(root)) { return; }
+    var dirs = Vec::<string>.new();
+    var depths = Vec::<i32>.new();
+    dirs.push(root.clone());
+    depths.push(0);
+    var cursor: i64 = 0;
+    while (cursor < dirs.len) {
+        let dir = dirs.get(cursor);
+        let depth = depths.get(cursor);
+        cursor = cursor + 1;
+        if (depth > 10) { continue; }
+        var files = lsp_list_dir_files(dir);
+        var subdirs = lsp_list_dir_dirs(dir);
+        var fi: i64 = 0;
+        while (fi < files.len) {
+            let name = files.get(fi);
+            if (lsp_ends_with(name, ".vyx") || lsp_ends_with(name, ".vyi")) {
+                lsp_index_package_file(server, lsp_join_path(dir, name));
+            }
+            fi = fi + 1;
+        }
+        var di: i64 = 0;
+        while (di < subdirs.len) {
+            let name = subdirs.get(di);
+            if (!lsp_should_skip_package_dirname(name)) {
+                dirs.push(lsp_join_path(dir, name));
+                depths.push(depth + 1);
+            }
+            di = di + 1;
+        }
+        files.destroy();
+        subdirs.destroy();
+    }
+    dirs.destroy();
+    depths.destroy();
+}
+
+fn lsp_try_scan_package_root(server: &mut LspServer, root: string) {
+    if (root.len == 0) { return; }
+    if (isDir(root)) {
+        lsp_scan_package_tree(server, root);
+    }
+}
+
+fn lsp_scan_registered_packages(server: &mut LspServer) {
+    lsp_try_scan_package_root(server, lsp_env_value("VYX_STD_PACKAGES"));
+    if (server.exe_dir.len > 0 && server.exe_dir != ".") {
+        lsp_try_scan_package_root(server, lsp_join_path(server.exe_dir, "std_packages"));
+        let parent = lsp_dirname(server.exe_dir);
+        lsp_try_scan_package_root(server, lsp_join_path(parent, "std_packages"));
+        lsp_try_scan_package_root(server, lsp_join_path(parent, "std"));
+    }
+    if (server.workspace_root.len > 0) {
+        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "std_packages"));
+        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "std"));
+        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "bootstrap_compiler/std_packages"));
+        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "bootstrap_compiler/std"));
+    }
+    lsp_try_scan_package_root(server, "std_packages");
+    lsp_try_scan_package_root(server, "bootstrap_compiler/std_packages");
+    var si: i64 = 0;
+    while (si < server.symbols.len) {
+        let s = server.symbols.get(si);
+        if (s.kind == lsp_kind_module()) {
+            lsp_register_package(server, s.name);
+        }
+        si = si + 1;
+    }
+}
+
+fn lsp_scan_workspace(server: &mut LspServer, root: string) {
+    if (root.len == 0) { return; }
+    lsp_trace("scan-root " + root);
+    if (!isDir(root) && !fileExists(root)) {
+        lsp_trace("scan-root-missing " + root);
+        return;
+    }
+    var dirs = Vec::<string>.new();
+    var depths = Vec::<i32>.new();
+    var vyx_paths = Vec::<string>.new();
+    dirs.push(root);
+    depths.push(0);
+    var cursor: i64 = 0;
+    while (cursor < dirs.len) {
+        let dir = dirs.get(cursor);
+        let depth = depths.get(cursor);
+        cursor = cursor + 1;
+        if (depth > 12) { continue; }
+        var files = lsp_list_dir_files(dir);
+        var subdirs = lsp_list_dir_dirs(dir);
+        var fi: i64 = 0;
+        while (fi < files.len) {
+            let name = files.get(fi);
+            lsp_trace("scan-file " + lsp_join_path(dir, name));
+            let full = lsp_join_path(dir, name);
+            if (lsp_ends_with(name, ".vyx")) {
+                vyx_paths.push(full.clone());
+                lsp_index_vyx_file(server, full);
+            } else if (lsp_ends_with(name, ".vyi")) {
+                lsp_index_vyi_file(server, full);
+            } else if (lsp_ends_with(name, ".dcib")) {
+                lsp_index_dcib_file(server, full);
+            }
+            fi = fi + 1;
+        }
+        var di: i64 = 0;
+        while (di < subdirs.len) {
+            let name = subdirs.get(di);
+            if (!lsp_should_skip_dirname(name)) {
+                dirs.push(lsp_join_path(dir, name));
+                depths.push(depth + 1);
+            }
+            di = di + 1;
+        }
+        files.destroy();
+        subdirs.destroy();
+    }
+    // A second source pass resolves locals whose initializer refers to a type
+    // or method declared in a file encountered later during directory walk.
+    var vi: i64 = 0;
+    while (vi < vyx_paths.len) {
+        lsp_index_vyx_file(server, vyx_paths.get(vi));
+        vi = vi + 1;
+    }
+    vyx_paths.destroy();
+    dirs.destroy();
+    depths.destroy();
+}
+
+fn lsp_ast_kind_to_completion(kind: i32) -> i32 {
+    if (kind == de_FN() || kind == de_EXTERN_FN()) { return lsp_kind_function(); }
+    if (kind == de_METHOD()) { return lsp_kind_method(); }
+    if (kind == de_CLASS()) { return lsp_kind_class(); }
+    if (kind == de_FIELD()) { return lsp_kind_field(); }
+    if (kind == de_ENUM()) { return lsp_kind_enum(); }
+    if (kind == de_VARIANT()) { return lsp_kind_enum_member(); }
+    if (kind == de_CONST() || kind == de_GLOBAL_VAR()) { return lsp_kind_variable(); }
+    if (kind == de_MODULE()) { return lsp_kind_module(); }
+    if (kind == de_TYPE_ALIAS()) { return lsp_kind_interface(); }
+    return lsp_kind_text();
+}
+
+fn lsp_ast_kind_detail(kind: i32) -> string {
+    if (kind == de_FN()) { return "fn"; }
+    if (kind == de_EXTERN_FN()) { return "extern fn"; }
+    if (kind == de_METHOD()) { return "method"; }
+    if (kind == de_CLASS()) { return "class"; }
+    if (kind == de_FIELD()) { return "field"; }
+    if (kind == de_ENUM()) { return "enum"; }
+    if (kind == de_VARIANT()) { return "variant"; }
+    if (kind == de_CONST()) { return "const"; }
+    if (kind == de_GLOBAL_VAR()) { return "var"; }
+    if (kind == de_MODULE()) { return "module"; }
+    if (kind == de_TYPE_ALIAS()) { return "type"; }
+    if (kind == de_USE()) { return "use"; }
+    return "decl";
+}
+
+fn lsp_to_zero_based(v: i32) -> i32 {
+    if (v > 0) { return v - 1; }
+    return v;
+}
+
+fn lsp_type_ref_text(ty: rawptr) -> string {
+    if (ty == null) { return ""; }
+    let kind = tref_get_kind(ty);
+    if (kind == ty_I8()) { return "i8"; }
+    if (kind == ty_I16()) { return "i16"; }
+    if (kind == ty_I32()) { return "i32"; }
+    if (kind == ty_I64()) { return "i64"; }
+    if (kind == ty_U8()) { return "u8"; }
+    if (kind == ty_U16()) { return "u16"; }
+    if (kind == ty_U32()) { return "u32"; }
+    if (kind == ty_U64()) { return "u64"; }
+    if (kind == ty_ISIZE()) { return "isize"; }
+    if (kind == ty_USIZE()) { return "usize"; }
+    if (kind == ty_F32()) { return "f32"; }
+    if (kind == ty_F64()) { return "f64"; }
+    if (kind == ty_BOOL()) { return "bool"; }
+    if (kind == ty_CHAR()) { return "char"; }
+    if (kind == ty_STRING()) { return "string"; }
+    if (kind == ty_RAWPTR()) { return "rawptr"; }
+    if (kind == ty_VOID()) { return "void"; }
+    if (kind == ty_RANGE()) { return "Range"; }
+    if (kind == ty_PTR()) { return "*" + lsp_type_ref_text(tref_pointee(ty)); }
+    if (kind == ty_REF()) { return "&" + lsp_type_ref_text(tref_pointee(ty)); }
+    if (kind == ty_MUTREF()) { return "&mut " + lsp_type_ref_text(tref_pointee(ty)); }
+    if (kind == ty_ARRAY()) {
+        return "[" + lsp_type_ref_text(tref_array_elem(ty)) + ";"
+            + policy_i64_to_string(tref_array_size(ty)) + "]";
+    }
+    if (kind == ty_TUPLE()) {
+        var out = "(";
+        var i: i64 = 0;
+        let count = tref_tuple_count(ty);
+        while (i < count) {
+            if (i > 0) { out = out + ", "; }
+            out = out + lsp_type_ref_text(tref_tuple_elem_at(ty, i));
+            i = i + 1;
+        }
+        return out + ")";
+    }
+    if (kind == ty_FN() || kind == ty_CFN()) {
+        var out2 = "fn(";
+        if (kind == ty_CFN()) { out2 = "unsafe fn("; }
+        var j: i64 = 0;
+        let count2 = tref_fn_param_count(ty);
+        while (j < count2) {
+            if (j > 0) { out2 = out2 + ", "; }
+            out2 = out2 + lsp_type_ref_text(tref_fn_param_at(ty, j));
+            j = j + 1;
+        }
+        return out2 + ") -> " + lsp_type_ref_text(tref_fn_ret(ty));
+    }
+    let name = tref_get_name(ty);
+    if (name.len > 0) { return name; }
+    return "type";
+}
+
+fn lsp_decl_detail(decl: rawptr, kind: i32) -> string {
+    if (kind != de_FN() && kind != de_EXTERN_FN() && kind != de_METHOD()) {
+        return lsp_ast_kind_detail(kind);
+    }
+    var out = "fn " + decl_get_name(decl) + "(";
+    if (kind == de_EXTERN_FN()) { out = "extern fn " + decl_get_name(decl) + "("; }
+    var param = decl_get_params(decl);
+    var count: i32 = 0;
+    while (param != null) {
+        if (count > 0) { out = out + ", "; }
+        let param_name = decl_get_name(param);
+        let param_type = lsp_type_ref_text(decl_get_ty(param));
+        if (param_name.len > 0) {
+            out = out + param_name;
+            if (param_type.len > 0 && param_type != "void") {
+                out = out + ": " + param_type;
+            }
+        } else {
+            out = out + param_type;
+        }
+        param = decl_get_next(param);
+        count = count + 1;
+    }
+    out = out + ")";
+    let ret = lsp_type_ref_text(decl_get_ty(decl));
+    if (ret.len > 0 && ret != "void") { out = out + " -> " + ret; }
+    return out;
+}
+
+fn lsp_trace(text: string) {
+    let configured = getenv("VYX_LSP_TRACE".c_str());
+    if (configured == null) { return; }
+    let path = from_cstr(configured);
+    if (path.len == 0) { return; }
+    appendFile(path, text + "\n");
+}
+
+fn lsp_semantic_type_for_decl(kind: i32) -> i32 {
+    if (kind == de_MODULE()) { return 0; }
+    if (kind == de_CLASS()) { return 2; }
+    if (kind == de_ENUM()) { return 3; }
+    if (kind == de_TYPE_ALIAS()) { return 1; }
+    if (kind == de_VARIANT()) { return 10; }
+    if (kind == de_FIELD()) { return 9; }
+    if (kind == de_METHOD()) { return 12; }
+    if (kind == de_FN() || kind == de_EXTERN_FN()) { return 11; }
+    return 8;
+}
+
+fn lsp_type_base_name(text: string) -> string {
+    var out = lsp_trim(text);
+    while (out.startsWith("&mut ")) { out = lsp_trim(out.substring(5, out.len)); }
+    while (out.startsWith("&") || out.startsWith("*")) {
+        out = lsp_trim(out.substring(1, out.len));
+    }
+    let generic = out.indexOf("::<");
+    if (generic >= 0) { out = out.substring(0, generic); }
+    else {
+        let angle = out.indexOf("<");
+        if (angle >= 0) { out = out.substring(0, angle); }
+    }
+    var dot: i64 = -1;
+    var i: i64 = 0;
+    while (i < out.len) {
+        if (out.charAt(i) == 46) { dot = i; }
+        i = i + 1;
+    }
+    if (dot >= 0 && dot + 1 < out.len) { out = out.substring(dot + 1, out.len); }
+    return out;
+}
+
+fn lsp_owner_matches(owner: string, type_name: string) -> bool {
+    if (owner.len == 0 || type_name.len == 0) { return false; }
+    return lsp_type_base_name(owner) == lsp_type_base_name(type_name);
+}
+
+fn lsp_callable_base_name(name: string) -> string {
+    var out = name.clone();
+    let generic = out.indexOf("::<");
+    if (generic >= 0) { out = out.substring(0, generic); }
+    let version = out.indexOf("@");
+    if (version >= 0) { out = out.substring(0, version); }
+    return out;
+}
+
+fn lsp_find_visible_symbol(server: &mut LspServer, name: string, uri: string, line: i32) -> LspSymbol {
+    let empty = lsp_empty_symbol();
+    if (name.len == 0) { return empty; }
+    var found = empty;
+    var best_line: i32 = -1;
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let s = server.symbols.get(i);
+        if (s.name == name && lsp_same_uri(s.uri, uri)
+            && s.scope_start_line >= 0
+            && line >= s.scope_start_line && line <= s.scope_end_line
+            && s.line <= line && s.line >= best_line) {
+            found = s;
+            best_line = s.line;
+        }
+        i = i + 1;
+    }
+    if (found.name.len > 0) { return found; }
+    i = 0;
+    while (i < server.symbols.len) {
+        let s2 = server.symbols.get(i);
+        if (s2.name == name && lsp_same_uri(s2.uri, uri) && s2.owner.len == 0
+            && s2.scope_start_line < 0) { return s2; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < server.symbols.len) {
+        let s_method = server.symbols.get(i);
+        if (s_method.name == name && lsp_same_uri(s_method.uri, uri)
+            && s_method.scope_start_line < 0) { return s_method; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < server.symbols.len) {
+        let s3 = server.symbols.get(i);
+        if (s3.name == name && s3.owner.len == 0 && s3.scope_start_line < 0) { return s3; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < server.symbols.len) {
+        let s4 = server.symbols.get(i);
+        if (s4.name == name && s4.scope_start_line < 0) { return s4; }
+        i = i + 1;
+    }
+    return empty;
+}
+
+fn lsp_find_member_symbol(server: &mut LspServer, owner_type: string, name: string) -> LspSymbol {
+    let empty = lsp_empty_symbol();
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let s = server.symbols.get(i);
+        if (s.name == name && lsp_owner_matches(s.owner, owner_type)
+            && (s.kind == lsp_kind_method() || s.kind == lsp_kind_field())) {
+            return s;
+        }
+        i = i + 1;
+    }
+    return empty;
+}
+
+fn lsp_decl_param_type(decl: rawptr, name: string) -> string {
+    var param = decl_get_params(decl);
+    while (param != null) {
+        if (decl_get_name(param) == name) { return lsp_type_ref_text(decl_get_ty(param)); }
+        param = decl_get_next(param);
+    }
+    return "";
+}
+
+fn lsp_type_element(type_name: string) -> string {
+    let text = lsp_trim(type_name);
+    if (text.startsWith("*")) { return lsp_trim(text.substring(1, text.len)); }
+    if (text.startsWith("&mut ")) { return lsp_trim(text.substring(5, text.len)); }
+    if (text.startsWith("&")) { return lsp_trim(text.substring(1, text.len)); }
+    if (text.startsWith("[")) {
+        let semicolon = text.indexOf(";");
+        let close = text.indexOf("]");
+        var end = semicolon;
+        if (end < 0) { end = close; }
+        if (end > 1) { return lsp_trim(text.substring(1, end)); }
+    }
+    return "";
+}
+
+fn lsp_infer_expr_type(server: &mut LspServer, expr: rawptr, decl: rawptr,
+                       uri: string, line: i32) -> string {
+    if (expr == null) { return ""; }
+    let kind = expr_get_kind(expr);
+    if (kind == ex_INT_LIT()) {
+        let literal = expr_get_str_val(expr);
+        if (literal.contains(".")) { return "f64"; }
+        if (lsp_ends_with(literal, "i8")) { return "i8"; }
+        if (lsp_ends_with(literal, "i16")) { return "i16"; }
+        if (lsp_ends_with(literal, "i32")) { return "i32"; }
+        if (lsp_ends_with(literal, "i64")) { return "i64"; }
+        if (lsp_ends_with(literal, "u8")) { return "u8"; }
+        if (lsp_ends_with(literal, "u16")) { return "u16"; }
+        if (lsp_ends_with(literal, "u32")) { return "u32"; }
+        if (lsp_ends_with(literal, "u64")) { return "u64"; }
+        return "i64";
+    }
+    if (kind == ex_STR_LIT() || kind == ex_FSTRING()) { return "string"; }
+    if (kind == ex_CHAR_LIT()) { return "char"; }
+    if (kind == ex_BOOL_LIT()) { return "bool"; }
+    if (kind == ex_NULL_LIT()) { return "rawptr"; }
+    if (kind == ex_IDENT()) {
+        let name = lsp_callable_base_name(expr_get_name(expr));
+        let param_type = lsp_decl_param_type(decl, name);
+        if (param_type.len > 0) { return param_type; }
+        let sym = lsp_find_visible_symbol(server, name, uri, line);
+        return sym.type_name;
+    }
+    if (kind == ex_CAST()) { return lsp_type_ref_text(expr_get_ty(expr)); }
+    if (kind == ex_NEW()) { return "*" + lsp_type_ref_text(expr_get_captures(expr)); }
+    if (kind == ex_UNARY() || kind == ex_AWAIT() || kind == ex_COMPTIME()) {
+        return lsp_infer_expr_type(server, expr_get_lhs(expr), decl, uri, line);
+    }
+    if (kind == ex_ADDR_OF()) {
+        return "&" + lsp_infer_expr_type(server, expr_get_lhs(expr), decl, uri, line);
+    }
+    if (kind == ex_DEREF()) {
+        return lsp_type_element(lsp_infer_expr_type(server, expr_get_lhs(expr), decl, uri, line));
+    }
+    if (kind == ex_BIN() || kind == ex_ASSIGN()) {
+        let left = lsp_infer_expr_type(server, expr_get_lhs(expr), decl, uri, line);
+        let right = lsp_infer_expr_type(server, expr_get_rhs(expr), decl, uri, line);
+        if (left.len > 0 && left == right) { return left; }
+        if (left.len > 0 && left != "rawptr") { return left; }
+        return right;
+    }
+    if (kind == ex_INDEX()) {
+        return lsp_type_element(lsp_infer_expr_type(server, expr_get_lhs(expr), decl, uri, line));
+    }
+    if (kind == ex_MEMBER()) {
+        let receiver_type = lsp_infer_expr_type(server, expr_get_lhs(expr), decl, uri, line);
+        let member = lsp_find_member_symbol(server, receiver_type,
+                                             lsp_callable_base_name(expr_get_name(expr)));
+        return member.type_name;
+    }
+    if (kind == ex_CALL()) {
+        let callee = expr_get_lhs(expr);
+        if (callee == null) { return ""; }
+        if (expr_get_kind(callee) == ex_IDENT()) {
+            let target = lsp_find_visible_symbol(server,
+                lsp_callable_base_name(expr_get_name(callee)), uri, line);
+            return target.type_name;
+        }
+        if (expr_get_kind(callee) == ex_MEMBER()) {
+            let receiver_type = lsp_infer_expr_type(server, expr_get_lhs(callee), decl, uri, line);
+            let target2 = lsp_find_member_symbol(server, receiver_type,
+                lsp_callable_base_name(expr_get_name(callee)));
+            return target2.type_name;
+        }
+    }
+    return "";
+}
+
+fn lsp_infer_return_type_from_stmt(server: &mut LspServer, stmt: rawptr, decl: rawptr,
+                                   uri: string) -> string {
+    var cur = stmt;
+    while (cur != null) {
+        let kind = stmt_get_kind(cur);
+        if (kind == st_RETURN() && stmt_get_init(cur) != null) {
+            let line = lsp_to_zero_based(stmt_loc_line(cur));
+            let ty = lsp_infer_expr_type(server, stmt_get_init(cur), decl, uri, line);
+            if (ty.len > 0) { return ty; }
+        }
+        var nested = lsp_infer_return_type_from_stmt(server, stmt_get_then_blk(cur), decl, uri);
+        if (nested.len == 0) {
+            nested = lsp_infer_return_type_from_stmt(server, stmt_get_else_blk(cur), decl, uri);
+        }
+        if (nested.len == 0) {
+            nested = lsp_infer_return_type_from_stmt(server, stmt_get_body(cur), decl, uri);
+        }
+        if (nested.len > 0) { return nested; }
+        cur = stmt_get_next(cur);
+    }
+    return "";
+}
+
+fn lsp_decl_value_type(server: &mut LspServer, decl: rawptr, uri: string) -> string {
+    let explicit = lsp_type_ref_text(decl_get_ty(decl));
+    if (explicit.len > 0) { return explicit; }
+    let kind = decl_get_kind(decl);
+    if (kind == de_CLASS() || kind == de_ENUM() || kind == de_TYPE_ALIAS()) {
+        return decl_get_name(decl);
+    }
+    if ((kind == de_FN() || kind == de_METHOD()) && decl_get_body(decl) != null) {
+        let inferred = lsp_infer_return_type_from_stmt(server, decl_get_body(decl), decl, uri);
+        if (inferred.len > 0) { return inferred; }
+        return "void";
+    }
+    return "";
+}
+
+fn lsp_symbol_is_interface(sym: LspSymbol) -> bool {
+    return lsp_ends_with(sym.uri, ".vyi") || lsp_ends_with(sym.uri, ".dcib");
+}
+
+fn lsp_text_delimiters_balanced(text: string) -> bool {
+    var parens: i32 = 0;
+    var brackets: i32 = 0;
+    var braces: i32 = 0;
+    var in_string = false;
+    var in_char = false;
+    var escaped = false;
+    var line_comment = false;
+    var i: i64 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (line_comment) {
+            if (c == 10) { line_comment = false; }
+        } else if (in_string) {
+            if (escaped) { escaped = false; }
+            else if (c == 92) { escaped = true; }
+            else if (c == 34) { in_string = false; }
+        } else if (in_char) {
+            if (escaped) { escaped = false; }
+            else if (c == 92) { escaped = true; }
+            else if (c == 39) { in_char = false; }
+        } else if (c == 47 && i + 1 < text.len && text.charAt(i + 1) == 47) {
+            line_comment = true;
+            i = i + 1;
+        } else if (c == 34) {
+            in_string = true;
+        } else if (c == 39) {
+            in_char = true;
+        } else if (c == 40) { parens = parens + 1; }
+        else if (c == 41) { parens = parens - 1; }
+        else if (c == 91) { brackets = brackets + 1; }
+        else if (c == 93) { brackets = brackets - 1; }
+        else if (c == 123) { braces = braces + 1; }
+        else if (c == 125) { braces = braces - 1; }
+        if (parens < 0 || brackets < 0 || braces < 0) { return false; }
+        i = i + 1;
+    }
+    return parens == 0 && brackets == 0 && braces == 0 && !in_string && !in_char;
+}
+
+fn lsp_index_stmt_locals(server: &mut LspServer, stmt: rawptr, owner_decl: rawptr,
+                         uri: string, text: string,
+                         scope_start_line: i32, scope_end_line: i32) {
+    var cur = stmt;
+    while (cur != null) {
+        let kind = stmt_get_kind(cur);
+        if (kind == st_LET() || kind == st_VAR() || kind == st_FOR() || kind == st_FOREACH()) {
+            let name = stmt_get_name(cur);
+            if (name.len > 0) {
+                let line = lsp_to_zero_based(stmt_loc_line(cur));
+                var col = lsp_to_zero_based(stmt_loc_col(cur));
+                col = lsp_find_ident_col(lsp_line_at(text, line), name, col);
+                var type_name = lsp_type_ref_text(stmt_get_ty(cur));
+                if (type_name.len == 0) {
+                    type_name = lsp_infer_expr_type(server, stmt_get_init(cur),
+                                                    owner_decl, uri, line);
+                }
+                var detail = "let " + name;
+                if (kind == st_VAR()) { detail = "var " + name; }
+                if (kind == st_FOR() || kind == st_FOREACH()) { detail = "loop " + name; }
+                if (type_name.len > 0) { detail = detail + ": " + type_name; }
+                lsp_push_typed_symbol(server, name, lsp_kind_variable(), detail,
+                                      "", type_name, uri, line, col,
+                                      line, col + (name.len as i32),
+                                      line, scope_end_line, 8, false);
+            }
+        }
+        if (stmt_get_then_blk(cur) != null) {
+            lsp_index_stmt_locals(server, stmt_get_then_blk(cur), owner_decl, uri, text,
+                                  scope_start_line, scope_end_line);
+        }
+        if (stmt_get_else_blk(cur) != null) {
+            lsp_index_stmt_locals(server, stmt_get_else_blk(cur), owner_decl, uri, text,
+                                  scope_start_line, scope_end_line);
+        }
+        if (stmt_get_body(cur) != null) {
+            lsp_index_stmt_locals(server, stmt_get_body(cur), owner_decl, uri, text,
+                                  scope_start_line, scope_end_line);
+        }
+        cur = stmt_get_next(cur);
+    }
+}
+
+fn lsp_decl_body_end_line(text: string, start_line: i32) -> i32 {
+    var line: i32 = 0;
+    var i: i64 = 0;
+    while (i < text.len && line < start_line) {
+        if (text.charAt(i) == 10) { line = line + 1; }
+        i = i + 1;
+    }
+    var depth: i32 = 0;
+    var opened = false;
+    var in_string = false;
+    var in_char = false;
+    var escaped = false;
+    var line_comment = false;
+    var block_comment = false;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        var next: i32 = -1;
+        if (i + 1 < text.len) { next = text.charAt(i + 1); }
+        if (line_comment) {
+            if (c == 10) { line_comment = false; line = line + 1; }
+        } else if (block_comment) {
+            if (c == 42 && next == 47) { block_comment = false; i = i + 1; }
+            else if (c == 10) { line = line + 1; }
+        } else if (in_string) {
+            if (escaped) { escaped = false; }
+            else if (c == 92) { escaped = true; }
+            else if (c == 34) { in_string = false; }
+            else if (c == 10) { line = line + 1; }
+        } else if (in_char) {
+            if (escaped) { escaped = false; }
+            else if (c == 92) { escaped = true; }
+            else if (c == 39) { in_char = false; }
+            else if (c == 10) { line = line + 1; }
+        } else if (c == 47 && next == 47) {
+            line_comment = true;
+            i = i + 1;
+        } else if (c == 47 && next == 42) {
+            block_comment = true;
+            i = i + 1;
+        } else if (c == 34) {
+            in_string = true;
+        } else if (c == 39) {
+            in_char = true;
+        } else if (c == 123) {
+            opened = true;
+            depth = depth + 1;
+        } else if (c == 125 && opened) {
+            depth = depth - 1;
+            if (depth == 0) { return line; }
+        } else if (c == 10) {
+            line = line + 1;
+        }
+        i = i + 1;
+    }
+    return start_line;
+}
+
+fn lsp_index_decl_tree(server: &mut LspServer, decl: rawptr, owner: string,
+                       uri: string, text: string) {
+    if (decl == null) { return; }
+    let kind = decl_get_kind(decl);
+    let name = decl_get_name(decl);
+    let line = lsp_to_zero_based(decl_loc_line(decl));
+    var col = lsp_to_zero_based(decl_loc_col(decl));
+    var end_line = lsp_to_zero_based(decl_loc_end_line(decl));
+    var end_col = lsp_to_zero_based(decl_loc_end_col(decl));
+    col = lsp_find_ident_col(lsp_line_at(text, line), name, col);
+    if (end_line < line || (end_line == line && end_col <= col)) {
+        end_line = line;
+        end_col = col + (name.len as i32);
+    }
+    if (name.len > 0 && kind != de_USE()) {
+        let type_name = lsp_decl_value_type(server, decl, uri);
+        var detail = lsp_decl_detail(decl, kind);
+        if ((kind == de_FN() || kind == de_METHOD())
+            && decl_get_ty(decl) == null && type_name.len > 0 && type_name != "void") {
+            detail = detail + " -> " + type_name;
+        } else if ((kind == de_FIELD() || kind == de_CONST() || kind == de_GLOBAL_VAR())
+                   && type_name.len > 0) {
+            detail = lsp_ast_kind_detail(kind) + " " + name + ": " + type_name;
+        }
+        lsp_push_typed_symbol(server, name, lsp_ast_kind_to_completion(kind), detail,
+                              owner, type_name, uri, line, col, end_line, end_col,
+                              -1, 2147483647, lsp_semantic_type_for_decl(kind),
+                              decl_get_is_static(decl));
+    }
+
+    if (kind == de_FN() || kind == de_EXTERN_FN() || kind == de_METHOD()) {
+        var scope_end_line = end_line;
+        if (decl_get_body(decl) != null) {
+            scope_end_line = lsp_decl_body_end_line(text, line);
+        }
+        var param = decl_get_params(decl);
+        while (param != null) {
+            let param_name = decl_get_name(param);
+            if (param_name.len > 0) {
+                var param_line = lsp_to_zero_based(decl_loc_line(param));
+                var param_col = lsp_to_zero_based(decl_loc_col(param));
+                if (param_line <= 0) { param_line = line; }
+                param_col = lsp_find_ident_col(lsp_line_at(text, param_line), param_name, param_col);
+                let param_type = lsp_type_ref_text(decl_get_ty(param));
+                var param_detail = "param " + param_name;
+                if (param_type.len > 0) { param_detail = param_detail + ": " + param_type; }
+                lsp_push_typed_symbol(server, param_name, lsp_kind_variable(), param_detail,
+                                       "", param_type, uri, param_line, param_col,
+                                       param_line, param_col + (param_name.len as i32),
+                                       line, scope_end_line, 7, false);
+            }
+            param = decl_get_next(param);
+        }
+        lsp_index_stmt_locals(server, decl_get_body(decl), decl, uri, text, line, scope_end_line);
+    }
+
+    var child_owner = owner;
+    if (kind == de_CLASS() || kind == de_ENUM()) { child_owner = name.clone(); }
+    var mem = decl_get_members(decl);
+    while (mem != null) {
+        lsp_index_decl_tree(server, mem, child_owner, uri, text);
+        mem = decl_get_next(mem);
+    }
+}
+
+fn lsp_has_symbol_at(server: &mut LspServer, uri: string, name: string,
+                     line: i32, col: i32) -> bool {
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let sym = server.symbols.get(i);
+        if (lsp_same_uri(sym.uri, uri) && sym.name == name && sym.line == line && sym.col == col) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// The light parser deliberately accepts only the stable bootstrap grammar.
+// A valid project may still contain newer constructs (for example versioned
+// imports/calls) before a declaration, leaving the partial AST empty or
+// truncated.  Supplement it from lexer tokens so function references keep
+// their semantic identity instead of degrading to a generic variable.
+fn lsp_index_lexical_declarations(server: &mut LspServer, lex: rawptr,
+                                  uri: string, text: string) {
+    let count = lex_token_count(lex);
+    var i: i32 = 0;
+    var brace_depth: i32 = 0;
+    var pending_owner = "";
+    var current_owner = "";
+    var owner_depth: i32 = -1;
+    while (i + 1 < count) {
+        let tok = lex_token_at(lex, i);
+        let kind = token_kind(tok);
+        if (kind == tk_LBRACE()) {
+            brace_depth = brace_depth + 1;
+            if (pending_owner.len > 0) {
+                current_owner = pending_owner.clone();
+                owner_depth = brace_depth;
+                pending_owner = "";
+            }
+            i = i + 1;
+            continue;
+        }
+        if (kind == tk_RBRACE()) {
+            if (owner_depth == brace_depth) {
+                current_owner = "";
+                owner_depth = -1;
+            }
+            if (brace_depth > 0) { brace_depth = brace_depth - 1; }
+            i = i + 1;
+            continue;
+        }
+        if (kind == tk_SEMI() && pending_owner.len > 0) { pending_owner = ""; }
+        let next = lex_token_at(lex, i + 1);
+        if (token_kind(next) == tk_IDENT()) {
+            let name = token_lexeme(next);
+            let line = lsp_to_zero_based(token_line(next));
+            let col = lsp_to_zero_based(token_col(next));
+            if (kind == tk_KEYWORD_CLASS() || kind == tk_KEYWORD_STRUCT()
+                || kind == tk_KEYWORD_ENUM() || kind == tk_KEYWORD_INTERFACE()) {
+                pending_owner = name.clone();
+            }
+            if (!lsp_has_symbol_at(server, uri, name, line, col)) {
+                if (kind == tk_KEYWORD_FN()) {
+                    var detail = lsp_trim(lsp_line_at(text, line));
+                    if (detail.len == 0) { detail = "fn " + name + "()"; }
+                    var completion_kind = lsp_kind_function();
+                    var semantic_type: i32 = 11;
+                    var owner = "";
+                    if (current_owner.len > 0 && brace_depth >= owner_depth) {
+                        completion_kind = lsp_kind_method();
+                        semantic_type = 12;
+                        owner = current_owner.clone();
+                    }
+                    lsp_push_typed_symbol(server, name, completion_kind, detail,
+                                          owner, "", uri, line, col,
+                                          line, col + (name.len as i32),
+                                          -1, 2147483647, semantic_type, false);
+                } else if (kind == tk_KEYWORD_CLASS()) {
+                    lsp_push_typed_symbol(server, name, lsp_kind_class(), "class " + name,
+                                          "", name, uri, line, col,
+                                          line, col + (name.len as i32),
+                                          -1, 2147483647, 2, false);
+                } else if (kind == tk_KEYWORD_STRUCT()) {
+                    lsp_push_typed_symbol(server, name, lsp_kind_struct(), "struct " + name,
+                                          "", name, uri, line, col,
+                                          line, col + (name.len as i32),
+                                          -1, 2147483647, 5, false);
+                } else if (kind == tk_KEYWORD_ENUM()) {
+                    lsp_push_typed_symbol(server, name, lsp_kind_enum(), "enum " + name,
+                                          "", name, uri, line, col,
+                                          line, col + (name.len as i32),
+                                          -1, 2147483647, 3, false);
+                } else if (kind == tk_KEYWORD_INTERFACE()) {
+                    lsp_push_typed_symbol(server, name, lsp_kind_interface(), "interface " + name,
+                                          "", name, uri, line, col,
+                                          line, col + (name.len as i32),
+                                          -1, 2147483647, 4, false);
+                } else if (kind == tk_KEYWORD_TYPE()) {
+                    lsp_push_typed_symbol(server, name, lsp_kind_interface(), "type " + name,
+                                          "", name, uri, line, col,
+                                          line, col + (name.len as i32),
+                                          -1, 2147483647, 1, false);
+                } else if (kind == tk_KEYWORD_MODULE()) {
+                    var qname = name.clone();
+                    var qi = i + 2;
+                    while (qi + 1 < count) {
+                        let sep = lex_token_at(lex, qi);
+                        let seg = lex_token_at(lex, qi + 1);
+                        if (token_kind(sep) != tk_DOT() || token_kind(seg) != tk_IDENT()) {
+                            break;
+                        }
+                        qname = qname + "." + token_lexeme(seg);
+                        qi = qi + 2;
+                    }
+                    lsp_push_typed_symbol(server, qname, lsp_kind_module(), "module " + qname,
+                                          "", "", uri, line, col,
+                                          line, col + (qname.len as i32),
+                                          -1, 2147483647, 0, false);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn lsp_tref_text(ty: rawptr) -> string {
+    if (ty == null) { return ""; }
+    let k = tref_get_kind(ty);
+    if (k == ty_I8()) { return "i8"; }
+    if (k == ty_I16()) { return "i16"; }
+    if (k == ty_I32()) { return "i32"; }
+    if (k == ty_I64()) { return "i64"; }
+    if (k == ty_U8()) { return "u8"; }
+    if (k == ty_U16()) { return "u16"; }
+    if (k == ty_U32()) { return "u32"; }
+    if (k == ty_U64()) { return "u64"; }
+    if (k == ty_ISIZE()) { return "isize"; }
+    if (k == ty_USIZE()) { return "usize"; }
+    if (k == ty_F32()) { return "f32"; }
+    if (k == ty_F64()) { return "f64"; }
+    if (k == ty_BOOL()) { return "bool"; }
+    if (k == ty_CHAR()) { return "char"; }
+    if (k == ty_STRING()) { return "string"; }
+    if (k == ty_RAWPTR()) { return "rawptr"; }
+    if (k == ty_VOID()) { return "void"; }
+    if (k == ty_CFN()) { return "cfn"; }
+    if (k == ty_FN()) { return "fn"; }
+    if (k == ty_REF()) {
+        let inner = tref_pointee(ty);
+        if (inner != null) { return "&" + lsp_tref_text(inner); }
+        return "&";
+    }
+    if (k == ty_MUTREF()) {
+        let inner2 = tref_pointee(ty);
+        if (inner2 != null) { return "&mut " + lsp_tref_text(inner2); }
+        return "&mut";
+    }
+    if (k == ty_PTR() || k == ty_ARRAY() || k == ty_TUPLE()
+        || k == ty_RANGE() || k == ty_CLASS()) {
+        return lsp_type_ref_text(ty);
+    }
+    let named = tref_get_name(ty);
+    if (named.len > 0) { return named; }
+    return "?";
+}
+
+fn lsp_note_ident_type(server: &mut LspServer, name: string, type_name: string,
+                       uri: string, line: i32, col: i32) {
+    if (name.len == 0 || type_name.len == 0) { return; }
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        var s = server.symbols.get(i);
+        if (lsp_same_uri(s.uri, uri) && s.name == name
+            && (s.line == line || s.type_name.len == 0)) {
+            if (s.type_name.len == 0 || s.line == line) {
+                s.type_name = type_name.clone();
+                if (!s.detail.contains(type_name)) {
+                    s.detail = s.detail + " : " + type_name;
+                }
+                server.symbols.set(i, s);
+                return;
+            }
+        }
+        i = i + 1;
+    }
+    lsp_push_typed_symbol(server, name, lsp_kind_variable(), type_name, "",
+                          type_name, uri, line, col, line, col + (name.len as i32),
+                          -1, 2147483647, 8, false);
+}
+
+fn lsp_walk_sema_expr(server: &mut LspServer, e: rawptr, uri: string) {
+    if (e == null) { return; }
+    if (expr_get_kind(e) == ex_IDENT()) {
+        let ty = expr_get_ty(e);
+        if (ty != null) {
+            lsp_note_ident_type(server, expr_get_name(e), lsp_tref_text(ty),
+                                uri, expr_loc_line(e), expr_loc_col(e));
+        }
+    }
+    lsp_walk_sema_expr(server, expr_get_lhs(e), uri);
+    lsp_walk_sema_expr(server, expr_get_rhs(e), uri);
+    var arg = expr_get_args(e);
+    while (arg != null) {
+        lsp_walk_sema_expr(server, stmt_get_init(arg), uri);
+        arg = stmt_get_next(arg);
+    }
+}
+
+fn lsp_walk_sema_stmt(server: &mut LspServer, sp: rawptr, uri: string) {
+    var cur = sp;
+    while (cur != null) {
+        lsp_walk_sema_expr(server, stmt_get_init(cur), uri);
+        lsp_walk_sema_expr(server, stmt_get_cond(cur), uri);
+        lsp_walk_sema_stmt(server, stmt_get_then_blk(cur), uri);
+        lsp_walk_sema_stmt(server, stmt_get_else_blk(cur), uri);
+        lsp_walk_sema_stmt(server, stmt_get_body(cur), uri);
+        cur = stmt_get_next(cur);
+    }
+}
+
+fn lsp_walk_sema_decl(server: &mut LspServer, d: rawptr, uri: string) {
+    var cur = d;
+    while (cur != null) {
+        lsp_walk_sema_stmt(server, decl_get_body(cur), uri);
+        lsp_walk_sema_decl(server, decl_get_members(cur), uri);
+        cur = decl_get_next(cur);
+    }
+}
+
+fn lsp_clear_uri_diags(server: &mut LspServer, uri: string) {
+    var nu = Vec::<string>.new();
+    var nc = Vec::<string>.new();
+    var nm = Vec::<string>.new();
+    var nl = Vec::<i32>.new();
+    var nco = Vec::<i32>.new();
+    var nj = Vec::<string>.new();
+    var i: i64 = 0;
+    while (i < server.diag_uris.len) {
+        if (!lsp_same_uri(server.diag_uris.get(i), uri)) {
+            nu.push(server.diag_uris.get(i));
+            nc.push(server.diag_codes.get(i));
+            nm.push(server.diag_msgs.get(i));
+            nl.push(server.diag_lines.get(i));
+            nco.push(server.diag_cols.get(i));
+            nj.push(server.diag_jsons.get(i));
+        }
+        i = i + 1;
+    }
+    server.diag_uris.destroy();
+    server.diag_codes.destroy();
+    server.diag_msgs.destroy();
+    server.diag_lines.destroy();
+    server.diag_cols.destroy();
+    server.diag_jsons.destroy();
+    server.diag_uris = nu;
+    server.diag_codes = nc;
+    server.diag_msgs = nm;
+    server.diag_lines = nl;
+    server.diag_cols = nco;
+    server.diag_jsons = nj;
+}
+
+fn lsp_extend_diag_end_col(text: string, line0: i32, col0: i32) -> i32 {
+    let line = lsp_line_at(text, line0);
+    var c = col0 as i64;
+    if (c < 0) { c = 0; }
+    if (c > line.len) { c = line.len; }
+    var right = c;
+    if (right < line.len && lsp_is_ident_char(line.charAt(right))) {
+        while (right < line.len && lsp_is_ident_char(line.charAt(right))) {
+            right = right + 1;
+        }
+    } else if (right < line.len) {
+        right = right + 1;
+    } else {
+        right = c + 1;
+    }
+    return right as i32;
+}
+
+fn lsp_ident_range_on_line(line: string, ident: string, hint_col: i32) -> i32 {
+    if (ident.len == 0 || line.len == 0) { return -1; }
+    var best: i64 = -1;
+    var best_dist: i64 = 2147483647;
+    var i: i64 = 0;
+    while (i + ident.len <= line.len) {
+        if (line.substring(i, i + ident.len) == ident) {
+            var dist = i - (hint_col as i64);
+            if (dist < 0) { dist = 0 - dist; }
+            if (dist < best_dist) {
+                best = i;
+                best_dist = dist;
+            }
+        }
+        i = i + 1;
+    }
+    return best as i32;
+}
+
+fn lsp_publish_diagnostics(server: &mut LspServer, uri: string, text: string) {
+    lsp_clear_uri_diags(server, uri);
+    var items = "[";
+    var n: i32 = 0;
+    var i: i32 = 0;
+    while (i < diag_capture_count()) {
+        let sev = diag_capture_severity(i);
+        var lsp_sev: i32 = 1;
+        if (sev == 0) { lsp_sev = 3; }
+        else if (sev == 1) { lsp_sev = 2; }
+        else { lsp_sev = 1; }
+        var line = diag_capture_line(i);
+        var col = diag_capture_col(i);
+        var end_line = diag_capture_end_line(i);
+        var end_col = diag_capture_end_col(i);
+        if (line > 0) { line = line - 1; }
+        if (col > 0) { col = col - 1; }
+        if (end_line > 0) { end_line = end_line - 1; }
+        if (end_col > 0) { end_col = end_col - 1; }
+        if (end_line < line) { end_line = line; }
+        let code = diag_capture_code(i);
+        let msg = diag_capture_message(i);
+        let quoted = lsp_quoted_ident(msg);
+        if (quoted.len > 0) {
+            let src_line = lsp_line_at(text, line);
+            let ident_col = lsp_ident_range_on_line(src_line, quoted, col);
+            if (ident_col >= 0) {
+                col = ident_col;
+                end_line = line;
+                end_col = ident_col + (quoted.len as i32);
+            }
+        }
+        // Parser/Sema often emit a 1-based (line,col) with end_col = col+1.
+        // After converting to 0-based LSP, that is a 1-character underline.
+        // Stretch it over the identifier (or current token) so Problems and
+        // the editor squiggle cover the whole name.
+        if (end_line == line && end_col <= col + 1) {
+            end_col = lsp_extend_diag_end_col(text, line, col);
+        }
+        server.diag_uris.push(uri.clone());
+        server.diag_codes.push(code.clone());
+        server.diag_msgs.push(msg.clone());
+        server.diag_lines.push(line);
+        server.diag_cols.push(col);
+        var item = "{\"range\":{\"start\":{\"line\":" + json_i32(line)
+            + ",\"character\":" + json_i32(col)
+            + "},\"end\":{\"line\":" + json_i32(end_line)
+            + ",\"character\":" + json_i32(end_col)
+            + "}},\"severity\":" + json_i32(lsp_sev)
+            + ",\"code\":" + json_escape(code)
+            + ",\"source\":\"vyxc\""
+            + ",\"message\":" + json_escape(msg) + "}";
+        server.diag_jsons.push(item.clone());
+        if (n > 0) { items = items + ","; }
+        items = items + item;
+        n = n + 1;
+        i = i + 1;
+    }
+    items = items + "]";
+    lsp_send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":"
+        + json_escape(uri) + ",\"diagnostics\":" + items + "}}");
+}
+
+fn lsp_stored_diagnostics_json(server: &mut LspServer, uri: string) -> string {
+    var items = "[";
+    var n: i32 = 0;
+    var i: i64 = 0;
+    while (i < server.diag_uris.len) {
+        if (lsp_same_uri(server.diag_uris.get(i), uri)) {
+            if (n > 0) { items = items + ","; }
+            items = items + server.diag_jsons.get(i);
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return items + "]";
+}
+
+fn lsp_handle_text_document_diagnostic(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    if (uri.len == 0) {
+        return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+            + ",\"result\":{\"kind\":\"full\",\"items\":[]}}";
+    }
+    var text = lsp_doc_text(server, uri);
+    if (text.len == 0) {
+        let path = uri_path_clean(uri);
+        if (fileExists(path) && lsp_ends_with(path, ".vyx")) {
+            text = readFile(path);
+            if (text.len > 0) {
+                lsp_store_document(server, uri, text);
+            }
+        }
+    }
+    if (text.len > 0) {
+        lsp_analyze_buffer(server, uri, text);
+    }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":{\"kind\":\"full\",\"items\":"
+        + lsp_stored_diagnostics_json(server, uri) + "}}";
+}
+
+fn lsp_analyze_buffer(server: &mut LspServer, uri: string, text: string) {
+    diag_set_source_context(uri_path_clean(uri), text);
+    diag_capture_begin();
+    diag_set_enabled(true);
+    let lex = lex_source(text);
+    if (lex == null) {
+        lsp_publish_diagnostics(server, uri, text);
+        diag_capture_end();
+        diag_set_enabled(true);
+        return;
+    }
+    let unit = parse_unit(lex);
+
+    var kept = Vec::<LspSymbol>.new();
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let s = server.symbols.get(i);
+        if (!lsp_same_uri(s.uri, uri)) {
+            kept.push(s);
+        }
+        i = i + 1;
+    }
+    server.symbols.destroy();
+    server.symbols = kept;
+
+    if (unit != null) {
+        var decl = unit_get_decls(unit);
+        while (decl != null) {
+            lsp_index_decl_tree(server, decl, "", uri, text);
+            decl = decl_get_next(decl);
+        }
+    }
+    lsp_index_lexical_declarations(server, lex, uri, text);
+
+    if (unit != null) {
+        let handle = analyze_unit_with_registry_options(unit, "", false);
+        if (handle != null) { free(handle); }
+        lsp_walk_sema_decl(server, unit_get_decls(unit), uri);
+    }
+    lsp_publish_diagnostics(server, uri, text);
+    diag_capture_end();
+    diag_set_enabled(true);
+    lexer_dispose(lex);
+}
+
+fn lsp_add_keywords(prefix: string) -> Vec<LspSymbol> {
+    var items = Vec::<LspSymbol>.new();
+    let kws = "fn|class|struct|enum|impl|trait|use|module|public|private|const|let|var|mut|if|else|while|for|in|match|case|default|return|break|continue|extern|type|where|as|true|false|null|self|Self|static|error|unsafe|rawptr|async|await|spawn|defer|box|ref|try|catch|throw|import|export";
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while (i <= kws.len) {
+        if (i == kws.len || kws.charAt(i) == 124) {
+            let kw = kws.substring(start, i);
+            if (prefix.len == 0 || kw.startsWith(prefix)) {
+                var sym = lsp_empty_symbol();
+                sym.name = kw.clone();
+                sym.kind = lsp_kind_keyword();
+                sym.detail = "keyword";
+                sym.semantic_type = 14;
+                items.push(sym);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return items;
+}
+
+fn lsp_line_at(text: string, line0: i32) -> string {
+    var line_no: i32 = 0;
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while (i <= text.len) {
+        let at_end = i == text.len;
+        let is_nl = (!at_end) && text.charAt(i) == 10;
+        if (at_end || is_nl) {
+            if (line_no == line0) {
+                var line = text.substring(start, i);
+                if (line.len > 0 && line.charAt(line.len - 1) == 13) {
+                    line = line.substring(0, line.len - 1);
+                }
+                return line.clone();
+            }
+            line_no = line_no + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn lsp_utf16_len(s: string) -> i64 {
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while (i < s.len) {
+        let c = s.charAt(i) & 255;
+        var cp: i32 = 0;
+        var step: i64 = 1;
+        if (c < 128) { cp = c; }
+        else if (c < 224 && i + 1 < s.len) {
+            cp = ((c & 31) << 6) | (s.charAt(i + 1) & 63);
+            step = 2;
+        } else if (c < 240 && i + 2 < s.len) {
+            cp = ((c & 15) << 12) | ((s.charAt(i + 1) & 63) << 6) | (s.charAt(i + 2) & 63);
+            step = 3;
+        } else if (i + 3 < s.len) {
+            cp = ((c & 7) << 18) | ((s.charAt(i + 1) & 63) << 12)
+                | ((s.charAt(i + 2) & 63) << 6) | (s.charAt(i + 3) & 63);
+            step = 4;
+        } else {
+            cp = c;
+        }
+        if (cp >= 65536) { n = n + 2; }
+        else { n = n + 1; }
+        i = i + step;
+    }
+    return n;
+}
+
+fn lsp_utf16_to_byte(s: string, units: i64) -> i64 {
+    if (units <= 0) { return 0; }
+    var n: i64 = 0;
+    var i: i64 = 0;
+    while (i < s.len && n < units) {
+        let c = s.charAt(i) & 255;
+        var cp: i32 = 0;
+        var step: i64 = 1;
+        if (c < 128) { cp = c; }
+        else if (c < 224 && i + 1 < s.len) {
+            cp = ((c & 31) << 6) | (s.charAt(i + 1) & 63);
+            step = 2;
+        } else if (c < 240 && i + 2 < s.len) {
+            cp = ((c & 15) << 12) | ((s.charAt(i + 1) & 63) << 6) | (s.charAt(i + 2) & 63);
+            step = 3;
+        } else if (i + 3 < s.len) {
+            cp = ((c & 7) << 18) | ((s.charAt(i + 1) & 63) << 12)
+                | ((s.charAt(i + 2) & 63) << 6) | (s.charAt(i + 3) & 63);
+            step = 4;
+        } else {
+            cp = c;
+        }
+        var w: i64 = 1;
+        if (cp >= 65536) { w = 2; }
+        if (n + w > units) { return i; }
+        n = n + w;
+        i = i + step;
+    }
+    return i;
+}
+
+fn lsp_offset_at(text: string, line0: i64, col0: i64) -> i64 {
+    var line: i64 = 0;
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while (i <= text.len) {
+        let at_end = i == text.len;
+        let is_nl = (!at_end) && text.charAt(i) == 10;
+        if (at_end || is_nl) {
+            if (line == line0) {
+                var line_text = text.substring(start, i);
+                if (line_text.len > 0 && line_text.charAt(line_text.len - 1) == 13) {
+                    line_text = line_text.substring(0, line_text.len - 1);
+                }
+                var col = col0;
+                if (col < 0) { col = 0; }
+                let max_col = lsp_utf16_len(line_text);
+                if (col > max_col) { col = max_col; }
+                return start + lsp_utf16_to_byte(line_text, col);
+            }
+            line = line + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return text.len;
+}
+
+fn lsp_apply_text_edit(text: string, start_line: i64, start_col: i64,
+                       end_line: i64, end_col: i64, neu: string) -> string {
+    var s_line = start_line;
+    var e_line = end_line;
+    var s_col = start_col;
+    var e_col = end_col;
+    if (s_line < 0) { s_line = 0; }
+    if (e_line < 0) { e_line = 0; }
+    if (e_line < s_line || (e_line == s_line && e_col < s_col)) {
+        let tl = s_line;
+        let tc = s_col;
+        s_line = e_line;
+        s_col = e_col;
+        e_line = tl;
+        e_col = tc;
+    }
+    let start = lsp_offset_at(text, s_line, s_col);
+    let end = lsp_offset_at(text, e_line, e_col);
+    var prefix = "";
+    if (start > 0) { prefix = text.substring(0, start); }
+    var suffix = "";
+    if (end < text.len) { suffix = text.substring(end, text.len); }
+    return prefix + neu + suffix;
+}
+
+fn lsp_apply_content_changes(current: string, body: string) -> string {
+    let arr_start = json_key_value_start(body, "contentChanges", 0, body.len);
+    if (arr_start < 0 || arr_start >= body.len || body.charAt(arr_start) != 91) {
+        if (json_has_key(body, "text")) { return json_extract_string(body, "text"); }
+        return current;
+    }
+    var i = arr_start + 1;
+    var text = current;
+    var saw = false;
+    while (i < body.len) {
+        i = json_skip_ws(body, i);
+        if (i >= body.len) { break; }
+        let c = body.charAt(i);
+        if (c == 93) { break; }
+        if (c == 44) { i = i + 1; continue; }
+        if (c != 123) { break; }
+        let item_end = json_skip_value(body, i);
+        let has_range = json_has_key_from(body, "range", i, item_end);
+        let neu = json_extract_string_from(body, "text", i, item_end);
+        if (!has_range) {
+            text = neu;
+        } else {
+            var start_line = json_extract_nested_int_from(body, "start", "line", i, item_end);
+            var start_col = json_extract_nested_int_from(body, "start", "character", i, item_end);
+            var end_line = json_extract_nested_int_from(body, "end", "line", i, item_end);
+            var end_col = json_extract_nested_int_from(body, "end", "character", i, item_end);
+            if (start_line < 0) { start_line = 0; }
+            if (start_col < 0) { start_col = 0; }
+            if (end_line < 0) { end_line = start_line; }
+            if (end_col < 0) { end_col = start_col; }
+            text = lsp_apply_text_edit(text, start_line, start_col, end_line, end_col, neu);
+        }
+        saw = true;
+        i = item_end;
+    }
+    if (!saw) { return current; }
+    return text;
+}
+
+fn lsp_is_ident_char(c: i32) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        || (c >= 48 && c <= 57) || c == 95;
+}
+
+fn lsp_word_at(text: string, line0: i32, col0: i32) -> string {
+    let line = lsp_line_at(text, line0);
+    if (line.len == 0) { return ""; }
+    var c = col0 as i64;
+    if (c > line.len) { c = line.len; }
+    var left = c;
+    while (left > 0 && lsp_is_ident_char(line.charAt(left - 1))) {
+        left = left - 1;
+    }
+    var right = c;
+    while (right < line.len && lsp_is_ident_char(line.charAt(right))) {
+        right = right + 1;
+    }
+    if (right <= left) { return ""; }
+    return line.substring(left, right).clone();
+}
+
+fn lsp_prefix_at(text: string, line0: i32, col0: i32) -> string {
+    let line = lsp_line_at(text, line0);
+    if (line.len == 0) { return ""; }
+    var c = col0 as i64;
+    if (c > line.len) { c = line.len; }
+    var left = c;
+    while (left > 0 && lsp_is_ident_char(line.charAt(left - 1))) {
+        left = left - 1;
+    }
+    if (left >= c) { return ""; }
+    return line.substring(left, c).clone();
+}
+
+fn lsp_receiver_before_member(text: string, line0: i32, col0: i32) -> string {
+    let line = lsp_line_at(text, line0);
+    if (line.len == 0) { return ""; }
+    var cursor = col0 as i64;
+    if (cursor > line.len) { cursor = line.len; }
+    while (cursor > 0 && lsp_is_ident_char(line.charAt(cursor - 1))) {
+        cursor = cursor - 1;
+    }
+    while (cursor > 0 && (line.charAt(cursor - 1) == 32 || line.charAt(cursor - 1) == 9)) {
+        cursor = cursor - 1;
+    }
+    if (cursor <= 0 || line.charAt(cursor - 1) != 46) { return ""; }
+    cursor = cursor - 1;
+    while (cursor > 0 && (line.charAt(cursor - 1) == 32 || line.charAt(cursor - 1) == 9)) {
+        cursor = cursor - 1;
+    }
+    let end = cursor;
+    while (cursor > 0 && lsp_is_ident_char(line.charAt(cursor - 1))) {
+        cursor = cursor - 1;
+    }
+    if (end <= cursor) { return ""; }
+    return line.substring(cursor, end).clone();
+}
+
+fn lsp_normalize_mod_path(raw: string) -> string {
+    var out = "";
+    var last_sep = true;
+    var i: i64 = 0;
+    while (i < raw.len) {
+        let c = raw.charAt(i);
+        if (c == 46 || c == 58) {
+            if (!last_sep && out.len > 0) {
+                out = out + ".";
+                last_sep = true;
+            }
+        } else if (c != 32 && c != 9) {
+            out = out + raw.substring(i, i + 1);
+            last_sep = false;
+        }
+        i = i + 1;
+    }
+    if (raw.len > 0) {
+        let last = raw.charAt(raw.len - 1);
+        if ((last == 46 || last == 58) && (out.len == 0 || out.charAt(out.len - 1) != 46)) {
+            out = out + ".";
+        }
+    }
+    return out;
+}
+
+fn lsp_rewrite_mod_seps(name: string, colon_style: bool) -> string {
+    if (!colon_style) { return name.clone(); }
+    var out = "";
+    var i: i64 = 0;
+    while (i < name.len) {
+        if (name.charAt(i) == 46) { out = out + "::"; }
+        else { out = out + name.substring(i, i + 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn lsp_sort_pad3(n: i64) -> string {
+    var v = n;
+    if (v < 0) { v = 0; }
+    if (v > 999) { v = 999; }
+    if (v < 10) { return "00" + policy_i64_to_string(v); }
+    if (v < 100) { return "0" + policy_i64_to_string(v); }
+    return policy_i64_to_string(v);
+}
+
+fn lsp_raw_has_colon(raw: string) -> bool {
+    var i: i64 = 0;
+    while (i < raw.len) {
+        if (raw.charAt(i) == 58) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn lsp_use_path_at(line: string, col0: i32) -> LspUsePath {
+    var info = LspUsePath { active: false, path: "", start_col: -1, colon_style: false };
+    var lim = col0 as i64;
+    if (lim > line.len) { lim = line.len; }
+    if (lim < 0) { lim = 0; }
+    var i = lsp_skip_ws_idx(line, 0);
+    if (i + 1 < line.len && line.charAt(i) == 47 && line.charAt(i + 1) == 47) {
+        return info;
+    }
+    if (i + 7 <= line.len && line.substring(i, i + 7) == "public ") {
+        i = lsp_skip_ws_idx(line, i + 7);
+    }
+    var kw: i64 = 0;
+    if (i + 4 <= line.len && line.substring(i, i + 4) == "use ") { kw = 4; }
+    else if (i + 7 <= line.len && line.substring(i, i + 7) == "import ") { kw = 7; }
+    if (kw == 0) { return info; }
+    i = lsp_skip_ws_idx(line, i + kw);
+    let ident = lsp_read_ident(line, i);
+    if (ident.len > 0) {
+        var after = lsp_skip_ws_idx(line, i + ident.len);
+        if (after < line.len && line.charAt(after) == 61) {
+            i = lsp_skip_ws_idx(line, after + 1);
+        }
+    }
+    if (lim < i) { return info; }
+    var j = i;
+    while (j < lim) {
+        let c = line.charAt(j);
+        if (lsp_is_ident_char(c) || c == 46 || c == 58) { j = j + 1; }
+        else { break; }
+    }
+    var k = j;
+    while (k < lim) {
+        if (line.charAt(k) == 59) { return info; }
+        k = k + 1;
+    }
+    var after_path = lsp_skip_ws_idx(line, j);
+    if (after_path + 3 <= lim && line.substring(after_path, after_path + 3) == "as ") {
+        return info;
+    }
+    let raw = line.substring(i, lim);
+    info.active = true;
+    info.start_col = i as i32;
+    info.colon_style = lsp_raw_has_colon(raw);
+    info.path = lsp_normalize_mod_path(raw);
+    return info;
+}
+
+fn lsp_package_seen(names: &mut Vec<string>, name: string) -> bool {
+    var i: i64 = 0;
+    while (i < names.len) {
+        if (names.get(i) == name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn lsp_add_package_candidate(names: &mut Vec<string>, name: string, prefix: string) {
+    if (name.len == 0) { return; }
+    if (prefix.len > 0 && !name.startsWith(prefix)) { return; }
+    if (lsp_package_seen(names, name)) { return; }
+    names.push(name.clone());
+}
+
+fn lsp_collect_package_completions(server: &mut LspServer, prefix: string) -> Vec<string> {
+    var names = Vec::<string>.new();
+    var pass: i32 = 0;
+    while (pass < 2) {
+        var i: i64 = 0;
+        while (i < server.packages.len) {
+            let pkg = server.packages.get(i);
+            let is_std = pkg == "std" || pkg.startsWith("std.");
+            if ((pass == 0 && is_std) || (pass == 1 && !is_std)) {
+                lsp_add_package_candidate(&mut names, pkg, prefix);
+                var d: i64 = 0;
+                while (d < pkg.len) {
+                    if (pkg.charAt(d) == 46) {
+                        lsp_add_package_candidate(&mut names, pkg.substring(0, d), prefix);
+                    }
+                    d = d + 1;
+                }
+            }
+            i = i + 1;
+        }
+        var si: i64 = 0;
+        while (si < server.symbols.len) {
+            let s = server.symbols.get(si);
+            if (s.kind == lsp_kind_module()) {
+                let is_std2 = s.name == "std" || s.name.startsWith("std.");
+                if ((pass == 0 && is_std2) || (pass == 1 && !is_std2)) {
+                    lsp_add_package_candidate(&mut names, s.name, prefix);
+                }
+            }
+            si = si + 1;
+        }
+        pass = pass + 1;
+    }
+    return names;
+}
+
+fn lsp_package_item_json(name: string, line: i32, start_col: i32, end_col: i32,
+                         colon_style: bool) -> string {
+    let insert = lsp_rewrite_mod_seps(name, colon_style);
+    var group = "1_";
+    if (name.startsWith("std.") || name == "std") { group = "0_"; }
+    let sort = group + lsp_sort_pad3(name.len) + "_" + name;
+    return "{\"label\":" + json_escape(name)
+        + ",\"kind\":" + json_i32(lsp_kind_module())
+        + ",\"detail\":\"package\""
+        + ",\"filterText\":" + json_escape(name)
+        + ",\"sortText\":" + json_escape(sort)
+        + ",\"commitCharacters\":[\".\",\";\"]"
+        + ",\"textEdit\":{\"range\":{\"start\":{\"line\":" + json_i32(line)
+        + ",\"character\":" + json_i32(start_col)
+        + "},\"end\":{\"line\":" + json_i32(line)
+        + ",\"character\":" + json_i32(end_col)
+        + "}},\"newText\":" + json_escape(insert) + "}}";
+}
+
+fn lsp_package_completion_json(server: &mut LspServer, use_path: LspUsePath, line: i32,
+                               character: i32) -> string {
+    var items = "[";
+    var count: i32 = 0;
+    let names = lsp_collect_package_completions(server, use_path.path);
+    var i: i64 = 0;
+    while (i < names.len && count < 256) {
+        if (count > 0) { items = items + ","; }
+        items = items + lsp_package_item_json(names.get(i), line, use_path.start_col,
+                                              character, use_path.colon_style);
+        count = count + 1;
+        i = i + 1;
+    }
+    names.destroy();
+    return items + "]";
+}
+
+fn lsp_trim(s: string) -> string {
+    var a: i64 = 0;
+    var b = s.len;
+    while (a < b) {
+        let c = s.charAt(a);
+        if (c == 32 || c == 9 || c == 10 || c == 13) { a = a + 1; }
+        else { break; }
+    }
+    while (b > a) {
+        let c2 = s.charAt(b - 1);
+        if (c2 == 32 || c2 == 9 || c2 == 10 || c2 == 13) { b = b - 1; }
+        else { break; }
+    }
+    return s.substring(a, b).clone();
+}
+
+fn lsp_find_substring(s: string, needle: string, start: i64) -> i64 {
+    if (needle.len == 0) { return start; }
+    var i = start;
+    while (i + needle.len <= s.len) {
+        if (s.substring(i, i + needle.len) == needle) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn lsp_signature_from_text(text: string, name: string) -> string {
+    if (name.len == 0) { return ""; }
+    let needle = "fn " + name;
+    var start: i64 = 0;
+    var i: i64 = 0;
+    while (i <= text.len) {
+        let at_end = i == text.len;
+        if (at_end || text.charAt(i) == 10) {
+            var line = lsp_strip_line_comment(text.substring(start, i));
+            let hit = lsp_find_substring(line, needle, 0);
+            if (hit >= 0) {
+                let after = hit + needle.len;
+                if (after < line.len && (line.charAt(after) == 40 || line.charAt(after) == 60)) {
+                    var end = line.len;
+                    var p = after;
+                    while (p < line.len) {
+                        let c = line.charAt(p);
+                        if (c == 123 || c == 59) { end = p; break; }
+                        p = p + 1;
+                    }
+                    return lsp_trim(line.substring(hit, end));
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn lsp_signature_params(signature: string) -> Vec<string> {
+    var out = Vec::<string>.new();
+    var open: i64 = -1;
+    var i: i64 = 0;
+    while (i < signature.len) {
+        if (signature.charAt(i) == 40) { open = i; break; }
+        i = i + 1;
+    }
+    if (open < 0) { return out; }
+    var start = open + 1;
+    var depth: i32 = 0;
+    i = start;
+    while (i < signature.len) {
+        let c = signature.charAt(i);
+        if (c == 40 || c == 91 || c == 123 || c == 60) {
+            depth = depth + 1;
+        } else if (c == 41) {
+            if (depth == 0) {
+                let final_param = lsp_trim(signature.substring(start, i));
+                if (final_param.len > 0) { out.push(final_param); }
+                break;
+            }
+            depth = depth - 1;
+        } else if (c == 93 || c == 125 || c == 62) {
+            if (depth > 0) { depth = depth - 1; }
+        } else if (c == 44 && depth == 0) {
+            let param = lsp_trim(signature.substring(start, i));
+            if (param.len > 0) { out.push(param); }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn lsp_param_name(label: string) -> string {
+    var end = label.len;
+    var i: i64 = 0;
+    while (i < label.len) {
+        if (label.charAt(i) == 58) { end = i; break; }
+        i = i + 1;
+    }
+    var name = lsp_trim(label.substring(0, end));
+    if (name.startsWith("mut ")) { name = lsp_trim(name.substring(4, name.len)); }
+    if (name.len == 0) { return "arg"; }
+    return name;
+}
+
+fn lsp_completion_insert_text(sym: LspSymbol) -> string {
+    if (sym.kind != lsp_kind_function() && sym.kind != lsp_kind_method()) {
+        return sym.name;
+    }
+    var params = lsp_signature_params(sym.detail);
+    var out = sym.name + "(";
+    var slot: i32 = 1;
+    var emitted: i32 = 0;
+    var i: i64 = 0;
+    while (i < params.len) {
+        let name = lsp_param_name(params.get(i));
+        if (name != "self") {
+            if (emitted > 0) { out = out + ", "; }
+            out = out + "\${" + json_i32(slot) + ":" + name + "}";
+            slot = slot + 1;
+            emitted = emitted + 1;
+        }
+        i = i + 1;
+    }
+    params.destroy();
+    return out + ")$0";
+}
+
+fn lsp_completion_item_json(sym: LspSymbol, sort_group: string) -> string {
+    var out = "{\"label\":" + json_escape(sym.name)
+        + ",\"kind\":" + json_i32(sym.kind)
+        + ",\"detail\":" + json_escape(sym.detail)
+        + ",\"sortText\":" + json_escape(sort_group + sym.name);
+    if (sym.kind == lsp_kind_function() || sym.kind == lsp_kind_method()) {
+        out = out + ",\"insertText\":" + json_escape(lsp_completion_insert_text(sym))
+            + ",\"insertTextFormat\":2";
+    }
+    return out + "}";
+}
+
+fn lsp_completion_seen_key(sym: LspSymbol) -> string {
+    if (sym.kind == lsp_kind_function() || sym.kind == lsp_kind_method()) {
+        return sym.name + "\n" + sym.detail;
+    }
+    return sym.name;
+}
+
+fn lsp_quoted_ident(msg: string) -> string {
+    var i: i64 = 0;
+    while (i < msg.len) {
+        if (msg.charAt(i) == 39) {
+            var j = i + 1;
+            while (j < msg.len && msg.charAt(j) != 39) { j = j + 1; }
+            if (j < msg.len && j > i + 1) {
+                return msg.substring(i + 1, j).clone();
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn lsp_ident_module(name: string) -> string {
+    if (name == "Vec" || name == "Dict" || name == "Set" || name == "Stack"
+        || name == "Queue" || name == "HashMap" || name == "HashSet"
+        || name == "Deque" || name == "BitSet") {
+        return "std.collections";
+    }
+    if (name == "Ref" || name == "Weak" || name == "Box") { return "std.ref"; }
+    if (name == "Option" || name == "Result" || name == "Some" || name == "None"
+        || name == "Ok" || name == "Err") {
+        return "std.core";
+    }
+    if (name == "Mutex" || name == "Channel") { return "std.sync"; }
+    if (name == "Path" || name == "File") { return "std.fs"; }
+    return "";
+}
+
+fn lsp_text_has_use(text: string, module_name: string) -> bool {
+    let needle = "use " + module_name;
+    return lsp_find_substring(text, needle, 0) >= 0;
+}
+
+fn lsp_use_insert_line(text: string) -> i32 {
+    var line: i32 = 0;
+    var last_use: i32 = 0;
+    var i: i64 = 0;
+    var col: i64 = 0;
+    var saw_use = false;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c == 10) {
+            line = line + 1;
+            col = 0;
+            i = i + 1;
+            continue;
+        }
+        if (col == 0) {
+            if (i + 4 <= text.len && text.substring(i, i + 4) == "use ") {
+                saw_use = true;
+                last_use = line + 1;
+            } else if (i + 7 <= text.len && text.substring(i, i + 7) == "module ") {
+                last_use = line + 1;
+            }
+        }
+        col = col + 1;
+        i = i + 1;
+    }
+    if (saw_use) { return last_use; }
+    return last_use;
+}
+
+fn lsp_similar_name(a: string, b: string) -> bool {
+    if (a.len == 0 || b.len == 0) { return false; }
+    if (a == b) { return false; }
+    if (a.startsWith(b) || b.startsWith(a)) {
+        var d = a.len - b.len;
+        if (d < 0) { d = 0 - d; }
+        return d <= 3;
+    }
+    if (a.charAt(0) != b.charAt(0)) { return false; }
+    var d2 = a.len - b.len;
+    if (d2 < 0) { d2 = 0 - d2; }
+    if (d2 > 2) { return false; }
+    var i: i64 = 0;
+    var miss: i32 = 0;
+    var n = a.len;
+    if (b.len < n) { n = b.len; }
+    while (i < n) {
+        if (a.charAt(i) != b.charAt(i)) { miss = miss + 1; }
+        i = i + 1;
+    }
+    return miss <= 2;
+}
+
+fn lsp_scan_push(st: LspScanState, c: i32, nxt: i32) -> i32 {
+    if (st.in_block) {
+        if (c == 42 && nxt == 47) { st.in_block = false; return 2; }
+        return 1;
+    }
+    if (st.in_string) {
+        if (c == 92) { return 2; }
+        if (c == 34) { st.in_string = false; }
+        return 1;
+    }
+    if (st.in_char) {
+        if (c == 92) { return 2; }
+        if (c == 39) { st.in_char = false; }
+        return 1;
+    }
+    if (c == 47 && nxt == 47) { return 1000; }
+    if (c == 47 && nxt == 42) { st.in_block = true; return 2; }
+    if (c == 34) { st.in_string = true; return 1; }
+    if (c == 39) { st.in_char = true; return 1; }
+    return 0;
+}
+
+fn lsp_line_indent_info(line: string, st: LspScanState) -> i64 {
+    var leading: i32 = 0;
+    var delta: i32 = 0;
+    var i: i64 = 0;
+    var seen_code = false;
+    while (i < line.len) {
+        let c = line.charAt(i);
+        var nxt: i32 = 0;
+        if (i + 1 < line.len) { nxt = line.charAt(i + 1); }
+        let consumed = lsp_scan_push(st, c, nxt);
+        if (consumed == 1000) { break; }
+        if (consumed > 0) {
+            i = i + (consumed as i64);
+            continue;
+        }
+        if (c == 32 || c == 9) {
+            i = i + 1;
+            continue;
+        }
+        if (!seen_code && (c == 125 || c == 93 || c == 41)) {
+            leading = leading + 1;
+            i = i + 1;
+            continue;
+        }
+        seen_code = true;
+        if (c == 123 || c == 91 || c == 40) { delta = delta + 1; }
+        else if (c == 125 || c == 93 || c == 41) { delta = delta - 1; }
+        i = i + 1;
+    }
+    return (leading as i64) * 10000 + (delta as i64) + 5000;
+}
+
+fn lsp_rtrim_line(line: string) -> string {
+    var b = line.len;
+    while (b > 0) {
+        let c = line.charAt(b - 1);
+        if (c == 32 || c == 9 || c == 13) { b = b - 1; }
+        else { break; }
+    }
+    return line.substring(0, b).clone();
+}
+
+fn lsp_ltrim_line(line: string) -> string {
+    var a: i64 = 0;
+    while (a < line.len) {
+        let c = line.charAt(a);
+        if (c == 32 || c == 9) { a = a + 1; }
+        else { break; }
+    }
+    return line.substring(a, line.len).clone();
+}
+
+fn lsp_format_source(src: string) -> string {
+    var st = LspScanState { in_block: false, in_string: false, in_char: false };
+    var out = "";
+    var indent: i32 = 0;
+    var i: i64 = 0;
+    var line_start: i64 = 0;
+    var emitted = false;
+    while (i <= src.len) {
+        let at_end = i == src.len;
+        let is_nl = !at_end && src.charAt(i) == 10;
+        if (at_end || is_nl) {
+            var raw = src.substring(line_start, i).clone();
+            if (raw.len > 0 && raw.charAt(raw.len - 1) == 13) {
+                raw = raw.substring(0, raw.len - 1).clone();
+            }
+            let trimmed = lsp_rtrim_line(raw);
+            let body = lsp_ltrim_line(trimmed);
+            if (body.len == 0) {
+                if (emitted) { out = out + "\n"; }
+            } else {
+                let info = lsp_line_indent_info(body, st);
+                let leading = (info / 10000) as i32;
+                let delta = (info % 10000 - 5000) as i32;
+                var level = indent - leading;
+                if (level < 0) { level = 0; }
+                if (emitted) { out = out + "\n"; }
+                var pad: i32 = 0;
+                while (pad < level) {
+                    out = out + "    ";
+                    pad = pad + 1;
+                }
+                out = out + body;
+                indent = level + delta;
+                if (indent < 0) { indent = 0; }
+            }
+            emitted = true;
+            line_start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (out.len == 0 || out.charAt(out.len - 1) != 10) { out = out + "\n"; }
+    return out;
+}
+
+fn lsp_line_count(text: string) -> i32 {
+    var n: i32 = 1;
+    var i: i64 = 0;
+    while (i < text.len) {
+        if (text.charAt(i) == 10) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn lsp_full_range_json(text: string) -> string {
+    let lines = lsp_line_count(text);
+    return "{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":"
+        + json_i32(lines) + ",\"character\":0}}";
+}
+
+fn lsp_handle_formatting(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let text = lsp_doc_text(server, uri);
+    if (text.len == 0) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":[]}"; }
+    let formatted = lsp_format_source(text);
+    if (formatted == text) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":[]}"; }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":[{\"range\":" + lsp_full_range_json(text)
+        + ",\"newText\":" + json_escape(formatted) + "}]}";
+}
+
+fn lsp_word_range_json(text: string, line0: i32, col0: i32) -> string {
+    let line = lsp_line_at(text, line0);
+    var c = col0 as i64;
+    if (c > line.len) { c = line.len; }
+    var left = c;
+    while (left > 0 && lsp_is_ident_char(line.charAt(left - 1))) { left = left - 1; }
+    var right = c;
+    while (right < line.len && lsp_is_ident_char(line.charAt(right))) { right = right + 1; }
+    if (right <= left) {
+        return "{\"start\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(col0)
+            + "},\"end\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(col0 + 1) + "}}";
+    }
+    return "{\"start\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(left as i32)
+        + "},\"end\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(right as i32) + "}}";
+}
+
+fn lsp_collect_word_edits(text: string, word: string, replacement: string) -> string {
+    var out = "[";
+    var n: i32 = 0;
+    var line: i32 = 0;
+    var col: i32 = 0;
+    var i: i64 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c == 10) {
+            line = line + 1;
+            col = 0;
+            i = i + 1;
+            continue;
+        }
+        if (lsp_is_ident_char(c)) {
+            let start = i;
+            let start_col = col;
+            while (i < text.len && lsp_is_ident_char(text.charAt(i))) {
+                i = i + 1;
+                col = col + 1;
+            }
+            let ident = text.substring(start, i).clone();
+            if (ident == word) {
+                if (n > 0) { out = out + ","; }
+                out = out + "{\"range\":{\"start\":{\"line\":" + json_i32(line)
+                    + ",\"character\":" + json_i32(start_col)
+                    + "},\"end\":{\"line\":" + json_i32(line)
+                    + ",\"character\":" + json_i32(col)
+                    + "}},\"newText\":" + json_escape(replacement) + "}";
+                n = n + 1;
+            }
+            continue;
+        }
+        col = col + 1;
+        i = i + 1;
+    }
+    return out + "]";
+}
+
+// FindUsages asks for every occurrence. Symbol records cover declarations
+// only, so a name that is also called in the same file used to return just
+// the declaration and CLion navigated there instead of opening the usage list.
+fn lsp_occurrence_locations_json(text: string, uri: string, word: string) -> string {
+    var out = "[";
+    var n: i32 = 0;
+    var line: i32 = 0;
+    var col: i32 = 0;
+    var k: i64 = 0;
+    while (k < text.len) {
+        let ch = text.charAt(k);
+        if (ch == 10) {
+            line = line + 1;
+            col = 0;
+            k = k + 1;
+            continue;
+        }
+        if (lsp_is_ident_char(ch)) {
+            let start = k;
+            let start_col = col;
+            while (k < text.len && lsp_is_ident_char(text.charAt(k))) {
+                k = k + 1;
+                col = col + 1;
+            }
+            if (text.substring(start, k) == word) {
+                if (n > 0) { out = out + ","; }
+                out = out + lsp_location_json(uri, line, start_col, line, col);
+                n = n + 1;
+            }
+            continue;
+        }
+        col = col + 1;
+        k = k + 1;
+    }
+    return out + "]";
+}
+
+fn lsp_handle_references(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let packed = json_position(body);
+    var line: i32 = 0;
+    var character: i32 = 0;
+    if (packed >= 0) {
+        line = (packed / 1000000) as i32;
+        character = (packed % 1000000) as i32;
+    }
+    let text = lsp_doc_text(server, uri);
+    let word = lsp_word_at(text, line, character);
+    if (word.len == 0) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":[]}"; }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":" + lsp_occurrence_locations_json(text, uri, word) + "}";
+}
+
+fn lsp_handle_prepare_rename(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let packed = json_position(body);
+    var line: i32 = 0;
+    var character: i32 = 0;
+    if (packed >= 0) {
+        line = (packed / 1000000) as i32;
+        character = (packed % 1000000) as i32;
+    }
+    let text = lsp_doc_text(server, uri);
+    let word = lsp_word_at(text, line, character);
+    if (word.len == 0) { return lsp_response_null(id_json); }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":" + lsp_word_range_json(text, line, character) + "}";
+}
+
+fn lsp_handle_rename(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let packed = json_position(body);
+    var line: i32 = 0;
+    var character: i32 = 0;
+    if (packed >= 0) {
+        line = (packed / 1000000) as i32;
+        character = (packed % 1000000) as i32;
+    }
+    let new_name = json_extract_string(body, "newName");
+    let text = lsp_doc_text(server, uri);
+    let word = lsp_word_at(text, line, character);
+    if (word.len == 0 || new_name.len == 0) { return lsp_response_null(id_json); }
+    let edits = lsp_collect_word_edits(text, word, new_name);
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":{\"changes\":{" + json_escape(uri) + ":" + edits + "}}}";
+}
+
+fn lsp_handle_folding(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let text = lsp_doc_text(server, uri);
+    var starts = Vec::<i32>.new();
+    var kinds = Vec::<i32>.new();
+    var out = "[";
+    var n: i32 = 0;
+    var line: i32 = 0;
+    var i: i64 = 0;
+    var st = LspScanState { in_block: false, in_string: false, in_char: false };
+    while (i <= text.len) {
+        let at_end = i == text.len;
+        var c: i32 = 0;
+        if (!at_end) { c = text.charAt(i); }
+        var nxt: i32 = 0;
+        if (i + 1 < text.len) { nxt = text.charAt(i + 1); }
+        if (at_end || c == 10) {
+            line = line + 1;
+            if (at_end) { break; }
+            i = i + 1;
+            continue;
+        }
+        let consumed = lsp_scan_push(st, c, nxt);
+        if (consumed == 1000) {
+            while (i < text.len && text.charAt(i) != 10) { i = i + 1; }
+            continue;
+        }
+        if (consumed > 0) {
+            i = i + (consumed as i64);
+            continue;
+        }
+        if (c == 123) {
+            starts.push(line);
+            kinds.push(0);
+        } else if (c == 125 && starts.len > 0) {
+            let start_line = starts.pop();
+            let kind = kinds.pop();
+            if (line > start_line) {
+                if (n > 0) { out = out + ","; }
+                out = out + "{\"startLine\":" + json_i32(start_line)
+                    + ",\"endLine\":" + json_i32(line)
+                    + ",\"kind\":\"region\"}";
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    starts.destroy();
+    kinds.destroy();
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":" + out + "]}";
+}
+
+fn lsp_text_edit_json(line: i32, col: i32, end_col: i32, new_text: string) -> string {
+    return "{\"range\":{\"start\":{\"line\":" + json_i32(line)
+        + ",\"character\":" + json_i32(col)
+        + "},\"end\":{\"line\":" + json_i32(line)
+        + ",\"character\":" + json_i32(end_col)
+        + "}},\"newText\":" + json_escape(new_text) + "}";
+}
+
+fn lsp_is_help_message(msg: string) -> bool {
+    return msg.startsWith("help:") || msg.startsWith("建议:");
+}
+
+fn lsp_line_code_end(line: string) -> i32 {
+    let stripped = lsp_strip_line_comment(line);
+    var endc = stripped.len as i32;
+    while (endc > 0) {
+        let ch = stripped.charAt((endc - 1) as i64);
+        if (ch == 32 || ch == 9 || ch == 13) { endc = endc - 1; }
+        else { break; }
+    }
+    return endc;
+}
+
+fn lsp_packed_pos(line: i32, col: i32) -> i64 {
+    return (line as i64) * 1000000 + (col as i64);
+}
+
+// Parser reports "expected ';'" on the *next* token (often `}` or the
+// following statement).  Insert at the end of the preceding statement
+// instead of the closer line.
+fn lsp_semi_insert_pos(text: string, dline: i32, dcol: i32) -> i64 {
+    let cur = lsp_line_at(text, dline);
+    var prefix_end = dcol as i64;
+    if (prefix_end > cur.len) { prefix_end = cur.len; }
+    if (prefix_end < 0) { prefix_end = 0; }
+    let prefix = cur.substring(0, prefix_end).clone();
+    let prefix_code_end = lsp_line_code_end(prefix);
+    if (prefix_code_end > 0) {
+        let last = prefix.charAt((prefix_code_end - 1) as i64);
+        if (last != 59 && last != 123 && last != 125) {
+            return lsp_packed_pos(dline, prefix_code_end);
+        }
+    }
+    var line = dline - 1;
+    while (line >= 0) {
+        let txt = lsp_line_at(text, line);
+        let endc = lsp_line_code_end(txt);
+        if (endc > 0) {
+            let stripped = lsp_strip_line_comment(txt);
+            let ch = stripped.charAt((endc - 1) as i64);
+            if (ch != 59 && ch != 123 && ch != 125) {
+                return lsp_packed_pos(line, endc);
+            }
+            break;
+        }
+        line = line - 1;
+    }
+    let fallback = lsp_line_code_end(cur);
+    return lsp_packed_pos(dline, fallback);
+}
+
+fn lsp_location_json(uri: string, line: i32, col: i32, end_line: i32, end_col: i32) -> string {
+    return "{\"uri\":" + json_escape(uri)
+        + ",\"range\":{\"start\":{\"line\":" + json_i32(line)
+        + ",\"character\":" + json_i32(col)
+        + "},\"end\":{\"line\":" + json_i32(end_line)
+        + ",\"character\":" + json_i32(end_col) + "}}}";
+}
+
+fn lsp_handle_code_action(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    var start_line = json_extract_int(body, "line") as i32;
+    if (start_line < 0) { start_line = 0; }
+    var out = "[";
+    var n: i32 = 0;
+    var i: i64 = 0;
+    while (i < server.diag_uris.len) {
+        if (!lsp_same_uri(server.diag_uris.get(i), uri)) {
+            i = i + 1;
+            continue;
+        }
+        let dline = server.diag_lines.get(i);
+        let dcol = server.diag_cols.get(i);
+        let code = server.diag_codes.get(i);
+        let msg = server.diag_msgs.get(i);
+        if (dline < start_line - 40 || dline > start_line + 40) {
+            i = i + 1;
+            continue;
+        }
+        if (lsp_is_help_message(msg)) {
+            i = i + 1;
+            continue;
+        }
+        let text = lsp_doc_text(server, uri);
+        var ident = lsp_quoted_ident(msg);
+        if (ident.len == 0) { ident = lsp_word_at(text, dline, dcol); }
+
+        if (code == "E2000" && ident.len > 0) {
+            var si: i64 = 0;
+            while (si < server.symbols.len) {
+                let cand = server.symbols.get(si);
+                if (lsp_similar_name(ident, cand.name)) {
+                    if (n > 0) { out = out + ","; }
+                    let wr = lsp_word_range_json(text, dline, dcol);
+                    out = out + "{\"title\":" + json_escape("Change '" + ident + "' to '" + cand.name + "'")
+                        + ",\"kind\":\"quickfix\""
+                        + ",\"edit\":{\"changes\":{" + json_escape(uri) + ":["
+                        + "{\"range\":" + wr + ",\"newText\":" + json_escape(cand.name) + "}]}}}";
+                    n = n + 1;
+                    if (n >= 6) { break; }
+                }
+                si = si + 1;
+            }
+            let mod_name = lsp_ident_module(ident);
+            if (mod_name.len > 0 && !lsp_text_has_use(text, mod_name)) {
+                let insert_at = lsp_use_insert_line(text);
+                if (n > 0) { out = out + ","; }
+                out = out + "{\"title\":" + json_escape("Add `use " + mod_name + ";`")
+                    + ",\"kind\":\"quickfix\""
+                    + ",\"edit\":{\"changes\":{" + json_escape(uri) + ":["
+                    + lsp_text_edit_json(insert_at, 0, 0, "use " + mod_name + ";\n")
+                    + "]}}}";
+                n = n + 1;
+            }
+        }
+
+        if ((code == "E0001" || code == "E0002") && lsp_find_substring(msg, "';'", 0) >= 0) {
+            let packed_semi = lsp_semi_insert_pos(text, dline, dcol);
+            let semi_line = (packed_semi / 1000000) as i32;
+            let semi_col = (packed_semi % 1000000) as i32;
+            let line_txt = lsp_line_at(text, semi_line);
+            if (semi_col == 0 || line_txt.len == 0
+                || (semi_col > 0 && line_txt.charAt((semi_col - 1) as i64) != 59)) {
+                if (n > 0) { out = out + ","; }
+                out = out + "{\"title\":\"Insert ';'\",\"kind\":\"quickfix\""
+                    + ",\"edit\":{\"changes\":{" + json_escape(uri) + ":["
+                    + lsp_text_edit_json(semi_line, semi_col, semi_col, ";") + "]}}}";
+                n = n + 1;
+            }
+        }
+
+
+        if (code == "E3100" && ident.len > 0) {
+            if (n > 0) { out = out + ","; }
+            out = out + "{\"title\":" + json_escape("Clone '" + ident + "' before move")
+                + ",\"kind\":\"quickfix\""
+                + ",\"edit\":{\"changes\":{" + json_escape(uri) + ":["
+                + "{\"range\":" + lsp_word_range_json(text, dline, dcol)
+                + ",\"newText\":" + json_escape(ident + ".clone()") + "}]}}}";
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":" + out + "]}";
+}
+
+fn lsp_handle_initialize(server: &mut LspServer, id_json: string, body: string) -> string {
+    var ws = json_extract_string(body, "rootUri");
+    if (ws.len == 0) { ws = json_extract_string(body, "rootPath"); }
+    if (ws.len == 0) { ws = json_extract_string(body, "uri"); }
+    if (ws.len > 0) {
+        server.workspace_root = uri_path_clean(ws);
+        lsp_scan_workspace(server, server.workspace_root);
+    }
+    lsp_scan_registered_packages(server);
+    server.initialized = true;
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":{"
+        + "\"capabilities\":{"
+        + "\"textDocumentSync\":{\"openClose\":true,\"change\":2,\"save\":{\"includeText\":true}},"
+        + "\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"],\"allCommitCharacters\":[\".\",\";\"]},"
+        + "\"hoverProvider\":true,"
+        + "\"definitionProvider\":true,"
+        + "\"documentSymbolProvider\":true,"
+        + "\"documentHighlightProvider\":true,"
+        + "\"workspaceSymbolProvider\":true,"
+        + "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]},"
+        + "\"semanticTokensProvider\":{"
+        + "\"legend\":{\"tokenTypes\":["
+        + "\"namespace\",\"type\",\"class\",\"enum\",\"interface\",\"struct\","
+        + "\"typeParameter\",\"parameter\",\"variable\",\"property\",\"enumMember\","
+        + "\"function\",\"method\",\"macro\",\"keyword\",\"modifier\",\"comment\","
+        + "\"string\",\"number\",\"regexp\",\"operator\",\"decorator\"],"
+        + "\"tokenModifiers\":[\"declaration\",\"definition\",\"readonly\",\"static\"]},\"full\":true},"
+        + "\"referencesProvider\":true,"
+        + "\"renameProvider\":{\"prepareProvider\":true},"
+        + "\"documentFormattingProvider\":true,"
+        + "\"documentRangeFormattingProvider\":true,"
+        + "\"foldingRangeProvider\":true,"
+        + "\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\",\"source.fixAll\"]},"
+        + "\"diagnosticProvider\":{\"interFileDependencies\":false,\"workspaceDiagnostics\":false}"
+        + "},"
+        + "\"serverInfo\":{\"name\":\"vyxc-lsp\",\"version\":\"1.0.0-alpha.1\"}"
+        + "}}";
+}
+
+fn lsp_document_index(server: &mut LspServer, uri: string) -> i64 {
+    var i: i64 = 0;
+    while (i < server.document_uris.len) {
+        let slot = server.document_uris.get_ptr(i);
+        if (lsp_same_uri(*slot, uri)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn lsp_doc_text(server: &mut LspServer, uri: string) -> string {
+    let idx = lsp_document_index(server, uri);
+    if (idx < 0) { return ""; }
+    let slot = server.document_texts.get_ptr(idx);
+    return (*slot).clone();
+}
+
+fn lsp_store_document(server: &mut LspServer, uri: string, text: string) {
+    let idx = lsp_document_index(server, uri);
+    if (idx >= 0) {
+        let removed_uri = server.document_uris.remove(idx);
+        let removed_text = server.document_texts.remove(idx);
+    }
+    server.document_uris.push(uri.clone());
+    server.document_texts.push(text.clone());
+}
+
+fn lsp_handle_did_open(server: &mut LspServer, body: string) {
+    let uri = json_extract_string(body, "uri");
+    let text = json_extract_string(body, "text");
+    if (uri.len == 0) { return; }
+    lsp_store_document(server, uri, text);
+    lsp_analyze_buffer(server, uri, text);
+}
+
+fn lsp_handle_did_change(server: &mut LspServer, body: string) {
+    let uri = json_extract_string(body, "uri");
+    if (uri.len == 0) { return; }
+    var text = lsp_doc_text(server, uri);
+    if (text.len == 0) {
+        let path = uri_path_clean(uri);
+        if (fileExists(path)) { text = readFile(path); }
+    }
+    text = lsp_apply_content_changes(text, body);
+    lsp_store_document(server, uri, text);
+    lsp_analyze_buffer(server, uri, text);
+}
+
+fn lsp_handle_did_save(server: &mut LspServer, body: string) {
+    let uri = json_extract_string(body, "uri");
+    if (uri.len == 0) { return; }
+    var text = "";
+    if (json_has_key(body, "text")) {
+        text = json_extract_string(body, "text");
+    }
+    if (text.len == 0) {
+        text = lsp_doc_text(server, uri);
+    }
+    if (text.len == 0) {
+        let path = uri_path_clean(uri);
+        if (fileExists(path)) { text = readFile(path); }
+    }
+    if (text.len == 0) { return; }
+    lsp_store_document(server, uri, text);
+    lsp_analyze_buffer(server, uri, text);
+}
+
+fn lsp_handle_did_close(server: &mut LspServer, body: string) {
+    let uri = json_extract_string(body, "uri");
+    if (uri.len == 0) { return; }
+    let document_idx = lsp_document_index(server, uri);
+    if (document_idx >= 0) {
+        let removed_uri = server.document_uris.remove(document_idx);
+        let removed_text = server.document_texts.remove(document_idx);
+    }
+    var kept = Vec::<LspSymbol>.new();
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let s = server.symbols.get(i);
+        let is_index = lsp_symbol_is_interface(s);
+        if (!lsp_same_uri(s.uri, uri) || is_index) {
+            kept.push(s);
+        }
+        i = i + 1;
+    }
+    server.symbols.destroy();
+    server.symbols = kept;
+    lsp_clear_uri_diags(server, uri);
+    lsp_send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":"
+        + json_escape(uri) + ",\"diagnostics\":[]}}");
+    let path = uri_path_clean(uri);
+    if (fileExists(path) && lsp_ends_with(path, ".vyx")) {
+        lsp_index_vyx_file(server, path);
+    }
+}
+
+fn lsp_completion_items_json(server: &mut LspServer, prefix: string, uri: string,
+                             line: i32, receiver: string) -> string {
+    var items = "[";
+    var count: i32 = 0;
+    var seen = Dict::<string, i32>.new();
+
+    if (receiver.len > 0) {
+        let receiver_symbol = lsp_find_visible_symbol(server, receiver, uri, line);
+        var receiver_type = receiver_symbol.type_name;
+        if (receiver_type.len == 0 && receiver_symbol.kind == lsp_kind_class()) {
+            receiver_type = receiver_symbol.name.clone();
+        }
+        if (receiver_type.len == 0 && receiver.len > 0
+            && receiver.charAt(0) >= 65 && receiver.charAt(0) <= 90) {
+            receiver_type = receiver.clone();
+        }
+        var mi: i64 = 0;
+        while (mi < server.symbols.len && count < 256) {
+            let member = server.symbols.get(mi);
+            if (lsp_owner_matches(member.owner, receiver_type)
+                && (member.kind == lsp_kind_method() || member.kind == lsp_kind_field())
+                && (prefix.len == 0 || member.name.startsWith(prefix))) {
+                let seen_key = lsp_completion_seen_key(member);
+                if (!seen.contains(seen_key)) {
+                    if (count > 0) { items = items + ","; }
+                    items = items + lsp_completion_item_json(member, "0_");
+                    seen.put(seen_key, 1);
+                    count = count + 1;
+                }
+            }
+            mi = mi + 1;
+        }
+        seen.destroy();
+        return items + "]";
+    }
+
+    var i: i64 = 0;
+    while (i < server.symbols.len && count < 256) {
+        let s = server.symbols.get(i);
+        if (lsp_same_uri(s.uri, uri) && s.owner.len == 0
+            && line >= s.scope_start_line && line <= s.scope_end_line
+            && (s.scope_start_line < 0 || s.line <= line)
+            && (prefix.len == 0 || s.name.startsWith(prefix))) {
+            let seen_key2 = lsp_completion_seen_key(s);
+            if (!seen.contains(seen_key2)) {
+                if (count > 0) { items = items + ","; }
+                items = items + lsp_completion_item_json(s, "0_");
+                seen.put(seen_key2, 1);
+                count = count + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < server.symbols.len && count < 256) {
+        let s = server.symbols.get(i);
+        if (!lsp_same_uri(s.uri, uri) && s.owner.len == 0
+            && (prefix.len == 0 || s.name.startsWith(prefix))) {
+            let seen_key3 = lsp_completion_seen_key(s);
+            if (!seen.contains(seen_key3)) {
+                if (count > 0) { items = items + ","; }
+                items = items + lsp_completion_item_json(s, "1_");
+                seen.put(seen_key3, 1);
+                count = count + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    var kw_items = lsp_add_keywords(prefix);
+    var ki: i64 = 0;
+    while (ki < kw_items.len && count < 256) {
+        let s = kw_items.get(ki);
+        if (!seen.contains(s.name)) {
+            if (count > 0) { items = items + ","; }
+            items = items + lsp_completion_item_json(s, "2_");
+            seen.put(s.name, 1);
+            count = count + 1;
+        }
+        ki = ki + 1;
+    }
+    kw_items.destroy();
+    seen.destroy();
+    return items + "]";
+}
+
+fn lsp_handle_completion(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let packed = json_position(body);
+    var line: i32 = 0;
+    var character: i32 = 0;
+    if (packed >= 0) {
+        line = (packed / 1000000) as i32;
+        character = (packed % 1000000) as i32;
+    }
+    let text = lsp_doc_text(server, uri);
+    let line_text = lsp_line_at(text, line);
+    let use_path = lsp_use_path_at(line_text, character);
+    if (use_path.active) {
+        if (server.packages.len == 0) {
+            lsp_scan_registered_packages(server);
+        }
+        let items = lsp_package_completion_json(server, use_path, line, character);
+        return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+            + ",\"result\":{\"isIncomplete\":true,\"items\":" + items + "}}";
+    }
+    let prefix = lsp_prefix_at(text, line, character);
+    let receiver = lsp_receiver_before_member(text, line, character);
+    let items = lsp_completion_items_json(server, prefix, uri, line, receiver);
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":{\"isIncomplete\":false,\"items\":" + items + "}}";
+}
+
+fn lsp_find_symbol(server: &mut LspServer, name: string, prefer_uri: string) -> LspSymbol {
+    let empty = lsp_empty_symbol();
+    if (name.len == 0) { return empty; }
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let s = server.symbols.get(i);
+        if (s.name == name && lsp_same_uri(s.uri, prefer_uri)) { return s; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < server.symbols.len) {
+        let s = server.symbols.get(i);
+        if (s.name == name) { return s; }
+        i = i + 1;
+    }
+    return empty;
+}
+
+fn lsp_builtin_type_name(name: string) -> bool {
+    return name == "i8" || name == "i16" || name == "i32" || name == "i64"
+        || name == "u8" || name == "u16" || name == "u32" || name == "u64"
+        || name == "isize" || name == "usize" || name == "f32" || name == "f64"
+        || name == "bool" || name == "char" || name == "string" || name == "wstring" || name == "rawptr"
+        || name == "void";
+}
+
+fn lsp_semantic_token_type(server: &mut LspServer, uri: string, lex: rawptr, idx: i32) -> i32 {
+    let tok = lex_token_at(lex, idx);
+    let kind = token_kind(tok);
+    let word = token_lexeme(tok);
+    let token_line0 = lsp_to_zero_based(token_line(tok));
+    let token_col0 = lsp_to_zero_based(token_col(tok));
+    if (kind == tk_STRING() || kind == tk_CHAR() || kind == tk_CHAR_LIT()
+        || kind == tk_FSTRING_RAW()) { return 17; }
+    if (kind == tk_INT() || kind == tk_FLOAT()) { return 18; }
+    if (kind == tk_BOOL() || kind == tk_NULL()) { return 14; }
+    if (kind >= 6 && kind <= 80) {
+        if (word == "public" || word == "private" || word == "static"
+            || word == "mut" || word == "unsafe" || word == "comptime") {
+            return 15;
+        }
+        return 14;
+    }
+    if (kind >= 81 && kind <= 123) { return 20; }
+    if (kind == tk_AT()) { return 21; }
+    if (kind != tk_IDENT()) { return -1; }
+    if (lsp_builtin_type_name(word)) { return 1; }
+    if (word == "new" || word == "sizeof" || word == "typeof" || word == "typeinfo") {
+        return 14;
+    }
+
+    var prev_kind = tk_EOF();
+    var next_kind = tk_EOF();
+    if (idx > 0) { prev_kind = token_kind(lex_token_at(lex, idx - 1)); }
+    if (idx + 1 < lex_token_count(lex)) { next_kind = token_kind(lex_token_at(lex, idx + 1)); }
+    if (prev_kind == tk_AT()) { return 21; }
+    if (prev_kind == tk_KEYWORD_CLASS()) { return 2; }
+    if (prev_kind == tk_KEYWORD_ENUM()) { return 3; }
+    if (prev_kind == tk_KEYWORD_INTERFACE()) { return 4; }
+    if (prev_kind == tk_KEYWORD_STRUCT()) { return 5; }
+    if (prev_kind == tk_KEYWORD_TYPE()) { return 1; }
+    if (prev_kind == tk_KEYWORD_FN()) { return 11; }
+    if (prev_kind == tk_KEYWORD_MODULE() || prev_kind == tk_KEYWORD_USE()
+        || prev_kind == tk_KEYWORD_IMPORT()) { return 0; }
+
+    var si: i64 = 0;
+    while (si < server.symbols.len) {
+        let declared = server.symbols.get(si);
+        if (lsp_same_uri(declared.uri, uri) && declared.name == word
+            && declared.line == token_line0 && declared.col == token_col0) {
+            return declared.semantic_type;
+        }
+        si = si + 1;
+    }
+
+    if (prev_kind == tk_DOT()) {
+        var doc_text = lsp_doc_text(server, uri);
+        if (doc_text.len == 0) {
+            let path = uri_path_clean(uri);
+            if (fileExists(path)) { doc_text = readFile(path); }
+        }
+        let receiver = lsp_receiver_before_member(doc_text, token_line0,
+                                                   token_col0 + (word.len as i32));
+        let receiver_symbol = lsp_find_visible_symbol(server, receiver, uri, token_line0);
+        var receiver_type = receiver_symbol.type_name;
+        if (receiver_type.len == 0) { receiver_type = receiver.clone(); }
+        let member = lsp_find_member_symbol(server, receiver_type, word);
+        if (member.name.len > 0) { return member.semantic_type; }
+        if (next_kind == tk_LPAREN()) { return 12; }
+        return 9;
+    }
+    let visible = lsp_find_visible_symbol(server, word, uri, token_line0);
+    if (visible.name.len > 0) { return visible.semantic_type; }
+    if (next_kind == tk_LPAREN()) { return 11; }
+    if (word.len > 0 && word.charAt(0) >= 65 && word.charAt(0) <= 90) { return 1; }
+    // Unknown identifiers are intentionally omitted.  Returning `variable`
+    // here overwrites the richer immediate lexer coloring for locals, fields
+    // and function-value references whenever the light parser sees a newer
+    // construct and cannot build a complete AST.
+    return -1;
+}
+
+fn lsp_semantic_token_modifiers(server: &mut LspServer, uri: string,
+                                lex: rawptr, idx: i32) -> i32 {
+    let tok = lex_token_at(lex, idx);
+    if (token_kind(tok) != tk_IDENT()) { return 0; }
+    let word = token_lexeme(tok);
+    let line = lsp_to_zero_based(token_line(tok));
+    let col = lsp_to_zero_based(token_col(tok));
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let declared = server.symbols.get(i);
+        if (lsp_same_uri(declared.uri, uri) && declared.name == word
+            && declared.line == line && declared.col == col) {
+            var modifiers: i32 = 1; // declaration
+            if (declared.detail.startsWith("const ")) { modifiers = modifiers | 4; }
+            if (declared.is_static) { modifiers = modifiers | 8; }
+            return modifiers;
+        }
+        i = i + 1;
+    }
+    let visible = lsp_find_visible_symbol(server, word, uri, line);
+    var usage_modifiers: i32 = 0;
+    if (visible.name.len > 0 && visible.detail.startsWith("const ")) {
+        usage_modifiers = usage_modifiers | 4;
+    }
+    if (visible.name.len > 0 && visible.is_static) {
+        usage_modifiers = usage_modifiers | 8;
+    }
+    return usage_modifiers;
+}
+
+fn lsp_semantic_tokens_json(server: &mut LspServer, uri: string, text: string) -> string {
+    diag_set_enabled(false);
+    let lex = lex_source(text);
+    if (lex == null) {
+        diag_set_enabled(true);
+        return "[]";
+    }
+    var data = "[";
+    var emitted: i32 = 0;
+    var last_line: i32 = 0;
+    var last_col: i32 = 0;
+    var i: i32 = 0;
+    let count = lex_token_count(lex);
+    while (i < count) {
+        let tok = lex_token_at(lex, i);
+        let kind = token_kind(tok);
+        let lexeme = token_lexeme(tok);
+        let token_type = lsp_semantic_token_type(server, uri, lex, i);
+        let token_modifiers = lsp_semantic_token_modifiers(server, uri, lex, i);
+        if (kind != tk_EOF() && kind != tk_INVALID() && token_type >= 0 && lexeme.len > 0
+            && !lexeme.contains("\n") && !lexeme.contains("\r")) {
+            let line = lsp_to_zero_based(token_line(tok));
+            let col = lsp_to_zero_based(token_col(tok));
+            var delta_line = line;
+            var delta_col = col;
+            if (emitted > 0) {
+                delta_line = line - last_line;
+                if (delta_line == 0) { delta_col = col - last_col; }
+            }
+            if (delta_line >= 0 && delta_col >= 0) {
+                if (emitted > 0) { data = data + ","; }
+                data = data + json_i32(delta_line) + "," + json_i32(delta_col)
+                    + "," + policy_i64_to_string(lexeme.len) + ","
+                    + json_i32(token_type) + "," + json_i32(token_modifiers);
+                last_line = line;
+                last_col = col;
+                emitted = emitted + 1;
+            }
+        }
+        i = i + 1;
+    }
+    lexer_dispose(lex);
+    diag_set_enabled(true);
+    return data + "]";
+}
+
+fn lsp_handle_semantic_tokens(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let path = uri_path_clean(uri);
+    // Open documents are authoritative.  Reading disk first makes semantic
+    // highlighting lag behind unsaved editor changes.
+    var text = lsp_doc_text(server, uri);
+    if (text.len == 0 && fileExists(path)) { text = readFile(path); }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":{\"data\":" + lsp_semantic_tokens_json(server, uri, text) + "}}";
+}
+
+fn lsp_handle_signature_help(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let packed = json_position(body);
+    var line: i32 = 0;
+    var character: i32 = 0;
+    if (packed >= 0) {
+        line = (packed / 1000000) as i32;
+        character = (packed % 1000000) as i32;
+    }
+    let document_path = uri_path_clean(uri);
+    // Signature help must use the current editor buffer before the saved file.
+    var document_text = lsp_doc_text(server, uri);
+    if (document_text.len == 0 && fileExists(document_path)) {
+        document_text = readFile(document_path);
+    }
+    let line_text = lsp_line_at(document_text, line);
+    var cursor = character as i64;
+    if (cursor > line_text.len) { cursor = line_text.len; }
+    if (cursor <= 0 && line_text.len > 0) {
+        // Recover when the bootstrap JSON extractor retained `line` but lost
+        // the nested `character` field. Signature help is requested inside a
+        // call, so the last closing parenthesis is the safest local boundary.
+        var p: i64 = 0;
+        var last_close: i64 = -1;
+        while (p < line_text.len) {
+            if (line_text.charAt(p) == 41) { last_close = p; }
+            p = p + 1;
+        }
+        if (last_close > 0) { cursor = last_close; }
+    }
+    var active: i32 = 0;
+    var call_name = "";
+    var paren_depth: i32 = 0;
+    var call_depth: i32 = 0;
+    var last_ident = "";
+    var last_ident_end: i64 = -1;
+    var scan: i64 = 0;
+    while (scan < cursor) {
+        let c = line_text.charAt(scan);
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) {
+            let start = scan;
+            scan = scan + 1;
+            while (scan < cursor && lsp_is_ident_char(line_text.charAt(scan))) {
+                scan = scan + 1;
+            }
+            last_ident = line_text.substring(start, scan).clone();
+            last_ident_end = scan;
+            continue;
+        }
+        if (c == 40) {
+            var only_ws = last_ident_end >= 0;
+            var gap = last_ident_end;
+            while (only_ws && gap < scan) {
+                let gc = line_text.charAt(gap);
+                if (gc != 32 && gc != 9) { only_ws = false; }
+                gap = gap + 1;
+            }
+            paren_depth = paren_depth + 1;
+            if (only_ws && last_ident.len > 0) {
+                call_name = last_ident.clone();
+                call_depth = paren_depth;
+                active = 0;
+            }
+        } else if (c == 41) {
+            if (paren_depth == call_depth) {
+                call_name = "";
+                call_depth = 0;
+                active = 0;
+            }
+            if (paren_depth > 0) { paren_depth = paren_depth - 1; }
+        } else if (c == 44 && call_name.len > 0 && paren_depth == call_depth) {
+            active = active + 1;
+        }
+        if (c != 32 && c != 9) {
+            last_ident = "";
+            last_ident_end = -1;
+        }
+        scan = scan + 1;
+    }
+    if (call_name.len == 0) { return lsp_response_null(id_json); }
+
+    var signature = lsp_signature_from_text(document_text, call_name);
+    var i: i64 = 0;
+    while (signature.len == 0 && i < server.symbols.len) {
+        let candidate = server.symbols.get(i);
+        if (candidate.name == call_name && lsp_same_uri(candidate.uri, uri)
+            && (candidate.kind == lsp_kind_function() || candidate.kind == lsp_kind_method())) {
+            signature = candidate.detail.clone();
+            break;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (signature.len == 0 && i < server.symbols.len) {
+        let candidate = server.symbols.get(i);
+        if (candidate.name == call_name
+            && (candidate.kind == lsp_kind_function() || candidate.kind == lsp_kind_method())) {
+            signature = candidate.detail.clone();
+            break;
+        }
+        i = i + 1;
+    }
+    if (signature.len == 0) { return lsp_response_null(id_json); }
+
+    var params = lsp_signature_params(signature);
+    var params_json = "[";
+    i = 0;
+    while (i < params.len) {
+        if (i > 0) { params_json = params_json + ","; }
+        params_json = params_json + "{\"label\":" + json_escape(params.get(i)) + "}";
+        i = i + 1;
+    }
+    params_json = params_json + "]";
+    if (params.len > 0 && (active as i64) >= params.len) { active = (params.len - 1) as i32; }
+    params.destroy();
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":{\"signatures\":[{\"label\":" + json_escape(signature)
+        + ",\"parameters\":" + params_json + "}],\"activeSignature\":0,\"activeParameter\":"
+        + json_i32(active) + "}}";
+}
+
+fn lsp_symbol_kind(kind: i32) -> i32 {
+    if (kind == lsp_kind_module()) { return 2; }
+    if (kind == lsp_kind_class()) { return 5; }
+    if (kind == lsp_kind_method()) { return 6; }
+    if (kind == lsp_kind_field()) { return 8; }
+    if (kind == lsp_kind_enum()) { return 10; }
+    if (kind == lsp_kind_interface()) { return 11; }
+    if (kind == lsp_kind_function()) { return 12; }
+    if (kind == lsp_kind_variable()) { return 13; }
+    if (kind == lsp_kind_enum_member()) { return 22; }
+    if (kind == lsp_kind_struct()) { return 23; }
+    return 13;
+}
+
+fn lsp_line_char_len(text: string, line: i32) -> i32 {
+    if (line < 0) { return 0; }
+    var current: i32 = 0;
+    var i: i64 = 0;
+    var start: i64 = 0;
+    while (i <= text.len) {
+        let at_end = i == text.len;
+        if (at_end || text.charAt(i) == 10) {
+            if (current == line) {
+                var end = i;
+                if (end > start && text.charAt(end - 1) == 13) { end = end - 1; }
+                return (end - start) as i32;
+            }
+            current = current + 1;
+            start = i + 1;
+        }
+        if (at_end) { break; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// CLion sticky lines use selectionRange.start as the text offset and range.end
+// as the line end. StickyLineInfo requires textOffset < endOffset, so a symbol
+// whose range is only its name (selection start == range end) aborts the
+// highlighting pass and leaves the IDE indicator at "analyzing". Columns past
+// the real line are clamped first: the IDE clamps them too, and an unclamped
+// pair can collapse to the same document offset.
+fn lsp_clamp_symbol_col(text: string, line: i32, col: i32) -> i32 {
+    let limit = lsp_line_char_len(text, line);
+    if (col < 0 || col > limit) { return limit; }
+    return col;
+}
+
+fn lsp_symbol_enclosing_end(server: &mut LspServer, sym: LspSymbol) -> i64 {
+    var best_line = sym.scope_end_line;
+    var best_col: i32 = 0;
+    if (best_line == 2147483647 || best_line < sym.line) {
+        best_line = sym.end_line;
+        best_col = sym.end_col;
+    }
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let other = server.symbols.get(i);
+        if (lsp_same_uri(other.uri, sym.uri)
+            && other.scope_start_line == sym.line
+            && other.scope_end_line > best_line
+            && other.scope_end_line != 2147483647) {
+            best_line = other.scope_end_line;
+            best_col = 0;
+        }
+        i = i + 1;
+    }
+    if (best_line < sym.line || (best_line == sym.line && best_col <= sym.col)) {
+        best_line = sym.line;
+        best_col = sym.col + 1;
+        if (sym.end_line > sym.line || (sym.end_line == sym.line && sym.end_col > sym.col)) {
+            best_line = sym.end_line;
+            best_col = sym.end_col;
+        }
+    }
+    return (best_line as i64) * 1000000 + (best_col as i64);
+}
+
+fn lsp_position_json(line: i32, character: i32) -> string {
+    return "{\"line\":" + json_i32(line) + ",\"character\":" + json_i32(character) + "}";
+}
+
+fn lsp_range_json(start_line: i32, start_col: i32, end_line: i32, end_col: i32) -> string {
+    return "{\"start\":" + lsp_position_json(start_line, start_col)
+        + ",\"end\":" + lsp_position_json(end_line, end_col) + "}";
+}
+
+fn lsp_handle_document_symbols(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    var out = "[";
+    var count: i32 = 0;
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let sym = server.symbols.get(i);
+        if (lsp_same_uri(sym.uri, uri) && !lsp_symbol_is_interface(sym)) {
+            if (count > 0) { out = out + ","; }
+            let text = lsp_doc_text(server, uri);
+            var start_line = sym.line;
+            var start_col = lsp_clamp_symbol_col(text, start_line, sym.col);
+            let line_len = lsp_line_char_len(text, start_line);
+            if (start_col >= line_len && line_len > 0) { start_col = line_len - 1; }
+            let packed = lsp_symbol_enclosing_end(server, sym);
+            var range_end_line = (packed / 1000000) as i32;
+            var range_end_col = lsp_clamp_symbol_col(text, range_end_line, (packed % 1000000) as i32);
+            var sel_end_col = start_col + (sym.name.len as i32);
+            let sel_limit = lsp_line_char_len(text, start_line);
+            if (sel_end_col > sel_limit) { sel_end_col = sel_limit; }
+            if (sel_end_col <= start_col) { sel_end_col = start_col + 1; }
+            if (range_end_line < start_line
+                || (range_end_line == start_line && range_end_col <= start_col)) {
+                range_end_line = start_line;
+                range_end_col = sel_end_col;
+            }
+            if (range_end_line == start_line && range_end_col <= start_col) {
+                range_end_line = start_line + 1;
+                range_end_col = 0;
+            }
+            let range = lsp_range_json(start_line, start_col, range_end_line, range_end_col);
+            let selection = lsp_range_json(start_line, start_col, start_line, sel_end_col);
+            out = out + "{\"name\":" + json_escape(sym.name)
+                + ",\"detail\":" + json_escape(sym.detail)
+                + ",\"kind\":" + json_i32(lsp_symbol_kind(sym.kind))
+                + ",\"range\":" + range
+                + ",\"selectionRange\":" + selection + "}";
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":" + out + "]}";
+}
+
+fn lsp_handle_hover(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let packed = json_position(body);
+    var line: i32 = 0;
+    var character: i32 = 0;
+    if (packed >= 0) {
+        line = (packed / 1000000) as i32;
+        character = (packed % 1000000) as i32;
+    }
+    let text = lsp_doc_text(server, uri);
+    let word = lsp_word_at(text, line, character);
+    if (word.len == 0) { return lsp_response_null(id_json); }
+    let receiver = lsp_receiver_before_member(text, line, character);
+    var sym = lsp_empty_symbol();
+    if (receiver.len > 0) {
+        let receiver_symbol = lsp_find_visible_symbol(server, receiver, uri, line);
+        var receiver_type = receiver_symbol.type_name;
+        if (receiver_type.len == 0) { receiver_type = receiver.clone(); }
+        sym = lsp_find_member_symbol(server, receiver_type, word);
+    }
+    if (sym.name.len == 0) { sym = lsp_find_visible_symbol(server, word, uri, line); }
+    if (sym.name.len == 0) {
+        if (!lsp_builtin_type_name(word)) { return lsp_response_null(id_json); }
+        let builtin_md = "```vyx\n" + word + "\n```";
+        return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+            + ",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":"
+            + json_escape(builtin_md) + "}}}";
+    }
+    var md = "```vyx\n" + word + "\n```";
+    if (sym.type_name.len > 0) {
+        md = "```vyx\n" + word + ": " + sym.type_name + "\n```";
+        if (sym.detail.len > 0) { md = md + "\n\n" + sym.detail; }
+    } else if (sym.detail.len > 0) {
+        md = "```vyx\n" + sym.detail + "\n```";
+    }
+    if (sym.owner.len > 0) { md = md + "\n\nDeclared in **" + sym.owner + "**"; }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":"
+        + json_escape(md) + "}}}";
+}
+
+fn lsp_handle_definition(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let packed = json_position(body);
+    var line: i32 = 0;
+    var character: i32 = 0;
+    if (packed >= 0) {
+        line = (packed / 1000000) as i32;
+        character = (packed % 1000000) as i32;
+    }
+    let text = lsp_doc_text(server, uri);
+    let word = lsp_word_at(text, line, character);
+    if (word.len == 0) { return lsp_response_null(id_json); }
+    let receiver = lsp_receiver_before_member(text, line, character);
+    var sym = lsp_empty_symbol();
+    if (receiver.len > 0) {
+        let receiver_symbol = lsp_find_visible_symbol(server, receiver, uri, line);
+        var receiver_type = receiver_symbol.type_name;
+        if (receiver_type.len == 0) { receiver_type = receiver.clone(); }
+        sym = lsp_find_member_symbol(server, receiver_type, word);
+    }
+    if (sym.name.len == 0) { sym = lsp_find_visible_symbol(server, word, uri, line); }
+    if (sym.name.len == 0 || sym.uri.len == 0) { return lsp_response_null(id_json); }
+    // CLion converts a Location into a LocationLink by copying range into both
+    // targetRange and targetSelectionRange. A name-sized target then compares
+    // equal to the word under the caret, and GotoDeclaration drops it. Return
+    // the link directly: the caret word is the origin, the declaration body is
+    // the target, and the name stays the selection.
+    let origin = lsp_word_range_json(text, line, character);
+    let target_text = lsp_doc_text(server, sym.uri);
+    let decl_line = lsp_line_at(target_text, sym.line);
+    var target_end_line = sym.line;
+    var target_end_col = sym.col + (sym.name.len as i32);
+    // Only a brace opened on the declaration line belongs to that declaration.
+    // A later impl/fn brace must not swallow a field or variable.
+    if (lsp_find_substring(decl_line, "{", sym.col as i64) >= 0) {
+        target_end_line = lsp_decl_body_end_line(target_text, sym.line);
+        target_end_col = 1;
+    }
+    if (target_end_line <= sym.line) {
+        target_end_line = sym.line;
+        target_end_col = sym.col + (sym.name.len as i32);
+    }
+    if (target_end_line < sym.line
+        || (target_end_line == sym.line && target_end_col <= sym.col)) {
+        target_end_line = sym.line;
+        target_end_col = sym.col + (sym.name.len as i32);
+    }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":{\"targetUri\":" + json_escape(sym.uri)
+        + ",\"targetRange\":" + lsp_range_json(sym.line, sym.col, target_end_line, target_end_col)
+        + ",\"targetSelectionRange\":" + lsp_range_json(sym.line, sym.col, sym.line, sym.col + (sym.name.len as i32))
+        + ",\"originSelectionRange\":" + origin + "}}";
+}
+
+fn lsp_query_matches(name: string, query: string) -> bool {
+    if (query.len == 0) { return true; }
+    if (name.startsWith(query)) { return true; }
+    let hay = name.toLower();
+    let needle = query.toLower();
+    return lsp_find_substring(hay, needle, 0) >= 0;
+}
+
+fn lsp_handle_document_highlight(server: &mut LspServer, id_json: string, body: string) -> string {
+    let uri = json_extract_string(body, "uri");
+    let packed = json_position(body);
+    var line: i32 = 0;
+    var character: i32 = 0;
+    if (packed >= 0) {
+        line = (packed / 1000000) as i32;
+        character = (packed % 1000000) as i32;
+    }
+    let text = lsp_doc_text(server, uri);
+    let word = lsp_word_at(text, line, character);
+    if (word.len == 0) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":[]}"; }
+    var out = "[";
+    var n: i32 = 0;
+    var line2: i32 = 0;
+    var col2: i32 = 0;
+    var k: i64 = 0;
+    while (k < text.len) {
+        let ch = text.charAt(k);
+        if (ch == 10) {
+            line2 = line2 + 1;
+            col2 = 0;
+            k = k + 1;
+            continue;
+        }
+        if (lsp_is_ident_char(ch)) {
+            let start = k;
+            let start_col = col2;
+            while (k < text.len && lsp_is_ident_char(text.charAt(k))) {
+                k = k + 1;
+                col2 = col2 + 1;
+            }
+            let ident = text.substring(start, k).clone();
+            if (ident == word) {
+                var kind: i32 = 2;
+                var si: i64 = 0;
+                while (si < server.symbols.len) {
+                    let sym = server.symbols.get(si);
+                    if (lsp_same_uri(sym.uri, uri) && sym.name == word
+                        && sym.line == line2 && sym.col == start_col) {
+                        kind = 3;
+                        break;
+                    }
+                    si = si + 1;
+                }
+                if (n > 0) { out = out + ","; }
+                out = out + "{\"range\":{\"start\":{\"line\":" + json_i32(line2)
+                    + ",\"character\":" + json_i32(start_col)
+                    + "},\"end\":{\"line\":" + json_i32(line2)
+                    + ",\"character\":" + json_i32(col2)
+                    + "}},\"kind\":" + json_i32(kind) + "}";
+                n = n + 1;
+            }
+            continue;
+        }
+        col2 = col2 + 1;
+        k = k + 1;
+    }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":" + out + "]}";
+}
+
+fn lsp_handle_workspace_symbol(server: &mut LspServer, id_json: string, body: string) -> string {
+    let query = json_extract_string(body, "query");
+    var out = "[";
+    var n: i32 = 0;
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let sym = server.symbols.get(i);
+        if (sym.name.len > 0 && lsp_query_matches(sym.name, query)) {
+            if (n > 0) { out = out + ","; }
+            var item = "{\"name\":" + json_escape(sym.name)
+                + ",\"kind\":" + json_i32(lsp_symbol_kind(sym.kind))
+                + ",\"location\":" + lsp_location_json(sym.uri, sym.line, sym.col, sym.end_line, sym.end_col);
+            if (sym.owner.len > 0) {
+                item = item + ",\"containerName\":" + json_escape(sym.owner);
+            }
+            out = out + item + "}";
+            n = n + 1;
+            if (n >= 256) { break; }
+        }
+        i = i + 1;
+    }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":" + out + "]}";
+}
+
+fn lsp_dispatch(server: &mut LspServer, body: string) -> i32 {
+    let method = json_extract_string(body, "method");
+    let id_json = json_extract_id_json(body);
+
+    if (method == "initialize") {
+        lsp_send_message(lsp_handle_initialize(server, id_json, body));
+    } else if (method == "initialized") {
+        // notification no-op
+    } else if (method == "shutdown") {
+        server.shutdown_requested = true;
+        lsp_send_message(lsp_response_null(id_json));
+    } else if (method == "exit") {
+        return 0;
+    } else if (method == "textDocument/didOpen") {
+        lsp_handle_did_open(server, body);
+    } else if (method == "textDocument/didChange") {
+        lsp_handle_did_change(server, body);
+    } else if (method == "textDocument/didSave") {
+        lsp_handle_did_save(server, body);
+    } else if (method == "textDocument/didClose") {
+        lsp_handle_did_close(server, body);
+    } else if (method == "textDocument/completion") {
+        lsp_send_message(lsp_handle_completion(server, id_json, body));
+    } else if (method == "textDocument/hover") {
+        lsp_send_message(lsp_handle_hover(server, id_json, body));
+    } else if (method == "textDocument/definition") {
+        lsp_send_message(lsp_handle_definition(server, id_json, body));
+    } else if (method == "textDocument/documentSymbol") {
+        lsp_send_message(lsp_handle_document_symbols(server, id_json, body));
+    } else if (method == "textDocument/documentHighlight") {
+        lsp_send_message(lsp_handle_document_highlight(server, id_json, body));
+    } else if (method == "workspace/symbol") {
+        lsp_send_message(lsp_handle_workspace_symbol(server, id_json, body));
+    } else if (method == "textDocument/signatureHelp") {
+        lsp_send_message(lsp_handle_signature_help(server, id_json, body));
+    } else if (method == "textDocument/semanticTokens/full") {
+        lsp_send_message(lsp_handle_semantic_tokens(server, id_json, body));
+    } else if (method == "textDocument/formatting" || method == "textDocument/rangeFormatting") {
+        lsp_send_message(lsp_handle_formatting(server, id_json, body));
+    } else if (method == "textDocument/codeAction") {
+        lsp_send_message(lsp_handle_code_action(server, id_json, body));
+    } else if (method == "textDocument/references") {
+        lsp_send_message(lsp_handle_references(server, id_json, body));
+    } else if (method == "textDocument/prepareRename") {
+        lsp_send_message(lsp_handle_prepare_rename(server, id_json, body));
+    } else if (method == "textDocument/rename") {
+        lsp_send_message(lsp_handle_rename(server, id_json, body));
+    } else if (method == "textDocument/foldingRange") {
+        lsp_send_message(lsp_handle_folding(server, id_json, body));
+    } else if (method == "textDocument/diagnostic") {
+        lsp_send_message(lsp_handle_text_document_diagnostic(server, id_json, body));
+    } else if (method == "$/cancelRequest") {
+        // ignore
+    } else if (id_json.len > 0) {
+        lsp_send_message(lsp_response_null(id_json));
+    }
+    return 1;
+}
+
+fn lsp_show_help() {
+    print("vyxc-lsp — Vyx Language Server (bootstrap)");
+    print("Usage: vyxc-lsp [--stdio]");
+    print("  Speaks LSP over stdin/stdout with Content-Length framing.");
+    print("  Workspace index: .vyx source + .vyi + .dcib interfaces");
+    print("  IDE features: Sema types, diagnostics, hover, completion, symbols,");
+    print("    parse/sema diagnostics, format, code actions, highlights, workspace symbols,");
+    print("    pull diagnostics,");
+    print("    references, rename, folding");
+    print("    use/import package completion from the module registry");
+}
+
+fn main() -> i32 {
+    var i: i32 = 1;
+    let argc = argCount();
+    while (i < argc) {
+        let a = getArg(i);
+        if (a == "-h" || a == "--help" || a == "help") {
+            lsp_show_help();
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    var server = LspServer.create();
+    if (argCount() > 0) {
+        server.exe_dir = lsp_dirname(getArg(0));
+    }
+    while (true) {
+        let msg = lsp_read_message();
+        if (msg.len == 0) { break; }
+        let cont = lsp_dispatch(&mut server, msg);
+        if (cont == 0) { break; }
+    }
+    while (server.document_uris.len > 0) {
+        let uri = server.document_uris.pop();
+        let text = server.document_texts.pop();
+    }
+    server.document_uris.destroy();
+    server.document_texts.destroy();
+    server.symbols.destroy();
+    server.packages.destroy();
+    server.diag_uris.destroy();
+    server.diag_codes.destroy();
+    server.diag_msgs.destroy();
+    server.diag_lines.destroy();
+    server.diag_cols.destroy();
+    server.diag_jsons.destroy();
+    return 0;
+}

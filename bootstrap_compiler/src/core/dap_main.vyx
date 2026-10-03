@@ -1,0 +1,1863 @@
+module bootstrap.dap_main;
+
+/// Independent Debug Adapter Protocol binary for the Vyx bootstrap toolchain.
+/// The adapter itself is implemented in Vyx and speaks DAP over stdio.  LLDB
+/// is driven through private child-process pipes; no host DAP implementation is
+/// linked into this target.
+///
+/// Linux: native ptrace + DWARF engine in `vyx_compiler_backend`
+/// (`vyx_dap_*`). Other hosts may use LLDB CLI only with an explicit debugger
+/// path or LLVM SDK configuration; the adapter does not guess a host path.
+
+use std.fs;
+use std.string;
+use std.collections;
+
+extern "C" {
+    fn getchar() -> i32;
+    fn putchar(c: i32) -> i32;
+    fn fflush(stream: rawptr) -> i32;
+    fn malloc(size: i64) -> rawptr;
+    fn calloc(count: i64, size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memset(dst: rawptr, value: i32, n: i64) -> rawptr;
+    fn getenv(name: rawptr) -> rawptr;
+    fn vyx_dap_engine_available() -> i32;
+    fn vyx_dap_launch(exe: rawptr, cwd: rawptr) -> i32;
+    fn vyx_dap_set_breakpoint(file: rawptr, line: i32) -> i32;
+    fn vyx_dap_clear_breakpoints() -> i32;
+    fn vyx_dap_continue() -> i32;
+    fn vyx_dap_step_over() -> i32;
+    fn vyx_dap_step_in() -> i32;
+    fn vyx_dap_step_out() -> i32;
+    fn vyx_dap_pause() -> i32;
+    fn vyx_dap_wait_stop(reason: rawptr, cap: i32) -> i32;
+    fn vyx_dap_stack_json(buf: rawptr, cap: i32) -> i32;
+    fn vyx_dap_vars_json(frame: i32, buf: rawptr, cap: i32) -> i32;
+    fn vyx_dap_evaluate(expr: rawptr, buf: rawptr, cap: i32) -> i32;
+    fn vyx_dap_disconnect();
+}
+
+@[platform("windows")]
+extern "C" {
+    fn CreatePipe(read_pipe: rawptr, write_pipe: rawptr, attributes: rawptr, size: u32) -> i32;
+    fn SetHandleInformation(handle: rawptr, mask: u32, flags: u32) -> i32;
+    fn CreateProcessA(application: rawptr, command_line: rawptr,
+                      process_attributes: rawptr, thread_attributes: rawptr,
+                      inherit_handles: i32, creation_flags: u32,
+                      environment: rawptr, current_directory: rawptr,
+                      startup_info: rawptr, process_info: rawptr) -> i32;
+    fn ReadFile(handle: rawptr, buffer: rawptr, size: u32,
+                read_count: rawptr, overlapped: rawptr) -> i32;
+    fn WriteFile(handle: rawptr, buffer: rawptr, size: u32,
+                 write_count: rawptr, overlapped: rawptr) -> i32;
+    fn CloseHandle(handle: rawptr) -> i32;
+    fn WaitForSingleObject(handle: rawptr, milliseconds: u32) -> u32;
+    fn TerminateProcess(handle: rawptr, exit_code: u32) -> i32;
+    fn Sleep(milliseconds: u32);
+    fn SetEnvironmentVariableA(name: rawptr, value: rawptr) -> i32;
+    fn GetCurrentProcessId() -> u32;
+    fn GetFullPathNameA(path: rawptr, size: u32, buffer: rawptr, file_part: rawptr) -> u32;
+    fn FindFirstFileA(pattern: rawptr, data: rawptr) -> rawptr;
+    fn FindNextFileA(handle: rawptr, data: rawptr) -> i32;
+    fn FindClose(handle: rawptr) -> i32;
+}
+
+@[platform("posix")]
+extern "C" {
+    fn pipe(fds: rawptr) -> i32;
+    fn fork() -> i32;
+    fn dup2(old_fd: i32, new_fd: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn read(fd: i32, buffer: rawptr, size: i64) -> i64;
+    fn write(fd: i32, buffer: rawptr, size: i64) -> i64;
+    fn chdir(path: rawptr) -> i32;
+    fn execlp(path: rawptr, arg0: rawptr, arg1: rawptr, terminator: rawptr) -> i32;
+    fn kill(pid: i32, signal: i32) -> i32;
+    fn waitpid(pid: i32, status: rawptr, options: i32) -> i32;
+    fn usleep(microseconds: u32) -> i32;
+    fn getcwd(buffer: rawptr, size: i64) -> rawptr;
+    fn getpid() -> i32;
+}
+
+class DapBreakpoint {
+    public source_path: string;
+    public line: i32;
+    public id: i32;
+    public debugger_id: i32;
+    public verified: bool;
+}
+
+class DapServer {
+    public sequence: i32;
+    public next_breakpoint_id: i32;
+    public next_variable_reference: i32;
+    public running: bool;
+    public terminated: bool;
+    public stop_on_entry: bool;
+    public debugger_path: string;
+    public debugger_buffer: string;
+    public program_path: string;
+    public working_directory: string;
+    public target_stdout_path: string;
+    public target_stderr_path: string;
+    public target_stdout_offset: i64;
+    public target_stderr_offset: i64;
+    public debugger_process: rawptr;
+    public debugger_stdin: rawptr;
+    public debugger_stdout: rawptr;
+    public debugger_pid: i32;
+    public debugger_write_fd: i32;
+    public debugger_read_fd: i32;
+    public native_engine: bool;
+    public last_stop_location: string;
+    public breakpoints: Vec<DapBreakpoint>;
+    public variables: Dict<i32, string>;
+
+    public static fn create() -> DapServer {
+        return DapServer {
+            sequence: 1,
+            next_breakpoint_id: 1,
+            next_variable_reference: 1000,
+            running: false,
+            terminated: false,
+            stop_on_entry: false,
+            debugger_path: "",
+            debugger_buffer: "",
+            program_path: "",
+            working_directory: "",
+            target_stdout_path: "",
+            target_stderr_path: "",
+            target_stdout_offset: 0,
+            target_stderr_offset: 0,
+            debugger_process: null,
+            debugger_stdin: null,
+            debugger_stdout: null,
+            debugger_pid: -1,
+            debugger_write_fd: -1,
+            debugger_read_fd: -1,
+            native_engine: false,
+            last_stop_location: "",
+            breakpoints: Vec::<DapBreakpoint>.new(),
+            variables: Dict::<i32, string>.new()
+        };
+    }
+}
+
+fn dap_i64_text(value: i64) -> string {
+    if (value == 0) { return "0"; }
+    let digits = "0123456789";
+    var n = value;
+    var negative = false;
+    if (n < 0) { negative = true; }
+    else { n = 0 - n; }
+    var out = "";
+    while (n < 0) {
+        let d = (0 - (n % 10)) as i32;
+        out = digits.substring(d, d + 1) + out;
+        n = n / 10;
+    }
+    if (negative) { return "-" + out; }
+    return out;
+}
+
+fn dap_write_raw(text: string) {
+    var i: i64 = 0;
+    while (i < text.len) {
+        putchar(text.charAt(i));
+        i = i + 1;
+    }
+}
+
+@[platform("windows")]
+fn dap_header_separator() -> string { return "\n\n"; }
+
+@[platform("posix")]
+fn dap_header_separator() -> string { return "\r\n\r\n"; }
+
+fn dap_send_protocol_message(body: string) {
+    dap_write_raw("Content-Length: " + dap_i64_text(body.len) + dap_header_separator());
+    dap_write_raw(body);
+    fflush(null);
+}
+
+fn dap_read_line() -> string {
+    var capacity: i64 = 128;
+    var length: i64 = 0;
+    var buffer = malloc(capacity + 1);
+    if (buffer == null) { return ""; }
+    while (true) {
+        let raw = getchar();
+        if (raw < 0) { break; }
+        let ch = raw & 255;
+        if (ch == 10) { break; }
+        if (ch == 13) { continue; }
+        if (length + 1 >= capacity) {
+            let next_capacity = capacity * 2;
+            let next = malloc(next_capacity + 1);
+            if (next == null) { free(buffer); return ""; }
+            memcpy(next, buffer, length);
+            free(buffer);
+            buffer = next;
+            capacity = next_capacity;
+        }
+        var byte_value: i32 = ch;
+        memcpy(buffer + length, to_rawptr(&byte_value), 1);
+        length = length + 1;
+    }
+    var zero: i32 = 0;
+    memcpy(buffer + length, to_rawptr(&zero), 1);
+    let result = from_cstr_len(buffer, length);
+    free(buffer);
+    return result;
+}
+
+fn dap_read_exact(length: i64) -> string {
+    if (length <= 0) { return ""; }
+    let buffer = malloc(length + 1);
+    if (buffer == null) { return ""; }
+    var received: i64 = 0;
+    while (received < length) {
+        let raw = getchar();
+        if (raw < 0) { break; }
+        var byte_value: i32 = raw & 255;
+        memcpy(buffer + received, to_rawptr(&byte_value), 1);
+        received = received + 1;
+    }
+    var zero: i32 = 0;
+    memcpy(buffer + received, to_rawptr(&zero), 1);
+    let result = from_cstr_len(buffer, received);
+    free(buffer);
+    if (received != length) { return ""; }
+    return result;
+}
+
+fn dap_read_message() -> string {
+    var content_length: i64 = 0;
+    while (true) {
+        let line = dap_read_line();
+        if (line.len == 0) { break; }
+        if (line.toLower().startsWith("content-length:")) {
+            var i: i64 = 15;
+            while (i < line.len && (line.charAt(i) == 32 || line.charAt(i) == 9)) { i = i + 1; }
+            var value: i64 = 0;
+            while (i < line.len) {
+                let ch = line.charAt(i);
+                if (ch < 48 || ch > 57) { break; }
+                value = value * 10 + (ch - 48);
+                i = i + 1;
+            }
+            content_length = value;
+        }
+    }
+    if (content_length <= 0) { return ""; }
+    return dap_read_exact(content_length);
+}
+
+fn dap_utf8(codepoint: i32) -> string {
+    let buffer = calloc(5, 1);
+    if (buffer == null) { return ""; }
+    var length: i64 = 0;
+    if (codepoint <= 127) {
+        var b0 = codepoint;
+        memcpy(buffer, to_rawptr(&b0), 1);
+        length = 1;
+    } else if (codepoint <= 2047) {
+        var b1 = 192 | (codepoint >> 6);
+        var b2 = 128 | (codepoint & 63);
+        memcpy(buffer, to_rawptr(&b1), 1);
+        memcpy(buffer + 1, to_rawptr(&b2), 1);
+        length = 2;
+    } else {
+        var b3 = 224 | (codepoint >> 12);
+        var b4 = 128 | ((codepoint >> 6) & 63);
+        var b5 = 128 | (codepoint & 63);
+        memcpy(buffer, to_rawptr(&b3), 1);
+        memcpy(buffer + 1, to_rawptr(&b4), 1);
+        memcpy(buffer + 2, to_rawptr(&b5), 1);
+        length = 3;
+    }
+    let out = from_cstr_len(buffer, length);
+    free(buffer);
+    return out;
+}
+
+fn dap_hex_digit(ch: i32) -> i32 {
+    if (ch >= 48 && ch <= 57) { return ch - 48; }
+    if (ch >= 97 && ch <= 102) { return ch - 97 + 10; }
+    if (ch >= 65 && ch <= 70) { return ch - 65 + 10; }
+    return -1;
+}
+
+fn dap_json_escape(value: string) -> string {
+    var out = "\"";
+    var i: i64 = 0;
+    while (i < value.len) {
+        let ch = value.charAt(i);
+        if (ch == 34) { out = out + "\\\""; }
+        else if (ch == 92) { out = out + "\\\\"; }
+        else if (ch == 8) { out = out + "\\b"; }
+        else if (ch == 12) { out = out + "\\f"; }
+        else if (ch == 10) { out = out + "\\n"; }
+        else if (ch == 13) { out = out + "\\r"; }
+        else if (ch == 9) { out = out + "\\t"; }
+        else if (ch >= 32) { out = out + value.substring(i, i + 1); }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+fn dap_find_key(json: string, key: string) -> i64 {
+    return json.indexOf("\"" + key + "\"");
+}
+
+fn dap_json_string(json: string, key: string) -> string {
+    let key_position = dap_find_key(json, key);
+    if (key_position < 0) { return ""; }
+    var i = key_position + key.len + 2;
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+    if (i >= json.len) { return ""; }
+    i = i + 1;
+    while (i < json.len && (json.charAt(i) == 32 || json.charAt(i) == 9
+                            || json.charAt(i) == 10 || json.charAt(i) == 13)) { i = i + 1; }
+    if (i >= json.len || json.charAt(i) != 34) { return ""; }
+    i = i + 1;
+    var out = "";
+    while (i < json.len) {
+        let ch = json.charAt(i);
+        if (ch == 34) { return out; }
+        if (ch != 92) {
+            out = out + json.substring(i, i + 1);
+            i = i + 1;
+            continue;
+        }
+        i = i + 1;
+        if (i >= json.len) { return ""; }
+        let escaped = json.charAt(i);
+        if (escaped == 34) { out = out + "\""; }
+        else if (escaped == 92) { out = out + "\\"; }
+        else if (escaped == 47) { out = out + "/"; }
+        else if (escaped == 98) { out = out + dap_utf8(8); }
+        else if (escaped == 102) { out = out + dap_utf8(12); }
+        else if (escaped == 110) { out = out + "\n"; }
+        else if (escaped == 114) { out = out + "\r"; }
+        else if (escaped == 116) { out = out + "\t"; }
+        else if (escaped == 117 && i + 4 < json.len) {
+            var codepoint: i32 = 0;
+            var j: i32 = 0;
+            while (j < 4) {
+                let digit = dap_hex_digit(json.charAt(i + 1 + (j as i64)));
+                if (digit < 0) { return ""; }
+                codepoint = (codepoint << 4) | digit;
+                j = j + 1;
+            }
+            out = out + dap_utf8(codepoint);
+            i = i + 4;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn dap_json_int(json: string, key: string) -> i32 {
+    let key_position = dap_find_key(json, key);
+    if (key_position < 0) { return 0; }
+    var i = key_position + key.len + 2;
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+    if (i >= json.len) { return 0; }
+    i = i + 1;
+    while (i < json.len && (json.charAt(i) == 32 || json.charAt(i) == 9
+                            || json.charAt(i) == 10 || json.charAt(i) == 13)) { i = i + 1; }
+    var negative = false;
+    if (i < json.len && json.charAt(i) == 45) { negative = true; i = i + 1; }
+    var value: i32 = 0;
+    while (i < json.len) {
+        let ch = json.charAt(i);
+        if (ch < 48 || ch > 57) { break; }
+        value = value * 10 + (ch - 48);
+        i = i + 1;
+    }
+    if (negative) { return 0 - value; }
+    return value;
+}
+
+fn dap_json_bool(json: string, key: string) -> bool {
+    let key_position = dap_find_key(json, key);
+    if (key_position < 0) { return false; }
+    var i = key_position + key.len + 2;
+    while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+    if (i >= json.len) { return false; }
+    i = i + 1;
+    while (i < json.len && (json.charAt(i) == 32 || json.charAt(i) == 9
+                            || json.charAt(i) == 10 || json.charAt(i) == 13)) { i = i + 1; }
+    return i + 4 <= json.len && json.substring(i, i + 4) == "true";
+}
+
+fn dap_send_event(server: &mut DapServer, event: string, body: string) {
+    var message = "{\"seq\":" + dap_i64_text(server.sequence as i64)
+        + ",\"type\":\"event\",\"event\":" + dap_json_escape(event);
+    server.sequence = server.sequence + 1;
+    if (body.len > 0) { message = message + ",\"body\":" + body; }
+    dap_send_protocol_message(message + "}");
+}
+
+fn dap_send_response(server: &mut DapServer, request_sequence: i32, command: string,
+                     success: bool, body: string) {
+    dap_trace(server, "dap => " + command + " " + body);
+    var message = "{\"seq\":" + dap_i64_text(server.sequence as i64)
+        + ",\"type\":\"response\",\"request_seq\":" + dap_i64_text(request_sequence as i64)
+        + ",\"success\":";
+    server.sequence = server.sequence + 1;
+    if (success) { message = message + "true"; }
+    else { message = message + "false"; }
+    message = message + ",\"command\":" + dap_json_escape(command);
+    if (body.len > 0) { message = message + ",\"body\":" + body; }
+    dap_send_protocol_message(message + "}");
+}
+
+fn dap_trace(server: &mut DapServer, text: string) {
+    if (dap_env("VYX_DAP_TRACE").len == 0) { return; }
+    dap_send_event(server, "output", "{\"category\":\"console\",\"output\":"
+        + dap_json_escape("[vyx-dap] " + text + "\n") + "}");
+}
+
+fn dap_send_error(server: &mut DapServer, request_sequence: i32, command: string, text: string) {
+    let message = "{\"seq\":" + dap_i64_text(server.sequence as i64)
+        + ",\"type\":\"response\",\"request_seq\":" + dap_i64_text(request_sequence as i64)
+        + ",\"success\":false,\"command\":" + dap_json_escape(command)
+        + ",\"message\":" + dap_json_escape(text) + "}";
+    server.sequence = server.sequence + 1;
+    dap_send_protocol_message(message);
+}
+
+fn dap_env(name: string) -> string {
+    let value = getenv(name.c_str());
+    if (value == null) { return ""; }
+    return from_cstr(value).clone();
+}
+
+@[platform("windows")]
+fn dap_path_separator() -> string { return "\\"; }
+
+@[platform("posix")]
+fn dap_path_separator() -> string { return "/"; }
+
+fn dap_join_path(left: string, right: string) -> string {
+    if (left.len == 0) { return right; }
+    if (right.len == 0) { return left; }
+    if (left.endsWith("/") || left.endsWith("\\")) { return left + right; }
+    return left + dap_path_separator() + right;
+}
+
+fn dap_last_separator(path: string) -> i64 {
+    var i = path.len;
+    while (i > 0) {
+        i = i - 1;
+        let ch = path.charAt(i);
+        if (ch == 47 || ch == 92) { return i; }
+    }
+    return -1;
+}
+
+fn dap_basename(path: string) -> string {
+    let split = dap_last_separator(path);
+    if (split < 0) { return path; }
+    return path.substring(split + 1, path.len);
+}
+
+fn dap_dirname(path: string) -> string {
+    let split = dap_last_separator(path);
+    if (split < 0) { return ""; }
+    return path.substring(0, split);
+}
+
+@[platform("windows")]
+fn dap_absolute_path(path: string) -> string {
+    let buffer = calloc(32768, 1);
+    if (buffer == null) { return path; }
+    let length = GetFullPathNameA(path.c_str(), 32768, buffer, null);
+    if (length == 0 || length >= 32768) { free(buffer); return path; }
+    let out = from_cstr_len(buffer, length as i64);
+    free(buffer);
+    return out;
+}
+
+@[platform("posix")]
+fn dap_absolute_path(path: string) -> string {
+    if (path.startsWith("/")) { return path; }
+    let buffer = calloc(4096, 1);
+    if (buffer == null) { return path; }
+    if (getcwd(buffer, 4096) == null) { free(buffer); return path; }
+    let out = dap_join_path(from_cstr(buffer), path);
+    free(buffer);
+    return out;
+}
+
+fn dap_quote_lldb(value: string) -> string {
+    var out = "\"";
+    var i: i64 = 0;
+    while (i < value.len) {
+        let ch = value.charAt(i);
+        if (ch == 34) { out = out + "\\\""; }
+        else { out = out + value.substring(i, i + 1); }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+fn dap_last_index_before(text: string, needle: string, before: i64) -> i64 {
+    if (needle.len == 0 || before <= 0) { return -1; }
+    var found: i64 = -1;
+    var i: i64 = 0;
+    while (i + needle.len <= text.len && i < before) {
+        if (text.substring(i, i + needle.len) == needle) { found = i; }
+        i = i + 1;
+    }
+    return found;
+}
+
+fn dap_last_char_before(text: string, ch: i32, before: i64) -> i64 {
+    var i = before;
+    if (i > text.len) { i = text.len; }
+    while (i > 0) {
+        i = i - 1;
+        if (text.charAt(i) == ch) { return i; }
+    }
+    return -1;
+}
+
+fn dap_decimal(text: string) -> bool {
+    if (text.len == 0) { return false; }
+    var i: i64 = 0;
+    while (i < text.len) {
+        let ch = text.charAt(i);
+        if (ch < 48 || ch > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn dap_parse_i32(text: string) -> i32 {
+    var value: i32 = 0;
+    var i: i64 = 0;
+    while (i < text.len) {
+        let ch = text.charAt(i);
+        if (ch < 48 || ch > 57) { break; }
+        value = value * 10 + (ch - 48);
+        i = i + 1;
+    }
+    return value;
+}
+
+@[platform("windows")]
+fn dap_python_runtime_name(name: string) -> bool {
+    if (name == "python3.dll") { return true; }
+    if (!name.startsWith("python3") || !name.endsWith(".dll") || name.len != 13) { return false; }
+    let major = name.charAt(7);
+    let minor = name.charAt(8);
+    return major >= 48 && major <= 57 && minor >= 48 && minor <= 57;
+}
+
+@[platform("windows")]
+fn dap_directory_has_python_runtime(root: string) -> bool {
+    if (root.len == 0 || !isDir(root)) { return false; }
+    let pattern = dap_join_path(root, "python3*.dll");
+    let data = calloc(592, 1);
+    if (data == null) { return false; }
+    let handle = FindFirstFileA(pattern.c_str(), data);
+    if (handle == null || handle as i64 == -1) { free(data); return false; }
+    var found = false;
+    var keep = true;
+    while (keep && !found) {
+        let name = from_cstr(data + 44);
+        if (dap_python_runtime_name(name)) { found = true; }
+        keep = FindNextFileA(handle, data) != 0;
+    }
+    FindClose(handle);
+    free(data);
+    return found;
+}
+
+@[platform("windows")]
+fn dap_python_home_in_root(root: string) -> string {
+    if (dap_directory_has_python_runtime(root)) { return root; }
+    if (root.len == 0 || !isDir(root)) { return ""; }
+    let pattern = dap_join_path(root, "*");
+    let data = calloc(592, 1);
+    if (data == null) { return ""; }
+    let handle = FindFirstFileA(pattern.c_str(), data);
+    if (handle == null || handle as i64 == -1) { free(data); return ""; }
+    var found = "";
+    var keep = true;
+    while (keep && found.len == 0) {
+        let attributes = ptr_read_i32(data);
+        let name = from_cstr(data + 44);
+        if (name != "." && name != ".." && (attributes & 16) != 0) {
+            let candidate = dap_join_path(root, name);
+            if (dap_directory_has_python_runtime(candidate)) { found = candidate.clone(); }
+        }
+        keep = FindNextFileA(handle, data) != 0;
+    }
+    FindClose(handle);
+    free(data);
+    return found;
+}
+
+@[platform("windows")]
+fn dap_configure_lldb_python() {
+    var home = dap_python_home_in_root(dap_env("PYTHONHOME"));
+    if (home.len == 0) {
+        let appdata = dap_env("APPDATA");
+        if (appdata.len > 0) { home = dap_python_home_in_root(dap_join_path(appdata, "uv\\python")); }
+    }
+    if (home.len == 0) {
+        let local = dap_env("LOCALAPPDATA");
+        if (local.len > 0) { home = dap_python_home_in_root(dap_join_path(local, "Programs\\Python")); }
+    }
+    if (home.len == 0) { return; }
+    SetEnvironmentVariableA("PYTHONHOME".c_str(), home.c_str());
+    let existing = dap_env("PATH");
+    var path = home;
+    if (existing.len > 0) { path = path + ";" + existing; }
+    SetEnvironmentVariableA("PATH".c_str(), path.c_str());
+}
+
+@[platform("posix")]
+fn dap_configure_lldb_python() { return; }
+
+@[platform("windows")]
+fn dap_windows_debugger_candidate(path: string) -> string {
+    if (path.len == 0 || !isFile(path)) { return ""; }
+    if (!dap_directory_has_python_runtime(dap_dirname(path))) { return ""; }
+    return path;
+}
+
+@[platform("windows")]
+fn dap_debugger_from_path() -> string {
+    let path = dap_env("PATH");
+    var start: i64 = 0;
+    while (start <= path.len) {
+        var end = start;
+        while (end < path.len && path.charAt(end) != 59) { end = end + 1; }
+        var entry = path.substring(start, end).trim();
+        if (entry.len >= 2 && entry.startsWith("\"") && entry.endsWith("\"")) {
+            entry = entry.substring(1, entry.len - 1);
+        }
+        let candidate = dap_windows_debugger_candidate(dap_join_path(entry, "lldb.exe"));
+        if (candidate.len > 0) { return candidate; }
+        if (end >= path.len) { break; }
+        start = end + 1;
+    }
+    return "";
+}
+
+@[platform("windows")]
+fn dap_debugger_in_tree(root: string, depth: i32) -> string {
+    if (root.len == 0 || depth > 5 || !isDir(root)) { return ""; }
+    let direct = dap_windows_debugger_candidate(dap_join_path(root, "lldb.exe"));
+    if (direct.len > 0) { return direct; }
+    let bundled = dap_windows_debugger_candidate(
+        dap_join_path(root, "bin\\lldb\\win\\x64\\bin\\lldb.exe"));
+    if (bundled.len > 0) { return bundled; }
+    if (depth == 5) { return ""; }
+    let pattern = dap_join_path(root, "*");
+    let data = calloc(592, 1);
+    if (data == null) { return ""; }
+    let handle = FindFirstFileA(pattern.c_str(), data);
+    if (handle == null || handle as i64 == -1) { free(data); return ""; }
+    var found = "";
+    var keep = true;
+    while (keep && found.len == 0) {
+        let attributes = ptr_read_i32(data);
+        let name = from_cstr(data + 44);
+        if (name != "." && name != ".." && (attributes & 16) != 0) {
+            let lower = name.toLower();
+            if (lower.startsWith("clion") || lower.startsWith("rider") || lower == "apps"
+                || lower == "jetbrains" || lower == "bin" || lower == "lldb") {
+                found = dap_debugger_in_tree(dap_join_path(root, name), depth + 1).clone();
+            }
+        }
+        keep = FindNextFileA(handle, data) != 0;
+    }
+    FindClose(handle);
+    free(data);
+    return found;
+}
+
+@[platform("windows")]
+fn dap_debugger_under_product_root(root: string) -> string {
+    if (!isDir(root)) { return ""; }
+    let pattern = dap_join_path(root, "*");
+    let data = calloc(592, 1);
+    if (data == null) { return ""; }
+    let handle = FindFirstFileA(pattern.c_str(), data);
+    if (handle == null || handle as i64 == -1) { free(data); return ""; }
+    var found = "";
+    var keep = true;
+    while (keep && found.len == 0) {
+        let attributes = ptr_read_i32(data);
+        let name = from_cstr(data + 44);
+        let lower = name.toLower();
+        if (name != "." && name != ".." && (attributes & 16) != 0
+            && (lower.startsWith("clion") || lower.startsWith("rider"))) {
+            found = dap_debugger_in_tree(dap_join_path(root, name), 0).clone();
+        }
+        keep = FindNextFileA(handle, data) != 0;
+    }
+    FindClose(handle);
+    free(data);
+    return found;
+}
+
+@[platform("windows")]
+fn dap_debugger_near_jetbrains() -> string {
+    let local = dap_env("LOCALAPPDATA");
+    if (local.len > 0) {
+        let toolbox = dap_debugger_in_tree(dap_join_path(local, "JetBrains\\Toolbox\\apps"), 0);
+        if (toolbox.len > 0) { return toolbox; }
+    }
+    let program_files = dap_env("ProgramFiles");
+    if (program_files.len > 0) {
+        let installed = dap_debugger_under_product_root(dap_join_path(program_files, "JetBrains"));
+        if (installed.len > 0) { return installed; }
+    }
+    let drives = "CDEFGHIJ";
+    var i: i64 = 0;
+    while (i < drives.len) {
+        let drive = drives.substring(i, i + 1) + ":\\JetBrains";
+        let installed = dap_debugger_under_product_root(drive);
+        if (installed.len > 0) { return installed; }
+        i = i + 1;
+    }
+    return "";
+}
+
+@[platform("windows")]
+fn dap_default_debugger() -> string {
+    let configured = dap_windows_debugger_candidate(dap_env("VYX_LLDB"));
+    if (configured.len > 0) { return configured; }
+    let explicit = dap_env("VYX_LLDB");
+    if (explicit.len > 0 && isFile(explicit)) { return explicit; }
+    let llvm_root = dap_env("LLVM_ROOT");
+    if (llvm_root.len > 0) {
+        let candidate = dap_windows_debugger_candidate(dap_join_path(dap_join_path(llvm_root, "bin"), "lldb.exe"));
+        if (candidate.len > 0) { return candidate; }
+    }
+    let from_path = dap_debugger_from_path();
+    if (from_path.len > 0) { return from_path; }
+    return dap_debugger_near_jetbrains();
+}
+
+@[platform("windows")]
+fn dap_process_id() -> i64 { return GetCurrentProcessId() as i64; }
+
+@[platform("posix")]
+fn dap_process_id() -> i64 { return getpid() as i64; }
+
+@[platform("windows")]
+fn dap_null_device() -> string { return "NUL"; }
+
+@[platform("posix")]
+fn dap_null_device() -> string { return "/dev/null"; }
+
+fn dap_prepare_target_io(server: &mut DapServer) -> bool {
+    let stem = ".vyx-dap-" + dap_i64_text(dap_process_id());
+    server.target_stdout_path = dap_join_path(server.working_directory, stem + ".stdout");
+    server.target_stderr_path = dap_join_path(server.working_directory, stem + ".stderr");
+    server.target_stdout_offset = 0;
+    server.target_stderr_offset = 0;
+    if (isFile(server.target_stdout_path)) { deleteFile(server.target_stdout_path); }
+    if (isFile(server.target_stderr_path)) { deleteFile(server.target_stderr_path); }
+    let input_result = dap_debug_command(server, "settings set target.input-path "
+        + dap_quote_lldb(dap_null_device()));
+    let output_result = dap_debug_command(server, "settings set target.output-path "
+        + dap_quote_lldb(server.target_stdout_path));
+    let error_result = dap_debug_command(server, "settings set target.error-path "
+        + dap_quote_lldb(server.target_stderr_path));
+    dap_trace(server, "target io input=" + input_result.trim());
+    dap_trace(server, "target io output=" + output_result.trim());
+    dap_trace(server, "target io error=" + error_result.trim());
+    return !input_result.toLower().contains("error:")
+        && !output_result.toLower().contains("error:")
+        && !error_result.toLower().contains("error:");
+}
+
+fn dap_flush_target_output(server: &mut DapServer) {
+    if (server.target_stdout_path.len > 0 && isFile(server.target_stdout_path)) {
+        let content = readFile(server.target_stdout_path);
+        if (content.len > server.target_stdout_offset) {
+            let fresh = content.substring(server.target_stdout_offset, content.len);
+            dap_send_event(server, "output", "{\"category\":\"stdout\",\"output\":"
+                + dap_json_escape(fresh) + "}");
+            server.target_stdout_offset = content.len;
+        }
+    }
+    if (server.target_stderr_path.len > 0 && isFile(server.target_stderr_path)) {
+        let content = readFile(server.target_stderr_path);
+        if (content.len > server.target_stderr_offset) {
+            let fresh = content.substring(server.target_stderr_offset, content.len);
+            dap_send_event(server, "output", "{\"category\":\"stderr\",\"output\":"
+                + dap_json_escape(fresh) + "}");
+            server.target_stderr_offset = content.len;
+        }
+    }
+}
+
+fn dap_cleanup_target_io(server: &mut DapServer) {
+    if (server.target_stdout_path.len > 0 && isFile(server.target_stdout_path)) {
+        deleteFile(server.target_stdout_path);
+    }
+    if (server.target_stderr_path.len > 0 && isFile(server.target_stderr_path)) {
+        deleteFile(server.target_stderr_path);
+    }
+    server.target_stdout_path = "";
+    server.target_stderr_path = "";
+    server.target_stdout_offset = 0;
+    server.target_stderr_offset = 0;
+}
+
+@[platform("posix")]
+fn dap_default_debugger() -> string {
+    let configured = dap_env("VYX_LLDB");
+    if (configured.len > 0) { return configured; }
+    let llvm_root = dap_env("LLVM_ROOT");
+    if (llvm_root.len > 0) {
+        let candidate = dap_join_path(dap_join_path(llvm_root, "bin"), "lldb");
+        if (isFile(candidate)) { return candidate; }
+    }
+    return "";
+}
+
+@[platform("windows")]
+fn dap_debugger_config_hint() -> string {
+    return "LLDB backend is not configured; set VYX_LLDB or LLVM_ROOT, or install LLDB beside its Python runtime";
+}
+
+@[platform("posix")]
+fn dap_debugger_config_hint() -> string {
+    return "LLDB backend is not configured; set VYX_LLDB or LLVM_ROOT to an LLVM SDK containing bin/lldb";
+}
+
+fn dap_write_pointer(address: rawptr, value: rawptr) {
+    var copy = value;
+    memcpy(address, to_rawptr(&copy), 8);
+}
+
+fn dap_read_pointer(address: rawptr) -> rawptr {
+    var value: rawptr = null;
+    memcpy(to_rawptr(&value), address, 8);
+    return value;
+}
+
+@[platform("windows")]
+fn dap_spawn_debugger(server: &mut DapServer) -> bool {
+    var stdin_read: rawptr = null;
+    var stdin_write: rawptr = null;
+    var stdout_read: rawptr = null;
+    var stdout_write: rawptr = null;
+    let attributes = calloc(24, 1);
+    if (attributes == null) { return false; }
+    ptr_write_i32(attributes, 24);
+    ptr_write_i32(attributes + 16, 1);
+    if (CreatePipe(to_rawptr(&stdin_read), to_rawptr(&stdin_write), attributes, 0) == 0
+        || CreatePipe(to_rawptr(&stdout_read), to_rawptr(&stdout_write), attributes, 0) == 0) {
+        if (stdin_read != null) { CloseHandle(stdin_read); }
+        if (stdin_write != null) { CloseHandle(stdin_write); }
+        if (stdout_read != null) { CloseHandle(stdout_read); }
+        if (stdout_write != null) { CloseHandle(stdout_write); }
+        free(attributes);
+        return false;
+    }
+    free(attributes);
+    SetHandleInformation(stdin_write, 1, 0);
+    SetHandleInformation(stdout_read, 1, 0);
+
+    let startup = calloc(104, 1);
+    let process = calloc(24, 1);
+    if (startup == null || process == null) {
+        if (startup != null) { free(startup); }
+        if (process != null) { free(process); }
+        CloseHandle(stdin_read); CloseHandle(stdin_write);
+        CloseHandle(stdout_read); CloseHandle(stdout_write);
+        return false;
+    }
+    ptr_write_i32(startup, 104);
+    ptr_write_i32(startup + 60, 256);
+    dap_write_pointer(startup + 80, stdin_read);
+    dap_write_pointer(startup + 88, stdout_write);
+    dap_write_pointer(startup + 96, stdout_write);
+
+    let command = dap_quote_lldb(server.debugger_path) + " --no-lldbinit";
+    let mutable_command = calloc(command.len + 1, 1);
+    if (mutable_command == null) {
+        free(startup); free(process);
+        CloseHandle(stdin_read); CloseHandle(stdin_write);
+        CloseHandle(stdout_read); CloseHandle(stdout_write);
+        return false;
+    }
+    memcpy(mutable_command, command.c_str(), command.len);
+    let created = CreateProcessA(null, mutable_command, null, null, 1, 134217728,
+                                 null, server.working_directory.c_str(), startup, process);
+    free(mutable_command);
+    free(startup);
+    CloseHandle(stdin_read);
+    CloseHandle(stdout_write);
+    if (created == 0) {
+        CloseHandle(stdin_write);
+        CloseHandle(stdout_read);
+        free(process);
+        return false;
+    }
+    server.debugger_process = dap_read_pointer(process);
+    let thread = dap_read_pointer(process + 8);
+    if (thread != null) { CloseHandle(thread); }
+    server.debugger_stdin = stdin_write;
+    server.debugger_stdout = stdout_read;
+    free(process);
+    return true;
+}
+
+@[platform("posix")]
+fn dap_spawn_debugger(server: &mut DapServer) -> bool {
+    var to_debugger: [i32; 2];
+    var from_debugger: [i32; 2];
+    if (pipe(to_rawptr(&to_debugger)) != 0 || pipe(to_rawptr(&from_debugger)) != 0) { return false; }
+    let pid = fork();
+    if (pid == 0) {
+        close(to_debugger[1]);
+        close(from_debugger[0]);
+        dup2(to_debugger[0], 0);
+        dup2(from_debugger[1], 1);
+        dup2(from_debugger[1], 2);
+        chdir(server.working_directory.c_str());
+        execlp(server.debugger_path.c_str(), server.debugger_path.c_str(), "--no-lldbinit".c_str(), null);
+        return false;
+    }
+    close(to_debugger[0]);
+    close(from_debugger[1]);
+    if (pid < 0) {
+        close(to_debugger[1]);
+        close(from_debugger[0]);
+        return false;
+    }
+    server.debugger_pid = pid;
+    server.debugger_write_fd = to_debugger[1];
+    server.debugger_read_fd = from_debugger[0];
+    return true;
+}
+
+@[platform("windows")]
+fn dap_write_debugger(server: &mut DapServer, text: string) -> bool {
+    if (server.debugger_stdin == null) { return false; }
+    var written_total: i64 = 0;
+    while (written_total < text.len) {
+        var written: i32 = 0;
+        let remaining = text.len - written_total;
+        if (WriteFile(server.debugger_stdin, text.c_str() + written_total,
+                      remaining as u32, to_rawptr(&written), null) == 0 || written <= 0) { return false; }
+        written_total = written_total + (written as i64);
+    }
+    return true;
+}
+
+@[platform("posix")]
+fn dap_write_debugger(server: &mut DapServer, text: string) -> bool {
+    if (server.debugger_write_fd < 0) { return false; }
+    var written_total: i64 = 0;
+    while (written_total < text.len) {
+        let written = write(server.debugger_write_fd, text.c_str() + written_total, text.len - written_total);
+        if (written <= 0) { return false; }
+        written_total = written_total + written;
+    }
+    return true;
+}
+
+@[platform("windows")]
+fn dap_read_debugger_chunk(server: &mut DapServer) -> string {
+    if (server.debugger_stdout == null) { return ""; }
+    let buffer = malloc(4096);
+    if (buffer == null) { return ""; }
+    var received: i32 = 0;
+    if (ReadFile(server.debugger_stdout, buffer, 4096, to_rawptr(&received), null) == 0 || received <= 0) {
+        free(buffer);
+        return "";
+    }
+    let out = from_cstr_len(buffer, received as i64);
+    free(buffer);
+    return out;
+}
+
+@[platform("posix")]
+fn dap_read_debugger_chunk(server: &mut DapServer) -> string {
+    if (server.debugger_read_fd < 0) { return ""; }
+    let buffer = malloc(4096);
+    if (buffer == null) { return ""; }
+    let received = read(server.debugger_read_fd, buffer, 4096);
+    if (received <= 0) { free(buffer); return ""; }
+    let out = from_cstr_len(buffer, received);
+    free(buffer);
+    return out;
+}
+
+fn dap_read_until_marker(server: &mut DapServer, marker: string, sentinel: string) -> string {
+    while (true) {
+        let marker_position = server.debugger_buffer.indexOf(marker);
+        if (marker_position >= 0) {
+            var output_end = marker_position;
+            let echo_position = dap_last_index_before(server.debugger_buffer, sentinel, marker_position);
+            var sentinel_line = echo_position;
+            if (echo_position >= 0) {
+                sentinel_line = dap_last_char_before(server.debugger_buffer, 10, echo_position);
+            }
+            if (sentinel_line >= 0 && sentinel_line < output_end) {
+                let line_start = sentinel_line;
+                if (line_start < 0) { output_end = 0; }
+                else { output_end = line_start + 1; }
+            }
+            let output = server.debugger_buffer.substring(0, output_end).clone();
+            var erase_end = marker_position + marker.len;
+            if (erase_end < server.debugger_buffer.len && server.debugger_buffer.charAt(erase_end) == 13) {
+                erase_end = erase_end + 1;
+            }
+            if (erase_end < server.debugger_buffer.len && server.debugger_buffer.charAt(erase_end) == 10) {
+                erase_end = erase_end + 1;
+            }
+            server.debugger_buffer = server.debugger_buffer.substring(erase_end, server.debugger_buffer.len).clone();
+            return output;
+        }
+        let chunk = dap_read_debugger_chunk(server);
+        if (chunk.len == 0) {
+            let remaining = server.debugger_buffer.clone();
+            server.debugger_buffer = "";
+            return remaining;
+        }
+        server.debugger_buffer = server.debugger_buffer + chunk;
+    }
+}
+
+fn dap_debug_command(server: &mut DapServer, command: string) -> string {
+    dap_trace(server, "lldb <= " + command);
+    let sentinel = "__VYX_DAP_COMMAND_DONE__";
+    let marker = "error: '" + sentinel + "' is not a valid command.";
+    if (!server.running || !dap_write_debugger(server, command + "\n" + sentinel + "\n")) { return ""; }
+    return dap_read_until_marker(server, marker, sentinel);
+}
+
+@[platform("windows")]
+fn dap_sleep_poll() { Sleep(10); }
+
+@[platform("posix")]
+fn dap_sleep_poll() { usleep(10000); }
+
+@[platform("windows")]
+fn dap_kill_debugger(server: &mut DapServer) {
+    if (server.debugger_stdin != null) { dap_write_debugger(server, "quit\n"); }
+    if (server.debugger_process != null) {
+        if (WaitForSingleObject(server.debugger_process, 1500) == 258) {
+            TerminateProcess(server.debugger_process, 0);
+        }
+        CloseHandle(server.debugger_process);
+    }
+    if (server.debugger_stdin != null) { CloseHandle(server.debugger_stdin); }
+    if (server.debugger_stdout != null) { CloseHandle(server.debugger_stdout); }
+    server.debugger_process = null;
+    server.debugger_stdin = null;
+    server.debugger_stdout = null;
+    server.running = false;
+    dap_cleanup_target_io(server);
+}
+
+@[platform("posix")]
+fn dap_kill_debugger(server: &mut DapServer) {
+    if (server.debugger_write_fd >= 0) { dap_write_debugger(server, "quit\n"); }
+    if (server.debugger_pid > 0) {
+        var status: i32 = 0;
+        if (waitpid(server.debugger_pid, to_rawptr(&status), 1) == 0) { kill(server.debugger_pid, 15); }
+    }
+    if (server.debugger_write_fd >= 0) { close(server.debugger_write_fd); }
+    if (server.debugger_read_fd >= 0) { close(server.debugger_read_fd); }
+    server.debugger_pid = -1;
+    server.debugger_write_fd = -1;
+    server.debugger_read_fd = -1;
+    server.running = false;
+    dap_cleanup_target_io(server);
+}
+
+fn dap_launch_debugger(server: &mut DapServer) -> bool {
+    dap_configure_lldb_python();
+    if (server.debugger_path.len == 0) { server.debugger_path = dap_default_debugger(); }
+    if (server.debugger_path.len == 0) { return false; }
+    if (!dap_spawn_debugger(server)) { return false; }
+    server.running = true;
+    // Resume commands must return to the adapter while the inferior is still
+    // running.  In synchronous mode LLDB holds the command interpreter until
+    // the next stop, which also prevents the adapter from forwarding target
+    // stdout/stderr incrementally.  Async mode lets the sentinel complete
+    // immediately; dap_wait_for_stop then polls status and flushes both files.
+    let async_output = dap_debug_command(server, "script lldb.debugger.SetAsync(True)");
+    if (async_output.toLower().contains("error:")) {
+        dap_kill_debugger(&mut server);
+        return false;
+    }
+    let target_output = dap_debug_command(server, "target create " + dap_quote_lldb(server.program_path));
+    if (target_output.toLower().contains("error:")) {
+        dap_kill_debugger(server);
+        return false;
+    }
+    if (!dap_prepare_target_io(server)) {
+        dap_kill_debugger(server);
+        return false;
+    }
+    return true;
+}
+
+fn dap_report_process_failure(server: &mut DapServer, reason: string) {
+    dap_send_event(server, "output", "{\"category\":\"stderr\",\"output\":" + dap_json_escape(reason + "\n") + "}");
+    dap_send_event(server, "terminated", "");
+    dap_kill_debugger(server);
+    server.terminated = true;
+}
+
+fn dap_stop_is_same_breakpoint(status: string) -> bool {
+    let lower = status.toLower();
+    return lower.contains("stop reason = breakpoint");
+}
+
+fn dap_stop_location(status: string) -> string {
+    let marker = "frame #0:";
+    let marker_at = status.indexOf(marker);
+    if (marker_at < 0) { return ""; }
+    var line_end = marker_at;
+    while (line_end < status.len && status.charAt(line_end) != 10 && status.charAt(line_end) != 13) {
+        line_end = line_end + 1;
+    }
+    return status.substring(marker_at, line_end).trim();
+}
+
+fn dap_wait_for_stop(server: &mut DapServer, stopped_reason: string) {
+    var same_breakpoint_resumes: i32 = 0;
+    while (server.running && !server.terminated) {
+        dap_flush_target_output(server);
+        let status = dap_debug_command(server, "process status");
+        dap_trace(server, "process status => " + status);
+        dap_flush_target_output(server);
+        let lower = status.toLower();
+        let location = dap_stop_location(status);
+        if (stopped_reason != "breakpoint" && location.len > 0
+            && location == server.last_stop_location
+            && same_breakpoint_resumes < 8) {
+            same_breakpoint_resumes = same_breakpoint_resumes + 1;
+            dap_debug_command(server, "process continue");
+            continue;
+        }
+        if (lower.contains("exited with status") || lower.contains("process 0 exited")
+            || lower.contains("process exited")) {
+            dap_send_event(server, "exited", "{\"exitCode\":0}");
+            dap_send_event(server, "terminated", "");
+            dap_kill_debugger(server);
+            server.terminated = true;
+            return;
+        }
+        if (lower.contains(" stopped")) {
+            if (location.len > 0) { server.last_stop_location = location; }
+            dap_send_event(server, "stopped", "{\"reason\":" + dap_json_escape(stopped_reason)
+                + ",\"threadId\":1,\"allThreadsStopped\":true}");
+            return;
+        }
+        if (status.len == 0 || lower.contains("error: no process") || lower.contains("invalid target")
+            || lower.contains("process 0 unloaded")) {
+            dap_report_process_failure(server, "LLDB process status failed");
+            return;
+        }
+        dap_sleep_poll();
+    }
+}
+
+fn dap_breakpoint_lines(json: string) -> Vec<i32> {
+    var lines = Vec::<i32>.new();
+    var cursor: i64 = 0;
+    while (cursor + 6 <= json.len) {
+        let relative = json.substring(cursor, json.len).indexOf("\"line\"");
+        if (relative < 0) { break; }
+        var i = cursor + relative + 6;
+        while (i < json.len && json.charAt(i) != 58) { i = i + 1; }
+        if (i >= json.len) { break; }
+        i = i + 1;
+        while (i < json.len && (json.charAt(i) == 32 || json.charAt(i) == 9
+                                || json.charAt(i) == 10 || json.charAt(i) == 13)) { i = i + 1; }
+        var line: i32 = 0;
+        while (i < json.len) {
+            let ch = json.charAt(i);
+            if (ch < 48 || ch > 57) { break; }
+            line = line * 10 + (ch - 48);
+            i = i + 1;
+        }
+        if (line > 0) { lines.push(line); }
+        cursor = i;
+    }
+    return lines;
+}
+
+fn dap_canonical_source(server: &mut DapServer, debugger_path: string) -> string {
+    if (debugger_path.len == 0) { return ""; }
+    let wanted = dap_basename(debugger_path);
+    var i: i64 = 0;
+    while (i < server.breakpoints.len) {
+        let breakpoint = server.breakpoints.get(i);
+        if (dap_basename(breakpoint.source_path) == wanted) { return breakpoint.source_path; }
+        i = i + 1;
+    }
+    return dap_absolute_path(debugger_path);
+}
+
+fn dap_stack_frames_json(server: &mut DapServer, output: string) -> string {
+    var frames = "[";
+    var count: i32 = 0;
+    var start: i64 = 0;
+    while (start <= output.len) {
+        var end = start;
+        while (end < output.len && output.charAt(end) != 10) { end = end + 1; }
+        let line = output.substring(start, end).trim();
+        let frame_position = line.indexOf("frame #");
+        if (frame_position >= 0) {
+            var number_position = frame_position + 7;
+            var frame_id: i32 = 0;
+            while (number_position < line.len) {
+                let ch = line.charAt(number_position);
+                if (ch < 48 || ch > 57) { break; }
+                frame_id = frame_id * 10 + (ch - 48);
+                number_position = number_position + 1;
+            }
+            var name = "<unknown>";
+            let tick = line.substring(number_position, line.len).indexOf("`");
+            if (tick >= 0) {
+                let name_start = number_position + tick + 1;
+                var name_end = line.len;
+                let at_relative = line.substring(name_start, line.len).indexOf(" at ");
+                let plus_relative = line.substring(name_start, line.len).indexOf(" + ");
+                if (at_relative >= 0) { name_end = name_start + at_relative; }
+                if (plus_relative >= 0 && name_start + plus_relative < name_end) { name_end = name_start + plus_relative; }
+                if (name_end > name_start) { name = line.substring(name_start, name_end).trim(); }
+            }
+
+            var source_path = "";
+            var source_line: i32 = 0;
+            var source_column: i32 = 1;
+            let at_position = dap_last_index_before(line, " at ", line.len);
+            if (at_position >= 0) {
+                var location = line.substring(at_position + 4, line.len).trim();
+                let suffix = location.indexOf(" ");
+                if (suffix >= 0) { location = location.substring(0, suffix); }
+                let last_colon = dap_last_char_before(location, 58, location.len);
+                if (last_colon >= 0) {
+                    let last_number = location.substring(last_colon + 1, location.len);
+                    if (dap_decimal(last_number)) {
+                        source_line = dap_parse_i32(last_number);
+                        source_path = location.substring(0, last_colon);
+                        let previous_colon = dap_last_char_before(source_path, 58, source_path.len);
+                        if (previous_colon >= 0) {
+                            let possible_line = source_path.substring(previous_colon + 1, source_path.len);
+                            if (dap_decimal(possible_line)) {
+                                source_column = source_line;
+                                source_line = dap_parse_i32(possible_line);
+                                source_path = source_path.substring(0, previous_colon);
+                            }
+                        }
+                        source_path = dap_canonical_source(server, source_path);
+                    }
+                }
+            }
+
+            if (count > 0) { frames = frames + ","; }
+            frames = frames + "{\"id\":" + dap_i64_text(frame_id as i64)
+                + ",\"name\":" + dap_json_escape(name)
+                + ",\"line\":" + dap_i64_text(source_line as i64)
+                + ",\"column\":" + dap_i64_text(source_column as i64);
+            if (source_path.len > 0) {
+                frames = frames + ",\"source\":{\"name\":" + dap_json_escape(dap_basename(source_path))
+                    + ",\"path\":" + dap_json_escape(source_path) + "}";
+            }
+            frames = frames + "}";
+            count = count + 1;
+        }
+        if (end >= output.len) { break; }
+        start = end + 1;
+    }
+    if (count == 0) {
+        frames = frames + "{\"id\":0,\"name\":\"<unknown>\",\"line\":0,\"column\":1}";
+        count = 1;
+    }
+    return "{\"stackFrames\":" + frames + "],\"totalFrames\":" + dap_i64_text(count as i64) + "}";
+}
+
+fn dap_lldb_type_end(line: string) -> i64 {
+    if (!line.startsWith("(")) { return -1; }
+    var depth: i32 = 0;
+    var i: i64 = 0;
+    while (i < line.len) {
+        let ch = line.charAt(i);
+        if (ch == 40) { depth = depth + 1; }
+        else if (ch == 41) {
+            depth = depth - 1;
+            if (depth == 0) { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn dap_lldb_equals(line: string, value_start: i64) -> i64 {
+    if (value_start < 0 || value_start >= line.len) { return -1; }
+    let relative = line.substring(value_start, line.len).indexOf(" = ");
+    if (relative >= 0) { return value_start + relative; }
+    return -1;
+}
+
+fn dap_brace_delta(text: string) -> i32 {
+    var depth: i32 = 0;
+    var i: i64 = 0;
+    while (i < text.len) {
+        let ch = text.charAt(i);
+        if (ch == 123) { depth = depth + 1; }
+        else if (ch == 125) { depth = depth - 1; }
+        i = i + 1;
+    }
+    return depth;
+}
+
+fn dap_lldb_value(output: string) -> string {
+    var start: i64 = 0;
+    while (start <= output.len) {
+        var end = start;
+        while (end < output.len && output.charAt(end) != 10) { end = end + 1; }
+        let line = output.substring(start, end).trim();
+        let type_end = dap_lldb_type_end(line);
+        if (type_end > 0) {
+            let equals = dap_lldb_equals(line, type_end + 1);
+            if (equals >= 0) {
+                let value = line.substring(equals + 3, line.len).trim();
+                if (value != "{") { return value; }
+                var body = "{";
+                var depth = dap_brace_delta(value);
+                while (end < output.len && depth > 0) {
+                    start = end + 1;
+                    end = start;
+                    while (end < output.len && output.charAt(end) != 10) { end = end + 1; }
+                    let member = output.substring(start, end).trim();
+                    if (member.len > 0) {
+                        body = body + " " + member;
+                        depth = depth + dap_brace_delta(member);
+                    }
+                    if (end >= output.len) { break; }
+                }
+                return body;
+            }
+        }
+        if (end >= output.len) { break; }
+        start = end + 1;
+    }
+    return "";
+}
+
+fn dap_lldb_type(output: string) -> string {
+    var start: i64 = 0;
+    while (start <= output.len) {
+        var end = start;
+        while (end < output.len && output.charAt(end) != 10) { end = end + 1; }
+        let line = output.substring(start, end).trim();
+        let type_end = dap_lldb_type_end(line);
+        if (type_end > 0) { return line.substring(1, type_end).trim(); }
+        if (end >= output.len) { break; }
+        start = end + 1;
+    }
+    return "";
+}
+
+fn dap_simple_identifier(expression: string) -> bool {
+    let text = expression.trim();
+    if (text.len == 0) { return false; }
+    var i: i64 = 0;
+    while (i < text.len) {
+        let ch = text.charAt(i);
+        let alpha = (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95;
+        let digit = ch >= 48 && ch <= 57;
+        if (!alpha && !(i > 0 && digit)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn dap_variable_entry(name: string, type_name: string, value: string) -> string {
+    return "{\"name\":" + dap_json_escape(name)
+        + ",\"value\":" + dap_json_escape(value)
+        + ",\"type\":" + dap_json_escape(type_name)
+        + ",\"variablesReference\":0}";
+}
+
+fn dap_append_variable(variables: string, count: i32, entry: string) -> string {
+    if (count > 0) { return variables + "," + entry; }
+    return variables + entry;
+}
+
+fn dap_variables_json(output: string) -> string {
+    var variables = "[";
+    var count: i32 = 0;
+    var start: i64 = 0;
+    while (start <= output.len) {
+        var end = start;
+        while (end < output.len && output.charAt(end) != 10) { end = end + 1; }
+        let line = output.substring(start, end).trim();
+        if (!line.startsWith("(")) {
+            if (end >= output.len) { break; }
+            start = end + 1;
+            continue;
+        }
+        let type_end = dap_lldb_type_end(line);
+        if (type_end > 0) {
+            let equals = dap_lldb_equals(line, type_end + 1);
+            if (equals >= 0) {
+                let type_name = line.substring(1, type_end);
+                let name = line.substring(type_end + 1, equals).trim();
+                let value = line.substring(equals + 3, line.len).trim();
+                if (name.len > 0 && !name.startsWith("$")) {
+                    if (value == "{") {
+                        var body = "{";
+                        var depth: i32 = 1;
+                        while (end < output.len && depth > 0) {
+                            start = end + 1;
+                            end = start;
+                            while (end < output.len && output.charAt(end) != 10) { end = end + 1; }
+                            let member = output.substring(start, end).trim();
+                            if (member.len > 0) {
+                                body = body + " " + member;
+                                depth = depth + dap_brace_delta(member);
+                            }
+                            if (end >= output.len) { break; }
+                        }
+                        if (depth > 0) { start = end + 1; }
+                        variables = dap_append_variable(variables, count, dap_variable_entry(name, type_name, body));
+                    } else {
+                        variables = dap_append_variable(variables, count, dap_variable_entry(name, type_name, value));
+                    }
+                    count = count + 1;
+                }
+            }
+        }
+        if (end >= output.len) { break; }
+        start = end + 1;
+    }
+    return variables + "]";
+}
+
+fn dap_evaluate_result(output: string) -> string {
+    return dap_lldb_value(output);
+}
+
+fn dap_location_address(output: string) -> string {
+    var start: i64 = 0;
+    while (start <= output.len) {
+        var end = start;
+        while (end < output.len && output.charAt(end) != 10) { end = end + 1; }
+        let line = output.substring(start, end).trim();
+        if (line.startsWith("0x") || line.startsWith("0X")) {
+            var address_end: i64 = 2;
+            while (address_end < line.len && dap_hex_digit(line.charAt(address_end)) >= 0) {
+                address_end = address_end + 1;
+            }
+            if (address_end > 2 && address_end < line.len && line.charAt(address_end) == 58) {
+                return line.substring(0, address_end);
+            }
+        }
+        if (end >= output.len) { break; }
+        start = end + 1;
+    }
+    return "";
+}
+
+fn dap_hover_result(server: &mut DapServer, expression: string, value: string) -> string {
+    if (!dap_simple_identifier(expression) || value.len == 0 || value.startsWith("0x")) { return value; }
+    let location = dap_debug_command(server, "frame variable --location -- " + expression);
+    if (location.toLower().contains("error:")) { return value; }
+    let address = dap_location_address(location);
+    if (address.len == 0) { return value; }
+    return address + " = " + value;
+}
+
+fn dap_evaluate_body(result: string, type_name: string) -> string {
+    return "{\"result\":" + dap_json_escape(result)
+        + ",\"type\":" + dap_json_escape(type_name)
+        + ",\"variablesReference\":0}";
+}
+
+fn dap_send_evaluate(server: &mut DapServer, request_sequence: i32,
+                     expression: string, value: string, type_name: string) {
+    dap_send_response(server, request_sequence, "evaluate", true,
+        dap_evaluate_body(dap_hover_result(server, expression, value), type_name));
+}
+
+fn dap_handle_initialize(server: &mut DapServer, request_sequence: i32) {
+    dap_send_response(server, request_sequence, "initialize", true,
+        "{\"supportsConfigurationDoneRequest\":true,"
+        + "\"supportsEvaluateForHovers\":true,"
+        + "\"supportsTerminateRequest\":true,"
+        + "\"supportsConditionalBreakpoints\":false,"
+        + "\"supportsFunctionBreakpoints\":false,"
+        + "\"supportsSetVariable\":false}");
+    dap_send_event(server, "initialized", "");
+}
+
+fn dap_native_reason(cap: i32) -> string {
+    let buf = malloc(cap as i64);
+    if (buf == null) { return "error"; }
+    memset(buf, 0, cap as i64);
+    vyx_dap_wait_stop(buf, cap);
+    let out = from_cstr(buf);
+    free(buf);
+    return out;
+}
+
+fn dap_handle_launch(server: &mut DapServer, request_sequence: i32, body: string) {
+    server.program_path = dap_json_string(body, "program");
+    server.working_directory = dap_json_string(body, "cwd");
+    server.debugger_path = dap_json_string(body, "debuggerPath");
+    server.stop_on_entry = dap_json_bool(body, "stopOnEntry");
+    if (server.program_path.len == 0) {
+        dap_send_error(server, request_sequence, "launch", "No program specified");
+        return;
+    }
+    server.program_path = dap_absolute_path(server.program_path);
+    if (!isFile(server.program_path)) {
+        dap_send_error(server, request_sequence, "launch", "Program not found: " + server.program_path);
+        return;
+    }
+    if (server.working_directory.len == 0) { server.working_directory = dap_dirname(server.program_path); }
+    server.working_directory = dap_absolute_path(server.working_directory);
+    if (vyx_dap_engine_available() != 0
+        && vyx_dap_launch(server.program_path.c_str(), server.working_directory.c_str()) == 0) {
+        server.native_engine = true;
+        server.running = true;
+        dap_send_response(server, request_sequence, "launch", true, "");
+        return;
+    }
+    if (!dap_launch_debugger(server)) {
+        if (server.debugger_path.len == 0) {
+            dap_send_error(server, request_sequence, "launch", dap_debugger_config_hint());
+        } else {
+            dap_send_error(server, request_sequence, "launch",
+                           "Failed to start configured debugger: " + server.debugger_path);
+        }
+        return;
+    }
+    dap_trace(server, "launch running=" + dap_i64_text(server.running as i64)
+        + " native=" + dap_i64_text(server.native_engine as i64));
+    dap_send_response(server, request_sequence, "launch", true, "");
+}
+
+fn dap_handle_set_breakpoints(server: &mut DapServer, request_sequence: i32, body: string) {
+    let source_path = dap_json_string(body, "path");
+    dap_trace(server, "setBreakpoints running=" + dap_i64_text(server.running as i64)
+        + " native=" + dap_i64_text(server.native_engine as i64));
+    var i: i64 = 0;
+    while (i < server.breakpoints.len) {
+        let old = server.breakpoints.get(i);
+        if (old.source_path == source_path) {
+            if (old.debugger_id > 0 && server.running) {
+                dap_debug_command(server, "breakpoint delete " + dap_i64_text(old.debugger_id as i64));
+            }
+            server.breakpoints.remove(i);
+        } else { i = i + 1; }
+    }
+
+    var lines = dap_breakpoint_lines(body);
+    var response = "[";
+    i = 0;
+    while (i < lines.len) {
+        let line = lines.get(i);
+        var breakpoint = DapBreakpoint {
+            source_path: source_path.clone(),
+            line: line,
+            id: server.next_breakpoint_id,
+            debugger_id: 0,
+            verified: false
+        };
+        server.next_breakpoint_id = server.next_breakpoint_id + 1;
+        if (server.native_engine && server.running) {
+            breakpoint.verified = vyx_dap_set_breakpoint(source_path.c_str(), line) != 0;
+        } else if (server.running) {
+            let output = dap_debug_command(server, "breakpoint set --file "
+                + dap_quote_lldb(dap_basename(source_path)) + " --line " + dap_i64_text(line as i64));
+            breakpoint.verified = output.contains("Breakpoint ")
+                && !output.toLower().contains("no locations") && !output.toLower().contains("error:");
+            let marker = output.indexOf("Breakpoint ");
+            if (marker >= 0) {
+                var number = marker + 11;
+                while (number < output.len) {
+                    let ch = output.charAt(number);
+                    if (ch < 48 || ch > 57) { break; }
+                    breakpoint.debugger_id = breakpoint.debugger_id * 10 + (ch - 48);
+                    number = number + 1;
+                }
+            }
+        }
+        if (i > 0) { response = response + ","; }
+        response = response + "{\"id\":" + dap_i64_text(breakpoint.id as i64)
+            + ",\"verified\":";
+        if (breakpoint.verified) { response = response + "true"; }
+        else { response = response + "false"; }
+        response = response + ",\"line\":" + dap_i64_text(line as i64)
+            + ",\"source\":{\"name\":" + dap_json_escape(dap_basename(source_path))
+            + ",\"path\":" + dap_json_escape(source_path) + "}}";
+        server.breakpoints.push(breakpoint);
+        i = i + 1;
+    }
+    lines.destroy();
+    dap_send_response(server, request_sequence, "setBreakpoints", true,
+        "{\"breakpoints\":" + response + "]}");
+}
+
+fn dap_handle_configuration_done(server: &mut DapServer, request_sequence: i32) {
+    dap_send_response(server, request_sequence, "configurationDone", true, "");
+    dap_trace(server, "configuration running=" + dap_i64_text(server.running as i64)
+        + " native=" + dap_i64_text(server.native_engine as i64));
+    if (!server.running) { return; }
+    if (server.native_engine) {
+        dap_trace(server, "configuration native continue");
+        if (!server.stop_on_entry) {
+            vyx_dap_continue();
+            let reason = dap_native_reason(64);
+            if (reason == "exited") {
+                dap_send_event(server, "exited", "{\"exitCode\":0}");
+                dap_send_event(server, "terminated", "");
+                vyx_dap_disconnect();
+                server.running = false;
+                return;
+            }
+            dap_send_event(server, "stopped", "{\"reason\":" + dap_json_escape(reason)
+                + ",\"threadId\":1,\"allThreadsStopped\":true}");
+            return;
+        }
+        dap_send_event(server, "stopped", "{\"reason\":\"entry\",\"threadId\":1,\"allThreadsStopped\":true}");
+        return;
+    }
+    var command = "run";
+    if (server.stop_on_entry) { command = "process launch --stop-at-entry"; }
+    dap_trace(server, "configuration entering " + command);
+    dap_trace(server, "sending " + command);
+    let launch_output = dap_debug_command(server, command);
+    dap_trace(server, command + " => " + launch_output);
+    if (launch_output.toLower().contains("error:")) {
+        dap_report_process_failure(server, launch_output.trim());
+        return;
+    }
+    dap_wait_for_stop(server, "breakpoint");
+}
+
+fn dap_handle_stack_trace(server: &mut DapServer, request_sequence: i32) {
+    if (server.native_engine) {
+        let buf = malloc(4096);
+        if (buf == null) {
+            dap_send_response(server, request_sequence, "stackTrace", true,
+                "{\"stackFrames\":[],\"totalFrames\":0}");
+            return;
+        }
+        memset(buf, 0, 4096);
+        vyx_dap_stack_json(buf, 4096);
+        let json = from_cstr(buf);
+        free(buf);
+        dap_send_response(server, request_sequence, "stackTrace", true, json);
+        return;
+    }
+    let output = dap_debug_command(server, "thread backtrace --count 64");
+    dap_trace(server, "thread backtrace => " + output);
+    dap_send_response(server, request_sequence, "stackTrace", true, dap_stack_frames_json(server, output));
+}
+
+fn dap_handle_scopes(server: &mut DapServer, request_sequence: i32, body: string) {
+    let frame_id = dap_json_int(body, "frameId");
+    if (server.native_engine) {
+        let buf = malloc(2048);
+        var variables = "[]";
+        if (buf != null) {
+            memset(buf, 0, 2048);
+            vyx_dap_vars_json(frame_id, buf, 2048);
+            variables = from_cstr(buf);
+            free(buf);
+        }
+        let reference = server.next_variable_reference;
+        server.next_variable_reference = server.next_variable_reference + 1;
+        server.variables.put(reference, variables);
+        dap_send_response(server, request_sequence, "scopes", true,
+            "{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":"
+            + dap_i64_text(reference as i64) + ",\"expensive\":false}]}");
+        return;
+    }
+    dap_debug_command(server, "frame select " + dap_i64_text(frame_id as i64));
+    let reference = server.next_variable_reference;
+    server.next_variable_reference = server.next_variable_reference + 1;
+    let variable_output = dap_debug_command(server, "frame variable --show-types");
+    dap_trace(server, "frame variable => " + variable_output);
+    let variables = dap_variables_json(variable_output);
+    server.variables.put(reference, variables);
+    dap_send_response(server, request_sequence, "scopes", true,
+        "{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":"
+        + dap_i64_text(reference as i64) + ",\"expensive\":false}]}");
+}
+
+fn dap_handle_variables(server: &mut DapServer, request_sequence: i32, body: string) {
+    let reference = dap_json_int(body, "variablesReference");
+    var variables = "[]";
+    if (server.variables.contains(reference)) { variables = server.variables.get(reference); }
+    dap_send_response(server, request_sequence, "variables", true, "{\"variables\":" + variables + "}");
+}
+
+fn dap_handle_evaluate(server: &mut DapServer, request_sequence: i32, body: string) {
+    let frame_id = dap_json_int(body, "frameId");
+    if (frame_id >= 0) { dap_debug_command(server, "frame select " + dap_i64_text(frame_id as i64)); }
+    let expression = dap_json_string(body, "expression").trim();
+    if (expression.len == 0 || expression.contains("\n") || expression.contains("\r")) {
+        dap_send_error(server, request_sequence, "evaluate", "Invalid expression");
+        return;
+    }
+    var output = "";
+    if (dap_simple_identifier(expression)) {
+        output = dap_debug_command(server, "frame variable --show-types -- " + expression);
+    }
+    if (output.len == 0 || output.toLower().contains("error:")
+        || dap_evaluate_result(output).len == 0) {
+        output = dap_debug_command(server, "expression -- " + expression);
+    }
+    if (output.toLower().contains("error:")) {
+        dap_send_error(server, request_sequence, "evaluate", output.trim());
+        return;
+    }
+    let result = dap_evaluate_result(output);
+    if (result.len == 0) {
+        dap_send_error(server, request_sequence, "evaluate", "LLDB returned no value for '" + expression + "'");
+        return;
+    }
+    let type_name = dap_lldb_type(output);
+    dap_send_evaluate(server, request_sequence, expression, result, type_name);
+}
+
+fn dap_handle_resume(server: &mut DapServer, request_sequence: i32, command: string,
+                     debugger_command: string, reason: string) {
+    var body = "";
+    if (command == "continue") { body = "{\"allThreadsContinued\":true}"; }
+    dap_send_response(server, request_sequence, command, true, body);
+    if (server.native_engine) {
+        if (command == "continue") { vyx_dap_continue(); }
+        else if (command == "next") { vyx_dap_step_over(); }
+        else if (command == "stepIn") { vyx_dap_step_in(); }
+        else { vyx_dap_step_out(); }
+        let stopped = dap_native_reason(64);
+        if (stopped == "exited") {
+            dap_send_event(server, "exited", "{\"exitCode\":0}");
+            dap_send_event(server, "terminated", "");
+            vyx_dap_disconnect();
+            server.running = false;
+            return;
+        }
+        dap_send_event(server, "stopped", "{\"reason\":" + dap_json_escape(stopped)
+            + ",\"threadId\":1,\"allThreadsStopped\":true}");
+        return;
+    }
+    dap_debug_command(server, debugger_command);
+    dap_wait_for_stop(server, reason);
+}
+
+fn dap_handle_disconnect(server: &mut DapServer, request_sequence: i32, command: string) {
+    dap_send_response(server, request_sequence, command, true, "");
+    if (server.native_engine) {
+        vyx_dap_disconnect();
+        server.running = false;
+    } else {
+        dap_kill_debugger(server);
+    }
+    server.terminated = true;
+}
+
+fn dap_dispatch(server: &mut DapServer, body: string) {
+    let command = dap_json_string(body, "command");
+    let request_sequence = dap_json_int(body, "seq");
+    if (command == "initialize") {
+        dap_handle_initialize(server, request_sequence);
+    } else if (command == "launch") {
+        dap_handle_launch(server, request_sequence, body);
+    } else if (command == "attach") {
+        dap_send_error(server, request_sequence, command, "Attach mode is not supported");
+    } else if (command == "setBreakpoints") {
+        dap_handle_set_breakpoints(server, request_sequence, body);
+    } else if (command == "setExceptionBreakpoints") {
+        dap_send_response(server, request_sequence, command, true, "{\"breakpoints\":[]}");
+    } else if (command == "setFunctionBreakpoints") {
+        dap_send_response(server, request_sequence, command, true, "{\"breakpoints\":[]}");
+    } else if (command == "configurationDone") {
+        dap_handle_configuration_done(server, request_sequence);
+    } else if (command == "threads") {
+        dap_send_response(server, request_sequence, command, true,
+            "{\"threads\":[{\"id\":1,\"name\":\"main\"}]}");
+    } else if (command == "stackTrace") {
+        dap_handle_stack_trace(server, request_sequence);
+    } else if (command == "scopes") {
+        dap_handle_scopes(server, request_sequence, body);
+    } else if (command == "variables") {
+        dap_handle_variables(server, request_sequence, body);
+    } else if (command == "evaluate") {
+        dap_handle_evaluate(server, request_sequence, body);
+    } else if (command == "continue") {
+        dap_handle_resume(server, request_sequence, command, "process continue", "breakpoint");
+    } else if (command == "next") {
+        dap_handle_resume(server, request_sequence, command, "thread step-over", "step");
+    } else if (command == "stepIn") {
+        dap_handle_resume(server, request_sequence, command, "thread step-in", "step");
+    } else if (command == "stepOut") {
+        dap_handle_resume(server, request_sequence, command, "thread step-out", "step");
+    } else if (command == "pause") {
+        dap_send_response(server, request_sequence, command, true, "");
+        if (server.native_engine) {
+            vyx_dap_pause();
+            let stopped = dap_native_reason(64);
+            dap_send_event(server, "stopped", "{\"reason\":" + dap_json_escape(stopped)
+                + ",\"threadId\":1,\"allThreadsStopped\":true}");
+        } else {
+            dap_debug_command(server, "process interrupt");
+            dap_wait_for_stop(server, "pause");
+        }
+    } else if (command == "disconnect" || command == "terminate") {
+        dap_handle_disconnect(server, request_sequence, command);
+    } else {
+        dap_send_response(server, request_sequence, command, true, "");
+    }
+}
+
+fn dap_show_help() {
+    print("vyxc-dap — Vyx Debug Adapter (bootstrap)");
+    print("Usage: vyxc-dap [--stdio]");
+    print("  Speaks DAP over stdin/stdout. Linux uses the native ptrace+DWARF engine;");
+    print("  the LLDB backend is used only when explicitly configured with VYX_LLDB or LLVM_ROOT.");
+}
+
+fn main() -> i32 {
+    var i: i32 = 1;
+    let argc = argCount();
+    while (i < argc) {
+        let argument = getArg(i);
+        if (argument == "-h" || argument == "--help" || argument == "help") {
+            dap_show_help();
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    var server = DapServer.create();
+    while (!server.terminated) {
+        let message = dap_read_message();
+        if (message.len == 0) { break; }
+        dap_dispatch(&mut server, message);
+    }
+    if (server.running) { dap_kill_debugger(&mut server); }
+    server.breakpoints.destroy();
+    server.variables.destroy();
+    return 0;
+}

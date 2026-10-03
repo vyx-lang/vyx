@@ -1,0 +1,390 @@
+module bootstrap.lang_items;
+
+use std.string;
+use bootstrap.ast;
+
+extern "C" {
+    fn getenv(name: rawptr) -> rawptr;
+}
+
+/// LangItemRegistry — bootstrap mirror of `src/Sema/LangItemRegistry.h`
+/// (canonical at workspace root). Records the curated slot names
+/// (`"option"`, `"result"`, `"string"`, `"box"`, `"ref"`, `"scope"`,
+/// `"vec"`, `"dict"`, …) declared with `@[lang_item("<slot>")]` so
+/// downstream Sema/Mono/CodeGen paths can resolve well-known stdlib
+/// declarations without hard-coding the literal class name.
+///
+/// Slot → Decl* table:
+///
+///   * Insertion-only — first wins, duplicates are silently absorbed
+///     so a `use` chain that re-exports an already-registered slot
+///     doesn't trample the first registration. The bootstrap path
+///     emits no diagnostic on duplicates (host version does); the
+///     decision to bring this in line with host is part of WU1's
+///     diagnostic refit — keeping it silent here avoids a phantom
+///     SEMA-002-Duplicate trip for std modules that legitimately
+///     re-export the slot under a wider name path.
+///
+///   * Lookups are constant-time: open-addressing hash table with
+///     load factor 0.7 and FNV-1a 64-bit hash, same flavour as
+///     `bootstrap.canon` / `bootstrap.fact_base`.
+///
+///   * Slot keys are duplicated on the EXE-side `malloc` heap so
+///     `lang_items_dispose` can `free` them safely without tripping
+///     the cross-CRT bug that bit `canon_smoke` / `mono_scheduler_smoke`.
+///
+/// ════════════════════════════════════════════════════════════════════
+///   STATE LAYOUT (malloc-backed, 24 B)
+/// ════════════════════════════════════════════════════════════════════
+///   0..7    buf_ptr   : rawptr   (slot table)
+///   8..11   buf_cap   : i32      (power of two, start 64)
+///   12..15  buf_count : i32      (occupied slot count)
+///   16..23  prelude_active : i64 (bit-mask, see lang_items_prelude_* fns)
+///
+/// ════════════════════════════════════════════════════════════════════
+///   SLOT LAYOUT (32 B)
+/// ════════════════════════════════════════════════════════════════════
+///   0..7    key_ptr   : rawptr   (null = empty; owned by table)
+///   8..15   key_len   : i64
+///   16..23  key_hash  : i64
+///   24..31  decl_ptr  : rawptr   (host-side Decl pointer, not owned)
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+}
+
+fn li_dup_bytes(src: rawptr, n: i64) -> rawptr {
+    if (n < 0) { return null; }
+    let alloc_len: i64 = n + 1;
+    let p = malloc(alloc_len as u64);
+    if (p == null) { return null; }
+    if (n > 0 && src != null) {
+        memcpy(p, src, n as u64);
+    }
+    var nul: i32 = 0;
+    memcpy(ptr_offset(p, n as i32), to_rawptr(&nul), 1);
+    return p;
+}
+
+fn li_state_size() -> i32 { return 24; }
+fn li_slot_size()  -> i32 { return 32; }
+fn li_init_cap()   -> i32 { return 64; }
+
+// Prelude-active bit assignments — referenced by sema's
+// `host_analyze_apply_prelude_imports` to track which `use <module>;`
+// preludes have been encountered. Same names host uses internally,
+// kept stable so future WUs can `or` additional bits without renumbering.
+public fn lang_items_prelude_bit_std_core()    -> i64 { return 1; }
+public fn lang_items_prelude_bit_std_result()  -> i64 { return 2; }
+public fn lang_items_prelude_bit_std_io()      -> i64 { return 4; }
+public fn lang_items_prelude_bit_std_string()  -> i64 { return 8; }
+
+// ════════════════════════════════════════════════════════════════════
+//   Allocator / disposer
+// ════════════════════════════════════════════════════════════════════
+
+public fn lang_items_alloc() -> rawptr {
+    let s = malloc(li_state_size() as u64);
+    if (s == null) { return null; }
+    memset(s, 0, li_state_size() as u64);
+    let cap = li_init_cap();
+    let buf = li_table_alloc(cap);
+    ast_write_rawptr(s, buf);
+    ptr_write_i32(ptr_offset(s, 8), cap);
+    ptr_write_i32(ptr_offset(s, 12), 0);
+    ptr_write_i64(ptr_offset(s, 16), 0);
+    return s;
+}
+
+public fn lang_items_dispose(s: rawptr) {
+    if (s == null) { return; }
+    let buf = ast_read_rawptr(s);
+    let cap = ptr_read_i32(ptr_offset(s, 8));
+    li_table_dispose(buf, cap);
+    free(s);
+}
+
+public fn lang_items_clear(s: rawptr) {
+    if (s == null) { return; }
+    let buf = ast_read_rawptr(s);
+    let cap = ptr_read_i32(ptr_offset(s, 8));
+    li_table_dispose(buf, cap);
+    let fresh_cap = li_init_cap();
+    let fresh = li_table_alloc(fresh_cap);
+    ast_write_rawptr(s, fresh);
+    ptr_write_i32(ptr_offset(s, 8), fresh_cap);
+    ptr_write_i32(ptr_offset(s, 12), 0);
+    ptr_write_i64(ptr_offset(s, 16), 0);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   register / find
+// ════════════════════════════════════════════════════════════════════
+
+/// Returns true when a brand-new slot was reserved, false when the
+/// slot was already registered (first-wins). Mirrors host
+/// `LangItemRegistry::registerItem` minus the diag emission — see
+/// the file-header comment for why bootstrap stays silent here.
+public fn lang_items_register(s: rawptr, slot: string, decl: rawptr) -> bool {
+    if (s == null || slot.len == 0 || decl == null) { return false; }
+    let buf = ast_read_rawptr(s);
+    let cap = ptr_read_i32(ptr_offset(s, 8));
+    let slotp = li_lookup_or_reserve(buf, cap, slot);
+    if (slotp == null) { return false; }
+    if (ast_read_rawptr(slotp) != null) {
+        return false;
+    }
+    let key = li_dup_bytes(slot.c_str(), slot.len);
+    ast_write_rawptr(slotp, key);
+    ptr_write_i64(ptr_offset(slotp, 8), slot.len);
+    ptr_write_i64(ptr_offset(slotp, 16), li_hash_bytes(slot.c_str(), slot.len));
+    ast_write_rawptr(ptr_offset(slotp, 24), decl);
+    let cnt = ptr_read_i32(ptr_offset(s, 12)) + 1;
+    ptr_write_i32(ptr_offset(s, 12), cnt);
+    if (li_needs_grow(cnt, cap)) {
+        li_grow(s);
+    }
+    return true;
+}
+
+/// Returns the Decl pointer registered for `slot`, or null when no
+/// slot was registered. Callers must tolerate null and fall back to
+/// the legacy hard-coded behaviour so a unit that hasn't imported
+/// the relevant stdlib module still works (mirrors host contract).
+public fn lang_items_find(s: rawptr, slot: string) -> rawptr {
+    if (s == null || slot.len == 0) { return null; }
+    let buf = ast_read_rawptr(s);
+    let cap = ptr_read_i32(ptr_offset(s, 8));
+    let slotp = li_lookup_only(buf, cap, slot);
+    if (slotp == null) { return null; }
+    if (ast_read_rawptr(slotp) == null) { return null; }
+    return ast_read_rawptr(ptr_offset(slotp, 24));
+}
+
+public fn lang_items_slot_count(s: rawptr) -> i32 {
+    if (s == null) { return 0; }
+    return ptr_read_i32(ptr_offset(s, 12));
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   prelude_active bitmask
+// ════════════════════════════════════════════════════════════════════
+
+public fn lang_items_prelude_set(s: rawptr, bit: i64) {
+    if (s == null) { return; }
+    let cur = ptr_read_i64(ptr_offset(s, 16));
+    ptr_write_i64(ptr_offset(s, 16), cur | bit);
+}
+
+public fn lang_items_prelude_has(s: rawptr, bit: i64) -> bool {
+    if (s == null) { return false; }
+    return (ptr_read_i64(ptr_offset(s, 16)) & bit) != 0;
+}
+
+public fn lang_items_prelude_mask(s: rawptr) -> i64 {
+    if (s == null) { return 0; }
+    return ptr_read_i64(ptr_offset(s, 16));
+}
+
+/// Telemetry dump — bootstrap mirror of the diagnostic line host
+/// `Sema` would print when scanning lang-item attributes. Early-returns
+/// when neither slot count nor prelude mask has anything to report, so
+/// CI parity gates that grep for the line stay quiet on units that
+/// don't import the stdlib (mirrors host's "only print when there's
+/// something to say" convention).
+public fn lang_items_dump_stats(s: rawptr) {
+    if (s == null) { return; }
+    if (getenv("VYX_DEBUG_LANG_ITEMS".c_str()) == null) { return; }
+    let n = lang_items_slot_count(s);
+    let mask = lang_items_prelude_mask(s);
+    if (n == 0 && mask == 0) { return; }
+    print("[R5 lang-items] slots=" + lang_items_format_dec_i64(n as i64)
+          + " prelude_mask=0x" + lang_items_format_hex_i64(mask));
+}
+
+fn lang_items_format_dec_i64(v: i64) -> string {
+    if (v == 0) { return "0"; }
+    var n = v;
+    var neg: bool = false;
+    if (n < 0) {
+        neg = true;
+        n = 0 - n;
+    }
+    var buf: rawptr = malloc(32);
+    if (buf == null) { return "?"; }
+    var i: i32 = 31;
+    var nul: i32 = 0;
+    memcpy(buf + i, to_rawptr(&nul), 1);
+    i = i - 1;
+    while (n > 0 && i >= 0) {
+        let d = n % 10;
+        var c: i32 = 48 + (d as i32);
+        memcpy(buf + i, to_rawptr(&c), 1);
+        n = n / 10;
+        i = i - 1;
+    }
+    if (neg && i >= 0) {
+        var dash: i32 = 45;
+        memcpy(buf + i, to_rawptr(&dash), 1);
+        i = i - 1;
+    }
+    let start = i + 1;
+    let len = 31 - start;
+    let out = from_cstr_len(buf + start, len as i64);
+    free(buf);
+    return out;
+}
+
+fn lang_items_format_hex_i64(v: i64) -> string {
+    if (v == 0) { return "0"; }
+    let digits = "0123456789abcdef";
+    var buf: rawptr = malloc(17);
+    if (buf == null) { return "?"; }
+    var i: i32 = 16;
+    var nul: i32 = 0;
+    memcpy(ptr_offset(buf, i), to_rawptr(&nul), 1);
+    var n: i64 = v;
+    if (n < 0) { n = -n; }
+    while (n > 0 && i > 0) {
+        i = i - 1;
+        let dig = (n & 15) as i32;
+        var ch: i32 = digits.charAt(dig);
+        memcpy(ptr_offset(buf, i), to_rawptr(&ch), 1);
+        n = n >> 4;
+    }
+    let out = from_cstr_len(ptr_offset(buf, i), (16 - i) as i64);
+    free(buf);
+    return out;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Internal: hash table primitives
+// ════════════════════════════════════════════════════════════════════
+
+fn li_table_alloc(cap: i32) -> rawptr {
+    let bytes = (cap * li_slot_size()) as u64;
+    let buf = malloc(bytes);
+    if (buf != null) { memset(buf, 0, bytes); }
+    return buf;
+}
+
+fn li_table_dispose(buf: rawptr, cap: i32) {
+    if (buf == null) { return; }
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = ptr_offset(buf, i * li_slot_size());
+        let kp = ast_read_rawptr(slot);
+        if (kp != null) {
+            free(kp);
+        }
+        i = i + 1;
+    }
+    free(buf);
+}
+
+fn li_lookup_only(buf: rawptr, cap: i32, slot: string) -> rawptr {
+    if (buf == null || cap <= 0) { return null; }
+    let h = li_hash_bytes(slot.c_str(), slot.len);
+    let mask = (cap - 1) as i64;
+    var idx = (h & mask) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let cell = ptr_offset(buf, idx * li_slot_size());
+        if (ast_read_rawptr(cell) == null) { return null; }
+        if (li_cell_matches(cell, slot, h)) { return cell; }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn li_lookup_or_reserve(buf: rawptr, cap: i32, slot: string) -> rawptr {
+    if (buf == null || cap <= 0) { return null; }
+    let h = li_hash_bytes(slot.c_str(), slot.len);
+    let mask = (cap - 1) as i64;
+    var idx = (h & mask) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let cell = ptr_offset(buf, idx * li_slot_size());
+        if (ast_read_rawptr(cell) == null) { return cell; }
+        if (li_cell_matches(cell, slot, h)) { return cell; }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn li_cell_matches(cell: rawptr, slot: string, h: i64) -> bool {
+    if (ptr_read_i64(ptr_offset(cell, 16)) != h) { return false; }
+    let kl = ptr_read_i64(ptr_offset(cell, 8));
+    if (kl != slot.len) { return false; }
+    if (kl == 0) { return true; }
+    let kp = ast_read_rawptr(cell);
+    if (kp == null) { return false; }
+    return memcmp(kp, slot.c_str(), kl as u64) == 0;
+}
+
+fn li_hash_bytes(ptr: rawptr, n: i64) -> i64 {
+    var h: i64 = 1469598103934665603;
+    if (ptr == null) { return h; }
+    var i: i64 = 0;
+    while (i < n) {
+        var b: i32 = 0;
+        memcpy(to_rawptr(&b), ptr_offset(ptr, i as i32), 1);
+        h = (h ^ ((b & 0xFF) as i64)) * 1099511628211;
+        i = i + 1;
+    }
+    if (h < 0) { h = 0 - h; }
+    if (h < 0) { h = 0; }
+    return h;
+}
+
+fn li_needs_grow(count: i32, cap: i32) -> bool {
+    return (count * 10) > (cap * 7);
+}
+
+fn li_grow(s: rawptr) {
+    let old_buf = ast_read_rawptr(s);
+    let old_cap = ptr_read_i32(ptr_offset(s, 8));
+    if (old_buf == null || old_cap <= 0) { return; }
+    let new_cap = old_cap * 2;
+    let new_buf = li_table_alloc(new_cap);
+    if (new_buf == null) { return; }
+    let mask = (new_cap - 1) as i64;
+    var i: i32 = 0;
+    while (i < old_cap) {
+        let cell = ptr_offset(old_buf, i * li_slot_size());
+        let kp = ast_read_rawptr(cell);
+        if (kp != null) {
+            let kl = ptr_read_i64(ptr_offset(cell, 8));
+            let kh = ptr_read_i64(ptr_offset(cell, 16));
+            let decl = ast_read_rawptr(ptr_offset(cell, 24));
+            var idx = (kh & mask) as i32;
+            var probes: i32 = 0;
+            while (probes < new_cap) {
+                let dst = ptr_offset(new_buf, idx * li_slot_size());
+                if (ast_read_rawptr(dst) == null) {
+                    ast_write_rawptr(dst, kp);
+                    ptr_write_i64(ptr_offset(dst, 8), kl);
+                    ptr_write_i64(ptr_offset(dst, 16), kh);
+                    ast_write_rawptr(ptr_offset(dst, 24), decl);
+                    ast_write_rawptr(cell, null);
+                    break;
+                }
+                idx = idx + 1;
+                if (idx >= new_cap) { idx = 0; }
+                probes = probes + 1;
+            }
+        }
+        i = i + 1;
+    }
+    li_table_dispose(old_buf, old_cap);
+    ast_write_rawptr(s, new_buf);
+    ptr_write_i32(ptr_offset(s, 8), new_cap);
+}

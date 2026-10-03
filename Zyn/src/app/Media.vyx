@@ -1,0 +1,569 @@
+module Zyn.App;
+
+use std.collections;
+use Color = Zyn.Nut.Types.Color;
+
+// ---------------------------------------------------------------------------
+// ZC-10 media and feedback
+//
+// Two halves, both of which the App layer was missing:
+//
+//   media   - an asset registry with a lifecycle, DPI variant selection, and
+//             the loading / failed / ready placeholders every image needs.
+//             Nut already decodes images and owns the atlas; what was missing
+//             was the App-side contract. The bitmap itself still needs a view
+//             kind that the renderer understands, so the view produced here
+//             carries the resolved asset in a resource and draws the
+//             placeholder; wiring the draw call is the remaining visual half.
+//
+//   feedback- toast / snackbar / tooltip / popover, progress with cancel, and
+//             drag-and-drop targets. Transient UI lives on M0 overlay layers
+//             and is expired by the ZC-06 effect clock, so there is no second
+//             timer and no second dismissal path.
+// ---------------------------------------------------------------------------
+
+public fn appToastInfo() -> i32 { return 1; }
+public fn appToastSuccess() -> i32 { return 2; }
+public fn appToastWarning() -> i32 { return 3; }
+public fn appToastError() -> i32 { return 4; }
+
+public fn appDragKindText() -> i32 { return 1; }
+public fn appDragKindFile() -> i32 { return 2; }
+public fn appDragKindRow() -> i32 { return 3; }
+
+public fn appMediaLoading() -> i32 { return 1; }
+public fn appMediaReady() -> i32 { return 2; }
+public fn appMediaFailed() -> i32 { return 3; }
+
+// ------------------------------------------------------------------
+// Asset registry and DPI variants
+// ------------------------------------------------------------------
+
+public class AppAssetStore {
+    public static fn assetKey(asset_id: string) -> string { return "asset:" + asset_id; }
+    public static fn widthKey(asset_id: string) -> string { return "asset:" + asset_id + ":w"; }
+    public static fn heightKey(asset_id: string) -> string { return "asset:" + asset_id + ":h"; }
+    public static fn variantKey(asset_id: string) -> string { return "asset:" + asset_id + ":variants"; }
+    public static fn refKey(asset_id: string) -> string { return "asset:" + asset_id + ":refs"; }
+    public static fn viewKey(view_id: string) -> string { return "media:" + view_id; }
+
+    // Declares the intrinsic size once. Re-declaring the same asset is a no-op
+    // so two components can both ask for it without a fight.
+    public static fn register(world: AppWorld, asset_id: string, width: i32, height: i32) -> AppWorld {
+        if (asset_id.len == 0) { return world; }
+        var out = world;
+        if (out.stringResource(AppAssetStore.assetKey(asset_id), "").len == 0) {
+            out = out.setStringResource(AppAssetStore.assetKey(asset_id), asset_id);
+            out = out.setIntResource(AppAssetStore.widthKey(asset_id), width);
+            out = out.setIntResource(AppAssetStore.heightKey(asset_id), height);
+        }
+        return out;
+    }
+
+    public static fn isRegistered(world: AppWorld, asset_id: string) -> bool {
+        return world.stringResource(AppAssetStore.assetKey(asset_id), "").len > 0;
+    }
+
+    public static fn width(world: AppWorld, asset_id: string) -> i32 {
+        return world.intResource(AppAssetStore.widthKey(asset_id), 0);
+    }
+
+    public static fn height(world: AppWorld, asset_id: string) -> i32 {
+        return world.intResource(AppAssetStore.heightKey(asset_id), 0);
+    }
+
+    // A variant is stored as `scale|path`, e.g. `2|icons/add@2x.png`.
+    public static fn addVariant(world: AppWorld, asset_id: string, scale: i32, path: string) -> AppWorld {
+        if (asset_id.len == 0 || path.len == 0) { return world; }
+        return world.appendStringListResource(AppAssetStore.variantKey(asset_id), format("%d", scale as i64) + "|" + path);
+    }
+
+    public static fn variantCount(world: AppWorld, asset_id: string) -> i32 {
+        return world.stringListResourceCount(AppAssetStore.variantKey(asset_id));
+    }
+
+    public static fn variantAt(world: AppWorld, asset_id: string, index: i32) -> string {
+        return world.stringListResourceAt(AppAssetStore.variantKey(asset_id), index);
+    }
+
+    // Picks the smallest variant that is at least the requested scale, and falls
+    // back to the largest one when the screen is denser than every asset. This
+    // is what keeps a 1x asset from being upscaled on a 2x display when a 2x
+    // file exists, without the caller branching on DPI.
+    public static fn variantFor(world: AppWorld, asset_id: string, scale: i32) -> string {
+        var best = "";
+        var best_scale: i32 = 0;
+        var largest = "";
+        var largest_scale: i32 = 0;
+        var i: i32 = 0;
+        let total = AppAssetStore.variantCount(world, asset_id);
+        while (i < total) {
+            let entry = AppAssetStore.variantAt(world, asset_id, i);
+            let bar = entry.indexOf("|");
+            if (bar > 0) {
+                let entry_scale = app_parse_i32_or(entry.substring(0 as i64, bar), 0);
+                let path = entry.substring((bar + 1) as i64, entry.len as i64);
+                if (entry_scale > largest_scale) {
+                    largest_scale = entry_scale;
+                    largest = path;
+                }
+                if (entry_scale >= scale && (best.len == 0 || entry_scale < best_scale)) {
+                    best = path;
+                    best_scale = entry_scale;
+                }
+            }
+            i = i + 1;
+        }
+        if (best.len > 0) { return best; }
+        return largest;
+    }
+
+    // Reference counting is what makes release safe when two views share one
+    // asset: the bytes go away only when the last holder lets go.
+    public static fn retain(world: AppWorld, asset_id: string) -> AppWorld {
+        if (asset_id.len == 0) { return world; }
+        return world.incrementIntResource(AppAssetStore.refKey(asset_id), 1);
+    }
+
+    public static fn release(world: AppWorld, asset_id: string) -> AppWorld {
+        if (asset_id.len == 0) { return world; }
+        let current = world.intResource(AppAssetStore.refKey(asset_id), 0);
+        if (current <= 1) { return world.setIntResource(AppAssetStore.refKey(asset_id), 0); }
+        return world.incrementIntResource(AppAssetStore.refKey(asset_id), -1);
+    }
+
+    public static fn refCount(world: AppWorld, asset_id: string) -> i32 {
+        return world.intResource(AppAssetStore.refKey(asset_id), 0);
+    }
+}
+
+public class AppMediaState {
+    public status: i32;
+    public error_message: string;
+
+    public static fn create(status: i32, error_message: string) -> AppMediaState {
+        return AppMediaState { status: status, error_message: error_message };
+    }
+
+    public static fn loading() -> AppMediaState { return AppMediaState.create(appMediaLoading(), ""); }
+    public static fn ready() -> AppMediaState { return AppMediaState.create(appMediaReady(), ""); }
+    public static fn failed(message: string) -> AppMediaState { return AppMediaState.create(appMediaFailed(), message); }
+
+    public fn isLoading(&self) -> bool { return self.status == appMediaLoading(); }
+    public fn isReady(&self) -> bool { return self.status == appMediaReady(); }
+    public fn isFailed(&self) -> bool { return self.status == appMediaFailed(); }
+
+    public fn dup(&self) -> AppMediaState {
+        return AppMediaState.create(self.status, self.error_message);
+    }
+}
+
+public class ImageView {
+    // The resolved asset id is written into a resource keyed by the view id, so
+    // the renderer (and the developer inspector) can read it without the view
+    // having to carry a pointer to decoded pixels.
+    public static fn create(id: string, asset_id: string, state: AppMediaState, width: f32, height: f32, retry_action: string, world: AppWorld) -> View {
+        var out = Container.create().id(id).size(width, height)
+            .background(Color.rgba(0.0, 0.0, 0.0, 0.06))
+            .cornerRadius(6.0)
+            .accessibility("image", asset_id, "");
+        if (state.isLoading()) {
+            return out.child(Progress.create("").id(id + ".spinner").size(width, height));
+        }
+        if (state.isFailed()) {
+            return out.child(Button.tonalAction(id + ".retry", "Retry", retry_action).size(width, height)
+                .accessibility("button", "Retry loading " + asset_id, state.error_message));
+        }
+        return out;
+    }
+
+    public static fn bindAsset(world: AppWorld, view_id: string, asset_id: string) -> AppWorld {
+        return world.setStringResource(AppAssetStore.viewKey(view_id), asset_id);
+    }
+
+    public static fn assetOf(world: AppWorld, view_id: string) -> string {
+        return world.stringResource(AppAssetStore.viewKey(view_id), "");
+    }
+}
+
+public class IconView {
+    // Icons are text glyphs today (see the MD3 button helpers), so an icon needs
+    // no asset at all; it only needs a stable accessible name.
+    public static fn create(id: string, glyph: string, label: string, action_name: string) -> View {
+        return Button.tonalAction(id, glyph, action_name)
+            .size(36.0, 36.0)
+            .accessibility("button", label, "");
+    }
+}
+
+// ------------------------------------------------------------------
+// Toast / snackbar
+// ------------------------------------------------------------------
+
+public class AppToastStore {
+    public static fn listKey(owner: string) -> string { return "toasts:" + owner; }
+    public static fn messageKey(owner: string, id: string) -> string { return "toast:" + owner + ":" + id + ":message"; }
+    public static fn kindKey(owner: string, id: string) -> string { return "toast:" + owner + ":" + id + ":kind"; }
+    public static fn actionLabelKey(owner: string, id: string) -> string { return "toast:" + owner + ":" + id + ":action_label"; }
+    public static fn actionNameKey(owner: string, id: string) -> string { return "toast:" + owner + ":" + id + ":action"; }
+    public static fn deadlineKey(owner: string, id: string) -> string { return "toast:" + owner + ":" + id + ":deadline"; }
+
+    // The deadline is expressed on the world's own effect clock, so a replayed
+    // timeline dismisses the toast at the same frame it did when recorded.
+    public static fn show(world: AppWorld, owner: string, id: string, kind: i32, message: string, action_label: string, action_name: string, duration_frames: u64) -> AppWorld {
+        if (owner.len == 0 || id.len == 0) { return world; }
+        var out = AppToastStore.dismiss(world, owner, id);
+        out = out.appendStringListResource(AppToastStore.listKey(owner), id);
+        out = out.setStringResource(AppToastStore.messageKey(owner, id), message);
+        out = out.setIntResource(AppToastStore.kindKey(owner, id), kind);
+        out = out.setStringResource(AppToastStore.actionLabelKey(owner, id), action_label);
+        out = out.setStringResource(AppToastStore.actionNameKey(owner, id), action_name);
+        var deadline = 0 as u64;
+        if (duration_frames > 0 as u64) { deadline = out.effectClock() + duration_frames; }
+        out = out.setStringResource(AppToastStore.deadlineKey(owner, id), format("%d", deadline as i64));
+        return out;
+    }
+
+    public static fn count(world: AppWorld, owner: string) -> i32 {
+        if (owner.len == 0) { return 0; }
+        return world.stringListResourceCount(AppToastStore.listKey(owner));
+    }
+
+    public static fn idAt(world: AppWorld, owner: string, index: i32) -> string {
+        return world.stringListResourceAt(AppToastStore.listKey(owner), index);
+    }
+
+    public static fn messageAt(world: AppWorld, owner: string, index: i32) -> string {
+        let id = AppToastStore.idAt(world, owner, index);
+        if (id.len == 0) { return ""; }
+        return world.stringResource(AppToastStore.messageKey(owner, id), "");
+    }
+
+    public static fn actionLabelAt(world: AppWorld, owner: string, index: i32) -> string {
+        let id = AppToastStore.idAt(world, owner, index);
+        if (id.len == 0) { return ""; }
+        return world.stringResource(AppToastStore.actionLabelKey(owner, id), "");
+    }
+
+    public static fn actionNameAt(world: AppWorld, owner: string, index: i32) -> string {
+        let id = AppToastStore.idAt(world, owner, index);
+        if (id.len == 0) { return ""; }
+        return world.stringResource(AppToastStore.actionNameKey(owner, id), "");
+    }
+
+    public static fn hasAction(world: AppWorld, owner: string, index: i32) -> bool {
+        return AppToastStore.actionNameAt(world, owner, index).len > 0;
+    }
+
+    public static fn dismiss(world: AppWorld, owner: string, id: string) -> AppWorld {
+        var out = world;
+        var i: i32 = AppToastStore.count(out, owner) - 1;
+        while (i >= 0) {
+            if (out.stringListResourceAt(AppToastStore.listKey(owner), i) == id) {
+                out = out.removeStringListResourceAt(AppToastStore.listKey(owner), i);
+            }
+            i = i - 1;
+        }
+        out = out.setStringResource(AppToastStore.messageKey(owner, id), "");
+        out = out.setStringResource(AppToastStore.actionNameKey(owner, id), "");
+        return out;
+    }
+
+    // Dismisses everything whose deadline has passed. A zero deadline never
+    // expires, which is what a snackbar with an action wants.
+    public static fn expire(world: AppWorld, owner: string) -> AppWorld {
+        var out = world;
+        let clock = out.effectClock();
+        var i: i32 = AppToastStore.count(out, owner) - 1;
+        while (i >= 0) {
+            let id = out.stringListResourceAt(AppToastStore.listKey(owner), i);
+            let deadline = app_parse_i32_or(out.stringResource(AppToastStore.deadlineKey(owner, id), "0"), 0) as u64;
+            if (deadline > 0 as u64 && clock >= deadline) {
+                out = AppToastStore.dismiss(out, owner, id);
+            }
+            i = i - 1;
+        }
+        return out;
+    }
+
+    public static fn clear(world: AppWorld, owner: string) -> AppWorld {
+        return AppRowStore.clearList(world, AppToastStore.listKey(owner));
+    }
+}
+
+public class ToastView {
+    // Toasts do not trap focus, so the layer is explicitly non-modal: a snackbar
+    // that swallowed Tab would be worse than no snackbar.
+    public static fn create(id: string, owner: string, layer_id: string, world: AppWorld) -> View {
+        var out = Column.create().id(id).gap(6.0).layer(layer_id)
+            .padding(10.0)
+            .background(Color.rgba(0.16, 0.16, 0.18, 0.94))
+            .cornerRadius(10.0);
+        var i: i32 = 0;
+        let total = AppToastStore.count(world, owner);
+        while (i < total) {
+            let message = AppToastStore.messageAt(world, owner, i);
+            var row = Row.create().id(id + ".item." + format("%d", i as i64)).gap(8.0).height(40.0)
+                .child(Text.body(message).id(id + ".message." + format("%d", i as i64)).expanded().height(40.0)
+                    .foreground(Color.rgba(1.0, 1.0, 1.0, 1.0)));
+            if (AppToastStore.hasAction(world, owner, i)) {
+                row = row.child(Button.tonalAction(id + ".action." + format("%d", i as i64),
+                    AppToastStore.actionLabelAt(world, owner, i),
+                    AppToastStore.actionNameAt(world, owner, i)).size(88.0, 36.0));
+            }
+            out = out.child(row);
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+// ------------------------------------------------------------------
+// Tooltip
+// ------------------------------------------------------------------
+
+public class AppTooltipStore {
+    public static fn textKey(owner: string) -> string { return "tooltip:" + owner + ":text"; }
+    public static fn anchorKey(owner: string) -> string { return "tooltip:" + owner + ":anchor"; }
+    public static fn readyAtKey(owner: string) -> string { return "tooltip:" + owner + ":ready_at"; }
+    public static fn visibleKey(owner: string) -> string { return "tooltip:" + owner + ":visible"; }
+
+    // Hovering for a moment should not pop a tooltip, and moving on should hide
+    // it again: the delay is expressed on the effect clock like every other
+    // timer in the framework.
+    public static fn arm(world: AppWorld, owner: string, anchor_id: string, text: string, delay_frames: u64) -> AppWorld {
+        if (owner.len == 0) { return world; }
+        var out = world.setStringResource(AppTooltipStore.textKey(owner), text);
+        out = out.setStringResource(AppTooltipStore.anchorKey(owner), anchor_id);
+        out = out.setStringResource(AppTooltipStore.readyAtKey(owner), format("%d", (out.effectClock() + delay_frames) as i64));
+        out = out.setBoolResource(AppTooltipStore.visibleKey(owner), false);
+        return out;
+    }
+
+    public static fn disarm(world: AppWorld, owner: string) -> AppWorld {
+        var out = world.setBoolResource(AppTooltipStore.visibleKey(owner), false);
+        out = out.setStringResource(AppTooltipStore.textKey(owner), "");
+        out = out.setStringResource(AppTooltipStore.readyAtKey(owner), "0");
+        return out;
+    }
+
+    public static fn tick(world: AppWorld, owner: string) -> AppWorld {
+        if (world.stringResource(AppTooltipStore.textKey(owner), "").len == 0) { return world; }
+        let ready_at = app_parse_i32_or(world.stringResource(AppTooltipStore.readyAtKey(owner), "0"), 0) as u64;
+        if (ready_at > 0 as u64 && world.effectClock() >= ready_at) {
+            return world.setBoolResource(AppTooltipStore.visibleKey(owner), true);
+        }
+        return world;
+    }
+
+    public static fn isVisible(world: AppWorld, owner: string) -> bool {
+        return world.boolResource(AppTooltipStore.visibleKey(owner), false);
+    }
+
+    public static fn text(world: AppWorld, owner: string) -> string {
+        if (!AppTooltipStore.isVisible(world, owner)) { return ""; }
+        return world.stringResource(AppTooltipStore.textKey(owner), "");
+    }
+
+    public static fn anchor(world: AppWorld, owner: string) -> string {
+        return world.stringResource(AppTooltipStore.anchorKey(owner), "");
+    }
+}
+
+// ------------------------------------------------------------------
+// Popover
+// ------------------------------------------------------------------
+
+public class AppPopover {
+    public static fn placementTop() -> i32 { return 1; }
+    public static fn placementBottom() -> i32 { return 2; }
+    public static fn placementStart() -> i32 { return 3; }
+    public static fn placementEnd() -> i32 { return 4; }
+
+    public static fn anchorKey(popover_id: string) -> string { return "popover:" + popover_id + ":anchor"; }
+    public static fn placementKey(popover_id: string) -> string { return "popover:" + popover_id + ":placement"; }
+
+    public static fn recordAnchor(world: AppWorld, popover_id: string, anchor_id: string, placement: i32) -> AppWorld {
+        var out = world.setStringResource(AppPopover.anchorKey(popover_id), anchor_id);
+        return out.setIntResource(AppPopover.placementKey(popover_id), placement);
+    }
+
+    public static fn anchorOf(world: AppWorld, popover_id: string) -> string {
+        return world.stringResource(AppPopover.anchorKey(popover_id), "");
+    }
+
+    public static fn placementOf(world: AppWorld, popover_id: string) -> i32 {
+        return world.intResource(AppPopover.placementKey(popover_id), AppPopover.placementBottom());
+    }
+
+    // A popover is an overlay layer, so opening and closing it is the same call
+    // the dialog uses.
+    public static fn open(world: AppWorld, popover_id: string, anchor_id: string, placement: i32) -> AppWorld {
+        var out = world.openLayer(AppLayer.popover(popover_id));
+        out = out.setStringResource(AppPopover.anchorKey(popover_id), anchor_id);
+        out = out.setIntResource(AppPopover.placementKey(popover_id), placement);
+        return out;
+    }
+
+    public static fn close(world: AppWorld, popover_id: string) -> AppWorld {
+        return world.closeLayer(popover_id);
+    }
+}
+
+// ------------------------------------------------------------------
+// Progress with cancel
+// ------------------------------------------------------------------
+
+public class AppProgress {
+    public value: f32;
+    public total: f32;
+    public is_indeterminate: bool;
+    public cancel_action: string;
+
+    public static fn create(value: f32, total: f32) -> AppProgress {
+        return AppProgress {
+            value: value,
+            total: total,
+            is_indeterminate: false,
+            cancel_action: ""
+        };
+    }
+
+    public static fn indeterminate() -> AppProgress {
+        var out = AppProgress.create(0.0, 0.0);
+        out.is_indeterminate = true;
+        return out;
+    }
+
+    public fn withCancel(mut self, action_name: string) -> AppProgress {
+        self.cancel_action = action_name;
+        return self;
+    }
+
+    public fn isCancellable(&self) -> bool { return self.cancel_action.len > 0; }
+
+    public fn fraction(&self) -> f32 {
+        if (self.is_indeterminate || self.total <= 0.0) { return 0.0; }
+        var out = self.value / self.total;
+        if (out < 0.0) { out = 0.0; }
+        if (out > 1.0) { out = 1.0; }
+        return out;
+    }
+
+    public fn isComplete(&self) -> bool {
+        return !self.is_indeterminate && self.total > 0.0 && self.value >= self.total;
+    }
+
+    public fn dup(&self) -> AppProgress {
+        var out = AppProgress.create(self.value, self.total);
+        out.is_indeterminate = self.is_indeterminate;
+        out.cancel_action = self.cancel_action;
+        return out;
+    }
+}
+
+public class ProgressView {
+    public static fn create(id: string, label: string, progress: AppProgress, percent: i32) -> View {
+        var out = Column.create().id(id).gap(6.0)
+            .child(Text.body(label).id(id + ".label").height(24.0))
+            .child(Progress.create(format("%d", percent as i64) + "%").id(id + ".bar").height(8.0)
+                .accessibility("progressbar", label, format("%d", percent as i64) + " percent"));
+        if (progress.isCancellable()) {
+            out = out.child(Button.outlinedAction(id + ".cancel", "Cancel", progress.cancel_action).height(40.0)
+                .accessibility("button", "Cancel " + label, ""));
+        }
+        return out;
+    }
+
+    public static fn percentOf(progress: AppProgress) -> i32 {
+        return (progress.fraction() * 100.0) as i32;
+    }
+}
+
+// ------------------------------------------------------------------
+// Drag and drop
+// ------------------------------------------------------------------
+
+public class AppDragSession {
+    public static fn activeKey() -> string { return "drag:active"; }
+    public static fn kindKey() -> string { return "drag:kind"; }
+    public static fn payloadKey() -> string { return "drag:payload"; }
+    public static fn sourceKey() -> string { return "drag:source"; }
+    public static fn targetKey() -> string { return "drag:target"; }
+    public static fn targetSpecKey(target_id: string) -> string { return "droptarget:" + target_id; }
+
+    public static fn registerTarget(world: AppWorld, target_id: string, accepts_kind: i32, action_name: string) -> AppWorld {
+        if (target_id.len == 0 || action_name.len == 0) { return world; }
+        return world.setStringResource(AppDragSession.targetSpecKey(target_id),
+            format("%d", accepts_kind as i64) + "|" + action_name);
+    }
+
+    public static fn targetAction(world: AppWorld, target_id: string) -> string {
+        let spec = world.stringResource(AppDragSession.targetSpecKey(target_id), "");
+        let bar = spec.indexOf("|");
+        if (bar < 0) { return ""; }
+        return spec.substring((bar + 1) as i64, spec.len as i64);
+    }
+
+    public static fn targetAccepts(world: AppWorld, target_id: string, kind: i32) -> bool {
+        let spec = world.stringResource(AppDragSession.targetSpecKey(target_id), "");
+        let bar = spec.indexOf("|");
+        if (bar <= 0) { return false; }
+        return app_parse_i32_or(spec.substring(0 as i64, bar), 0) == kind;
+    }
+
+    public static fn begin(world: AppWorld, kind: i32, payload: string, source_id: string) -> AppWorld {
+        var out = world.setBoolResource(AppDragSession.activeKey(), true);
+        out = out.setIntResource(AppDragSession.kindKey(), kind);
+        out = out.setStringResource(AppDragSession.payloadKey(), payload);
+        out = out.setStringResource(AppDragSession.sourceKey(), source_id);
+        out = out.setStringResource(AppDragSession.targetKey(), "");
+        return out;
+    }
+
+    public static fn isActive(world: AppWorld) -> bool {
+        return world.boolResource(AppDragSession.activeKey(), false);
+    }
+
+    public static fn kind(world: AppWorld) -> i32 {
+        return world.intResource(AppDragSession.kindKey(), 0);
+    }
+
+    public static fn payload(world: AppWorld) -> string {
+        return world.stringResource(AppDragSession.payloadKey(), "");
+    }
+
+    public static fn sourceId(world: AppWorld) -> string {
+        return world.stringResource(AppDragSession.sourceKey(), "");
+    }
+
+    public static fn currentTarget(world: AppWorld) -> string {
+        return world.stringResource(AppDragSession.targetKey(), "");
+    }
+
+    // Hovering a target that does not accept this kind clears the highlight,
+    // which is the feedback a user needs before letting go of the drag.
+    public static fn moveOver(world: AppWorld, target_id: string) -> AppWorld {
+        if (!AppDragSession.isActive(world)) { return world; }
+        if (AppDragSession.targetAccepts(world, target_id, AppDragSession.kind(world))) {
+            return world.setStringResource(AppDragSession.targetKey(), target_id);
+        }
+        return world.setStringResource(AppDragSession.targetKey(), "");
+    }
+
+    public static fn cancel(world: AppWorld) -> AppWorld {
+        var out = world.setBoolResource(AppDragSession.activeKey(), false);
+        out = out.setStringResource(AppDragSession.targetKey(), "");
+        out = out.setStringResource(AppDragSession.payloadKey(), "");
+        return out;
+    }
+
+    // Returns the action name to dispatch, or empty when the drop lands on
+    // nothing. The session is always cleared, so a drop can never leave the app
+    // stuck in drag state.
+    public static fn drop(world: AppWorld) -> string {
+        let target = AppDragSession.currentTarget(world);
+        if (target.len == 0) { return ""; }
+        return AppDragSession.targetAction(world, target);
+    }
+}

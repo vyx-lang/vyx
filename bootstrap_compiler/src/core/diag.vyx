@@ -1,0 +1,1179 @@
+module bootstrap.diag;
+
+use std.string;
+use bootstrap.ast;
+
+/// Diagnostics engine for the self-host compiler.
+///
+/// Bootstrap-side mirror of `src/Common/Diagnostics.h+.cpp`:
+///
+///   * `DiagSeverity` enum — Note / Warning / Error / Fatal, identical
+///     ordering to the host `enum class DiagLevel` so a future stage
+///     can lift the same values straight into the rendered prefix.
+///   * `SourceLoc` — file path + 1-based (line, col) + (end_line, end_col)
+///     span. AST nodes embed a 16-byte compact form (line/col/end_line/
+///     end_col); the file path travels per-translation-unit via the
+///     module-global `g_diag_current_file` set from `main.vyx` once the
+///     input source has been read.
+///   * `DiagCode` — string-valued tags that match the host's `errorCoded`
+///     family verbatim (`V-MOVE-001`, `SEMA-001..009`, `MONO-006-CloneDepth`
+///     and so on). No new code is invented; if Sema discovers a new
+///     condition that has no host code yet, it falls through to the
+///     generic `SEMA-001` family slot.
+///   * `Diag` engine — emit/emit_at/with_note helpers, dedup table
+///     keyed by (code, file_hash, line, col, msg_hash), severity
+///     counts and `dispose()`. State lives in module-globals (matching
+///     the existing `canon.vyx` / `mono_scheduler.vyx` patterns) so
+///     it survives across host-vyxc value-copy class handoffs.
+///
+/// Dedup contract: a six-tuple key `(code, file_hash, line, col,
+/// msg_hash, severity)` collapses repeated diagnostics to a single
+/// emitted line plus a hit-count. Repeats keep bumping the per-code
+/// hit count but never re-print, matching the host idiom used in
+/// `Monomorphize::reportFailureFromHelper` (first sight emits, later
+/// sights silently dedup).
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn getenv(name: rawptr) -> rawptr;
+    fn vyx_string_starts_with(hay: rawptr, hay_len: u64, needle: rawptr, needle_len: u64) -> i32;
+    fn vyx_string_contains(hay: rawptr, hay_len: u64, needle: rawptr, needle_len: u64) -> i32;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   1. DiagSeverity — identical ordering to host `DiagLevel`.
+// ════════════════════════════════════════════════════════════════════
+
+public fn diag_sev_NOTE()    -> i32 { return 0; }
+public fn diag_sev_WARNING() -> i32 { return 1; }
+public fn diag_sev_ERROR()   -> i32 { return 2; }
+public fn diag_sev_FATAL()   -> i32 { return 3; }
+
+fn diag_sev_label(sev: i32) -> string {
+    if (diag_lang_is_zh()) {
+        if (sev == 0) { return "注意"; }
+        if (sev == 1) { return "警告"; }
+        if (sev == 2) { return "错误"; }
+        if (sev == 3) { return "致命"; }
+        return "诊断";
+    }
+    if (sev == 0) { return "note"; }
+    if (sev == 1) { return "warning"; }
+    if (sev == 2) { return "error"; }
+    if (sev == 3) { return "fatal"; }
+    return "diag";
+}
+
+fn diag_sev_json_label(sev: i32) -> string {
+    if (sev == 0) { return "note"; }
+    if (sev == 1) { return "warning"; }
+    if (sev == 2) { return "error"; }
+    if (sev == 3) { return "fatal"; }
+    return "diag";
+}
+
+fn diag_env_value(name: string) -> string {
+    let raw = getenv(name.c_str());
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}
+
+fn diag_lang_is_zh() -> bool {
+    var lang = diag_env_value("VYX_LANG");
+    if (lang.len == 0) { lang = diag_env_value("LC_ALL"); }
+    if (lang.len == 0) { lang = diag_env_value("LANG"); }
+    if (lang.len < 2) { return false; }
+    if (lang.startsWith("zh")) { return true; }
+    if (lang.startsWith("ZH")) { return true; }
+    return false;
+}
+
+fn diag_json_enabled() -> bool {
+    let raw = diag_env_value("VYX_DIAG_JSON");
+    if (raw == "1") { return true; }
+    if (raw == "true") { return true; }
+    if (raw == "TRUE") { return true; }
+    return false;
+}
+
+fn diag_code_tail(code: string) -> string {
+    if (code.len <= 1) { return "0000"; }
+    return code.substring(1, code.len as i32);
+}
+
+fn diag_code_for_severity(code: string, severity: i32) -> string {
+    if (code.len <= 0) { return code; }
+    let first = code.charAt(0);
+    let tail = diag_code_tail(code);
+    if (severity == 0) {
+        if (first == 78) { return code; } // N
+        return "N" + tail;
+    }
+    if (severity == 1) {
+        if (first == 87) { return code; } // W
+        return "W" + tail;
+    }
+    if (severity == 2) {
+        if (first == 87 || first == 78) { return "E" + tail; }
+        return code;
+    }
+    if (severity == 3) {
+        if (first == 73) { return code; } // I
+        return "I" + tail;
+    }
+    return code;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   2. DiagCode constants — host-aligned string tags.
+//
+//   These are not enum values: vyxc's bootstrap class layout deliberately
+//   keeps codes as malloc'd C-strings so a new host code (e.g. `SEMA-010`)
+//   can be added in one place without touching every Sema callsite. The
+//   `diag_code_*` helpers below are the canonical spellings; any callsite
+//   that needs to reference one of these codes does so via the helper.
+// ════════════════════════════════════════════════════════════════════
+
+public fn diag_code_syntax_unexpected()      -> string { return "E0001"; }
+public fn diag_code_syntax_missing()         -> string { return "E0002"; }
+public fn diag_code_cli_usage()              -> string { return "E0003"; }
+public fn diag_code_lex_invalid_escape()     -> string { return "E0101"; }
+public fn diag_code_lex_unterminated_string() -> string { return "E0102"; }
+public fn diag_code_lex_unterminated_char()  -> string { return "E0103"; }
+public fn diag_code_lex_unexpected_char()    -> string { return "E0104"; }
+public fn diag_code_sema_type_mismatch()     -> string { return "E1000"; }
+public fn diag_code_sema_trait_bound()       -> string { return "E1100"; }
+public fn diag_code_sema_control_flow()      -> string { return "E1200"; }
+public fn diag_code_sema_undefined()         -> string { return "E2000"; }
+public fn diag_code_sema_duplicate()         -> string { return "E2100"; }
+public fn diag_code_sema_redefinition()      -> string { return "E2101"; }
+public fn diag_code_sema_no_overload()       -> string { return "E2200"; }
+public fn diag_code_sema_ambiguity()         -> string { return "E2300"; }
+public fn diag_code_sema_version_policy()    -> string { return "E2400"; }
+public fn diag_code_sema_generic()           -> string { return "E3000"; }
+public fn diag_code_v_move_001()             -> string { return "E3100"; }
+public fn diag_code_v_borrow_invalidation()  -> string { return "E3101"; }
+public fn diag_code_mono_clone_depth()       -> string { return "E3200"; }
+public fn diag_code_codegen_failure()        -> string { return "I0100"; }
+/// A capability boundary of this backend: the input is well-formed and the
+/// descriptor is truthful, but the backend has no representation for it (for
+/// example a foreign value layout alignment with no anchor type).  Kept
+/// distinct from `I0100` because the help text must say what *is* supported
+/// rather than telling the user to file a compiler bug.
+public fn diag_code_codegen_unsupported()    -> string { return "E3300"; }
+public fn diag_code_internal()               -> string { return "I0001"; }
+public fn diag_code_parser_unexpected()      -> string { return diag_code_syntax_unexpected(); }
+
+// ════════════════════════════════════════════════════════════════════
+//   3. Module globals — engine state + per-TU file path + dedup table.
+//
+//   Dedup slot layout (48 B per slot, capacity = 1024, linear probe):
+//     0..7   : code_ptr  (rawptr, NUL-less malloc copy of code text)
+//     8..15  : code_len  (i64)
+//     16..23 : file_hash (i64, FNV-1a)
+//     24..27 : line      (i32)
+//     28..31 : col       (i32)
+//     32..39 : msg_hash  (i64, FNV-1a)
+//     40..43 : severity  (i32)
+//     44..47 : hits      (i32, post-dedup repeat count starting at 1)
+// ════════════════════════════════════════════════════════════════════
+
+// Slot layout / table capacity / FNV-1a constants are inlined at every
+// call site (rather than declared as module-level `let i64 = ...`)
+// because the host vyxc's codegen had an interning collision between
+// shared-value module-level i64 constants across translation units
+// (manifest: `verifyModule failed: Global variable initializer type
+// does not match global variable type` on `g_diag_current_file` when
+// `bootstrap.canon` and `bootstrap.diag` both held i64 lets of the
+// same FNV basis / prime). Inlining keeps each constant local to its
+// use, sidestepping the global table the host emitter is currently
+// over-interning into.
+
+var g_diag_table: rawptr = null;
+var g_diag_table_used: i32 = 0;
+var g_diag_error_count: i32 = 0;
+var g_diag_warning_count: i32 = 0;
+var g_diag_note_count: i32 = 0;
+var g_diag_dup_drops: i32 = 0;
+var g_diag_error_limit: i32 = 100;
+var g_diag_error_limit_reported: i32 = 0;
+// File path is held as a malloc-copied byte buffer + length, NOT as a
+// `string` module global. The host vyxc currently emits an LLVM
+// initializer-type mismatch when a string-typed module global is
+// default-initialised with a literal (`verifyModule failed: Global
+// variable initializer type does not match global variable type` on
+// `@g_diag_current_file`). Carrying the path as `rawptr + i64`
+// keeps every module-global slot in the boring `null/0` shape that
+// the existing `canon.vyx` / `mono_scheduler.vyx` patterns already use.
+var g_diag_current_file_ptr: rawptr = null;
+var g_diag_current_file_len: i64 = 0;
+var g_diag_current_file_hash: i64 = 0;
+var g_diag_current_source_ptr: rawptr = null;
+var g_diag_current_source_len: i64 = 0;
+var g_diag_enabled_flag: i32 = 1;
+var g_diag_capture_on: i32 = 0;
+var g_diag_capture_ptr: rawptr = null;
+var g_diag_capture_count: i32 = 0;
+
+fn diag_capture_cap() -> i32 { return 256; }
+/// Capture slot: code*, msg*, line, col, severity, end_line, end_col, pad.
+/// 8+8+4+4+4+4+4 = 36, rounded to 48 so later fields stay aligned.
+fn diag_capture_slot_size() -> i32 { return 48; }
+
+fn diag_alloc_zero(size: i32) -> rawptr {
+    let p = malloc(size as u64);
+    if (p == null) { return null; }
+    memset(p, 0, size as u64);
+    return p;
+}
+
+fn diag_dup_bytes(src: rawptr, len: i64) -> rawptr {
+    if (len < 0) { return null; }
+    let out = malloc((len + 1) as u64);
+    if (out == null) { return null; }
+    if (len > 0 && src != null) {
+        memcpy(out, src, len as u64);
+    }
+    var nul: i32 = 0;
+    memcpy(ptr_offset(out, len as i32), to_rawptr(&nul), 1);
+    return out;
+}
+
+fn diag_ensure_table() {
+    if (g_diag_table != null) { return; }
+    // 1024 slots * 48 B per slot = 48 KiB. Sized large enough for a
+    // self-hosting boot_a run (~600 distinct sema/parse diagnostics
+    // peak across the full std/ corpus) without falling back to the
+    // probe-failure path that prints without dedup.
+    g_diag_table = diag_alloc_zero(1024 * 48);
+}
+
+public fn diag_dispose() {
+    if (g_diag_table != null) {
+        var i: i32 = 0;
+        while (i < 1024) {
+            let slot = g_diag_table + (i * 48);
+            let code_p = ast_read_rawptr(slot);
+            if (code_p != null) { free(code_p); }
+            i = i + 1;
+        }
+        free(g_diag_table);
+        g_diag_table = null;
+    }
+    if (g_diag_current_file_ptr != null) {
+        free(g_diag_current_file_ptr);
+        g_diag_current_file_ptr = null;
+        g_diag_current_file_len = 0;
+        g_diag_current_file_hash = 0;
+    }
+    if (g_diag_current_source_ptr != null) {
+        free(g_diag_current_source_ptr);
+        g_diag_current_source_ptr = null;
+        g_diag_current_source_len = 0;
+    }
+    g_diag_table_used = 0;
+    g_diag_error_count = 0;
+    g_diag_warning_count = 0;
+    g_diag_note_count = 0;
+    g_diag_dup_drops = 0;
+    g_diag_error_limit = 100;
+    g_diag_error_limit_reported = 0;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   4. Hashing — FNV-1a 64-bit; matches `canon.vyx` byte-wise so a
+//      shared hash function family can be re-used by future passes.
+// ════════════════════════════════════════════════════════════════════
+
+fn diag_hash_bytes(ptr: rawptr, len: i64) -> i64 {
+    // FNV-1a 64-bit offset basis / prime — inlined to dodge the host
+    // vyxc i64 module-let interning collision noted above. Matches
+    // `canon.vyx::canon_hash_bytes`.
+    var h: i64 = 1469598103934665603;
+    if (ptr == null || len <= 0) { return h; }
+    var i: i64 = 0;
+    while (i < len) {
+        var b: i32 = 0;
+        memcpy(to_rawptr(&b), ptr_offset(ptr, i as i32), 1);
+        let bb: i64 = (b & 255) as i64;
+        h = h ^ bb;
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn diag_hash_str(s: string) -> i64 {
+    return diag_hash_bytes(s.c_str(), s.len);
+}
+
+fn diag_abs(h: i64) -> i64 {
+    if (h < 0) { return 0 - h; }
+    return h;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   5. Current-file tracking.
+//
+//   `diag_set_current_file` is called by the driver immediately after
+//   reading the input source so every Sema/Parser report carries the
+//   right file path without threading it through every method. The
+//   hash is precomputed once per file for the dedup table; the path
+//   text is the literal one passed in (typically the absolute or
+//   workspace-relative path the user typed on the CLI).
+// ════════════════════════════════════════════════════════════════════
+
+public fn diag_set_current_file(path: string) {
+    // Free the previous copy (if any) before installing the new path.
+    // Re-call is safe: the file path turns over once per `main()` only
+    // (driver-level), but the API has to tolerate repeated calls so
+    // sample / smoke harnesses can re-target between probes without
+    // leaking the prior buffer.
+    if (g_diag_current_file_ptr != null) {
+        free(g_diag_current_file_ptr);
+        g_diag_current_file_ptr = null;
+        g_diag_current_file_len = 0;
+    }
+    if (path.len <= 0) {
+        g_diag_current_file_hash = 0;
+        return;
+    }
+    let dup = diag_dup_bytes(path.c_str(), path.len);
+    if (dup == null) { return; }
+    g_diag_current_file_ptr = dup;
+    g_diag_current_file_len = path.len;
+    g_diag_current_file_hash = diag_hash_bytes(dup, path.len);
+}
+
+public fn diag_current_file() -> string {
+    if (g_diag_current_file_ptr == null || g_diag_current_file_len <= 0) {
+        return "<unknown>";
+    }
+    return from_cstr_len(g_diag_current_file_ptr, g_diag_current_file_len);
+}
+
+public fn diag_set_current_source(source: string) {
+    if (g_diag_current_source_ptr != null) {
+        free(g_diag_current_source_ptr);
+        g_diag_current_source_ptr = null;
+        g_diag_current_source_len = 0;
+    }
+    if (source.len <= 0) { return; }
+    let dup = diag_dup_bytes(source.c_str(), source.len);
+    if (dup == null) { return; }
+    g_diag_current_source_ptr = dup;
+    g_diag_current_source_len = source.len;
+}
+
+public fn diag_set_source_context(path: string, source: string) {
+    diag_set_current_file(path);
+    diag_set_current_source(source);
+}
+
+fn diag_current_source() -> string {
+    if (g_diag_current_source_ptr == null || g_diag_current_source_len <= 0) {
+        return "";
+    }
+    return from_cstr_len(g_diag_current_source_ptr, g_diag_current_source_len);
+}
+
+public fn diag_set_enabled(on: bool) {
+    if (on) { g_diag_enabled_flag = 1; } else { g_diag_enabled_flag = 0; }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   6. Dedup probe.
+//
+//   Linear probe over the slot table. A slot is empty iff its
+//   `code_ptr` is null. Two slots compare equal when every component
+//   of the six-tuple matches. Returns the slot index, or -1 if the
+//   table is full (in which case the diagnostic is still emitted, but
+//   subsequent duplicates of it cannot be suppressed — surfacing
+//   pressure on the table rather than dropping diagnostics is the
+//   intended failure mode, mirroring `Monomorphize::recordFailure`).
+// ════════════════════════════════════════════════════════════════════
+
+fn diag_slot_eq(slot: rawptr,
+                code: string,
+                file_hash: i64,
+                line: i32,
+                col: i32,
+                msg_hash: i64,
+                severity: i32) -> bool {
+    let cp = ast_read_rawptr(slot);
+    if (cp == null) { return false; }
+    let cl = ast_read_i64(ptr_offset(slot, 8));
+    if (cl != code.len) { return false; }
+    let fh = ast_read_i64(ptr_offset(slot, 16));
+    if (fh != file_hash) { return false; }
+    let ln = ast_read_i32(ptr_offset(slot, 24));
+    if (ln != line) { return false; }
+    let cc = ast_read_i32(ptr_offset(slot, 28));
+    if (cc != col) { return false; }
+    let mh = ast_read_i64(ptr_offset(slot, 32));
+    if (mh != msg_hash) { return false; }
+    let sv = ast_read_i32(ptr_offset(slot, 40));
+    if (sv != severity) { return false; }
+    if (cl == 0) { return true; }
+    let kp = code.c_str();
+    var i: i64 = 0;
+    while (i < cl) {
+        var a: i32 = 0;
+        var b: i32 = 0;
+        memcpy(to_rawptr(&a), ptr_offset(cp, i as i32), 1);
+        memcpy(to_rawptr(&b), ptr_offset(kp, i as i32), 1);
+        if ((a & 255) != (b & 255)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn diag_table_probe(code: string,
+                    file_hash: i64,
+                    line: i32,
+                    col: i32,
+                    msg_hash: i64,
+                    severity: i32) -> i32 {
+    diag_ensure_table();
+    if (g_diag_table == null) { return -1; }
+    // Table cap = 1024 (mask 0x3FF). Cap is inlined for the same
+    // host-vyxc interning reason as the FNV constants above.
+    let mask: i64 = 1023;
+    var h = diag_abs(msg_hash ^ file_hash ^ ((line as i64) * 131 + (col as i64)));
+    var idx: i32 = (h & mask) as i32;
+    var step: i32 = 0;
+    while (step < 1024) {
+        let slot = g_diag_table + (idx * 48);
+        let cp = ast_read_rawptr(slot);
+        if (cp == null) { return idx; }
+        if (diag_slot_eq(slot, code, file_hash, line, col, msg_hash, severity)) {
+            return idx;
+        }
+        idx = idx + 1;
+        if (idx >= 1024) { idx = 0; }
+        step = step + 1;
+    }
+    return -1;
+}
+
+fn diag_record(slot: rawptr,
+               code: string,
+               file_hash: i64,
+               line: i32,
+               col: i32,
+               msg_hash: i64,
+               severity: i32) {
+    let dup = diag_dup_bytes(code.c_str(), code.len);
+    if (dup == null) { return; }
+    ast_write_rawptr(slot, dup);
+    ast_write_i64(ptr_offset(slot, 8), code.len);
+    ast_write_i64(ptr_offset(slot, 16), file_hash);
+    ast_write_i32(ptr_offset(slot, 24), line);
+    ast_write_i32(ptr_offset(slot, 28), col);
+    ast_write_i64(ptr_offset(slot, 32), msg_hash);
+    ast_write_i32(ptr_offset(slot, 40), severity);
+    ast_write_i32(ptr_offset(slot, 44), 1);
+    g_diag_table_used = g_diag_table_used + 1;
+}
+
+fn diag_slot_bump_hits(slot: rawptr) -> i32 {
+    let cur = ast_read_i32(ptr_offset(slot, 44));
+    let nxt = cur + 1;
+    ast_write_i32(ptr_offset(slot, 44), nxt);
+    return nxt;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   7. Render — `file:line:col: error: E0000: message` + source span.
+// ════════════════════════════════════════════════════════════════════
+
+fn diag_json_escape(s: string) -> string {
+    var out: string = "";
+    var i: i64 = 0;
+    while (i < s.len) {
+        let c = s.charAt(i as i32);
+        if (c == 34) {
+            out = out + "\\\"";
+        } else if (c == 92) {
+            out = out + "\\\\";
+        } else if (c == 10) {
+            out = out + "\\n";
+        } else if (c == 13) {
+            out = out + "\\r";
+        } else if (c == 9) {
+            out = out + "\\t";
+        } else if (c < 32) {
+            out = out + " ";
+        } else {
+            out = out + s.substring(i as i32, (i + 1) as i32);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn diag_label_for_code(code: string) -> string {
+    if (code == diag_code_internal()) { return "internal"; }
+    if (code == diag_code_codegen_failure()) { return "codegen"; }
+    if (code == diag_code_codegen_unsupported()) { return "unsupported"; }
+    var normalized = code;
+    if (code.len > 1) { normalized = "E" + diag_code_tail(code); }
+    if (normalized == diag_code_codegen_unsupported()) { return "unsupported"; }
+    if (normalized == diag_code_sema_undefined()) { return "unresolved-name"; }
+    if (normalized == diag_code_sema_type_mismatch()) { return "type-mismatch"; }
+    if (normalized == diag_code_sema_duplicate()) { return "duplicate-symbol"; }
+    if (normalized == diag_code_sema_redefinition()) { return "redefinition"; }
+    if (normalized == diag_code_sema_trait_bound()) { return "trait-bound"; }
+    if (normalized == diag_code_sema_control_flow()) { return "control-flow"; }
+    if (normalized == diag_code_sema_no_overload()) { return "no-overload"; }
+    if (normalized == diag_code_sema_ambiguity()) { return "ambiguous"; }
+    if (normalized == diag_code_sema_version_policy()) { return "version-policy"; }
+    if (normalized == diag_code_sema_generic()) { return "constraint"; }
+    if (normalized == diag_code_v_move_001()) { return "moved-value"; }
+    if (normalized == diag_code_v_borrow_invalidation()) { return "borrow"; }
+    if (normalized == diag_code_mono_clone_depth()) { return "clone-depth"; }
+    if (normalized == diag_code_cli_usage()) { return "cli-usage"; }
+    if (normalized == diag_code_syntax_missing()) { return "missing-symbol"; }
+    if (normalized == diag_code_syntax_unexpected()) { return "syntax"; }
+    if (normalized == diag_code_lex_invalid_escape()) { return "invalid-escape"; }
+    if (normalized == diag_code_lex_unterminated_string()) { return "unterminated-string"; }
+    if (normalized == diag_code_lex_unterminated_char()) { return "unterminated-character"; }
+    if (normalized == diag_code_lex_unexpected_char()) { return "unexpected-character"; }
+    if (normalized == "E0100") { return "codegen"; }
+    return "diagnostic";
+}
+
+public fn diag_help_for_code(code: string) -> string {
+    var normalized = code;
+    if (code.len > 1 && (code.charAt(0) == 69 || code.charAt(0) == 78
+        || code.charAt(0) == 87 || code.charAt(0) == 73)) {
+        normalized = "E" + diag_code_tail(code);
+    }
+    if (code == diag_code_internal() || code == "I0001") {
+        if (diag_lang_is_zh()) { return "这是编译器内部不变量失败；请带着复现输入报缺陷"; }
+        return "this is a compiler-internal invariant failure; report a bug with this input";
+    }
+    if (code == diag_code_codegen_failure() || code == "I0100") {
+        if (diag_lang_is_zh()) { return "这是后端/代码生成失败；简化输入或带着复现输入报缺陷"; }
+        return "this is a backend/codegen failure; simplify the input or report a compiler bug";
+    }
+    if (code == diag_code_codegen_unsupported() || normalized == diag_code_codegen_unsupported()) {
+        if (diag_lang_is_zh()) {
+            return "这是本后端的已知能力边界，不是缺陷：外部值布局需要与记录对齐等宽度的锚点类型，"
+                + "当前支持 1、2、4、8、16、32、64、128 字节（超过 16 用向量锚点）。"
+                + "把该记录改为按指针传递，或在生产端降低对齐要求";
+        }
+        return "this is a known capability boundary of this backend, not a defect: a foreign"
+            + " value layout needs an anchor type as wide as the record's alignment, and this"
+            + " backend supports 1, 2, 4, 8, 16, 32, 64 and 128 bytes (above 16 the anchor is a"
+            + " vector). Pass the record behind a pointer, or lower its alignment in the"
+            + " producer";
+    }
+    if (normalized == diag_code_syntax_unexpected()) {
+        if (diag_lang_is_zh()) { return "删掉这个意外记号，或在它前面补上缺失的分隔符"; }
+        return "remove the unexpected token, or add the missing delimiter before it";
+    }
+    if (normalized == diag_code_syntax_missing()) {
+        if (diag_lang_is_zh()) { return "补上期望的记号，并检查是否漏了 `)`、`}` 或 `;`"; }
+        return "insert the expected token, and check for a missing `)`, `}`, or `;`";
+    }
+    if (normalized == diag_code_cli_usage()) {
+        if (diag_lang_is_zh()) { return "运行 `boot help`，改用文档里的 flag 或 `--emit=` 种类"; }
+        return "run `boot help` and pass a documented flag or `--emit=` kind";
+    }
+    if (normalized == diag_code_lex_invalid_escape()) {
+        if (diag_lang_is_zh()) { return "改用合法转义，例如 `\\n`、`\\t`、`\\\\` 或 `\\\"`"; }
+        return "use a valid escape such as `\\n`, `\\t`, `\\\\`, or `\\\"`";
+    }
+    if (normalized == diag_code_lex_unterminated_string()) {
+        if (diag_lang_is_zh()) { return "用匹配的 `\"` 结束字符串"; }
+        return "close the string with a matching `\"`";
+    }
+    if (normalized == diag_code_lex_unterminated_char()) {
+        if (diag_lang_is_zh()) { return "用匹配的 `'` 结束字符字面量"; }
+        return "close the character literal with a matching `'`";
+    }
+    if (normalized == diag_code_lex_unexpected_char()) {
+        if (diag_lang_is_zh()) { return "删掉这个字符，或把它放进字符串/注释"; }
+        return "delete the unexpected character, or wrap it in a string or comment";
+    }
+    if (normalized == diag_code_sema_type_mismatch()) {
+        if (diag_lang_is_zh()) { return "把值转换成期望类型，或改声明/期望类型"; }
+        return "convert the value to the expected type, or change the declared/expected type";
+    }
+    if (normalized == diag_code_sema_trait_bound()) {
+        if (diag_lang_is_zh()) { return "补上 `impl Trait for Type`，或放宽 where 约束"; }
+        return "add a matching `impl Trait for Type`, or relax the where-clause bound";
+    }
+    if (normalized == diag_code_sema_control_flow()) {
+        if (diag_lang_is_zh()) { return "把 `break`/`continue` 放进循环，或修正 `static_assert` 条件"; }
+        return "move `break`/`continue` into a loop, or fix the failing `static_assert` condition";
+    }
+    if (normalized == diag_code_sema_undefined()) {
+        if (diag_lang_is_zh()) { return "检查拼写，补 `use` 导入，或声明这个名字"; }
+        return "check spelling, add a `use` import, or declare the missing name";
+    }
+    if (normalized == diag_code_sema_duplicate()) {
+        if (diag_lang_is_zh()) { return "给其中一个声明改名，或删掉重复项"; }
+        return "rename one of the colliding declarations, or remove the duplicate";
+    }
+    if (normalized == diag_code_sema_redefinition()) {
+        if (diag_lang_is_zh()) { return "只保留一个定义，或给新声明换名字"; }
+        return "keep a single definition, or use a different name for the new one";
+    }
+    if (normalized == diag_code_sema_no_overload()) {
+        if (diag_lang_is_zh()) { return "按候选签名调整实参，或再加一个重载"; }
+        return "adjust the argument list to match a candidate, or add an overload";
+    }
+    if (normalized == diag_code_sema_ambiguity()) {
+        if (diag_lang_is_zh()) { return "加类型注解或补全实参，让只剩一个候选匹配"; }
+        return "add a type annotation or extra arguments so only one candidate matches";
+    }
+    if (normalized == diag_code_sema_version_policy()) {
+        if (diag_lang_is_zh()) { return "改成已存在的模块版本，或去掉 `@version` 选择器"; }
+        return "select an existing module version, or drop the `@version` selector";
+    }
+    if (normalized == diag_code_sema_generic()) {
+        if (diag_lang_is_zh()) { return "按这条约束改当前位置的写法"; }
+        return "apply the constraint described in the error at this location";
+    }
+    if (normalized == diag_code_v_move_001()) {
+        if (diag_lang_is_zh()) { return "先拷贝/重新绑定，或不要在 move 之后继续使用"; }
+        return "copy the value, rebind it, or stop using it after the move";
+    }
+    if (normalized == diag_code_v_borrow_invalidation()) {
+        if (diag_lang_is_zh()) { return "先结束冲突的借用，或改成不可变借用/不要 `delete`"; }
+        return "end the overlapping borrow first, or borrow immutably / avoid `delete`";
+    }
+    if (normalized == diag_code_mono_clone_depth()) {
+        if (diag_lang_is_zh()) { return "降低泛型嵌套，或把类型拆成更小的别名"; }
+        return "reduce generic nesting, or break the type into smaller aliases";
+    }
+    if (diag_lang_is_zh()) { return "按上方错误信息修改源码"; }
+    return "see the error message above and adjust the source accordingly";
+}
+
+fn diag_line_text(line: i32) -> string {
+    if (line <= 0) { return ""; }
+    let src = diag_current_source();
+    if (src.len == 0) { return ""; }
+    var cur_line: i32 = 1;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while ((i as i64) < src.len) {
+        let ch = src.charAt(i);
+        if (cur_line == line) {
+            var end = i;
+            while ((end as i64) < src.len) {
+                let ch2 = src.charAt(end);
+                if (ch2 == 10 || ch2 == 13) { break; }
+                end = end + 1;
+            }
+            return src.substring(start, end);
+        }
+        if (ch == 10) {
+            cur_line = cur_line + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (cur_line == line && (start as i64) <= src.len) {
+        return src.substring(start, src.len as i32);
+    }
+    return "";
+}
+
+fn diag_repeat(ch: string, count: i32) -> string {
+    var out: string = "";
+    var i: i32 = 0;
+    while (i < count) {
+        out = out + ch;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn diag_render_source_span(file: string,
+                           line: i32,
+                           col: i32,
+                           end_line: i32,
+                           end_col: i32) {
+    let raw_line = diag_line_text(line);
+    if (raw_line.len == 0 || line <= 0 || col <= 0) { return; }
+    var text = raw_line;
+    var caret_col = col;
+    if (text.len > 160) {
+        var start: i32 = 0;
+        if (col > 80) { start = col - 80; }
+        var end = start + 160;
+        if ((end as i64) > text.len) { end = text.len as i32; }
+        text = text.substring(start, end);
+        caret_col = col - start;
+        if (start > 0) {
+            text = "..." + text;
+            caret_col = caret_col + 3;
+        }
+    }
+    var caret_len: i32 = 1;
+    if (end_line == line && end_col > col) {
+        caret_len = end_col - col;
+    }
+    if (caret_len > 80) { caret_len = 80; }
+    if (caret_col < 1) { caret_col = 1; }
+    print("  --> " + file + ":" + line.toString() + ":" + col.toString());
+    print("   |");
+    print(line.toString() + " | " + text);
+    print("   | " + diag_repeat(" ", caret_col - 1) + diag_repeat("^", caret_len));
+}
+
+fn diag_render_json(code: string,
+                    severity: i32,
+                    line: i32,
+                    col: i32,
+                    end_line: i32,
+                    end_col: i32,
+                    msg: string) {
+    if (!diag_json_enabled()) { return; }
+    let file = diag_current_file();
+    let level = diag_sev_json_label(severity);
+    let label = diag_label_for_code(code);
+    let json = "{"
+               + "\"code\":\"" + diag_json_escape(code) + "\","
+               + "\"level\":\"" + diag_json_escape(level) + "\","
+               + "\"message\":\"" + diag_json_escape(msg) + "\","
+               + "\"location\":{"
+               + "\"file\":\"" + diag_json_escape(file) + "\","
+               + "\"line\":" + line.toString() + ","
+               + "\"column\":" + col.toString() + ","
+               + "\"span\":{\"start_line\":" + line.toString()
+               + ",\"start_column\":" + col.toString()
+               + ",\"end_line\":" + end_line.toString()
+               + ",\"end_column\":" + end_col.toString() + "}"
+               + "},"
+               + "\"labels\":[\"" + diag_json_escape(label) + "\"]"
+               + "}";
+    print(json);
+}
+
+fn diag_render(code: string,
+               severity: i32,
+               line: i32,
+               col: i32,
+               end_line: i32,
+               end_col: i32,
+               msg: string) {
+    let file = diag_current_file();
+    let prefix = file
+                 + ":" + line.toString()
+                 + ":" + col.toString()
+                 + ": " + diag_sev_label(severity)
+                 + ": " + code + ": ";
+    print(prefix + msg);
+    diag_render_source_span(file, line, col, end_line, end_col);
+    if (severity >= diag_sev_ERROR() && !msg.startsWith("too many errors")) {
+        let help = diag_help_for_code(code);
+        if (help.len > 0) {
+            if (diag_lang_is_zh()) {
+                print("建议: " + help);
+            } else {
+                print("help: " + help);
+            }
+        }
+    }
+    diag_render_json(code, severity, line, col, end_line, end_col, msg);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   8. Public emit API.
+//
+//   `diag_emit(sev, code, line, col, msg)` is the canonical entry; it
+//   resolves the file context from `g_diag_current_file`, hashes for
+//   dedup, and either renders + bumps the severity counter, or bumps
+//   the dedup-drop counter and returns false.
+//
+//   `diag_emit_at` takes a raw SourceLoc rawptr (16 B compact form, as
+//   embedded in AST nodes by `ast.vyx`). When `loc` is null the
+//   line/col fall back to (0,0) — the diagnostic is still emitted,
+//   just without precise positioning, mirroring the host behaviour
+//   when an AST node was constructed before the parser had reached a
+//   token.
+// ════════════════════════════════════════════════════════════════════
+
+public fn diag_emit(severity: i32,
+                    code: string,
+                    line: i32,
+                    col: i32,
+                    msg: string) -> bool {
+    return diag_emit_span(severity, code, line, col, line, col + 1, msg);
+}
+
+fn diag_emit_span(severity: i32,
+                  code: string,
+                  line: i32,
+                  col: i32,
+                  end_line: i32,
+                  end_col: i32,
+                  msg: string) -> bool {
+    if (g_diag_enabled_flag == 0) { return false; }
+    if (severity >= diag_sev_ERROR()
+        && g_diag_error_limit > 0
+        && g_diag_error_count >= g_diag_error_limit) {
+        if (g_diag_error_limit_reported == 0) {
+            g_diag_error_limit_reported = 1;
+            let cap_msg = "too many errors; stopping after "
+                + g_diag_error_limit.toString()
+                + " error(s)";
+            diag_render(diag_code_internal(),
+                        diag_sev_FATAL(),
+                        line,
+                        col,
+                        end_line,
+                        end_col,
+                        cap_msg);
+            g_diag_error_count = g_diag_error_count + 1;
+        }
+        return false;
+    }
+    let normalized_code = diag_code_for_severity(code, severity);
+    if (g_diag_capture_on != 0) {
+        diag_capture_push(normalized_code, severity, line, col, end_line, end_col, msg);
+    }
+    let file_hash = g_diag_current_file_hash;
+    let msg_hash = diag_hash_str(msg);
+    let idx = diag_table_probe(normalized_code, file_hash, line, col, msg_hash, severity);
+    if (g_diag_capture_on != 0) {
+        if (idx < 0) {
+            diag_bump_severity(severity);
+            return true;
+        }
+        let cap_slot = g_diag_table + (idx * 48);
+        if (ast_read_rawptr(cap_slot) == null) {
+            diag_record(cap_slot, normalized_code, file_hash, line, col, msg_hash, severity);
+            diag_bump_severity(severity);
+            return true;
+        }
+        diag_slot_bump_hits(cap_slot);
+        g_diag_dup_drops = g_diag_dup_drops + 1;
+        return false;
+    }
+    if (idx < 0) {
+        diag_render(normalized_code, severity, line, col, end_line, end_col, msg);
+        diag_bump_severity(severity);
+        return true;
+    }
+    let slot = g_diag_table + (idx * 48);
+    if (ast_read_rawptr(slot) == null) {
+        diag_record(slot, normalized_code, file_hash, line, col, msg_hash, severity);
+        diag_render(normalized_code, severity, line, col, end_line, end_col, msg);
+        diag_bump_severity(severity);
+        return true;
+    }
+    diag_slot_bump_hits(slot);
+    g_diag_dup_drops = g_diag_dup_drops + 1;
+    return false;
+}
+
+fn diag_bump_severity(severity: i32) {
+    if (severity == 0) { g_diag_note_count    = g_diag_note_count    + 1; return; }
+    if (severity == 1) { g_diag_warning_count = g_diag_warning_count + 1; return; }
+    g_diag_error_count = g_diag_error_count + 1;
+}
+
+public fn diag_emit_at(severity: i32,
+                       code: string,
+                       loc: rawptr,
+                       msg: string) -> bool {
+    var line: i32 = 0;
+    var col: i32 = 0;
+    var end_line: i32 = 0;
+    var end_col: i32 = 0;
+    if (loc != null) {
+        line = ast_read_i32(loc);
+        col = ast_read_i32(ptr_offset(loc, 4));
+        end_line = ast_read_i32(ptr_offset(loc, 8));
+        end_col = ast_read_i32(ptr_offset(loc, 12));
+    }
+    if (end_line <= 0) { end_line = line; }
+    if (end_col <= 0) { end_col = col + 1; }
+    if (end_line < line) { end_line = line; }
+    if (end_line == line && end_col <= col) { end_col = col + 1; }
+    return diag_emit_span(severity, code, line, col, end_line, end_col, msg);
+}
+
+/// Canonical diagnostic entry for every MIR phase (builder, verifier,
+/// optimizer and backend lowering).  MIR records are expected to carry a
+/// stable SourceLoc, but unit-wide failures (allocation, target setup, output
+/// finalization) have no owning record.  Those failures anchor at 1:1 instead
+/// of leaking the old 0:0 placeholder so every MIR error is rendered through
+/// the same source-diagnostic shape.
+public fn diag_emit_codegen_at(loc: rawptr, msg: string) -> bool {
+    if (loc != null && ast_read_i32(loc) > 0) {
+        return diag_emit_at(diag_sev_ERROR(),
+                            diag_code_codegen_failure(),
+                            loc,
+                            msg);
+    }
+    return diag_emit(diag_sev_ERROR(),
+                     diag_code_codegen_failure(),
+                     1,
+                     1,
+                     msg);
+}
+
+public fn diag_emit_codegen(msg: string) -> bool {
+    return diag_emit_codegen_at(null, msg);
+}
+
+public fn diag_emit_codegen_note_at(loc: rawptr, msg: string) -> bool {
+    if (loc != null && ast_read_i32(loc) > 0) {
+        return diag_emit_at(diag_sev_NOTE(),
+                            diag_code_codegen_failure(),
+                            loc,
+                            msg);
+    }
+    return diag_emit(diag_sev_NOTE(),
+                     diag_code_codegen_failure(),
+                     1,
+                     1,
+                     msg);
+}
+
+public fn diag_with_note(loc: rawptr, msg: string) -> bool {
+    return diag_emit_at(diag_sev_NOTE(), diag_code_sema_generic(), loc, msg);
+}
+
+public fn diag_emit_help_at(code: string, loc: rawptr, help: string) -> bool {
+    if (help.len == 0) { return false; }
+    var text = help;
+    if (!help.startsWith("help:") && !help.startsWith("建议:")) {
+        if (diag_lang_is_zh()) {
+            text = "建议: " + help;
+        } else {
+            text = "help: " + help;
+        }
+    }
+    if (loc != null) {
+        return diag_emit_at(diag_sev_NOTE(), code, loc, text);
+    }
+    return diag_emit(diag_sev_NOTE(), code, 1, 1, text);
+}
+
+public fn diag_emit_help(code: string, line: i32, col: i32, help: string) -> bool {
+    if (help.len == 0) { return false; }
+    var text = help;
+    if (!help.startsWith("help:") && !help.startsWith("建议:")) {
+        if (diag_lang_is_zh()) {
+            text = "建议: " + help;
+        } else {
+            text = "help: " + help;
+        }
+    }
+    var ln = line;
+    var cc = col;
+    if (ln <= 0) { ln = 1; }
+    if (cc <= 0) { cc = 1; }
+    return diag_emit(diag_sev_NOTE(), code, ln, cc, text);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   9. Counters — accessors for the driver-side summary print.
+// ════════════════════════════════════════════════════════════════════
+
+public fn diag_error_count()   -> i32 { return g_diag_error_count; }
+public fn diag_warning_count() -> i32 { return g_diag_warning_count; }
+public fn diag_note_count()    -> i32 { return g_diag_note_count; }
+public fn diag_dup_drops()     -> i32 { return g_diag_dup_drops; }
+public fn diag_unique_count()  -> i32 { return g_diag_table_used; }
+public fn diag_error_limit()   -> i32 { return g_diag_error_limit; }
+
+public fn diag_set_error_limit(limit: i32) {
+    if (limit < 0) { limit = 0; }
+    g_diag_error_limit = limit;
+    g_diag_error_limit_reported = 0;
+}
+
+public fn diag_too_many_errors() -> bool {
+    return g_diag_error_limit > 0 && g_diag_error_count >= g_diag_error_limit;
+}
+
+public fn diag_reset_counts() {
+    g_diag_error_count = 0;
+    g_diag_warning_count = 0;
+    g_diag_note_count = 0;
+    g_diag_dup_drops = 0;
+    g_diag_error_limit_reported = 0;
+}
+
+fn diag_capture_free_slots() {
+    if (g_diag_capture_ptr == null) { return; }
+    var i: i32 = 0;
+    while (i < g_diag_capture_count) {
+        let slot = g_diag_capture_ptr + (i * diag_capture_slot_size());
+        let code_p = ast_read_rawptr(slot);
+        let msg_p = ast_read_rawptr(slot + 8);
+        if (code_p != null) { free(code_p); }
+        if (msg_p != null) { free(msg_p); }
+        i = i + 1;
+    }
+    memset(g_diag_capture_ptr, 0, (diag_capture_cap() * diag_capture_slot_size()) as u64);
+    g_diag_capture_count = 0;
+}
+
+public fn diag_capture_begin() {
+    diag_reset_counts();
+    if (g_diag_table != null) {
+        var i: i32 = 0;
+        while (i < 1024) {
+            let slot = g_diag_table + (i * 48);
+            let code_p = ast_read_rawptr(slot);
+            if (code_p != null) { free(code_p); }
+            i = i + 1;
+        }
+        memset(g_diag_table, 0, (1024 * 48) as u64);
+        g_diag_table_used = 0;
+    }
+    if (g_diag_capture_ptr == null) {
+        g_diag_capture_ptr = diag_alloc_zero(diag_capture_cap() * diag_capture_slot_size());
+    } else {
+        diag_capture_free_slots();
+    }
+    g_diag_capture_on = 1;
+}
+
+public fn diag_capture_end() {
+    g_diag_capture_on = 0;
+}
+
+public fn diag_capture_count() -> i32 { return g_diag_capture_count; }
+
+fn diag_capture_slot(i: i32) -> rawptr {
+    if (g_diag_capture_ptr == null || i < 0 || i >= g_diag_capture_count) { return null; }
+    return g_diag_capture_ptr + (i * diag_capture_slot_size());
+}
+
+public fn diag_capture_code(i: i32) -> string {
+    let slot = diag_capture_slot(i);
+    if (slot == null) { return ""; }
+    let p = ast_read_rawptr(slot);
+    if (p == null) { return ""; }
+    return from_cstr(p);
+}
+
+public fn diag_capture_message(i: i32) -> string {
+    let slot = diag_capture_slot(i);
+    if (slot == null) { return ""; }
+    let p = ast_read_rawptr(slot + 8);
+    if (p == null) { return ""; }
+    return from_cstr(p);
+}
+
+public fn diag_capture_line(i: i32) -> i32 {
+    let slot = diag_capture_slot(i);
+    if (slot == null) { return 0; }
+    return ast_read_i32(slot + 16);
+}
+
+public fn diag_capture_col(i: i32) -> i32 {
+    let slot = diag_capture_slot(i);
+    if (slot == null) { return 0; }
+    return ast_read_i32(slot + 20);
+}
+
+public fn diag_capture_severity(i: i32) -> i32 {
+    let slot = diag_capture_slot(i);
+    if (slot == null) { return 0; }
+    return ast_read_i32(slot + 24);
+}
+
+public fn diag_capture_end_line(i: i32) -> i32 {
+    let slot = diag_capture_slot(i);
+    if (slot == null) { return 0; }
+    return ast_read_i32(slot + 28);
+}
+
+public fn diag_capture_end_col(i: i32) -> i32 {
+    let slot = diag_capture_slot(i);
+    if (slot == null) { return 0; }
+    return ast_read_i32(slot + 32);
+}
+
+fn diag_capture_push(code: string, severity: i32, line: i32, col: i32,
+                     end_line: i32, end_col: i32, msg: string) {
+    if (g_diag_capture_on == 0 || g_diag_capture_ptr == null) { return; }
+    if (g_diag_capture_count >= diag_capture_cap()) { return; }
+    let slot = g_diag_capture_ptr + (g_diag_capture_count * diag_capture_slot_size());
+    ast_write_rawptr(slot, diag_dup_bytes(code.c_str(), code.len));
+    ast_write_rawptr(slot + 8, diag_dup_bytes(msg.c_str(), msg.len));
+    ast_write_i32(slot + 16, line);
+    ast_write_i32(slot + 20, col);
+    ast_write_i32(slot + 24, severity);
+    var span_end_line = end_line;
+    var span_end_col = end_col;
+    if (span_end_line <= 0) { span_end_line = line; }
+    if (span_end_col <= 0) { span_end_col = col + 1; }
+    if (span_end_line < line) { span_end_line = line; }
+    if (span_end_line == line && span_end_col <= col) { span_end_col = col + 1; }
+    ast_write_i32(slot + 28, span_end_line);
+    ast_write_i32(slot + 32, span_end_col);
+    g_diag_capture_count = g_diag_capture_count + 1;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   10. Convenience: starts-with / contains for the sema rewire,
+//       reusing the host vyx_rt FFI so we don't add a per-call O(n)
+//       Vyx-level scan in the hot Sema path.
+// ════════════════════════════════════════════════════════════════════
+
+public fn diag_msg_starts_with(msg: string, prefix: string) -> bool {
+    if (prefix.len == 0) { return true; }
+    if (msg.len < prefix.len) { return false; }
+    return vyx_string_starts_with(msg.c_str(), msg.len as u64,
+                                  prefix.c_str(), prefix.len as u64) != 0;
+}
+
+public fn diag_msg_contains(msg: string, needle: string) -> bool {
+    if (needle.len == 0) { return true; }
+    if (msg.len < needle.len) { return false; }
+    return vyx_string_contains(msg.c_str(), msg.len as u64,
+                               needle.c_str(), needle.len as u64) != 0;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   11. DiagCode at the produce site.
+//
+//   Parser / Sema `report_error_coded` / `error_mismatch` / `error_unknown`
+//   pass a `diag_code_*()` string into `diag_emit*`. That explicit code is
+//   the source of truth. ERROR/FATAL also print `diag_help_for_code`.
+//   Site-specific fixes use `diag_emit_help_at` / Sema `report_error_help`.
+// ════════════════════════════════════════════════════════════════════
+
+fn diag_char_is_digit(c: i32) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// Produce-site tag when `msg` already starts with `E` + digits + `:`.
+public fn diag_code_carried_in_message(msg: string) -> string {
+    if (msg.len < 6) { return ""; }
+    if (msg.charAt(0) != 69) { return ""; }
+    var i: i32 = 1;
+    var digits: i32 = 0;
+    while (i < msg.len && diag_char_is_digit(msg.charAt(i))) {
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if (digits < 4) { return ""; }
+    if (i >= msg.len || msg.charAt(i) != 58) { return ""; }
+    return msg.substring(0, i);
+}
+
+/// Produce-site `diag_code_*` or a carried `Exxxx` in the message.
+/// Do not restore a prefix/needle table here — that mis-classified
+/// generic Sema text.
+public fn diag_classify_sema_message(msg: string) -> string {
+    let carried = diag_code_carried_in_message(msg);
+    if (carried.len > 0) { return carried; }
+    return diag_code_sema_generic();
+}

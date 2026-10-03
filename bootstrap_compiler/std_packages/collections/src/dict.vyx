@@ -1,0 +1,808 @@
+module std.collections;
+
+use std.defaults;
+use std.core;
+use std.hash;
+use std.string;
+
+/// Vyx Standard Library — Dict<K, V>
+/// SoA (Struct-of-Arrays) open-addressing hash table.
+/// Layout: ctrl[cap] | keys[cap * sizeof<K>] | vals[cap * sizeof<V>]
+///
+/// Key contract (R5 phase 6, 2026-04-23): K must implement Hashable + Eq.
+/// `_hash_key` and `_key_eq` dispatch through the trait methods — the old
+/// hardcoded byte-hash / Vec-header fallbacks are gone.  Primitive key
+/// types (i32 / i64 / string / bool / char) get their impls from
+/// std/hash.vyx; container keys (Vec<T>) carry their own impls in
+/// std/vec.vyx; user-defined key types must declare `: Hashable + Eq`
+/// and supply `hash()` + `operator_eq(other: Self)`.
+
+extern "C" {
+    fn malloc(size: i64) -> rawptr;
+    fn realloc(ptr: rawptr, size: i64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memset(dst: rawptr, val: i32, n: i64) -> rawptr;
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: i64) -> i32;
+    fn strncmp(a: rawptr, b: rawptr, n: i64) -> i32;
+    fn vyx_dict_i64_i64_put(dict: rawptr, key: i64, val: i64);
+    fn vyx_dict_i64_i64_try_get(dict: rawptr, key: i64, out: rawptr) -> i32;
+    fn vyx_dict_str_i64_put(dict: rawptr, key: rawptr, len: i64, cap: i64, owned: i64, val: i64);
+    fn vyx_dict_str_i64_try_get(dict: rawptr, key: rawptr, len: i64, out: rawptr) -> i32;
+}
+
+fn dict_default_value<V>() -> V where V: Default {
+    return V::default_value();
+}
+
+@[lang_item("dict")]
+class Dict<K, V> : Iterable where K: Hashable + Eq {
+    public data: rawptr;
+    public len: i64;
+    public cap: i64;
+    // Structural-mutation counter (put/remove/clear/rehash). See vec.vyx
+    // and the iter-invalidation notes in iter.vyx / dict.vyx's
+    // DictEntryIterator.
+    public gen: i64;
+    // Set to true by `destroy()`. Separate flag (not "data==null") so
+    // legitimate lazy-init paths that allocate on first `put` aren't
+    // mistaken for post-destroy reuse.
+    public destroyed: bool;
+
+    fn _check_alive() {
+        if (self.destroyed) {
+            panic("Dict: use-after-destroy");
+        }
+    }
+
+    fn _alloc_size(c: i64) -> i64 {
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl_bytes = (c + 7) & -8;
+        return ctrl_bytes + c * ks + c * vs;
+    }
+
+    fn _ctrl_ptr() -> rawptr { return self.data; }
+
+    fn _keys_ptr() -> rawptr {
+        let ctrl_bytes = (self.cap + 7) & -8;
+        return self.data + ctrl_bytes;
+    }
+
+    fn _vals_ptr() -> rawptr {
+        let ctrl_bytes = (self.cap + 7) & -8;
+        return self.data + ctrl_bytes + self.cap * sizeof::<K>();
+    }
+
+    public static fn new() -> Dict<K, V> {
+        let c: i64 = 64;
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl_bytes = (c + 7) & -8;
+        let total = ctrl_bytes + c * ks + c * vs;
+        let d = malloc(total);
+        if (d != null) { memset(d, 0, ctrl_bytes); }
+        return Dict::<K, V> { data: d, len: 0, cap: c, gen: 0, destroyed: false };
+    }
+
+    public static fn with_capacity(min_cap: i64) -> Dict<K, V> {
+        if (min_cap < 0) { panic("Dict: capacity request overflowed i64"); }
+        var c: i64 = 64;
+        // `needed = min_cap * 10 / 7 + 1` — guard against i64 overflow
+        // on the intermediate multiplication before the division reins
+        // it in. 922337203685477580 ≈ i64::MAX / 10.
+        if (min_cap > 922337203685477580) { panic("Dict: with_capacity overflowed"); }
+        let needed = min_cap * 10 / 7 + 1;
+        while (c < needed) {
+            if (c > 4611686018427387903) { panic("Dict: capacity doubling overflowed"); }
+            c = c * 2;
+        }
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl_bytes = (c + 7) & -8;
+        let total = ctrl_bytes + c * ks + c * vs;
+        if (total < 0) { panic("Dict: allocation size overflowed i64"); }
+        let d = malloc(total);
+        if (d != null) { memset(d, 0, ctrl_bytes); }
+        return Dict::<K, V> { data: d, len: 0, cap: c, gen: 0, destroyed: false };
+    }
+
+    /// Hash a key via its `Hashable` impl.  Single-line trait dispatch
+    /// replaces the pre-R5.6 byte-hash + Vec-header special cases.
+    /// Marked `@[inline] @[hot]` so monomorphisation collapses the
+    /// trampoline straight into the probe loop (esp. for string keys
+    /// where `hash_string_key` → `hash_bytes_key` is itself `@[inline]`).
+    @[borrow_args]
+    @[inline]
+    @[hot]
+    fn _hash_key(key: K) -> i64 {
+        return key.hash();
+    }
+
+    /// Hash a stored key already sitting in `buf` as `sizeof::<K>()` bytes
+    /// (used by `_grow` when rehashing the old table).  Loads the bytes
+    /// into a fresh K value so the trait dispatch sees a proper K.
+    fn _hash_raw(buf: rawptr, ks: i64) -> i64 {
+        var stored: K;
+        memcpy(to_rawptr(&stored), buf, ks);
+        return stored.hash();
+    }
+
+    /// Compare the stored key at slot `idx` with `key` via `Eq`.  Loads
+    /// the stored K bytes into a fresh local, then trait-dispatches.
+    /// `@[inline] @[hot]` plus `@[inline]` on `str_equals` means a
+    /// `Dict<string, V>` probe step becomes a length-first inline
+    /// compare with no helper-call overhead.
+    @[borrow_args]
+    @[inline]
+    @[hot]
+    fn _key_eq(keys_base: rawptr, idx: i64, key: K) -> bool {
+        let ks = sizeof::<K>();
+        var stored: K;
+        memcpy(to_rawptr(&stored), keys_base + idx * ks, ks);
+        return stored.operator_eq(key);
+    }
+
+    fn _grow() {
+        let old_cap = self.cap;
+        let old_data = self.data;
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let old_ctrl_bytes = (old_cap + 7) & -8;
+        let old_keys = old_data + old_ctrl_bytes;
+        let old_vals = old_keys + old_cap * ks;
+
+        // Overflow guard: doubling past i64::MAX/2 would wrap into
+        // negative territory, malloc would then see a huge unsigned
+        // size and either eat the address space or assert.
+        if (old_cap > 4611686018427387903) {
+            panic("Dict: capacity doubling overflowed i64");
+        }
+        let nc = old_cap * 2;
+        let new_ctrl_bytes = (nc + 7) & -8;
+        let total = new_ctrl_bytes + nc * ks + nc * vs;
+        if (total < 0) { panic("Dict: allocation size overflowed i64"); }
+        let nd = malloc(total);
+        if (nd == null) { panic("Dict: allocation failed"); }
+        memset(nd, 0, new_ctrl_bytes);
+
+        let new_keys = nd + new_ctrl_bytes;
+        let new_vals = new_keys + nc * ks;
+        let new_mask = nc - 1;
+
+        self.data = nd;
+        self.cap = nc;
+        self.len = 0;
+
+        let key_buf = malloc(ks);
+        let val_buf = malloc(vs);
+
+        var i: i64 = 0;
+        while (i < old_cap) {
+            var ctrl: i64 = 0;
+            memcpy(to_rawptr(&ctrl), old_data + i, 1);
+            ctrl = ctrl & 255;
+            if (ctrl == 1) {
+                memcpy(key_buf, old_keys + i * ks, ks);
+                memcpy(val_buf, old_vals + i * vs, vs);
+
+                let h = self._hash_raw(key_buf, ks);
+                var slot = h & new_mask;
+                if (slot < 0) { slot = 0 - slot; }
+                var found = false;
+                while (!found) {
+                    var sc: i64 = 0;
+                    memcpy(to_rawptr(&sc), nd + slot, 1);
+                    sc = sc & 255;
+                    if (sc == 0) {
+                        let one: i64 = 1;
+                        memcpy(nd + slot, to_rawptr(&one), 1);
+                        memcpy(new_keys + slot * ks, key_buf, ks);
+                        memcpy(new_vals + slot * vs, val_buf, vs);
+                        self.len = self.len + 1;
+                        found = true;
+                    } else {
+                        slot = (slot + 1) & new_mask;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        free(key_buf);
+        free(val_buf);
+        free(old_data);
+    }
+
+    @[hot]
+    public fn put(key: K, val: V) {
+        self._check_alive();
+        if (self.data == null && self.cap == 0) {
+            // Lazy-init path (first put on a struct-literal-built Dict).
+            let c: i64 = 64;
+            let ks2 = sizeof::<K>();
+            let vs2 = sizeof::<V>();
+            let cb2 = (c + 7) & -8;
+            let total2 = cb2 + c * ks2 + c * vs2;
+            self.data = malloc(total2);
+            if (self.data != null) { memset(self.data, 0, cb2); }
+            self.cap = c;
+            self.len = 0;
+        }
+        if (self.len * 10 >= self.cap * 7) { self._grow(); }
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl = self._ctrl_ptr();
+        let keys = self._keys_ptr();
+        let vals = self._vals_ptr();
+        let h = self._hash_key(key);
+        let mask = self.cap - 1;
+        var idx = h & mask;
+        if (idx < 0) { idx = 0 - idx; }
+        var tombstone_slot: i64 = -1;
+        var probes: i64 = 0;
+        while (probes < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), ctrl + idx, 1);
+            c = c & 255;
+            if (c == 0) {
+                if (tombstone_slot >= 0) { idx = tombstone_slot; }
+                let one: i64 = 1;
+                memcpy(ctrl + idx, to_rawptr(&one), 1);
+                memcpy(keys + idx * ks, to_rawptr(&key), ks);
+                memcpy(vals + idx * vs, to_rawptr(&val), vs);
+                self.len = self.len + 1;
+                self.gen = self.gen + 1;
+                return;
+            }
+            if (c == 2) {
+                if (tombstone_slot < 0) { tombstone_slot = idx; }
+            } elif (self._key_eq(keys, idx, key)) {
+                memcpy(vals + idx * vs, to_rawptr(&val), vs);
+                return;
+            }
+            idx = (idx + 1) & mask;
+            probes = probes + 1;
+        }
+        if (tombstone_slot >= 0) {
+            let one: i64 = 1;
+            memcpy(ctrl + tombstone_slot, to_rawptr(&one), 1);
+            memcpy(keys + tombstone_slot * ks, to_rawptr(&key), ks);
+            memcpy(vals + tombstone_slot * vs, to_rawptr(&val), vs);
+            self.len = self.len + 1;
+            self.gen = self.gen + 1;
+            return;
+        }
+        self._grow();
+        self.put(key, val);
+    }
+
+    public fn insert(key: K, val: V) { self.put(key, val); }
+    public fn set(key: K, val: V) { self.put(key, val); }
+
+    /// Returns the value for `key`, or the type's zero/default value if not found.
+    ///
+    /// Dict storage keeps raw bytes in its table. For owning V this method
+    /// returns a shallow view of the table-owned payload; Sema marks locals
+    /// bound from Dict.get/try_get as borrowed so scope exit does not drop
+    /// the table slot. Use clone() explicitly when an independent value is
+    /// required.
+    ///
+    /// `try_get()` is the fallible API when you need to distinguish a miss
+    /// from a present zero/default value.
+    @[borrow_args]
+    @[inline]
+    public fn get(key: K) -> V where V: Default {
+        self._check_alive();
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl = self._ctrl_ptr();
+        let keys = self._keys_ptr();
+        let vals = self._vals_ptr();
+        let h = self._hash_key(key);
+        let mask = self.cap - 1;
+        var idx = h & mask;
+        if (idx < 0) { idx = 0 - idx; }
+        var probes: i64 = 0;
+        var out: V = dict_default_value::<V>();
+        while (probes < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), ctrl + idx, 1);
+            c = c & 255;
+            if (c == 0) { return out; }
+            if (c == 1 && self._key_eq(keys, idx, key)) {
+                memcpy(to_rawptr(&out), vals + idx * vs, vs);
+                return out;
+            }
+            idx = (idx + 1) & mask;
+            probes = probes + 1;
+        }
+        return out;
+    }
+
+    /// Returns a stable pointer to the value slot for `key`.
+    /// Missing keys are inserted with V's default value, matching the
+    /// conventional mutable-map `operator[]` contract.
+    @[borrow_args]
+    @[inline]
+    public fn get_ptr(key: K) -> *V where V: Default {
+        self._check_alive();
+        if (self.data == null && self.cap == 0) {
+            let c0: i64 = 64;
+            let ks0 = sizeof::<K>();
+            let vs0 = sizeof::<V>();
+            let cb0 = (c0 + 7) & -8;
+            let total0 = cb0 + c0 * ks0 + c0 * vs0;
+            self.data = malloc(total0);
+            if (self.data != null) { memset(self.data, 0, cb0); }
+            self.cap = c0;
+            self.len = 0;
+        }
+        if (self.len * 10 >= self.cap * 7) { self._grow(); }
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl = self._ctrl_ptr();
+        let keys = self._keys_ptr();
+        let vals = self._vals_ptr();
+        let h = self._hash_key(key);
+        let mask = self.cap - 1;
+        var idx = h & mask;
+        if (idx < 0) { idx = 0 - idx; }
+        var tombstone_slot: i64 = -1;
+        var probes: i64 = 0;
+        while (probes < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), ctrl + idx, 1);
+            c = c & 255;
+            if (c == 0) {
+                var insert_idx = idx;
+                if (tombstone_slot >= 0) { insert_idx = tombstone_slot; }
+                let one: i64 = 1;
+                var zero: V = dict_default_value::<V>();
+                memcpy(ctrl + insert_idx, to_rawptr(&one), 1);
+                memcpy(keys + insert_idx * ks, to_rawptr(&key), ks);
+                memcpy(vals + insert_idx * vs, to_rawptr(&zero), vs);
+                self.len = self.len + 1;
+                self.gen = self.gen + 1;
+                return (vals + insert_idx * vs) as *V;
+            }
+            if (c == 2) {
+                if (tombstone_slot < 0) { tombstone_slot = idx; }
+            } elif (self._key_eq(keys, idx, key)) {
+                return (vals + idx * vs) as *V;
+            }
+            idx = (idx + 1) & mask;
+            probes = probes + 1;
+        }
+        if (tombstone_slot >= 0) {
+            let one2: i64 = 1;
+            var zero2: V = dict_default_value::<V>();
+            memcpy(ctrl + tombstone_slot, to_rawptr(&one2), 1);
+            memcpy(keys + tombstone_slot * ks, to_rawptr(&key), ks);
+            memcpy(vals + tombstone_slot * vs, to_rawptr(&zero2), vs);
+            self.len = self.len + 1;
+            self.gen = self.gen + 1;
+            return (vals + tombstone_slot * vs) as *V;
+        }
+        self._grow();
+        return self.get_ptr(key);
+    }
+
+    public fn operator[](&mut self, key: K) -> &mut V where V: Default {
+        let p = self.get_ptr(key);
+        return &mut p[0];
+    }
+
+    /// Returns Option::Some(borrowed value view) if key exists, Option::None otherwise.
+    @[borrow_args]
+    @[inline]
+    public fn try_get(key: K) -> Option<V> where V: Default {
+        self._check_alive();
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl = self._ctrl_ptr();
+        let keys = self._keys_ptr();
+        let vals = self._vals_ptr();
+        let h = self._hash_key(key);
+        let mask = self.cap - 1;
+        var idx = h & mask;
+        if (idx < 0) { idx = 0 - idx; }
+        var probes: i64 = 0;
+        while (probes < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), ctrl + idx, 1);
+            c = c & 255;
+            if (c == 0) { return None; }
+            if (c == 1 && self._key_eq(keys, idx, key)) {
+                var out: V = dict_default_value::<V>();
+                memcpy(to_rawptr(&out), vals + idx * vs, vs);
+                return Some(out);
+            }
+            idx = (idx + 1) & mask;
+            probes = probes + 1;
+        }
+        return None;
+    }
+
+    @[borrow_args]
+    @[inline]
+    public fn contains(key: K) -> bool {
+        self._check_alive();
+        let ks = sizeof::<K>();
+        let ctrl = self._ctrl_ptr();
+        let keys = self._keys_ptr();
+        let h = self._hash_key(key);
+        let mask = self.cap - 1;
+        var idx = h & mask;
+        if (idx < 0) { idx = 0 - idx; }
+        var probes: i64 = 0;
+        while (probes < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), ctrl + idx, 1);
+            c = c & 255;
+            if (c == 0) { return false; }
+            if (c == 1 && self._key_eq(keys, idx, key)) { return true; }
+            idx = (idx + 1) & mask;
+            probes = probes + 1;
+        }
+        return false;
+    }
+
+    @[borrow_args]
+    public fn remove(key: K) -> bool {
+        self._check_alive();
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl = self._ctrl_ptr();
+        let keys = self._keys_ptr();
+        let vals = self._vals_ptr();
+        let h = self._hash_key(key);
+        let mask = self.cap - 1;
+        var idx = h & mask;
+        if (idx < 0) { idx = 0 - idx; }
+        var probes: i64 = 0;
+        while (probes < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), ctrl + idx, 1);
+            c = c & 255;
+            if (c == 0) { return false; }
+            if (c == 1 && self._key_eq(keys, idx, key)) {
+                let tombstone: i64 = 2;
+                memcpy(ctrl + idx, to_rawptr(&tombstone), 1);
+                self.len = self.len - 1;
+                self.gen = self.gen + 1;
+                return true;
+            }
+            idx = (idx + 1) & mask;
+            probes = probes + 1;
+        }
+        return false;
+    }
+
+    public fn isEmpty() -> bool { return self.len == 0; }
+    public fn count() -> i64 { return self.len; }
+    public fn length() -> i64 { return self.len; }
+    public fn size() -> i64 { return self.len; }
+
+    public fn iter() -> DictEntryIterator {
+        self._check_alive();
+        let ctrl_bytes = (self.cap + 7) & -8;
+        let keys = self.data + ctrl_bytes;
+        let vals = keys + self.cap * sizeof::<K>();
+        return DictEntryIterator {
+            ctrl: self.data, keys: keys, vals: vals, cap: self.cap,
+            pos: 0, key: 0, value: 0,
+            key_size: sizeof::<K>(), val_size: sizeof::<V>(),
+            source_gen: to_rawptr(&self.gen),
+            gen_snapshot: self.gen
+        };
+    }
+
+    public fn keys() -> Vec<K> {
+        self._check_alive();
+        let es = sizeof::<K>();
+        var initial_cap = self.len;
+        if (initial_cap < 4) { initial_cap = 4; }
+        let initial_bytes = initial_cap * es;
+        let initial_data = malloc(initial_bytes);
+        if (initial_data != null) { memset(initial_data, 0, initial_bytes); }
+        var result: Vec<K>;
+        result.data = initial_data;
+        result.len = 0;
+        result.cap = initial_cap;
+        result.elem_size = es;
+        result.gen = 0;
+        let ctrl_bytes = (self.cap + 7) & -8;
+        let key_data = self.data + ctrl_bytes;
+        var i: i64 = 0;
+        while (i < self.cap) {
+            var ctrl_byte: i64 = 0;
+            memcpy(to_rawptr(&ctrl_byte), self.data + i, 1);
+            ctrl_byte = ctrl_byte & 255;
+            if (ctrl_byte == 1) {
+                var key: K;
+                memcpy(to_rawptr(&key), key_data + i * sizeof::<K>(), sizeof::<K>());
+                result.push(key);
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    public fn values() -> DictValIterator {
+        let ctrl_bytes = (self.cap + 7) & -8;
+        let keys_end = self.data + ctrl_bytes + self.cap * sizeof::<K>();
+        return DictValIterator { ctrl: self.data, vals: keys_end, cap: self.cap, pos: 0, val_size: sizeof::<V>() };
+    }
+
+    /// Materialise all present values into a Vec<V>. Mirrors `keys()` so
+    /// callers who want indexed access (`.size()` / `.get(i)`) have a path
+    /// that doesn't require reaching into the iterator internals.
+    public fn values_vec() -> Vec<V> {
+        self._check_alive();
+        let es = sizeof::<V>();
+        var initial_cap = self.len;
+        if (initial_cap < 4) { initial_cap = 4; }
+        let initial_bytes = initial_cap * es;
+        let initial_data = malloc(initial_bytes);
+        if (initial_data != null) { memset(initial_data, 0, initial_bytes); }
+        var result: Vec<V>;
+        result.data = initial_data;
+        result.len = 0;
+        result.cap = initial_cap;
+        result.elem_size = es;
+        result.gen = 0;
+        let ctrl_bytes = (self.cap + 7) & -8;
+        let key_data = self.data + ctrl_bytes;
+        let val_data = key_data + self.cap * sizeof::<K>();
+        var i: i64 = 0;
+        while (i < self.cap) {
+            var ctrl_byte: i64 = 0;
+            memcpy(to_rawptr(&ctrl_byte), self.data + i, 1);
+            ctrl_byte = ctrl_byte & 255;
+            if (ctrl_byte == 1) {
+                var val: V;
+                memcpy(to_rawptr(&val), val_data + i * es, es);
+                result.push(val);
+            }
+            i = i + 1;
+        }
+        return result;
+    }
+
+    public fn clear() {
+        self._check_alive();
+        let ctrl_bytes = (self.cap + 7) & -8;
+        memset(self.data, 0, ctrl_bytes);
+        self.len = 0;
+        self.gen = self.gen + 1;
+    }
+
+    /// Frees the backing buffer. Does NOT call destructors on keys/values —
+    /// caller must manually destroy elements if K or V own heap memory.
+    /// Idempotent via `self.destroyed`.
+    public fn destroy() {
+        if (to_rawptr(self) == null) { return; }
+        if (self.destroyed) { return; }
+        if (self.data != null) { free(self.data); }
+        self.data = null;
+        self.cap = 0;
+        self.len = 0;
+        self.destroyed = true;
+    }
+
+    /// SSS memory model (2026-04-24): `Drop` impl — auto-fires at scope
+    /// exit for every Dict local.  Pass-through to `destroy()`; safe
+    /// across shallow-struct aliasing because `destroyed` gates the
+    /// underlying free.
+    public fn drop() {
+        if (to_rawptr(self) == null) { return; }
+        self.destroy();
+    }
+
+    /// Deep copy. Independent from `self`; mutating the result does
+    /// not affect `self`. See std/clone.vyx Contract A.
+    ///
+    /// Iterates every occupied slot (ctrl byte == 1) and calls
+    /// `put(k.clone(), v.clone())` on a fresh Dict so both the table
+    /// layout and the key/value payloads are logically independent
+    /// from the original. Requires `K: Clone` AND `V: Clone` at call
+    /// time — failure surfaces as a monomorphisation error inside
+    /// this method for the offending type, never for callers who
+    /// never invoke it.
+    ///
+    /// Tagged `@[lazy]` so Dict<K, V> remains first-class for
+    /// non-Clone key/value types.
+    @[lazy]
+    public fn clone() -> Dict<K, V> {
+        self._check_alive();
+        var out = Dict::<K, V>.with_capacity(self.len);
+        if (self.data == null || self.cap == 0) { return out; }
+        let ks = sizeof::<K>();
+        let vs = sizeof::<V>();
+        let ctrl = self._ctrl_ptr();
+        let keys = self._keys_ptr();
+        let vals = self._vals_ptr();
+        var i: i64 = 0;
+        while (i < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), ctrl + i, 1);
+            c = c & 255;
+            if (c == 1) {
+                var k: K;
+                memcpy(to_rawptr(&k), keys + i * ks, ks);
+                var v: V;
+                memcpy(to_rawptr(&v), vals + i * vs, vs);
+                out.put(k.clone(), v.clone());
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+}
+
+/// Iteration over a Dict's entries via the legacy i64-shaped surface.
+///
+/// Slot addressing uses the true `sizeof::<K>()` / `sizeof::<V>()`
+/// strides captured at `iter()` time (`key_size` / `val_size`), so any
+/// K/V width walks the table correctly. The exposed `.key` / `.value`
+/// fields are i64: for K/V wider than 8 bytes they hold the first 8
+/// bytes of the payload — prefer `d.keys()` for full-width keys until
+/// a generic `DictEntryIterator<K, V>` lands.
+///
+/// Usage:
+///   let it = d.iter();
+///   while (it.next()) {
+///       // read `it.key`, `it.value`
+///   }
+///
+/// `next()` returns `true` when `.key` / `.value` hold the next entry,
+/// `false` when the iterator is exhausted. (Previously returned
+/// `Option<i64>` which leaked an implementation detail — the key's width —
+/// into the signature.)
+class DictEntryIterator {
+    public ctrl: rawptr;
+    public keys: rawptr;
+    public vals: rawptr;
+    public cap: i64;
+    public pos: i64;
+    public key: i64;
+    public value: i64;
+    // Per-slot strides, fixed once at iter() construction time.
+    public key_size: i64;
+    public val_size: i64;
+    // Iterator-invalidation guard — `source_gen` points to the Dict's
+    // gen counter; `gen_snapshot` is the value at iter() time. A
+    // mutation (put/remove/clear) between iter() and next() triggers a
+    // panic rather than silently reading rehashed / tombstoned data.
+    public source_gen: rawptr;
+    public gen_snapshot: i64;
+
+    public fn next() -> bool {
+        if (self.source_gen != null) {
+            var cur: i64 = 0;
+            memcpy(to_rawptr(&cur), self.source_gen, 8);
+            if (cur != self.gen_snapshot) {
+                panic("DictEntryIterator invalidated: Dict was modified during iteration");
+            }
+        }
+        var ks = self.key_size;
+        if (ks <= 0) { ks = 8; }
+        var kw = ks;
+        if (kw > 8) { kw = 8; }
+        var vs = self.val_size;
+        if (vs <= 0) { vs = 8; }
+        var vw = vs;
+        if (vw > 8) { vw = 8; }
+        while (self.pos < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), self.ctrl + self.pos, 1);
+            c = c & 255;
+            let idx = self.pos;
+            self.pos = self.pos + 1;
+            if (c == 1) {
+                self.key = 0;
+                self.value = 0;
+                memcpy(to_rawptr(&self.key), self.keys + idx * ks, kw);
+                memcpy(to_rawptr(&self.value), self.vals + idx * vs, vw);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public fn has_next() -> bool {
+        var i = self.pos;
+        while (i < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), self.ctrl + i, 1);
+            c = c & 255;
+            if (c == 1) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+class DictKeyIterator : Iter<i64> {
+    public ctrl: rawptr;
+    public keys: rawptr;
+    public cap: i64;
+    public pos: i64;
+
+    public fn next() -> Option<i64> {
+        while (self.pos < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), self.ctrl + self.pos, 1);
+            c = c & 255;
+            let idx = self.pos;
+            self.pos = self.pos + 1;
+            if (c == 1) {
+                var key: i64 = 0;
+                memcpy(to_rawptr(&key), self.keys + idx * 8, 8);
+                return Some(key);
+            }
+        }
+        return None;
+    }
+
+    public fn has_next() -> bool {
+        var i = self.pos;
+        while (i < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), self.ctrl + i, 1);
+            c = c & 255;
+            if (c == 1) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+class DictValIterator : Iter<i64> {
+    public ctrl: rawptr;
+    public vals: rawptr;
+    public cap: i64;
+    public pos: i64;
+    public val_size: i64;
+
+    public fn next() -> Option<i64> {
+        // Stride addresses the slot at its true V width; the copy width
+        // is clamped to 8 bytes so wide V payloads can never overrun the
+        // i64-shaped `val` local (they expose their first 8 bytes only).
+        var stride = self.val_size;
+        if (stride <= 0) { stride = 8; }
+        var width = stride;
+        if (width > 8) { width = 8; }
+        while (self.pos < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), self.ctrl + self.pos, 1);
+            c = c & 255;
+            let idx = self.pos;
+            self.pos = self.pos + 1;
+            if (c == 1) {
+                var val: i64 = 0;
+                memcpy(to_rawptr(&val), self.vals + idx * stride, width);
+                return Some(val);
+            }
+        }
+        return None;
+    }
+
+    public fn has_next() -> bool {
+        var i = self.pos;
+        while (i < self.cap) {
+            var c: i64 = 0;
+            memcpy(to_rawptr(&c), self.ctrl + i, 1);
+            c = c & 255;
+            if (c == 1) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+}
+
+impl Default for Dict<K, V> where K: Hashable + Eq {
+    static fn default_value() -> Dict<K, V> {
+        return Dict::<K, V>.new();
+    }
+}

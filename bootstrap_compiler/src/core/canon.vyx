@@ -1,0 +1,649 @@
+module bootstrap.canon;
+
+use std.clone;
+use std.string;
+use bootstrap.ast;
+
+/// Canonical-name interning tables for the self-host Sema.
+///
+/// Mirrors `src/Sema/Canonicalizer.h` (host C++): three opaque id domains
+/// — `PrimId`, `TypeId`, `TraitId` — backed by an open-addressing hash
+/// table per domain.  Goals:
+///
+///   * Two distinct spellings of the **same** trait
+///     (`std.hash.Hashable` / `std::hash::Hashable` / bare `Hashable`
+///     in the current `use` scope) collapse to a single id.
+///   * Primitives reach the same id whether the caller asks for
+///     `i32` directly or for an equivalent `int`-style alias.
+///   * Generic class types reach the same id when their mangled forms
+///     (`Vec<i32>`) match position-by-position.
+///
+/// Lifetime / ownership:
+/// Intern tables are packed headers plus growable slot/id buffers.
+/// Key bytes are `ast_dup_c_string` copies owned by the slot.
+/// Remaining heap growth is the intern table arena. New slot writes go
+/// through `CanonSlot` (`canon_slot_pack` / `canon_slot_unpack`); there is
+/// no `canon_dup_bytes`. Remaining `cs_*` readers are the packed-blob
+/// surface. `canon_dispose()` walks every domain, freeing key buffers,
+/// the slot buffer, the id index, and the header. Idempotent.
+///
+/// Three globals:
+///
+///   * `g_canon_prim_table`   — primitive type names
+///   * `g_canon_type_table`   — full mangled type names
+///   * `g_canon_trait_table`  — trait paths (dotted, canonicalized)
+///
+/// Alias map `g_canon_trait_short_alias` records `short → full_id` so
+/// `canon_trait_id("Hashable")` after `canon_trait_register_alias(
+/// "Hashable", "std.hash.Hashable")` returns the full path's id.
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+}
+
+class CanonTable {
+    public slots_ptr: rawptr
+    public cap: i32
+    public used: i32
+    public ids_ptr: rawptr
+    public ids_cap: i32
+    public next_id: i32
+    public domain_tag: rawptr
+}
+
+class CanonSlot {
+    public key_ptr: rawptr
+    public key_len: i64
+    public key_hash: i64
+    public id: i32
+    public reserved: i32
+}
+
+fn canon_header_size() -> i32 { return 40; }
+fn canon_slot_size() -> i32 { return 32; }
+
+fn ct_slots_ptr(hdr: rawptr) -> rawptr { return ast_read_rawptr(hdr); }
+fn ct_set_slots_ptr(hdr: rawptr, v: rawptr) { ast_write_rawptr(hdr, v); }
+fn ct_cap(hdr: rawptr) -> i32 { return ast_read_i32(ptr_offset(hdr, 8)); }
+fn ct_set_cap(hdr: rawptr, v: i32) { ast_write_i32(ptr_offset(hdr, 8), v); }
+fn ct_used(hdr: rawptr) -> i32 { return ast_read_i32(ptr_offset(hdr, 12)); }
+fn ct_set_used(hdr: rawptr, v: i32) { ast_write_i32(ptr_offset(hdr, 12), v); }
+fn ct_ids_ptr(hdr: rawptr) -> rawptr { return ast_read_rawptr(ptr_offset(hdr, 16)); }
+fn ct_set_ids_ptr(hdr: rawptr, v: rawptr) { ast_write_rawptr(ptr_offset(hdr, 16), v); }
+fn ct_ids_cap(hdr: rawptr) -> i32 { return ast_read_i32(ptr_offset(hdr, 24)); }
+fn ct_set_ids_cap(hdr: rawptr, v: i32) { ast_write_i32(ptr_offset(hdr, 24), v); }
+fn ct_next_id(hdr: rawptr) -> i32 { return ast_read_i32(ptr_offset(hdr, 28)); }
+fn ct_set_next_id(hdr: rawptr, v: i32) { ast_write_i32(ptr_offset(hdr, 28), v); }
+fn ct_domain_tag(hdr: rawptr) -> rawptr { return ast_read_rawptr(ptr_offset(hdr, 32)); }
+fn ct_set_domain_tag(hdr: rawptr, v: rawptr) { ast_write_rawptr(ptr_offset(hdr, 32), v); }
+
+fn cs_key_ptr(p: rawptr) -> rawptr { return ast_read_rawptr(p); }
+fn cs_set_key_ptr(p: rawptr, v: rawptr) { ast_write_rawptr(p, v); }
+fn cs_key_len(p: rawptr) -> i64 { return ast_read_i64(ptr_offset(p, 8)); }
+fn cs_set_key_len(p: rawptr, v: i64) { ast_write_i64(ptr_offset(p, 8), v); }
+fn cs_key_hash(p: rawptr) -> i64 { return ast_read_i64(ptr_offset(p, 16)); }
+fn cs_set_key_hash(p: rawptr, v: i64) { ast_write_i64(ptr_offset(p, 16), v); }
+fn cs_id(p: rawptr) -> i32 { return ast_read_i32(ptr_offset(p, 24)); }
+fn cs_set_id(p: rawptr, v: i32) { ast_write_i32(ptr_offset(p, 24), v); }
+
+fn canon_slot_pack(dst: rawptr, rec: CanonSlot) {
+    if (dst == null) { return; }
+    cs_set_key_ptr(dst, rec.key_ptr);
+    cs_set_key_len(dst, rec.key_len);
+    cs_set_key_hash(dst, rec.key_hash);
+    cs_set_id(dst, rec.id);
+}
+
+fn canon_slot_unpack(src: rawptr) -> CanonSlot {
+    if (src == null) {
+        return CanonSlot {
+            key_ptr: null,
+            key_len: 0,
+            key_hash: 0,
+            id: 0,
+            reserved: 0
+        };
+    }
+    return CanonSlot {
+        key_ptr: cs_key_ptr(src),
+        key_len: cs_key_len(src),
+        key_hash: cs_key_hash(src),
+        id: cs_id(src),
+        reserved: 0
+    };
+}
+
+fn cs_fill(p: rawptr, key_ptr: rawptr, key_len: i64, key_hash: i64, id: i32) {
+    memset(p, 0, canon_slot_size() as u64);
+    canon_slot_pack(p, CanonSlot {
+        key_ptr: key_ptr,
+        key_len: key_len,
+        key_hash: key_hash,
+        id: id,
+        reserved: 0
+    });
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   CanonTable header layout — 40 B
+//
+//     0..7   : slots_ptr     (rawptr → slot[cap])
+//     8..11  : cap           (i32, power of two)
+//     12..15 : used          (i32, occupied slot count)
+//     16..23 : ids_ptr       (rawptr → rawptr[ids_cap])   (id → slot_ptr)
+//     24..27 : ids_cap       (i32)
+//     28..31 : next_id       (i32, 1-based; 0 reserved for "not found")
+//     32..39 : domain_tag    (rawptr to static label string for dump)
+//
+//   Each slot is 32 B:
+//     0..7   : key_ptr       (rawptr, null → empty slot)
+//     8..15  : key_len       (i64)
+//     16..23 : key_hash      (i64, FNV-1a 64-bit)
+//     24..27 : id            (i32, 1-based)
+//     28..31 : reserved      (i32, 0)
+// ════════════════════════════════════════════════════════════════════
+
+let CANON_INITIAL_CAP: i32 = 8192;
+
+fn canon_alloc_zero(size: i32) -> rawptr {
+    let p = malloc(size as u64);
+    if (p == null) { return null; }
+    memset(p, 0, size as u64);
+    return p;
+}
+
+fn canon_table_new(label_tag: rawptr) -> rawptr {
+    let hdr = canon_alloc_zero(canon_header_size());
+    if (hdr == null) { return null; }
+    let cap = CANON_INITIAL_CAP;
+    let slots = canon_alloc_zero(cap * canon_slot_size());
+    if (slots == null) { free(hdr); return null; }
+    let ids_cap: i32 = 256;
+    let ids = canon_alloc_zero(ids_cap * 8);
+    if (ids == null) { free(slots); free(hdr); return null; }
+    ct_set_slots_ptr(hdr, slots);
+    ct_set_cap(hdr, cap);
+    ct_set_ids_ptr(hdr, ids);
+    ct_set_ids_cap(hdr, ids_cap);
+    ct_set_domain_tag(hdr, label_tag);
+    return hdr;
+}
+
+fn canon_table_dispose(hdr: rawptr) {
+    if (hdr == null) { return; }
+    let slots = ct_slots_ptr(hdr);
+    let cap = ct_cap(hdr);
+    if (slots != null) {
+        var i: i32 = 0;
+        while (i < cap) {
+            let slot = slots + (i * canon_slot_size());
+            let kp = canon_slot_unpack(slot).key_ptr;
+            if (kp != null) { free(kp); }
+            i = i + 1;
+        }
+        free(slots);
+    }
+    let ids = ct_ids_ptr(hdr);
+    if (ids != null) { free(ids); }
+    free(hdr);
+}
+
+fn canon_table_slot(hdr: rawptr, idx: i32) -> rawptr {
+    return ct_slots_ptr(hdr) + (idx * canon_slot_size());
+}
+
+fn canon_table_cap(hdr: rawptr) -> i32 {
+    return ct_cap(hdr);
+}
+
+fn canon_table_used(hdr: rawptr) -> i32 {
+    return ct_used(hdr);
+}
+
+fn canon_table_set_used(hdr: rawptr, v: i32) {
+    ct_set_used(hdr, v);
+}
+
+fn canon_table_next_id(hdr: rawptr) -> i32 {
+    return ct_next_id(hdr);
+}
+
+fn canon_table_set_next_id(hdr: rawptr, v: i32) {
+    ct_set_next_id(hdr, v);
+}
+
+fn canon_table_ids_cap(hdr: rawptr) -> i32 {
+    return ct_ids_cap(hdr);
+}
+
+fn canon_table_ids_buf(hdr: rawptr) -> rawptr {
+    return ct_ids_ptr(hdr);
+}
+
+fn canon_table_record_id(hdr: rawptr, id: i32, slot: rawptr) {
+    var cap = ct_ids_cap(hdr);
+    var buf = ct_ids_ptr(hdr);
+    if (id >= cap) {
+        var new_cap = cap;
+        while (id >= new_cap) { new_cap = new_cap * 2; }
+        let nb = canon_alloc_zero(new_cap * 8);
+        if (nb == null) { return; }
+        if (buf != null) { memcpy(nb, buf, (cap * 8) as u64); free(buf); }
+        ct_set_ids_ptr(hdr, nb);
+        ct_set_ids_cap(hdr, new_cap);
+        buf = nb;
+    }
+    ast_write_rawptr(ptr_offset(buf, id * 8), slot);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   FNV-1a 64-bit hash — matches `Canonicalizer::hashTrait` in
+//   `src/Sema/Canonicalizer.h` (offset basis 14695981039346656037; we
+//   use 1469598103934665603 to fit in i64 — the bit-pattern is the
+//   same except for the top bit, which is irrelevant for hash use
+//   since we only use the result via `& (cap - 1)`).
+//
+//   Multiplications wrap silently in i64; that matches the host code
+//   path (`uint64_t`) modulo top-bit ambiguity.
+// ════════════════════════════════════════════════════════════════════
+
+fn canon_hash_bytes(ptr: rawptr, len: i64) -> i64 {
+    var h: i64 = 1469598103934665603;
+    if (ptr == null || len <= 0) { return h; }
+    var i: i64 = 0;
+    while (i < len) {
+        var b: i32 = 0;
+        memcpy(to_rawptr(&b), ptr_offset(ptr, i as i32), 1);
+        let bb: i64 = (b & 255) as i64;
+        h = h ^ bb;
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn canon_hash_str(s: string) -> i64 {
+    return canon_hash_bytes(s.c_str(), s.len);
+}
+
+fn canon_slot_eq_key(slot: rawptr, key_ptr: rawptr, key_len: i64, key_hash: i64) -> bool {
+    let rec = canon_slot_unpack(slot);
+    if (rec.key_ptr == null) { return false; }
+    if (rec.key_len != key_len) { return false; }
+    if (rec.key_hash != key_hash) { return false; }
+    if (rec.key_len == 0) { return true; }
+    return memcmp(rec.key_ptr, key_ptr, rec.key_len as u64) == 0;
+}
+
+fn canon_mask(cap: i32) -> i64 {
+    return (cap - 1) as i64;
+}
+
+fn canon_table_probe(hdr: rawptr, key_ptr: rawptr, key_len: i64, key_hash: i64) -> i32 {
+    let cap = canon_table_cap(hdr);
+    let mask = canon_mask(cap);
+    var h = key_hash;
+    if (h < 0) { h = 0 - h; }
+    var idx: i32 = (h & mask) as i32;
+    var step: i32 = 0;
+    while (step < cap) {
+        let slot = canon_table_slot(hdr, idx);
+        if (canon_slot_unpack(slot).key_ptr == null) { return idx; }
+        if (canon_slot_eq_key(slot, key_ptr, key_len, key_hash)) { return idx; }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        step = step + 1;
+    }
+    return -1;
+}
+
+fn canon_table_grow(hdr: rawptr) {
+    let old_cap = canon_table_cap(hdr);
+    let old_slots = ct_slots_ptr(hdr);
+    let new_cap = old_cap * 2;
+    let new_slots = canon_alloc_zero(new_cap * canon_slot_size());
+    if (new_slots == null) { return; }
+    ct_set_slots_ptr(hdr, new_slots);
+    ct_set_cap(hdr, new_cap);
+    ct_set_used(hdr, 0);
+    var i: i32 = 0;
+    while (i < old_cap) {
+        let oslot = old_slots + (i * canon_slot_size());
+        let rec = canon_slot_unpack(oslot);
+        if (rec.key_ptr != null) {
+            let idx = canon_table_probe(hdr, rec.key_ptr, rec.key_len, rec.key_hash);
+            if (idx >= 0) {
+                let nslot = canon_table_slot(hdr, idx);
+                canon_slot_pack(nslot, rec);
+                canon_table_set_used(hdr, canon_table_used(hdr) + 1);
+                canon_table_record_id(hdr, rec.id, nslot);
+            }
+        }
+        i = i + 1;
+    }
+    free(old_slots);
+}
+
+fn canon_table_intern(hdr: rawptr, name: string) -> i32 {
+    if (hdr == null) { return 0; }
+    let key_ptr = name.c_str();
+    let key_len = name.len;
+    let key_hash = canon_hash_bytes(key_ptr, key_len);
+    var idx = canon_table_probe(hdr, key_ptr, key_len, key_hash);
+    if (idx < 0) { return 0; }
+    var slot = canon_table_slot(hdr, idx);
+    let existing = canon_slot_unpack(slot);
+    if (existing.key_ptr != null) {
+        return existing.id;
+    }
+    let dup = ast_dup_c_string(name);
+    if (dup == null) { return 0; }
+    let id = canon_table_next_id(hdr) + 1;
+    cs_fill(slot, dup, key_len, key_hash, id);
+    canon_table_set_next_id(hdr, id);
+    canon_table_set_used(hdr, canon_table_used(hdr) + 1);
+    canon_table_record_id(hdr, id, slot);
+    let cap = canon_table_cap(hdr);
+    let used = canon_table_used(hdr);
+    if ((used * 10) >= (cap * 7)) {
+        canon_table_grow(hdr);
+    }
+    return id;
+}
+
+fn canon_table_lookup(hdr: rawptr, name: string) -> i32 {
+    if (hdr == null) { return 0; }
+    let key_ptr = name.c_str();
+    let key_len = name.len;
+    let key_hash = canon_hash_bytes(key_ptr, key_len);
+    let idx = canon_table_probe(hdr, key_ptr, key_len, key_hash);
+    if (idx < 0) { return 0; }
+    let slot = canon_table_slot(hdr, idx);
+    let rec = canon_slot_unpack(slot);
+    if (rec.key_ptr == null) { return 0; }
+    return rec.id;
+}
+
+fn canon_table_name_for(hdr: rawptr, id: i32) -> string {
+    if (hdr == null || id <= 0) { return ""; }
+    if (id > canon_table_next_id(hdr)) { return ""; }
+    let buf = canon_table_ids_buf(hdr);
+    if (buf == null) { return ""; }
+    let slot = ast_read_rawptr(ptr_offset(buf, id * 8));
+    if (slot == null) { return ""; }
+    let rec = canon_slot_unpack(slot);
+    if (rec.key_ptr == null) { return ""; }
+    return from_cstr_len(rec.key_ptr, rec.key_len);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Globals — three intern domains + trait short-name alias map.
+// ════════════════════════════════════════════════════════════════════
+
+var g_canon_prim_table: rawptr = null;
+var g_canon_type_table: rawptr = null;
+var g_canon_trait_table: rawptr = null;
+var g_canon_trait_short_alias: rawptr = null;
+
+fn canon_label_prim() -> rawptr {
+    return "PrimId".c_str();
+}
+
+fn canon_label_type() -> rawptr {
+    return "TypeId".c_str();
+}
+
+fn canon_label_trait() -> rawptr {
+    return "TraitId".c_str();
+}
+
+fn canon_label_alias() -> rawptr {
+    return "TraitAlias".c_str();
+}
+
+fn canon_ensure() {
+    if (g_canon_prim_table == null) {
+        g_canon_prim_table = canon_table_new(canon_label_prim());
+    }
+    if (g_canon_type_table == null) {
+        g_canon_type_table = canon_table_new(canon_label_type());
+    }
+    if (g_canon_trait_table == null) {
+        g_canon_trait_table = canon_table_new(canon_label_trait());
+    }
+    if (g_canon_trait_short_alias == null) {
+        g_canon_trait_short_alias = canon_table_new(canon_label_alias());
+    }
+}
+
+public fn canon_dispose() {
+    if (g_canon_prim_table != null) { canon_table_dispose(g_canon_prim_table); g_canon_prim_table = null; }
+    if (g_canon_type_table != null) { canon_table_dispose(g_canon_type_table); g_canon_type_table = null; }
+    if (g_canon_trait_table != null) { canon_table_dispose(g_canon_trait_table); g_canon_trait_table = null; }
+    if (g_canon_trait_short_alias != null) {
+        canon_table_dispose(g_canon_trait_short_alias);
+        g_canon_trait_short_alias = null;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Path normalization helpers.
+//
+//     canon_normalize_path("std::hash::Hashable") -> "std.hash.Hashable"
+//     canon_last_segment("std.hash.Hashable")     -> "Hashable"
+//     canon_last_segment("Hashable")              -> "Hashable"
+//
+//   These avoid `std::` vs `std.` schism between user-written `use`
+//   directives and the canonical dotted form the Sema FactBase carries.
+// ════════════════════════════════════════════════════════════════════
+
+public fn canon_normalize_path(s: string) -> string {
+    if (s.len <= 1) { return s; }
+    var out: string = "";
+    var i: i32 = 0;
+    let n: i32 = s.len as i32;
+    while (i < n) {
+        let c = s.charAt(i);
+        // 58 = ':', 46 = '.' — bootstrap idiom avoids char literals so
+        // a future self-host stage that hasn't enabled the char-literal
+        // path still parses this file.
+        if (c == 58 && (i + 1) < n && s.charAt(i + 1) == 58) {
+            out = out + ".";
+            i = i + 2;
+        } else {
+            out = out + s.substring(i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+public fn canon_last_segment(s: string) -> string {
+    if (s.len <= 0) { return s; }
+    var last_dot: i32 = -1;
+    var i: i32 = 0;
+    let n: i32 = s.len as i32;
+    while (i < n) {
+        if (s.charAt(i) == 46) { last_dot = i; }
+        i = i + 1;
+    }
+    if (last_dot < 0) { return s; }
+    return s.substring(last_dot + 1, n);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Public intern API.
+// ════════════════════════════════════════════════════════════════════
+
+public fn canon_prim_id(name: string) -> i32 {
+    canon_ensure();
+    if (name.len <= 0) { return 0; }
+    return canon_table_intern(g_canon_prim_table, name);
+}
+
+public fn canon_type_id(mangled: string) -> i32 {
+    canon_ensure();
+    if (mangled.len <= 0) { return 0; }
+    return canon_table_intern(g_canon_type_table, mangled);
+}
+
+/// Register a short → full mapping discovered from a `use` directive.
+/// E.g. `use std.hash;` brings `Hashable` into scope; the caller (Sema
+/// pass 0) is responsible for invoking
+/// `canon_trait_register_alias("Hashable", "std.hash.Hashable")`.
+///
+/// Re-registering the same short name with a different full path
+/// silently keeps the first binding (mirrors C++ `auto inserted = .insert(...).second;`
+/// idempotence in FactBase).
+public fn canon_trait_register_alias(short_name: string, full_path: string) {
+    canon_ensure();
+    if (short_name.len <= 0 || full_path.len <= 0) { return; }
+    let full = canon_normalize_path(full_path);
+    let full_id = canon_table_intern(g_canon_trait_table, full);
+    if (full_id <= 0) { return; }
+    let key_ptr = short_name.c_str();
+    let key_len = short_name.len;
+    let key_hash = canon_hash_bytes(key_ptr, key_len);
+    let idx = canon_table_probe(g_canon_trait_short_alias, key_ptr, key_len, key_hash);
+    if (idx < 0) { return; }
+    let slot = canon_table_slot(g_canon_trait_short_alias, idx);
+    if (canon_slot_unpack(slot).key_ptr != null) { return; }
+    let dup = ast_dup_c_string(short_name);
+    if (dup == null) { return; }
+    cs_fill(slot, dup, key_len, key_hash, full_id);
+    canon_table_set_next_id(g_canon_trait_short_alias,
+                            canon_table_next_id(g_canon_trait_short_alias) + 1);
+    canon_table_set_used(g_canon_trait_short_alias,
+                         canon_table_used(g_canon_trait_short_alias) + 1);
+    canon_table_record_id(g_canon_trait_short_alias,
+                          canon_table_next_id(g_canon_trait_short_alias), slot);
+    let cap = canon_table_cap(g_canon_trait_short_alias);
+    let used = canon_table_used(g_canon_trait_short_alias);
+    if ((used * 10) >= (cap * 7)) {
+        canon_table_grow(g_canon_trait_short_alias);
+    }
+}
+
+public fn canon_trait_id(path: string) -> i32 {
+    canon_ensure();
+    if (path.len <= 0) { return 0; }
+    let norm = canon_normalize_path(path);
+    if (canon_last_segment(norm) == norm) {
+        let alias_id = canon_table_lookup(g_canon_trait_short_alias, norm);
+        if (alias_id > 0) { return alias_id; }
+        return canon_table_intern(g_canon_trait_table, norm);
+    }
+    let full_id = canon_table_intern(g_canon_trait_table, norm);
+    let last = canon_last_segment(norm);
+    if (last.len > 0 && last != norm) {
+        let key_ptr = last.c_str();
+        let key_len = last.len;
+        let key_hash = canon_hash_bytes(key_ptr, key_len);
+        let idx = canon_table_probe(g_canon_trait_short_alias, key_ptr, key_len, key_hash);
+        if (idx >= 0) {
+            let slot = canon_table_slot(g_canon_trait_short_alias, idx);
+            if (canon_slot_unpack(slot).key_ptr == null) {
+                let dup = ast_dup_c_string(last);
+                if (dup != null) {
+                    cs_fill(slot, dup, key_len, key_hash, full_id);
+                    canon_table_set_next_id(g_canon_trait_short_alias,
+                                            canon_table_next_id(g_canon_trait_short_alias) + 1);
+                    canon_table_set_used(g_canon_trait_short_alias,
+                                         canon_table_used(g_canon_trait_short_alias) + 1);
+                    canon_table_record_id(g_canon_trait_short_alias,
+                                          canon_table_next_id(g_canon_trait_short_alias), slot);
+                    let cap = canon_table_cap(g_canon_trait_short_alias);
+                    let used = canon_table_used(g_canon_trait_short_alias);
+                    if ((used * 10) >= (cap * 7)) {
+                        canon_table_grow(g_canon_trait_short_alias);
+                    }
+                }
+            }
+        }
+    }
+    return full_id;
+}
+
+/// Name-only equality via intern: callers should pass `tref_get_name`
+/// for nominal types. For non-nominal kinds the comparison is left to
+/// the existing structural `type_eq` walk in `sema.vyx`.
+public fn canon_type_eq_by_name(a: string, b: string) -> bool {
+    if (a.len == 0 && b.len == 0) { return true; }
+    if (a.len == 0 || b.len == 0) { return false; }
+    let ida = canon_type_id(a);
+    let idb = canon_type_id(b);
+    if (ida == 0 || idb == 0) { return a == b; }
+    return ida == idb;
+}
+
+public fn canon_prim_count() -> i32 {
+    if (g_canon_prim_table == null) { return 0; }
+    return canon_table_next_id(g_canon_prim_table);
+}
+
+public fn canon_type_count() -> i32 {
+    if (g_canon_type_table == null) { return 0; }
+    return canon_table_next_id(g_canon_type_table);
+}
+
+public fn canon_trait_count() -> i32 {
+    if (g_canon_trait_table == null) { return 0; }
+    return canon_table_next_id(g_canon_trait_table);
+}
+
+public fn canon_trait_alias_count() -> i32 {
+    if (g_canon_trait_short_alias == null) { return 0; }
+    return canon_table_next_id(g_canon_trait_short_alias);
+}
+
+public fn canon_prim_name(id: i32) -> string {
+    return canon_table_name_for(g_canon_prim_table, id);
+}
+
+public fn canon_type_name(id: i32) -> string {
+    return canon_table_name_for(g_canon_type_table, id);
+}
+
+public fn canon_trait_name(id: i32) -> string {
+    return canon_table_name_for(g_canon_trait_table, id);
+}
+
+/// Diagnostic dump — prints per-domain `(id, name)` lines to stdout.
+/// Output format is line-stable so test harnesses can pipe it to
+/// `diff` against an expected baseline.  Returns the total entry
+/// count across the three domains (alias map excluded since alias ids
+/// are not first-class interns).
+public fn canon_dump() -> i32 {
+    canon_ensure();
+    var total: i32 = 0;
+    print("[canon-dump] prim:");
+    var i: i32 = 1;
+    let np = canon_prim_count();
+    while (i <= np) {
+        print("  prim " + i.toString() + " = " + canon_prim_name(i));
+        i = i + 1;
+        total = total + 1;
+    }
+    print("[canon-dump] type:");
+    i = 1;
+    let nt = canon_type_count();
+    while (i <= nt) {
+        print("  type " + i.toString() + " = " + canon_type_name(i));
+        i = i + 1;
+        total = total + 1;
+    }
+    print("[canon-dump] trait:");
+    i = 1;
+    let nr = canon_trait_count();
+    while (i <= nr) {
+        print("  trait " + i.toString() + " = " + canon_trait_name(i));
+        i = i + 1;
+        total = total + 1;
+    }
+    print("[canon-dump] aliases=" + canon_trait_alias_count().toString());
+    return total;
+}

@@ -1,0 +1,1220 @@
+module bootstrap.lexer;
+
+use std.string;
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.policy;
+
+/// Full lexical pass — behavior aligned with `src/Lexer/Lexer.cpp` + `Token.h`
+/// (`nextToken` / `scanToken` / comments / numbers / strings / punctuation).
+///
+/// Token slots and the `lex_source` result handle are packed heap blobs
+/// for the parser's rawptr API. New writes go through `TokenSlot` values
+/// (`token_slot_pack` / `token_slot_unpack`); remaining `tok_*` readers
+/// are the public parser surface. Remaining heap growth here is the token
+/// arena / result handle — not a local `*_dup_bytes` bypass.
+
+class TokenSlot {
+    public kind: i32
+    public line: i32
+    public col: i32
+    public char_value: i32
+    public lexeme_ptr: rawptr
+    public lexeme_len: i64
+    public doc_ptr: rawptr
+    public doc_len: i64
+}
+
+class LexResult {
+    public token_count: i32
+    public error_count: i32
+    public tokens_buf: rawptr
+}
+
+fn token_slot_bytes() -> i32 {
+    return 48;
+}
+
+fn lex_result_bytes() -> i32 {
+    return 16;
+}
+
+fn tok_kind(p: rawptr) -> i32 { return ast_read_i32(p); }
+fn tok_set_kind(p: rawptr, v: i32) { ast_write_i32(p, v); }
+fn tok_line(p: rawptr) -> i32 { return ast_read_i32(ptr_offset(p, 4)); }
+fn tok_set_line(p: rawptr, v: i32) { ast_write_i32(ptr_offset(p, 4), v); }
+fn tok_col(p: rawptr) -> i32 { return ast_read_i32(ptr_offset(p, 8)); }
+fn tok_set_col(p: rawptr, v: i32) { ast_write_i32(ptr_offset(p, 8), v); }
+fn tok_char_value(p: rawptr) -> i32 { return ast_read_i32(ptr_offset(p, 12)); }
+fn tok_set_char_value(p: rawptr, v: i32) { ast_write_i32(ptr_offset(p, 12), v); }
+fn tok_lexeme_ptr(p: rawptr) -> rawptr { return ast_read_rawptr(ptr_offset(p, 16)); }
+fn tok_set_lexeme_ptr(p: rawptr, v: rawptr) { ast_write_rawptr(ptr_offset(p, 16), v); }
+fn tok_lexeme_len(p: rawptr) -> i64 { return ast_read_i64(ptr_offset(p, 24)); }
+fn tok_set_lexeme_len(p: rawptr, v: i64) { ast_write_i64(ptr_offset(p, 24), v); }
+fn tok_doc_ptr(p: rawptr) -> rawptr { return ast_read_rawptr(ptr_offset(p, 32)); }
+fn tok_set_doc_ptr(p: rawptr, v: rawptr) { ast_write_rawptr(ptr_offset(p, 32), v); }
+fn tok_doc_len(p: rawptr) -> i64 { return ast_read_i64(ptr_offset(p, 40)); }
+fn tok_set_doc_len(p: rawptr, v: i64) { ast_write_i64(ptr_offset(p, 40), v); }
+
+fn lr_token_count(p: rawptr) -> i32 { return ast_read_i32(p); }
+fn lr_set_token_count(p: rawptr, v: i32) { ast_write_i32(p, v); }
+fn lr_error_count(p: rawptr) -> i32 { return ast_read_i32(ptr_offset(p, 4)); }
+fn lr_set_error_count(p: rawptr, v: i32) { ast_write_i32(ptr_offset(p, 4), v); }
+fn lr_tokens_buf(p: rawptr) -> rawptr { return ast_read_rawptr(ptr_offset(p, 8)); }
+fn lr_set_tokens_buf(p: rawptr, v: rawptr) { ast_write_rawptr(ptr_offset(p, 8), v); }
+
+fn token_slot_pack(dst: rawptr, rec: TokenSlot) {
+    if (dst == null) { return; }
+    tok_set_kind(dst, rec.kind);
+    tok_set_line(dst, rec.line);
+    tok_set_col(dst, rec.col);
+    tok_set_char_value(dst, rec.char_value);
+    tok_set_lexeme_ptr(dst, rec.lexeme_ptr);
+    tok_set_lexeme_len(dst, rec.lexeme_len);
+    tok_set_doc_ptr(dst, rec.doc_ptr);
+    tok_set_doc_len(dst, rec.doc_len);
+}
+
+fn token_slot_unpack(src: rawptr) -> TokenSlot {
+    if (src == null) {
+        return TokenSlot {
+            kind: 0,
+            line: 0,
+            col: 0,
+            char_value: 0,
+            lexeme_ptr: null,
+            lexeme_len: 0,
+            doc_ptr: null,
+            doc_len: 0
+        };
+    }
+    return TokenSlot {
+        kind: tok_kind(src),
+        line: tok_line(src),
+        col: tok_col(src),
+        char_value: tok_char_value(src),
+        lexeme_ptr: tok_lexeme_ptr(src),
+        lexeme_len: tok_lexeme_len(src),
+        doc_ptr: tok_doc_ptr(src),
+        doc_len: tok_doc_len(src)
+    };
+}
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn vyx_note_string_len(s: rawptr, len: i64);
+    fn vyx_dup_bytes_raw(s: rawptr, len: i64) -> rawptr;
+    fn vyx_free_bytes_raw(s: rawptr);
+    fn vyx_decode_string_escapes(raw: rawptr, n: i64) -> rawptr;
+    fn strlen(s: rawptr) -> u64;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Helpers — character classification (pure)
+// ════════════════════════════════════════════════════════════════════
+
+@[borrow_args]
+public fn sub_at(s: string, i: i32) -> i32 {
+    return s.charAt(i);
+}
+
+public fn is_alpha(c: i32) -> bool {
+    if (c >= 65 && c <= 90) { return true; }
+    if (c >= 97 && c <= 122) { return true; }
+    return false;
+}
+
+public fn is_digit(c: i32) -> bool {
+    if (c >= 48 && c <= 57) { return true; }
+    return false;
+}
+
+public fn is_alnum(c: i32) -> bool {
+    if (is_alpha(c)) { return true; }
+    if (is_digit(c)) { return true; }
+    if (c == 95) { return true; }
+    return false;
+}
+
+public fn is_ws(c: i32) -> bool {
+    if (c == 32) { return true; }
+    if (c == 9)  { return true; }
+    if (c == 10) { return true; }
+    if (c == 13) { return true; }
+    return false;
+}
+
+fn is_hex_digit(c: i32) -> bool {
+    if (is_digit(c)) { return true; }
+    if (c >= 65 && c <= 70) { return true; }
+    if (c >= 97 && c <= 102) { return true; }
+    return false;
+}
+
+/// Mirrors `Lexer::scanIdentifierOrKeyword` + `getKeywordMap()` in
+/// `src/Lexer/Lexer.cpp` / `Token.h`: `true`/`false` resolve to **BoolLiteral**
+/// before keyword lookup (same numeric kind).
+fn classify_ident(s: string) -> i32 {
+    return policy_keyword_kind(s);
+}
+
+fn quote_cooked_string_token(raw: string) -> string {
+    var out = "\"";
+    var i: i64 = 0;
+    while (i < raw.len) {
+        let c = raw.charAt(i as i32);
+        if (c == 92) {
+            out = out + "\\\\";
+        } else if (c == 34) {
+            out = out + "\\\"";
+        } else {
+            out = out + raw.substring(i as i32, (i + 1) as i32);
+        }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+// Scan source spelling, before escape decoding. Quotes and comments inside
+// an interpolation belong to its expression, not to the enclosing string.
+fn lexer_quoted_string_end(source: string, start: i32, quote: i32, nesting: i32) -> i32 {
+    if (nesting > 128) { return -1; }
+    var pos = start + 1;
+    while ((pos as i64) < source.len) {
+        let c = source.charAt(pos);
+        if (c == 92) {
+            pos = pos + 2;
+        } else if (c == quote) {
+            return pos;
+        } else if (c == 10 || c == 13) {
+            return -1;
+        } else if (quote == 34 && c == 36 && source.charAt(pos + 1) == 123) {
+            let end = lexer_interpolation_end(source, pos + 2, nesting + 1);
+            if (end < 0) { return -1; }
+            pos = end + 1;
+        } else {
+            pos = pos + 1;
+        }
+    }
+    return -1;
+}
+
+public fn lexer_interpolation_end(source: string, start: i32, nesting: i32) -> i32 {
+    if (nesting > 128) { return -1; }
+    var pos = start;
+    var depth: i32 = 1;
+    while ((pos as i64) < source.len) {
+        let c = source.charAt(pos);
+        let next = source.charAt(pos + 1);
+        var quoted = c == 34 || c == 39;
+        // Match the lexer's distinction between a character and 'label.
+        if (c == 39 && (is_alpha(next) || next == 95) && source.charAt(pos + 2) != 39) {
+            quoted = false;
+        }
+        if (quoted) {
+            let end = lexer_quoted_string_end(source, pos, c, nesting + 1);
+            if (end < 0) { return -1; }
+            pos = end + 1;
+        } else if (c == 47 && next == 47) {
+            pos = pos + 2;
+            while ((pos as i64) < source.len && source.charAt(pos) != 10) { pos = pos + 1; }
+        } else if (c == 47 && next == 42) {
+            pos = pos + 2;
+            var comment_depth: i32 = 1;
+            while ((pos as i64) < source.len && comment_depth > 0) {
+                if (source.charAt(pos) == 47 && source.charAt(pos + 1) == 42) {
+                    comment_depth = comment_depth + 1;
+                    pos = pos + 2;
+                } else if (source.charAt(pos) == 42 && source.charAt(pos + 1) == 47) {
+                    comment_depth = comment_depth - 1;
+                    pos = pos + 2;
+                } else { pos = pos + 1; }
+            }
+            if (comment_depth != 0) { return -1; }
+        } else {
+            if (c == 123) { depth = depth + 1; }
+            if (c == 125) {
+                depth = depth - 1;
+                if (depth == 0) { return pos; }
+            }
+            pos = pos + 1;
+        }
+    }
+    return -1;
+}
+
+fn slot_at(buf: rawptr, idx: i32) -> rawptr {
+    return buf + (idx * token_slot_bytes());
+}
+
+// Parser AST nodes retain borrowed slices returned by token_lexeme() and
+// token_doc_comment(). Token storage therefore has compilation-unit lifetime,
+// rather than lexer-handle lifetime. Lexeme bytes go through `ast_dup_c_string`
+// (EXE CRT) so dispose does not free them.
+
+// ════════════════════════════════════════════════════════════════════
+//   Lexer — private builder, used only inside lex_source().
+//   All mutating operations are instance methods on `self` so the
+//   host's class-by-value param copy never strands a mutation.
+// ════════════════════════════════════════════════════════════════════
+
+class Lexer {
+    public source: string
+    public pos: i32
+    public line: i32
+    public col: i32
+    public tokens_buf: rawptr
+    public token_count: i32
+    public cap: i32
+    public error_count: i32
+    public token_start: i32
+    public token_start_line: i32
+    public token_start_col: i32
+    public pending_doc: string
+
+    public static fn create(src: string) -> Lexer {
+        let initial_cap: i32 = 64;
+        let buf = malloc((initial_cap * token_slot_bytes()) as u64);
+        return Lexer {
+            source: src,
+            pos: 0,
+            line: 1,
+            col: 1,
+            tokens_buf: buf,
+            token_count: 0,
+            cap: initial_cap,
+            error_count: 0,
+            token_start: 0,
+            token_start_line: 1,
+            token_start_col: 1,
+            pending_doc: ""
+        };
+    }
+
+    public fn at_end(self) -> bool {
+        return (self.pos as i64) >= self.source.len;
+    }
+
+    public fn peek(self) -> i32 {
+        if (self.at_end()) { return 0; }
+        return sub_at(self.source, self.pos);
+    }
+
+    public fn peek_next(self) -> i32 {
+        let np = self.pos + 1;
+        if ((np as i64) >= self.source.len) { return 0; }
+        return sub_at(self.source, np);
+    }
+
+    public fn starts_with_at(self, at: i32, needle: string) -> bool {
+        let n = needle.len;
+        if ((at as i64) + n > self.source.len) { return false; }
+        var i: i32 = 0;
+        while ((i as i64) < n) {
+            if (sub_at(self.source, at + i) != needle.charAt(i)) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    public fn consume_exact(self, text: string) -> bool {
+        if (!self.starts_with_at(self.pos, text)) { return false; }
+        var i: i64 = 0;
+        while (i < text.len) {
+            self.advance_lc();
+            i = i + 1;
+        }
+        return true;
+    }
+
+    public fn consume_int_suffix(self) {
+        if (self.consume_exact("isize")) { return; }
+        if (self.consume_exact("usize")) { return; }
+        if (self.consume_exact("i64")) { return; }
+        if (self.consume_exact("i32")) { return; }
+        if (self.consume_exact("i16")) { return; }
+        if (self.consume_exact("i8")) { return; }
+        if (self.consume_exact("u64")) { return; }
+        if (self.consume_exact("u32")) { return; }
+        if (self.consume_exact("u16")) { return; }
+        if (self.consume_exact("u8")) { return; }
+    }
+
+    /// `Lexer::advance` — consume current char, update line/col, return it.
+    public fn advance_lc(self) -> i32 {
+        if (self.at_end()) { return 0; }
+        let c = self.peek();
+        if (c == 10) {
+            self.line = self.line + 1;
+            self.col = 1;
+        } else {
+            self.col = self.col + 1;
+        }
+        self.pos = self.pos + 1;
+        return c;
+    }
+
+    /// `Lexer::match`
+    public fn match_ch(self, expected: i32) -> bool {
+        if (!self.at_end() && self.peek() == expected) {
+            self.advance_lc();
+            return true;
+        }
+        return false;
+    }
+
+    public fn grow_buf(self) {
+        let new_cap: i32 = self.cap * 2;
+        let new_buf = malloc((new_cap * token_slot_bytes()) as u64);
+        if (self.tokens_buf != null) {
+            memcpy(new_buf, self.tokens_buf, (self.token_count * token_slot_bytes()) as u64);
+            free(self.tokens_buf);
+        }
+        self.tokens_buf = new_buf;
+        self.cap = new_cap;
+    }
+
+    public fn push_token(self, kind: i32, lexeme: string, line: i32, col: i32) {
+        if (self.token_count >= self.cap) {
+            self.grow_buf();
+        }
+        let slot = slot_at(self.tokens_buf, self.token_count);
+        let n: i64 = lexeme.len;
+        let copy = ast_dup_c_string(lexeme);
+        token_slot_pack(slot, TokenSlot {
+            kind: kind,
+            line: line,
+            col: col,
+            char_value: 0,
+            lexeme_ptr: copy,
+            lexeme_len: n,
+            doc_ptr: null,
+            doc_len: 0
+        });
+        self.token_count = self.token_count + 1;
+    }
+
+    /// `Lexer::nextToken`: attach accumulated `///` lines to the token just produced.
+    public fn flush_pending_doc_to_last(self) {
+        if (self.token_count <= 0) {
+            return;
+        }
+        if (self.pending_doc.len == 0) {
+            return;
+        }
+        let slot = slot_at(self.tokens_buf, self.token_count - 1);
+        let n: i64 = self.pending_doc.len;
+        let copy = ast_dup_c_string(self.pending_doc);
+        if (copy == null) { return; }
+        var rec = token_slot_unpack(slot);
+        rec.doc_ptr = copy;
+        rec.doc_len = n;
+        token_slot_pack(slot, rec);
+        self.pending_doc = "";
+    }
+
+    public fn report_error_at(self,
+                              code: string,
+                              line: i32,
+                              col: i32,
+                              msg: string) {
+        diag_emit(diag_sev_ERROR(), code, line, col, msg);
+        self.error_count = self.error_count + 1;
+    }
+
+    public fn report_error(self, code: string, msg: string) {
+        self.report_error_at(code, self.token_start_line, self.token_start_col, msg);
+    }
+
+    public fn push_slice(self, kind: i32) {
+        let lx = str_view_range(self.source, self.token_start, self.pos);
+        self.push_token(kind, lx, self.token_start_line, self.token_start_col);
+    }
+
+    public fn skip_whitespace_and_comments(self) {
+        self.pending_doc = "";
+        while (!self.at_end()) {
+            let c = self.peek();
+            if (c == 32 || c == 9 || c == 13 || c == 10) {
+                self.advance_lc();
+            } else if (c == 47 && self.peek_next() == 47) {
+                var is_doc: bool = false;
+                if (((self.pos + 2) as i64) < self.source.len) {
+                    if (sub_at(self.source, self.pos + 2) == 47) { is_doc = true; }
+                }
+                if (is_doc) {
+                    self.advance_lc();
+                    self.advance_lc();
+                    self.advance_lc();
+                    if (!self.at_end() && self.peek() == 32) {
+                        self.advance_lc();
+                    }
+                    let text_start = self.pos;
+                    while (!self.at_end() && self.peek() != 10) {
+                        self.advance_lc();
+                    }
+                    let line_txt = str_view_range(self.source, text_start, self.pos);
+                    if (self.pending_doc.len > 0) {
+                        self.pending_doc = self.pending_doc + "\n";
+                    }
+                    self.pending_doc = self.pending_doc + line_txt;
+                } else {
+                    while (!self.at_end() && self.peek() != 10) {
+                        self.advance_lc();
+                    }
+                }
+            } else if (c == 47 && self.peek_next() == 42) {
+                self.advance_lc();
+                self.advance_lc();
+                var depth: i32 = 1;
+                while (!self.at_end() && depth > 0) {
+                    if (self.peek() == 47 && self.peek_next() == 42) {
+                        self.advance_lc();
+                        self.advance_lc();
+                        depth = depth + 1;
+                    } else if (self.peek() == 42 && self.peek_next() == 47) {
+                        self.advance_lc();
+                        self.advance_lc();
+                        depth = depth - 1;
+                    } else {
+                        self.advance_lc();
+                    }
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// `Lexer::parseEscapeChar` — caller positioned at `\` (consumes it here).
+    public fn parse_escape_char_lex(self) {
+        self.advance_lc();
+        if (self.at_end()) { return; }
+        let c = self.peek();
+        self.advance_lc();
+        if (c == 110 || c == 116 || c == 114 || c == 92 || c == 34 || c == 39 || c == 48 || c == 36) {
+            return;
+        }
+        self.report_error_at(diag_code_lex_invalid_escape(),
+                             self.line,
+                             self.col - 1,
+                             "unknown escape sequence");
+    }
+
+    /// Consume a `"..."` string body. Returns true when the body contains a
+    /// `${...}` interpolation segment. The baseline lexer still emits a normal
+    /// string token; parser/codegen decide whether it becomes interpolation.
+    public fn scan_string_body(self) -> bool {
+        var has_interp: bool = false;
+        while (!self.at_end() && self.peek() != 34) {
+            if (self.peek() == 10) {
+                self.report_error(diag_code_lex_unterminated_string(),
+                                  "unterminated string literal");
+                return has_interp;
+            }
+            if (self.peek() == 92) {
+                self.parse_escape_char_lex();
+            } else if (self.peek() == 36 && self.peek_next() == 123) {
+                has_interp = true;
+                self.advance_lc();
+                self.advance_lc();
+                let end = lexer_interpolation_end(self.source, self.pos, 0);
+                if (end < 0) {
+                    self.report_error(diag_code_lex_unterminated_string(),
+                                      "unterminated string interpolation");
+                    while (!self.at_end()) { self.advance_lc(); }
+                    return has_interp;
+                }
+                while (self.pos <= end) { self.advance_lc(); }
+            } else {
+                self.advance_lc();
+            }
+        }
+        if (self.at_end()) {
+            self.report_error(diag_code_lex_unterminated_string(),
+                              "unterminated string literal");
+        } else {
+            self.advance_lc();
+        }
+        return has_interp;
+    }
+
+    /// Consume a `'<char>'` literal body. Returns the decoded i32 codepoint
+    /// (post-escape) so the caller can stash it into the token slot's pad.
+    /// On error the codepoint defaults to 0 and `error_count` bumps.
+    public fn scan_char_body(self) -> i32 {
+        var value: i32 = 0;
+        if (!self.at_end() && self.peek() == 92) {
+            self.advance_lc();
+            if (!self.at_end()) {
+                let esc = self.peek();
+                self.advance_lc();
+                if (esc == 110)      { value = 10; }
+                else if (esc == 116) { value = 9; }
+                else if (esc == 114) { value = 13; }
+                else if (esc == 92)  { value = 92; }
+                else if (esc == 34)  { value = 34; }
+                else if (esc == 39)  { value = 39; }
+                else if (esc == 48)  { value = 0; }
+                else if (esc == 36)  { value = 36; }
+                else {
+                    self.report_error_at(diag_code_lex_invalid_escape(),
+                                         self.line,
+                                         self.col - 1,
+                                         "unknown escape sequence in character literal");
+                    value = esc;
+                }
+            }
+        } else if (!self.at_end()) {
+            value = self.peek();
+            self.advance_lc();
+        }
+        if (self.at_end() || self.peek() != 39) {
+            self.report_error(diag_code_lex_unterminated_char(),
+                              "unterminated character literal");
+        } else {
+            self.advance_lc();
+        }
+        return value;
+    }
+
+    public fn scan_multiline_string(self) {
+        self.advance_lc();
+        self.advance_lc();
+        var value: string = "";
+        while (!self.at_end()) {
+            if (self.peek() == 34
+                && ((self.pos + 1) as i64) < self.source.len
+                && sub_at(self.source, self.pos + 1) == 34
+                && ((self.pos + 2) as i64) < self.source.len
+                && sub_at(self.source, self.pos + 2) == 34) {
+                self.advance_lc();
+                self.advance_lc();
+                self.advance_lc();
+                var work: string = value.substring(0, value.len as i32);
+                let n = work.len;
+                if (n > 0 && sub_at(work, 0) == 10) {
+                    work = work.substring(1, n as i32);
+                }
+                let n2 = work.len;
+                if (n2 > 0 && sub_at(work, (n2 - 1) as i32) == 10) {
+                    work = work.substring(0, (n2 - 1) as i32);
+                }
+                var min_indent: i32 = 1000000000;
+                var p: i64 = 0;
+                while (p < work.len) {
+                    var indent: i32 = 0;
+                    while (p < work.len) {
+                        let ch = sub_at(work, p as i32);
+                        if (ch == 32 || ch == 9) {
+                            indent = indent + 1;
+                            p = p + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (p < work.len && sub_at(work, p as i32) != 10) {
+                        if (indent < min_indent) { min_indent = indent; }
+                    }
+                    while (p < work.len && sub_at(work, p as i32) != 10) {
+                        p = p + 1;
+                    }
+                    if (p < work.len) { p = p + 1; }
+                }
+                if (min_indent > 0 && min_indent < 1000000000) {
+                    var dedented: string = "";
+                    p = 0;
+                    while (p < work.len) {
+                        var skip: i32 = 0;
+                        while ((skip as i64) < (min_indent as i64)
+                            && (p + (skip as i64)) < work.len) {
+                            let ch2 = sub_at(work, (p + skip) as i32);
+                            if (ch2 == 32 || ch2 == 9) {
+                                skip = skip + 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        p = p + (skip as i64);
+                        while (p < work.len) {
+                            let ch3 = sub_at(work, p as i32);
+                            let frag = work.substring(p as i32, (p + 1) as i32);
+                            dedented = dedented + frag;
+                            if (ch3 == 10) {
+                                p = p + 1;
+                                break;
+                            }
+                            p = p + 1;
+                        }
+                    }
+                    work = dedented;
+                }
+                self.push_token(tk_STRING(),
+                                quote_cooked_string_token(work),
+                                self.token_start_line,
+                                self.token_start_col);
+                return;
+            }
+            let op = self.pos;
+            self.advance_lc();
+            value = intern_cat2(value, str_view_range(self.source, op, self.pos));
+        }
+        self.report_error(diag_code_lex_unterminated_string(),
+                          "unterminated multi-line string literal");
+        self.push_slice(tk_INVALID());
+    }
+
+    public fn scan_identifier_rest(self) {
+        while (!self.at_end() && is_alnum(self.peek())) {
+            self.advance_lc();
+        }
+        let lexeme = str_view_range(self.source, self.token_start, self.pos);
+        let kind = classify_ident(lexeme);
+        self.push_token(kind, lexeme, self.token_start_line, self.token_start_col);
+    }
+
+    // A digit sequence may not silently hand its tail to the identifier
+    // scanner.  Without this guard, `0b102`, `1e+`, and `42i` become several
+    // unrelated tokens and the parser reports a misleading follow-on error.
+    fn consume_invalid_number_tail(self) {
+        while (!self.at_end() && (is_alnum(self.peek()) || self.peek() == 95)) {
+            self.advance_lc();
+        }
+    }
+
+    fn report_invalid_number(self, reason: string) {
+        self.consume_invalid_number_tail();
+        let lexeme = str_view_range(self.source, self.token_start, self.pos);
+        self.report_error_at(diag_code_lex_unexpected_char(),
+                             self.token_start_line,
+                             self.token_start_col,
+                             "invalid numeric literal `" + lexeme + "`: " + reason);
+        self.push_slice(tk_INVALID());
+    }
+
+    public fn scan_number_rest(self) {
+        var is_float: bool = false;
+        var digit_count: i32 = 0;
+        let z = sub_at(self.source, self.token_start);
+        if (z == 48 && (self.peek() == 120 || self.peek() == 88)) {
+            self.advance_lc();
+            while (!self.at_end() && is_hex_digit(self.peek())) {
+                self.advance_lc();
+                digit_count = digit_count + 1;
+            }
+            if (digit_count == 0) {
+                self.report_invalid_number("base-16 prefix must be followed by at least one digit");
+                return;
+            }
+            self.consume_int_suffix();
+            if (!self.at_end() && (is_alnum(self.peek()) || self.peek() == 95)) {
+                self.report_invalid_number("unexpected characters after the literal");
+                return;
+            }
+        } else if (z == 48 && (self.peek() == 98 || self.peek() == 66)) {
+            self.advance_lc();
+            while (!self.at_end() && (self.peek() == 48 || self.peek() == 49)) {
+                self.advance_lc();
+                digit_count = digit_count + 1;
+            }
+            if (digit_count == 0) {
+                self.report_invalid_number("base-2 prefix must be followed by at least one digit");
+                return;
+            }
+            self.consume_int_suffix();
+            if (!self.at_end() && (is_alnum(self.peek()) || self.peek() == 95)) {
+                self.report_invalid_number("digit is not valid for this base or the suffix is malformed");
+                return;
+            }
+        } else if (z == 48 && (self.peek() == 111 || self.peek() == 79)) {
+            self.advance_lc();
+            while (!self.at_end() && self.peek() >= 48 && self.peek() <= 55) {
+                self.advance_lc();
+                digit_count = digit_count + 1;
+            }
+            if (digit_count == 0) {
+                self.report_invalid_number("base-8 prefix must be followed by at least one digit");
+                return;
+            }
+            self.consume_int_suffix();
+            if (!self.at_end() && (is_alnum(self.peek()) || self.peek() == 95)) {
+                self.report_invalid_number("digit is not valid for this base or the suffix is malformed");
+                return;
+            }
+        } else {
+            while (!self.at_end() && is_digit(self.peek())) {
+                self.advance_lc();
+            }
+            if (self.peek() == 46 && is_digit(self.peek_next())) {
+                is_float = true;
+                self.advance_lc();
+                while (!self.at_end() && is_digit(self.peek())) {
+                    self.advance_lc();
+                }
+            }
+            if (self.peek() == 101 || self.peek() == 69) {
+                is_float = true;
+                self.advance_lc();
+                if (self.peek() == 43 || self.peek() == 45) {
+                    self.advance_lc();
+                }
+                digit_count = 0;
+                while (!self.at_end() && is_digit(self.peek())) {
+                    self.advance_lc();
+                    digit_count = digit_count + 1;
+                }
+                if (digit_count == 0) {
+                    self.report_invalid_number("exponent must contain at least one digit");
+                    return;
+                }
+            }
+
+            if (is_float) {
+                // Float suffixes are not part of the Vyx lexical contract;
+                // reject them as one token instead of leaving an identifier.
+                if (!self.at_end() && (is_alpha(self.peek()) || self.peek() == 95)) {
+                    self.report_invalid_number("unexpected characters after the floating-point literal");
+                    return;
+                }
+            } else {
+                self.consume_int_suffix();
+                if (!self.at_end() && (is_alpha(self.peek()) || self.peek() == 95)) {
+                    self.report_invalid_number("integer suffix is not recognised");
+                    return;
+                }
+            }
+        }
+        if (is_float) {
+            self.push_slice(tk_FLOAT());
+        } else {
+            self.push_slice(tk_INT());
+        }
+    }
+
+    public fn scan_token_push(self) {
+        let c = self.advance_lc();
+        if (c == 40)  { self.push_slice(tk_LPAREN());   return; }
+        if (c == 41)  { self.push_slice(tk_RPAREN());   return; }
+        if (c == 123) { self.push_slice(tk_LBRACE());   return; }
+        if (c == 125) { self.push_slice(tk_RBRACE());   return; }
+        if (c == 91)  { self.push_slice(tk_LBRACKET()); return; }
+        if (c == 93)  { self.push_slice(tk_RBRACKET()); return; }
+        if (c == 44)  { self.push_slice(tk_COMMA());    return; }
+        if (c == 59)  { self.push_slice(tk_SEMI());     return; }
+        if (c == 126) { self.push_slice(98);            return; }
+        if (c == 64)  { self.push_slice(134);           return; }
+        if (c == 63) {
+            if (self.match_ch(63)) { self.push_slice(119); } else { self.push_slice(118); }
+            return;
+        }
+        if (c == 94) {
+            if (self.match_ch(61)) { self.push_slice(tk_CARETEQ()); } else { self.push_slice(tk_CARET()); }
+            return;
+        }
+        if (c == 46) {
+            if (self.match_ch(46)) {
+                if (self.match_ch(46)) { self.push_slice(116); }
+                else if (self.match_ch(61)) { self.push_slice(115); }
+                else { self.push_slice(114); }
+            } else {
+                self.push_slice(tk_DOT());
+            }
+            return;
+        }
+        if (c == 58) {
+            if (self.match_ch(58)) { self.push_slice(117); } else { self.push_slice(tk_COLON()); }
+            return;
+        }
+        if (c == 43) {
+            if (self.match_ch(43)) { self.push_slice(121); }
+            else if (self.match_ch(61)) { self.push_slice(102); }
+            else { self.push_slice(tk_PLUS()); }
+            return;
+        }
+        if (c == 45) {
+            if (self.match_ch(45)) { self.push_slice(122); }
+            else if (self.match_ch(62)) { self.push_slice(tk_ARROW()); }
+            else if (self.match_ch(61)) { self.push_slice(103); }
+            else { self.push_slice(tk_MINUS()); }
+            return;
+        }
+        if (c == 42) {
+            if (self.match_ch(61)) { self.push_slice(104); } else { self.push_slice(tk_STAR()); }
+            return;
+        }
+        if (c == 47) {
+            if (self.match_ch(61)) { self.push_slice(105); } else { self.push_slice(tk_SLASH()); }
+            return;
+        }
+        if (c == 37) {
+            if (self.match_ch(61)) { self.push_slice(106); } else { self.push_slice(85); }
+            return;
+        }
+        if (c == 61) {
+            if (self.match_ch(61)) { self.push_slice(tk_EQEQ()); }
+            else if (self.match_ch(62)) { self.push_slice(113); }
+            else if (self.match_ch(126)) { self.push_slice(120); }
+            else { self.push_slice(tk_EQ()); }
+            return;
+        }
+        if (c == 33) {
+            if (self.match_ch(61)) { self.push_slice(tk_NEQ()); } else { self.push_slice(tk_NOT()); }
+            return;
+        }
+        if (c == 60) {
+            if (self.match_ch(60)) {
+                if (self.match_ch(61)) { self.push_slice(tk_LSHIFTEQ()); } else { self.push_slice(tk_LSHIFT()); }
+            } else if (self.match_ch(61)) {
+                self.push_slice(tk_LE());
+            } else {
+                self.push_slice(tk_LT());
+            }
+            return;
+        }
+        if (c == 62) {
+            if (self.match_ch(62)) {
+                if (self.match_ch(61)) { self.push_slice(tk_RSHIFTEQ()); } else { self.push_slice(tk_RSHIFT()); }
+            } else if (self.match_ch(61)) {
+                self.push_slice(tk_GE());
+            } else {
+                self.push_slice(tk_GT());
+            }
+            return;
+        }
+        if (c == 38) {
+            if (self.match_ch(38)) { self.push_slice(tk_AND()); }
+            else if (self.match_ch(61)) { self.push_slice(tk_AMPEQ()); }
+            else { self.push_slice(tk_AMP()); }
+            return;
+        }
+        if (c == 124) {
+            if (self.match_ch(124)) { self.push_slice(tk_OR()); }
+            else if (self.match_ch(62)) { self.push_slice(tk_PIPEARROW()); }
+            else if (self.match_ch(61)) { self.push_slice(tk_PIPEEQ()); }
+            else { self.push_slice(tk_PIPE()); }
+            return;
+        }
+        if (c == 34) {
+            if (self.peek() == 34
+                && ((self.pos + 1) as i64) < self.source.len
+                && sub_at(self.source, self.pos + 1) == 34) {
+                self.scan_multiline_string();
+            } else {
+                self.scan_string_body();
+                self.push_slice(tk_STRING());
+            }
+            return;
+        }
+        if (c == 102 && self.peek() == 34 && self.peek_next() != 34) {
+            self.token_start = self.pos;
+            self.token_start_line = self.line;
+            self.token_start_col = self.col;
+            self.advance_lc();
+            self.scan_string_body();
+            self.push_slice(tk_FSTRING_RAW());
+            return;
+        }
+        if (c == 39) {
+            // Label: 'identifier  vs  char literal: 'x'
+            // If next char is alpha/_ AND the char after that is NOT ', treat as label.
+            // If next char is alpha/_ AND the char after that IS ', it's a single-char literal.
+            if (!self.at_end() && (is_alpha(self.peek()) || self.peek() == 95)) {
+                let np = self.pos + 1;
+                var after = 0;
+                if ((np as i64) < self.source.len) { after = sub_at(self.source, np); }
+                if (after != 39) {
+                    // Multi-char label like 'outer:
+                    self.token_start = self.pos;        // lexeme starts at identifier char
+                    self.token_start_line = self.line;   // ' was at (line, col-1)
+                    self.token_start_col = self.col - 1;
+                    self.scan_identifier_rest();         // consumes identifier chars
+                    return;
+                }
+            }
+            let cv = self.scan_char_body();
+            self.push_slice(tk_CHAR_LIT());
+            // Stash the decoded codepoint into the just-pushed slot's pad
+            // (offset 12..15) so a later parser pass can read it via
+            // `token_char_value(slot)` without re-scanning escapes.
+            if (self.token_count > 0) {
+                let last_slot = slot_at(self.tokens_buf, self.token_count - 1);
+                tok_set_char_value(last_slot, cv);
+            }
+            return;
+        }
+        if (is_alpha(c) || c == 95) {
+            self.scan_identifier_rest();
+            return;
+        }
+        if (is_digit(c)) {
+            self.scan_number_rest();
+            return;
+        }
+        self.report_error(diag_code_lex_unexpected_char(),
+                          "unexpected character `" + str_view_range(self.source, self.token_start, self.pos) + "`");
+        self.push_slice(tk_INVALID());
+    }
+
+    public fn run(self) {
+        var iters: i32 = 0;
+        var last_pos: i32 = -1;
+        let iter_cap = self.source.len + 1024;
+        while (true) {
+            self.skip_whitespace_and_comments();
+            self.token_start = self.pos;
+            self.token_start_line = self.line;
+            self.token_start_col = self.col;
+            if (self.at_end()) {
+                self.pending_doc = "";
+                self.push_token(tk_EOF(), "", self.line, self.col);
+                return;
+            }
+            if (iters > 0 && self.pos == last_pos) {
+                self.report_error_at(diag_code_internal(),
+                                     self.line,
+                                     self.col,
+                                     "lexer failed to make progress");
+                return;
+            }
+            last_pos = self.pos;
+            self.scan_token_push();
+            self.flush_pending_doc_to_last();
+            iters = iters + 1;
+            if ((iters as i64) > iter_cap) {
+                self.report_error_at(diag_code_internal(),
+                                     self.line,
+                                     self.col,
+                                     "lexer iteration limit exceeded");
+                return;
+            }
+        }
+    }
+}
+
+/// Decode the recognized bootstrap escape sequences inside a raw string
+/// literal. Pure (no Lexer state).
+fn decode_string_escapes(raw: string) -> string {
+    if (raw.len == 0) { return ""; }
+    let p = vyx_decode_string_escapes(raw.c_str(), raw.len);
+    if (p == null) { return ""; }
+    return from_cstr_view_len(p, strlen(p) as i64);
+}
+
+/// Turn a `StringLiteral` token lexeme (host shape: includes `"` delimiters
+/// and escape sequences as in source) into the cooked bytes the parser/AST
+/// expect. See `Lexer::scanString` + `Token::text` in the C++ baseline.
+public fn string_token_to_cooked(lex: string) -> string {
+    let n: i64 = lex.len;
+    if (n >= 2) {
+        if (sub_at(lex, 0) == 34 && sub_at(lex, (n - 1) as i32) == 34) {
+            let inner = lex.substring(1, (n - 1) as i32);
+            return decode_string_escapes(inner);
+        }
+    }
+    return decode_string_escapes(lex);
+}
+
+/// One line per token, same fields as `src/main.cpp` when `dumpTokens` is
+/// set: `path:line:col kind 'lexeme'`
+public fn dump_tokens_host_lines(handle: rawptr, path_for_loc: string) {
+    if (handle == null) { return; }
+    let count = lex_token_count(handle);
+    let buf = lex_tokens_buf(handle);
+    if (buf == null) { return; }
+    var i: i32 = 0;
+    while (i < count) {
+        let slot = slot_at(buf, i);
+        let k = token_kind(slot);
+        let l = token_line(slot);
+        let c = token_col(slot);
+        let lex = token_lexeme(slot);
+        print(path_for_loc + ":" + l.toString() + ":" + c.toString() + " " + k.toString() + " '" + lex + "'");
+        i = i + 1;
+    }
+}
+
+// Public API returns a heap `LexResult` so parser/sema keep a rawptr handle.
+
+public fn lex_source(src: string) -> rawptr {
+    return lex_source_at(src, 1, 1);
+}
+
+public fn lex_source_at(src: string, line: i32, col: i32) -> rawptr {
+    let lx = Lexer.create(src);
+    lx.line = line;
+    lx.col = col;
+    lx.run();
+    let h = malloc(lex_result_bytes() as u64);
+    if (h == null) { return null; }
+    memset(h, 0, lex_result_bytes() as u64);
+    lr_set_token_count(h, lx.token_count);
+    lr_set_error_count(h, lx.error_count);
+    lr_set_tokens_buf(h, lx.tokens_buf);
+    return h;
+}
+
+public fn lex_token_count(handle: rawptr) -> i32 {
+    if (handle == null) { return 0; }
+    return lr_token_count(handle);
+}
+
+public fn lex_error_count(handle: rawptr) -> i32 {
+    if (handle == null) { return 0; }
+    return lr_error_count(handle);
+}
+
+public fn lex_tokens_buf(handle: rawptr) -> rawptr {
+    if (handle == null) { return null; }
+    return lr_tokens_buf(handle);
+}
+
+/// Return the rawptr address of the slot at `idx` inside the lex result's
+/// token buffer. Bounds-checked: returns null when out of range.
+public fn lex_token_at(handle: rawptr, idx: i32) -> rawptr {
+    if (handle == null) { return null; }
+    let count = lr_token_count(handle);
+    if (idx < 0 || idx >= count) { return null; }
+    return slot_at(lr_tokens_buf(handle), idx);
+}
+
+public fn token_kind(t: rawptr) -> i32 {
+    if (t == null) { return tk_EOF(); }
+    return tok_kind(t);
+}
+
+public fn token_lexeme(t: rawptr) -> string {
+    if (t == null) { return ""; }
+    let buf = tok_lexeme_ptr(t);
+    let n = tok_lexeme_len(t);
+    if (buf == null || n <= 0) { return ""; }
+    return from_cstr_view_len(buf, n);
+}
+
+public fn token_line(t: rawptr) -> i32 {
+    if (t == null) { return 0; }
+    return tok_line(t);
+}
+
+public fn token_col(t: rawptr) -> i32 {
+    if (t == null) { return 0; }
+    return tok_col(t);
+}
+
+/// Decoded i32 codepoint payload — populated by `scan_char_body` into
+/// offset 12 of the token slot. Returns 0 for non-char tokens.
+public fn token_char_value(t: rawptr) -> i32 {
+    if (t == null) { return 0; }
+    return tok_char_value(t);
+}
+
+/// Cooked `///` doc attached by `flush_pending_doc_to_last` (same role as `Token::docComment`).
+public fn token_doc_comment(t: rawptr) -> string {
+    if (t == null) { return ""; }
+    let buf = tok_doc_ptr(t);
+    let n = tok_doc_len(t);
+    if (buf == null || n <= 0) { return ""; }
+    return from_cstr_view_len(buf, n);
+}
+
+public fn lexer_dispose(handle: rawptr) -> i32 {
+    if (handle == null) { return 0; }
+    let buf = lex_tokens_buf(handle);
+    if (buf == null) { free(handle); return 0; }
+    // Do not free lexeme/doc backing bytes here. Parser AST fields borrow
+    // them, and AST nodes intentionally live through semantic analysis and
+    // lowering. The compiler process owns this parse arena until exit.
+    free(buf);
+    free(handle);
+    return 0;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//   Debug helpers
+// ════════════════════════════════════════════════════════════════════
+
+public fn token_kind_name(kind: i32) -> string {
+    if (kind == tk_IDENT())              { return "TK_IDENT"; }
+    if (kind == tk_INT())                { return "TK_INT"; }
+    if (kind == tk_STRING())             { return "TK_STRING"; }
+    if (kind == tk_BOOL())               { return "TK_BOOL"; }
+    if (kind == tk_NULL())               { return "TK_NULL"; }
+    if (kind == tk_KEYWORD_FN())         { return "TK_KEYWORD_FN"; }
+    if (kind == tk_KEYWORD_LET())        { return "TK_KEYWORD_LET"; }
+    if (kind == tk_KEYWORD_VAR())        { return "TK_KEYWORD_VAR"; }
+    if (kind == tk_KEYWORD_IF())         { return "TK_KEYWORD_IF"; }
+    if (kind == tk_KEYWORD_ELIF())       { return "TK_KEYWORD_ELIF"; }
+    if (kind == tk_KEYWORD_ELSE())       { return "TK_KEYWORD_ELSE"; }
+    if (kind == tk_KEYWORD_WHILE())      { return "TK_KEYWORD_WHILE"; }
+    if (kind == tk_KEYWORD_BREAK())      { return "TK_KEYWORD_BREAK"; }
+    if (kind == tk_KEYWORD_CONTINUE())   { return "TK_KEYWORD_CONTINUE"; }
+    if (kind == tk_KEYWORD_RETURN())     { return "TK_KEYWORD_RETURN"; }
+    if (kind == tk_KEYWORD_CLASS())      { return "TK_KEYWORD_CLASS"; }
+    if (kind == tk_KEYWORD_PUBLIC())     { return "TK_KEYWORD_PUBLIC"; }
+    if (kind == tk_KEYWORD_STATIC())     { return "TK_KEYWORD_STATIC"; }
+    if (kind == tk_KEYWORD_EXTERN())     { return "TK_KEYWORD_EXTERN"; }
+    if (kind == tk_KEYWORD_IMPORT())     { return "TK_KEYWORD_IMPORT"; }
+    if (kind == tk_KEYWORD_USE())        { return "TK_KEYWORD_USE"; }
+    if (kind == tk_KEYWORD_MODULE())     { return "TK_KEYWORD_MODULE"; }
+    if (kind == tk_LPAREN())   { return "TK_LPAREN"; }
+    if (kind == tk_RPAREN())   { return "TK_RPAREN"; }
+    if (kind == tk_LBRACE())   { return "TK_LBRACE"; }
+    if (kind == tk_RBRACE())   { return "TK_RBRACE"; }
+    if (kind == tk_LBRACKET()) { return "TK_LBRACKET"; }
+    if (kind == tk_RBRACKET()) { return "TK_RBRACKET"; }
+    if (kind == tk_COMMA())    { return "TK_COMMA"; }
+    if (kind == tk_SEMI())     { return "TK_SEMI"; }
+    if (kind == tk_COLON())    { return "TK_COLON"; }
+    if (kind == tk_DOT())      { return "TK_DOT"; }
+    if (kind == tk_ARROW())    { return "TK_ARROW"; }
+    if (kind == tk_PLUS())     { return "TK_PLUS"; }
+    if (kind == tk_MINUS())    { return "TK_MINUS"; }
+    if (kind == tk_STAR())     { return "TK_STAR"; }
+    if (kind == tk_SLASH())    { return "TK_SLASH"; }
+    if (kind == tk_EQ())       { return "TK_EQ"; }
+    if (kind == tk_EQEQ())     { return "TK_EQEQ"; }
+    if (kind == tk_NEQ())      { return "TK_NEQ"; }
+    if (kind == tk_LT())       { return "TK_LT"; }
+    if (kind == tk_LE())       { return "TK_LE"; }
+    if (kind == tk_GT())       { return "TK_GT"; }
+    if (kind == tk_GE())       { return "TK_GE"; }
+    if (kind == tk_AND())      { return "TK_AND"; }
+    if (kind == tk_OR())       { return "TK_OR"; }
+    if (kind == tk_NOT())      { return "TK_NOT"; }
+    if (kind == tk_AMP())      { return "TK_AMP"; }
+    if (kind == tk_LSHIFTEQ()) { return "TK_LSHIFTEQ"; }
+    if (kind == tk_RSHIFTEQ()) { return "TK_RSHIFTEQ"; }
+    if (kind == tk_AMPEQ())    { return "TK_AMPEQ"; }
+    if (kind == tk_PIPEEQ())   { return "TK_PIPEEQ"; }
+    if (kind == tk_CARETEQ())  { return "TK_CARETEQ"; }
+    if (kind == tk_MATCHOP())  { return "TK_MATCHOP"; }
+    if (kind == tk_CHAR_LIT()) { return "TK_CHAR_LIT"; }
+    if (kind == tk_FSTRING_RAW()) { return "TK_FSTRING_RAW"; }
+    if (kind == tk_KEYWORD_EFFECT()) { return "TK_KEYWORD_EFFECT"; }
+    if (kind == tk_EOF())      { return "TK_EOF"; }
+    return "TK_?";
+}
+
+public fn print_token(t: rawptr) {
+    if (t == null) { print("(null token)"); return; }
+    let k = token_kind(t);
+    let l = token_line(t);
+    let c = token_col(t);
+    let lex = token_lexeme(t);
+    print(token_kind_name(k) + "@" + l.toString() + ":" + c.toString() + " '" + lex + "'");
+}
+
+public fn dump_tokens(handle: rawptr) {
+    if (handle == null) { return; }
+    let count = lex_token_count(handle);
+    let buf = lex_tokens_buf(handle);
+    if (buf == null) { return; }
+    var i: i32 = 0;
+    while (i < count) {
+        let slot = slot_at(buf, i);
+        print_token(slot);
+        i = i + 1;
+    }
+}

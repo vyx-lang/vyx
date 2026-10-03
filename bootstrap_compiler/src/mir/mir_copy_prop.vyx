@@ -1,0 +1,1123 @@
+module bootstrap.mir_copy_prop;
+
+use bootstrap.ast;
+use bootstrap.hir_type_table;
+use bootstrap.mir_analysis;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memset(dst: rawptr, value: i32, size: u64) -> rawptr;
+}
+
+// A copy fact is either TOP (not yet constrained), NONE, or a source LocalId.
+fn mc_fact_top() -> i32 { return -1; }
+fn mc_fact_none() -> i32 { return 0; }
+fn mc_proposal_unseen() -> i32 { return 0; }
+fn mc_proposal_source() -> i32 { return 1; }
+fn mc_proposal_blocked() -> i32 { return 2; }
+
+fn mc_max_cells() -> i64 { return 2000000; }
+fn mc_max_work_steps() -> i64 { return 16000000; }
+fn mc_max_plan_records() -> i64 { return 4000000; }
+
+fn mc_text(value: i32) -> string {
+    return policy_i64_to_string(value as i64);
+}
+
+fn mc_alloc_i32(count: i32) -> rawptr {
+    var actual = count;
+    if (actual < 1) { actual = 1; }
+    if (actual > 536870911) { return null; }
+    let bytes = ((actual as i64) * 4) as u64;
+    let out = malloc(bytes);
+    if (out != null) { memset(out, 0, bytes); }
+    return out;
+}
+
+fn mc_get_i32(values: rawptr, index: i32) -> i32 {
+    if (values == null || index < 0) { return 0; }
+    return ast_read_i32(ptr_offset(values, index * 4));
+}
+
+fn mc_set_i32(values: rawptr, index: i32, value: i32) {
+    if (values != null && index >= 0) {
+        ast_write_i32(ptr_offset(values, index * 4), value);
+    }
+}
+
+fn mc_fill_i32(values: rawptr, count: i32, value: i32) {
+    var index: i32 = 0;
+    while (index < count) {
+        mc_set_i32(values, index, value);
+        index = index + 1;
+    }
+}
+
+fn mc_integer_bits(kind: i32) -> i32 {
+    if (kind == ty_BOOL() || kind == ty_I8() || kind == ty_U8()) { return 8; }
+    if (kind == ty_I16() || kind == ty_U16()) { return 16; }
+    if (kind == ty_I32() || kind == ty_U32()) { return 32; }
+    if (kind == ty_I64() || kind == ty_U64()
+        || kind == ty_ISIZE() || kind == ty_USIZE()) { return 64; }
+    return 0;
+}
+
+fn mc_type_is_scalar(m: MirUnit, type_id: i32) -> bool {
+    if (type_id == mir_id_invalid()) { return false; }
+    let kind = hir_type_table_kind(m.types, type_id);
+    if (mc_integer_bits(kind) > 0 || kind == ty_CHAR()
+        || kind == ty_F32() || kind == ty_F64()) {
+        return true;
+    }
+    return kind == ty_RAWPTR() || kind == ty_PTR()
+        || kind == ty_REF() || kind == ty_MUTREF();
+}
+
+fn mc_valid_local(m: MirUnit, local_id: i32) -> bool {
+    return local_id >= 1 && local_id <= m.local_count
+        && m.local_record(local_id) != null;
+}
+
+fn mc_valid_place(m: MirUnit, place_id: i32) -> bool {
+    return place_id >= 1 && place_id <= m.place_count
+        && m.place_record(place_id) != null;
+}
+
+fn mc_valid_value(m: MirUnit, value_id: i32) -> bool {
+    return value_id >= 1 && value_id <= m.value_count
+        && m.value_record(value_id) != null;
+}
+
+fn mc_place_root_local(m: MirUnit, place_id: i32, depth: i32) -> i32 {
+    if (depth > 32 || !mc_valid_place(m, place_id)) { return mir_id_invalid(); }
+    let kind = m.place_kind(place_id);
+    if (kind == mir_place_local()) {
+        let local_id = m.place_local(place_id);
+        if (mc_valid_local(m, local_id)) { return local_id; }
+        return mir_id_invalid();
+    }
+    if (kind == mir_place_field() || kind == mir_place_index()) {
+        return mc_place_root_local(m, m.place_base(place_id), depth + 1);
+    }
+    return mir_id_invalid();
+}
+
+fn mc_value_root_local(m: MirUnit, value_id: i32, depth: i32) -> i32 {
+    if (depth > 32 || !mc_valid_value(m, value_id)) { return mir_id_invalid(); }
+    let kind = m.value_kind(value_id);
+    if (kind == mir_value_read_place()) {
+        return mc_place_root_local(m, m.value_place(value_id), depth + 1);
+    }
+    if (kind == mir_value_cast() || kind == mir_value_arg()) {
+        return mc_value_root_local(m, m.value_lhs(value_id), depth + 1);
+    }
+    return mir_id_invalid();
+}
+
+public class MirCopyPlan {
+    public ok: bool
+    public value_count: i32
+    public proposal_states: rawptr
+    public proposal_places: rawptr
+    public rewrite_count: i32
+    public skipped_functions: i32
+    public error_message: string
+
+    public static fn create(m: MirUnit) -> MirCopyPlan {
+        let records = (m.value_count as i64) + (m.local_count as i64)
+            + (m.block_count as i64);
+        if (m.value_count < 0 || m.local_count < 0 || m.block_count < 0
+            || records < 0 || records > mc_max_plan_records()) {
+            return MirCopyPlan {
+                ok: true,
+                value_count: m.value_count,
+                proposal_states: null,
+                proposal_places: null,
+                rewrite_count: 0,
+                skipped_functions: m.function_count,
+                error_message: ""
+            };
+        }
+        var plan = MirCopyPlan {
+            ok: true,
+            value_count: m.value_count,
+            proposal_states: mc_alloc_i32(m.value_count + 1),
+            proposal_places: mc_alloc_i32(m.value_count + 1),
+            rewrite_count: 0,
+            skipped_functions: 0,
+            error_message: ""
+        };
+        if (plan.proposal_states == null || plan.proposal_places == null) {
+            plan.set_error("cannot allocate copy propagation rewrite plan");
+        }
+        return plan;
+    }
+
+    public fn set_error(self, message: string) {
+        if (self.ok) { self.error_message = message; }
+        self.ok = false;
+    }
+
+    public fn mark_blocked(self, value_id: i32) {
+        if (!self.ok || value_id < 1 || value_id > self.value_count) { return; }
+        let state = mc_get_i32(self.proposal_states, value_id);
+        if (state == mc_proposal_source()) {
+            self.rewrite_count = self.rewrite_count - 1;
+        }
+        mc_set_i32(self.proposal_states, value_id, mc_proposal_blocked());
+        mc_set_i32(self.proposal_places, value_id, mir_id_invalid());
+    }
+
+    public fn propose(self, value_id: i32, place_id: i32) {
+        if (!self.ok || value_id < 1 || value_id > self.value_count
+            || place_id == mir_id_invalid()) { return; }
+        let state = mc_get_i32(self.proposal_states, value_id);
+        if (state == mc_proposal_unseen()) {
+            mc_set_i32(self.proposal_states, value_id, mc_proposal_source());
+            mc_set_i32(self.proposal_places, value_id, place_id);
+            self.rewrite_count = self.rewrite_count + 1;
+            return;
+        }
+        if (state == mc_proposal_source()
+            && mc_get_i32(self.proposal_places, value_id) != place_id) {
+            self.mark_blocked(value_id);
+        }
+    }
+
+    public fn state(self, value_id: i32) -> i32 {
+        if (value_id < 1 || value_id > self.value_count) { return mc_proposal_unseen(); }
+        return mc_get_i32(self.proposal_states, value_id);
+    }
+
+    public fn place(self, value_id: i32) -> i32 {
+        if (value_id < 1 || value_id > self.value_count) { return mir_id_invalid(); }
+        return mc_get_i32(self.proposal_places, value_id);
+    }
+
+    public fn dispose(self) {
+        if (self.proposal_states != null) { free(self.proposal_states); self.proposal_states = null; }
+        if (self.proposal_places != null) { free(self.proposal_places); self.proposal_places = null; }
+    }
+}
+
+fn mc_block_value_tree(m: MirUnit,
+                       plan: MirCopyPlan,
+                       value_id: i32,
+                       depth: i32) {
+    if (depth > 64 || !mc_valid_value(m, value_id)) { return; }
+    if (m.value_kind(value_id) == mir_value_read_place()
+        && (m.value_flags(value_id) & mir_value_flag_move_arg()) == 0) {
+        plan.mark_blocked(value_id);
+    }
+    mc_block_value_tree(m, plan, m.value_lhs(value_id), depth + 1);
+    mc_block_value_tree(m, plan, m.value_rhs(value_id), depth + 1);
+    mc_block_value_tree(m, plan, m.value_aux(value_id), depth + 1);
+    var arg_id = m.value_first_arg(value_id);
+    var guard: i32 = 0;
+    while (arg_id != mir_id_invalid() && guard <= m.value_count) {
+        mc_block_value_tree(m, plan, arg_id, depth + 1);
+        arg_id = m.value_next_arg(arg_id);
+        guard = guard + 1;
+    }
+}
+
+public class MirCopyLocalFacts {
+    public blocked: rawptr
+    public local_count: i32
+    public ok: bool
+
+    public static fn create(m: MirUnit) -> MirCopyLocalFacts {
+        var facts = MirCopyLocalFacts {
+            blocked: mc_alloc_i32(m.local_count + 1),
+            local_count: m.local_count,
+            ok: true
+        };
+        if (facts.blocked == null) {
+            facts.ok = false;
+            return facts;
+        }
+        var local_id: i32 = 1;
+        while (local_id <= m.local_count) {
+            facts.scan_local(m, local_id);
+            local_id = local_id + 1;
+        }
+        facts.scan_live_records(m);
+        return facts;
+    }
+
+    /// Function-scoped variant for the streaming pipeline.  The unit's local
+    /// table never rewinds after a streamed body is released (parameter
+    /// records stay live for later declarations), so a full-table scan per
+    /// pipeline call is quadratic in the number of lowered functions.  The
+    /// copy runner only consults blocked state through this function's own
+    /// records and the capture trees its body seeds, and a local created
+    /// before this function's body mark cannot capture one of its locals
+    /// (capture sources are recorded while the capturing local is created,
+    /// before those records existed).  Scanning this function's own local
+    /// chain plus every local created at or after `local_mark` -- the body
+    /// and the closure bodies its dependency walk materialized -- therefore
+    /// blocks the same set of locals the runner can observe.
+    public static fn create_scoped(m: MirUnit, local_mark: i32, function_filter: i32) -> MirCopyLocalFacts {
+        var facts = MirCopyLocalFacts {
+            blocked: mc_alloc_i32(m.local_count + 1),
+            local_count: m.local_count,
+            ok: true
+        };
+        if (facts.blocked == null) {
+            facts.ok = false;
+            return facts;
+        }
+        var local_id: i32 = m.function_first_local(function_filter);
+        var guard: i32 = 0;
+        while (local_id != mir_id_invalid()
+               && local_id >= 1
+               && local_id <= m.local_count
+               && guard <= m.local_count) {
+            facts.scan_local(m, local_id);
+            local_id = m.local_next(local_id);
+            guard = guard + 1;
+        }
+        var scan_id: i32 = local_mark + 1;
+        while (scan_id <= m.local_count) {
+            facts.scan_local(m, scan_id);
+            scan_id = scan_id + 1;
+        }
+        facts.scan_live_records(m);
+        return facts;
+    }
+
+    fn scan_local(self, m: MirUnit, local_id: i32) {
+        if (mc_valid_local(m, local_id)) {
+            let flags = m.local_flags(local_id);
+            if ((flags & mir_local_flag_capture()) != 0
+                || (flags & mir_local_flag_reference_capture()) != 0
+                || (flags & mir_local_flag_auto_drop()) != 0
+                || (flags & mir_local_flag_move_arg()) != 0
+                || (flags & mir_local_flag_self_receiver()) != 0) {
+                self.block(local_id);
+            }
+            self.block(m.local_capture_source(local_id));
+        }
+    }
+
+    fn scan_live_records(self, m: MirUnit) {
+        var place_id: i32 = 1;
+        while (place_id <= m.place_count) {
+            if (mc_valid_place(m, place_id) && m.place_kind(place_id) != mir_place_local()) {
+                self.block(mc_place_root_local(m, place_id, 0));
+                if (m.place_kind(place_id) == mir_place_deref()) {
+                    self.block(mc_value_root_local(m, m.place_index_value(place_id), 0));
+                }
+            }
+            place_id = place_id + 1;
+        }
+        var value_id: i32 = 1;
+        while (value_id <= m.value_count) {
+            if (mc_valid_value(m, value_id)) {
+                if (m.value_kind(value_id) == mir_value_address_of()) {
+                    self.block(mc_place_root_local(m, m.value_place(value_id), 0));
+                    self.block(mc_value_root_local(m, m.value_lhs(value_id), 0));
+                }
+                if (m.value_kind(value_id) == mir_value_read_place()
+                    && (m.value_flags(value_id) & mir_value_flag_move_arg()) != 0) {
+                    self.block(mc_place_root_local(m, m.value_place(value_id), 0));
+                }
+            }
+            value_id = value_id + 1;
+        }
+        var instr_id: i32 = 1;
+        while (instr_id <= m.instr_count) {
+            if (!mir_unit_instr_owner_is_removed(&m,  instr_id)
+                && m.instr_kind(instr_id) == mir_instr_defer()) {
+                self.block_value_tree(m, m.instr_value(instr_id), 0);
+            }
+            instr_id = instr_id + 1;
+        }
+    }
+
+    public fn block(self, local_id: i32) {
+        if (self.blocked == null || local_id < 1 || local_id > self.local_count) { return; }
+        mc_set_i32(self.blocked, local_id, 1);
+    }
+
+    public fn is_blocked(self, local_id: i32) -> bool {
+        if (self.blocked == null || local_id < 1 || local_id > self.local_count) { return true; }
+        return mc_get_i32(self.blocked, local_id) != 0;
+    }
+
+    public fn block_value_tree(self, m: MirUnit, value_id: i32, depth: i32) {
+        if (depth > 64 || !mc_valid_value(m, value_id)) { return; }
+        if (m.value_kind(value_id) == mir_value_read_place()) {
+            self.block(mc_place_root_local(m, m.value_place(value_id), 0));
+        }
+        self.block_value_tree(m, m.value_lhs(value_id), depth + 1);
+        self.block_value_tree(m, m.value_rhs(value_id), depth + 1);
+        self.block_value_tree(m, m.value_aux(value_id), depth + 1);
+        var arg_id = m.value_first_arg(value_id);
+        var guard: i32 = 0;
+        while (arg_id != mir_id_invalid() && guard <= m.value_count) {
+            self.block_value_tree(m, arg_id, depth + 1);
+            arg_id = m.value_next_arg(arg_id);
+            guard = guard + 1;
+        }
+    }
+
+    public fn dispose(self) {
+        if (self.blocked != null) { free(self.blocked); self.blocked = null; }
+    }
+}
+
+class MirCopyRunner {
+    public m: MirUnit
+    public cache: MirAnalysisCache
+    public plan: MirCopyPlan
+    public facts: MirCopyLocalFacts
+    public function_id: i32
+    public block_count: i32
+    public local_count: i32
+    public cell_count: i32
+    public block_ids: rawptr
+    public block_slots: rawptr
+    public local_ids: rawptr
+    public local_slots: rawptr
+    public in_sources: rawptr
+    public out_sources: rawptr
+    public work_sources: rawptr
+    public worklist: rawptr
+    public queued: rawptr
+    public seen_values: rawptr
+    public worklist_count: i32
+    public visit_stamp: i32
+    public work_steps: i64
+    public initialized: bool
+    public skipped: bool
+
+    public static fn create(m: MirUnit,
+                            cache: MirAnalysisCache,
+                            plan: MirCopyPlan,
+                            facts: MirCopyLocalFacts,
+                            function_id: i32) -> MirCopyRunner {
+        return MirCopyRunner {
+            m: m,
+            cache: cache,
+            plan: plan,
+            facts: facts,
+            function_id: function_id,
+            block_count: 0,
+            local_count: 0,
+            cell_count: 0,
+            block_ids: null,
+            block_slots: null,
+            local_ids: null,
+            local_slots: null,
+            in_sources: null,
+            out_sources: null,
+            work_sources: null,
+            worklist: null,
+            queued: null,
+            seen_values: null,
+            worklist_count: 0,
+            visit_stamp: 0,
+            work_steps: 0,
+            initialized: false,
+            skipped: false
+        };
+    }
+
+    public fn set_error(self, message: string) -> bool {
+        self.plan.set_error(message);
+        return false;
+    }
+
+    public fn function_has_legacy_match_target(self) -> bool {
+        var block_id = self.m.function_first_block(self.function_id);
+        var guard: i32 = 0;
+        while (block_id != mir_id_invalid()) {
+            if (self.m.block_term_kind(block_id) == mir_term_match()
+                && self.m.block_term_target(block_id) != mir_id_invalid()) {
+                return true;
+            }
+            block_id = self.m.block_next(block_id);
+            guard = guard + 1;
+            if (guard > self.m.block_count + 1) { return true; }
+        }
+        return false;
+    }
+
+    public fn local_is_eligible(self, local_id: i32) -> bool {
+        if (!mc_valid_local(self.m, local_id)
+            || self.m.local_function(local_id) != self.function_id
+            || self.facts.is_blocked(local_id)
+            || !mc_type_is_scalar(self.m, self.m.local_type(local_id))) {
+            return false;
+        }
+        let flags = self.m.local_flags(local_id);
+        if ((flags & mir_local_flag_self_receiver()) != 0) { return false; }
+        let place_id = self.m.local_place(local_id);
+        return mc_valid_place(self.m, place_id)
+            && self.m.place_function(place_id) == self.function_id
+            && self.m.place_kind(place_id) == mir_place_local()
+            && self.m.place_local(place_id) == local_id
+            && self.m.place_type(place_id) == self.m.local_type(local_id);
+    }
+
+    public fn count_function_records(self) -> bool {
+        if (!self.facts.ok) { return self.set_error("cannot allocate copy propagation local facts"); }
+        if (self.function_id < 1 || self.function_id > self.m.function_count
+            || self.m.function_record(self.function_id) == null) {
+            return self.set_error("invalid copy propagation function #" + mc_text(self.function_id));
+        }
+        if (self.function_has_legacy_match_target()) {
+            self.skipped = true;
+            self.plan.skipped_functions = self.plan.skipped_functions + 1;
+            return true;
+        }
+        var block_id = self.m.function_first_block(self.function_id);
+        var block_guard: i32 = 0;
+        while (block_id != mir_id_invalid()) {
+            if (block_id < 1 || block_id > self.m.block_count
+                || self.m.block_record(block_id) == null
+                || self.m.block_is_removed( block_id)
+                || self.m.block_function(block_id) != self.function_id) {
+                return self.set_error("invalid active block in copy propagation function #"
+                                      + mc_text(self.function_id));
+            }
+            self.block_count = self.block_count + 1;
+            block_id = self.m.block_next(block_id);
+            block_guard = block_guard + 1;
+            if (block_guard > self.m.block_count + 1) {
+                return self.set_error("cyclic block chain in copy propagation function #"
+                                      + mc_text(self.function_id));
+            }
+        }
+        var local_id = self.m.function_first_local(self.function_id);
+        var local_guard: i32 = 0;
+        while (local_id != mir_id_invalid()) {
+            if (!mc_valid_local(self.m, local_id)
+                || self.m.local_function(local_id) != self.function_id) {
+                return self.set_error("invalid local chain in copy propagation function #"
+                                      + mc_text(self.function_id));
+            }
+            if (self.local_is_eligible(local_id)) { self.local_count = self.local_count + 1; }
+            local_id = self.m.local_next(local_id);
+            local_guard = local_guard + 1;
+            if (local_guard > self.m.local_count + 1) {
+                return self.set_error("cyclic local chain in copy propagation function #"
+                                      + mc_text(self.function_id));
+            }
+        }
+        let cells64 = (self.block_count as i64) * (self.local_count as i64);
+        if (cells64 < 0 || cells64 > mc_max_cells()) {
+            self.skipped = true;
+            self.plan.skipped_functions = self.plan.skipped_functions + 1;
+            mir_analysis_audit("copy-prop skip function=" + mc_text(self.function_id)
+                               + " blocks=" + mc_text(self.block_count)
+                               + " locals=" + mc_text(self.local_count)
+                               + " cells=" + policy_i64_to_string(cells64));
+            return true;
+        }
+        self.cell_count = cells64 as i32;
+        return true;
+    }
+
+    public fn allocate_storage(self) -> bool {
+        self.block_ids = mc_alloc_i32(self.block_count);
+        self.block_slots = mc_alloc_i32(self.m.block_count + 1);
+        self.local_ids = mc_alloc_i32(self.local_count);
+        self.local_slots = mc_alloc_i32(self.m.local_count + 1);
+        self.in_sources = mc_alloc_i32(self.cell_count);
+        self.out_sources = mc_alloc_i32(self.cell_count);
+        self.work_sources = mc_alloc_i32(self.local_count);
+        self.worklist = mc_alloc_i32(self.block_count);
+        self.queued = mc_alloc_i32(self.block_count);
+        self.seen_values = mc_alloc_i32(self.m.value_count + 1);
+        if (self.block_ids == null || self.block_slots == null
+            || self.local_ids == null || self.local_slots == null
+            || self.in_sources == null || self.out_sources == null
+            || self.work_sources == null || self.worklist == null
+            || self.queued == null || self.seen_values == null) {
+            return self.set_error("cannot allocate copy propagation function scratch storage");
+        }
+        mc_fill_i32(self.in_sources, self.cell_count, mc_fact_top());
+        mc_fill_i32(self.out_sources, self.cell_count, mc_fact_top());
+        return true;
+    }
+
+    public fn index_records(self) -> bool {
+        var ordinal: i32 = 0;
+        var block_id = self.m.function_first_block(self.function_id);
+        while (block_id != mir_id_invalid() && ordinal < self.block_count) {
+            mc_set_i32(self.block_ids, ordinal, block_id);
+            mc_set_i32(self.block_slots, block_id, ordinal + 1);
+            ordinal = ordinal + 1;
+            block_id = self.m.block_next(block_id);
+        }
+        if (ordinal != self.block_count || block_id != mir_id_invalid()) {
+            return self.set_error("copy propagation block count changed while indexing");
+        }
+        ordinal = 0;
+        var local_id = self.m.function_first_local(self.function_id);
+        while (local_id != mir_id_invalid()) {
+            if (self.local_is_eligible(local_id)) {
+                if (ordinal >= self.local_count) {
+                    return self.set_error("copy propagation local count changed while indexing");
+                }
+                mc_set_i32(self.local_ids, ordinal, local_id);
+                mc_set_i32(self.local_slots, local_id, ordinal + 1);
+                ordinal = ordinal + 1;
+            }
+            local_id = self.m.local_next(local_id);
+        }
+        if (ordinal != self.local_count) {
+            return self.set_error("copy propagation local count changed while indexing");
+        }
+        return true;
+    }
+
+    public fn initialize(self) -> bool {
+        if (!self.count_function_records()) { return false; }
+        if (self.skipped || self.block_count == 0 || self.local_count == 0) {
+            self.initialized = true;
+            return true;
+        }
+        if (!self.allocate_storage() || !self.index_records()) { return false; }
+        self.initialized = true;
+        return true;
+    }
+
+    public fn cell_index(self, block_ordinal: i32, local_ordinal: i32) -> i32 {
+        return block_ordinal * self.local_count + local_ordinal;
+    }
+
+    public fn local_ordinal_for_place(self, place_id: i32) -> i32 {
+        if (!mc_valid_place(self.m, place_id)
+            || self.m.place_kind(place_id) != mir_place_local()) {
+            return -1;
+        }
+        let local_id = self.m.place_local(place_id);
+        if (local_id < 1 || local_id > self.m.local_count
+            || self.m.local_place(local_id) != place_id) {
+            return -1;
+        }
+        return mc_get_i32(self.local_slots, local_id) - 1;
+    }
+
+    public fn merge_fact(self, left: i32, right: i32) -> i32 {
+        if (left == mc_fact_top()) { return right; }
+        if (right == mc_fact_top()) { return left; }
+        if (left == right) { return left; }
+        return mc_fact_none();
+    }
+
+    public fn enqueue(self, block_ordinal: i32) {
+        if (block_ordinal < 0 || block_ordinal >= self.block_count
+            || mc_get_i32(self.queued, block_ordinal) != 0) { return; }
+        if (self.worklist_count >= self.block_count) {
+            self.plan.set_error("copy propagation worklist capacity exceeded");
+            return;
+        }
+        mc_set_i32(self.queued, block_ordinal, 1);
+        mc_set_i32(self.worklist, self.worklist_count, block_ordinal);
+        self.worklist_count = self.worklist_count + 1;
+    }
+
+    public fn enqueue_successors(self, block_ordinal: i32) {
+        let block_id = mc_get_i32(self.block_ids, block_ordinal);
+        var successor_ordinal: i32 = 0;
+        let successor_count = self.cache.cfg_successor_count(block_id);
+        while (successor_ordinal < successor_count) {
+            let successor_id = self.cache.cfg_successor_at(block_id, successor_ordinal);
+            let successor_slot = mc_get_i32(self.block_slots, successor_id) - 1;
+            if (successor_slot >= 0) { self.enqueue(successor_slot); }
+            successor_ordinal = successor_ordinal + 1;
+        }
+    }
+
+    public fn compute_input(self, block_ordinal: i32) -> bool {
+        mc_fill_i32(self.work_sources, self.local_count, mc_fact_top());
+        let block_id = mc_get_i32(self.block_ids, block_ordinal);
+        var saw_input = false;
+        if (block_id == self.m.function_first_block(self.function_id)) {
+            mc_fill_i32(self.work_sources, self.local_count, mc_fact_none());
+            saw_input = true;
+        }
+        var predecessor_ordinal: i32 = 0;
+        let predecessor_count = self.cache.cfg_predecessor_count(block_id);
+        while (predecessor_ordinal < predecessor_count) {
+            let predecessor_id = self.cache.cfg_predecessor_at(block_id, predecessor_ordinal);
+            let predecessor_slot = mc_get_i32(self.block_slots, predecessor_id) - 1;
+            if (predecessor_slot >= 0) {
+                var local_ordinal: i32 = 0;
+                while (local_ordinal < self.local_count) {
+                    let source = mc_get_i32(self.out_sources,
+                                            self.cell_index(predecessor_slot, local_ordinal));
+                    mc_set_i32(self.work_sources,
+                               local_ordinal,
+                               self.merge_fact(mc_get_i32(self.work_sources, local_ordinal), source));
+                    local_ordinal = local_ordinal + 1;
+                }
+                saw_input = true;
+            }
+            predecessor_ordinal = predecessor_ordinal + 1;
+        }
+        if (!saw_input) { return false; }
+        var local_ordinal2: i32 = 0;
+        while (local_ordinal2 < self.local_count) {
+            let index = self.cell_index(block_ordinal, local_ordinal2);
+            mc_set_i32(self.in_sources, index, mc_get_i32(self.work_sources, local_ordinal2));
+            local_ordinal2 = local_ordinal2 + 1;
+        }
+        return true;
+    }
+
+    public fn kill_mentions(self, local_id: i32) {
+        if (local_id == mir_id_invalid()) { return; }
+        var local_ordinal: i32 = 0;
+        while (local_ordinal < self.local_count) {
+            if (mc_get_i32(self.local_ids, local_ordinal) == local_id
+                || mc_get_i32(self.work_sources, local_ordinal) == local_id) {
+                mc_set_i32(self.work_sources, local_ordinal, mc_fact_none());
+            }
+            local_ordinal = local_ordinal + 1;
+        }
+    }
+
+    public fn kill_all(self) {
+        mc_fill_i32(self.work_sources, self.local_count, mc_fact_none());
+    }
+
+    public fn direct_copy_source(self, instr_id: i32) -> i32 {
+        if (instr_id < 1 || instr_id > self.m.instr_count
+            || self.m.instr_record(instr_id) == null
+            || self.m.instr_kind(instr_id) != mir_instr_assign()) {
+            return mir_id_invalid();
+        }
+        let destination_ordinal = self.local_ordinal_for_place(self.m.instr_place(instr_id));
+        if (destination_ordinal < 0) { return mir_id_invalid(); }
+        let destination_local = mc_get_i32(self.local_ids, destination_ordinal);
+        let value_id = self.m.instr_value(instr_id);
+        if (!mc_valid_value(self.m, value_id)
+            || self.m.value_kind(value_id) != mir_value_read_place()
+            || (self.m.value_flags(value_id) & mir_value_flag_move_arg()) != 0
+            || self.m.value_function(value_id) != self.function_id) {
+            return mir_id_invalid();
+        }
+        let source_ordinal = self.local_ordinal_for_place(self.m.value_place(value_id));
+        if (source_ordinal < 0) { return mir_id_invalid(); }
+        let source_local = mc_get_i32(self.local_ids, source_ordinal);
+        if (source_local == destination_local
+            || self.m.local_type(destination_local) != self.m.local_type(source_local)
+            || self.m.value_type(value_id) != self.m.local_type(destination_local)
+            || (self.m.instr_type(instr_id) != mir_id_invalid()
+                && self.m.instr_type(instr_id) != self.m.local_type(destination_local))) {
+            return mir_id_invalid();
+        }
+        return source_local;
+    }
+
+    // Resolve a direct-copy source against the facts available at the exact
+    // assignment point. Facts name the value snapshot, not a live alias, so
+    // storing the canonical source preserves a prior copy when its immediate
+    // source local is written later in the block.
+    public fn canonical_source_local(self, source_local: i32, expected_type: i32) -> i32 {
+        var current = source_local;
+        var depth: i32 = 0;
+        while (current != mc_fact_none() && current != mc_fact_top()) {
+            let ordinal = mc_get_i32(self.local_slots, current) - 1;
+            if (ordinal < 0 || ordinal >= self.local_count
+                || self.m.local_type(current) != expected_type) {
+                return mir_id_invalid();
+            }
+            let next = mc_get_i32(self.work_sources, ordinal);
+            if (next == mc_fact_none() || next == mc_fact_top()) {
+                return current;
+            }
+            if (next == current || depth > self.local_count) {
+                return mir_id_invalid();
+            }
+            current = next;
+            depth = depth + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn transfer_instr(self, instr_id: i32) {
+        let kind = self.m.instr_kind(instr_id);
+        if (kind == mir_instr_assign()) {
+            let destination_ordinal = self.local_ordinal_for_place(self.m.instr_place(instr_id));
+            if (destination_ordinal < 0) { return; }
+            let destination_local = mc_get_i32(self.local_ids, destination_ordinal);
+            let direct_source = self.direct_copy_source(instr_id);
+            let source_local = self.canonical_source_local(
+                direct_source, self.m.local_type(destination_local));
+            self.kill_mentions(destination_local);
+            if (source_local != mir_id_invalid() && source_local != destination_local) {
+                mc_set_i32(self.work_sources, destination_ordinal, source_local);
+            }
+            return;
+        }
+        if (kind == mir_instr_storage_live()
+            || kind == mir_instr_storage_dead()
+            || kind == mir_instr_foreach_bind()
+            || kind == mir_instr_drop()) {
+            let destination_ordinal2 = self.local_ordinal_for_place(self.m.instr_place(instr_id));
+            if (destination_ordinal2 >= 0) {
+                self.kill_mentions(mc_get_i32(self.local_ids, destination_ordinal2));
+            }
+            return;
+        }
+        if (kind == mir_instr_match_arm()) { self.kill_all(); }
+    }
+
+    public fn transfer_block(self, block_ordinal: i32) -> bool {
+        let block_id = mc_get_i32(self.block_ids, block_ordinal);
+        var instr_id = self.m.block_first_instr(block_id);
+        var guard: i32 = 0;
+        while (instr_id != mir_id_invalid()) {
+            if (instr_id < 1 || instr_id > self.m.instr_count
+                || self.m.instr_record(instr_id) == null
+                || self.m.instr_block(instr_id) != block_id) {
+                return self.set_error("invalid instruction chain in copy propagation block #"
+                                      + mc_text(block_id));
+            }
+            self.transfer_instr(instr_id);
+            instr_id = self.m.instr_next(instr_id);
+            guard = guard + 1;
+            if (guard > self.m.instr_count + 1) {
+                return self.set_error("cyclic instruction chain in copy propagation block #"
+                                      + mc_text(block_id));
+            }
+        }
+        return true;
+    }
+
+    public fn store_output(self, block_ordinal: i32) -> bool {
+        var changed = false;
+        var local_ordinal: i32 = 0;
+        while (local_ordinal < self.local_count) {
+            let index = self.cell_index(block_ordinal, local_ordinal);
+            let next = mc_get_i32(self.work_sources, local_ordinal);
+            if (mc_get_i32(self.out_sources, index) != next) {
+                mc_set_i32(self.out_sources, index, next);
+                changed = true;
+            }
+            local_ordinal = local_ordinal + 1;
+        }
+        return changed;
+    }
+
+    public fn solve(self) -> bool {
+        if (!self.initialized || self.skipped || self.block_count == 0 || self.local_count == 0) {
+            return self.plan.ok;
+        }
+        self.enqueue(0);
+        while (self.worklist_count > 0 && self.plan.ok) {
+            self.worklist_count = self.worklist_count - 1;
+            let block_ordinal = mc_get_i32(self.worklist, self.worklist_count);
+            mc_set_i32(self.queued, block_ordinal, 0);
+            self.work_steps = self.work_steps + 1;
+            if (self.work_steps > mc_max_work_steps()) {
+                self.skipped = true;
+                self.plan.skipped_functions = self.plan.skipped_functions + 1;
+                self.worklist_count = 0;
+                mir_analysis_audit("copy-prop skip function=" + mc_text(self.function_id)
+                                   + " reason=work-budget steps="
+                                   + policy_i64_to_string(self.work_steps));
+                return true;
+            }
+            if (self.compute_input(block_ordinal)) {
+                if (!self.transfer_block(block_ordinal)) { return false; }
+                if (self.store_output(block_ordinal)) {
+                    self.enqueue_successors(block_ordinal);
+                }
+            }
+        }
+        return self.plan.ok;
+    }
+
+    public fn load_final_input(self, block_ordinal: i32) {
+        var local_ordinal: i32 = 0;
+        while (local_ordinal < self.local_count) {
+            mc_set_i32(self.work_sources,
+                       local_ordinal,
+                       mc_get_i32(self.in_sources, self.cell_index(block_ordinal, local_ordinal)));
+            local_ordinal = local_ordinal + 1;
+        }
+    }
+
+    public fn begin_value_visit(self) {
+        self.visit_stamp = self.visit_stamp + 1;
+        if (self.visit_stamp <= 0) {
+            memset(self.seen_values, 0, ((self.m.value_count + 1) * 4) as u64);
+            self.visit_stamp = 1;
+        }
+    }
+
+    public fn source_place_for_read(self, value_id: i32) -> i32 {
+        if (!mc_valid_value(self.m, value_id)
+            || self.m.value_kind(value_id) != mir_value_read_place()
+            || (self.m.value_flags(value_id) & mir_value_flag_move_arg()) != 0
+            || self.m.value_function(value_id) != self.function_id) {
+            return mir_id_invalid();
+        }
+        let destination_ordinal = self.local_ordinal_for_place(self.m.value_place(value_id));
+        if (destination_ordinal < 0) { return mir_id_invalid(); }
+        let destination_local = mc_get_i32(self.local_ids, destination_ordinal);
+        if (self.m.local_type(destination_local) != self.m.value_type(value_id)) {
+            return mir_id_invalid();
+        }
+        var source_local = mc_get_i32(self.work_sources, destination_ordinal);
+        var depth: i32 = 0;
+        while (source_local != mc_fact_none() && source_local != mc_fact_top()) {
+            if (source_local == destination_local || depth > self.local_count) {
+                return mir_id_invalid();
+            }
+            let source_ordinal = mc_get_i32(self.local_slots, source_local) - 1;
+            if (source_ordinal < 0 || source_ordinal >= self.local_count
+                || self.m.local_type(source_local) != self.m.value_type(value_id)) {
+                return mir_id_invalid();
+            }
+            let next_source = mc_get_i32(self.work_sources, source_ordinal);
+            if (next_source == mc_fact_none() || next_source == mc_fact_top()) {
+                let source_place = self.m.local_place(source_local);
+                if (!mc_valid_place(self.m, source_place)
+                    || self.m.place_type(source_place) != self.m.value_type(value_id)) {
+                    return mir_id_invalid();
+                }
+                return source_place;
+            }
+            source_local = next_source;
+            depth = depth + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn record_value_tree(self, value_id: i32, depth: i32) {
+        if (depth > 64 || !mc_valid_value(self.m, value_id)
+            || self.m.value_function(value_id) != self.function_id) {
+            return;
+        }
+        if (mc_get_i32(self.seen_values, value_id) == self.visit_stamp) { return; }
+        mc_set_i32(self.seen_values, value_id, self.visit_stamp);
+        if (self.m.value_kind(value_id) == mir_value_read_place()
+            && (self.m.value_flags(value_id) & mir_value_flag_move_arg()) == 0) {
+            let source_place = self.source_place_for_read(value_id);
+            if (source_place == mir_id_invalid()) { self.plan.mark_blocked(value_id); }
+            else { self.plan.propose(value_id, source_place); }
+        }
+        self.record_value_tree(self.m.value_lhs(value_id), depth + 1);
+        self.record_value_tree(self.m.value_rhs(value_id), depth + 1);
+        self.record_value_tree(self.m.value_aux(value_id), depth + 1);
+        var arg_id = self.m.value_first_arg(value_id);
+        var guard: i32 = 0;
+        while (arg_id != mir_id_invalid() && guard <= self.m.value_count) {
+            self.record_value_tree(arg_id, depth + 1);
+            arg_id = self.m.value_next_arg(arg_id);
+            guard = guard + 1;
+        }
+    }
+
+    public fn block_value_tree(self, value_id: i32, depth: i32) {
+        if (depth > 64 || !mc_valid_value(self.m, value_id)
+            || self.m.value_function(value_id) != self.function_id) {
+            return;
+        }
+        if (mc_get_i32(self.seen_values, value_id) == self.visit_stamp) { return; }
+        mc_set_i32(self.seen_values, value_id, self.visit_stamp);
+        if (self.m.value_kind(value_id) == mir_value_read_place()
+            && (self.m.value_flags(value_id) & mir_value_flag_move_arg()) == 0) {
+            self.plan.mark_blocked(value_id);
+        }
+        self.block_value_tree(self.m.value_lhs(value_id), depth + 1);
+        self.block_value_tree(self.m.value_rhs(value_id), depth + 1);
+        self.block_value_tree(self.m.value_aux(value_id), depth + 1);
+        var arg_id = self.m.value_first_arg(value_id);
+        var guard: i32 = 0;
+        while (arg_id != mir_id_invalid() && guard <= self.m.value_count) {
+            self.block_value_tree(arg_id, depth + 1);
+            arg_id = self.m.value_next_arg(arg_id);
+            guard = guard + 1;
+        }
+    }
+
+    public fn record_value_root(self, value_id: i32) {
+        if (value_id == mir_id_invalid()) { return; }
+        self.begin_value_visit();
+        self.record_value_tree(value_id, 0);
+    }
+
+    public fn block_value_root(self, value_id: i32) {
+        if (value_id == mir_id_invalid()) { return; }
+        self.begin_value_visit();
+        self.block_value_tree(value_id, 0);
+    }
+
+    public fn plan_instruction(self, instr_id: i32) {
+        let kind = self.m.instr_kind(instr_id);
+        if (kind == mir_instr_assign()) {
+            // The dataflow solution is built before this rewrite plan. It is
+            // therefore safe to normalize a direct-copy RHS as well: the
+            // later transfer still reads the original MIR fact, while the
+            // stable ValueId and intrusive argument links remain intact.
+            self.record_value_root(self.m.instr_value(instr_id));
+            self.transfer_instr(instr_id);
+            return;
+        }
+        if (kind == mir_instr_eval() || kind == mir_instr_static_assert()) {
+            self.record_value_root(self.m.instr_value(instr_id));
+        } else if (kind == mir_instr_storage_live() || kind == mir_instr_storage_dead()) {
+            // No value root; the transfer still kills a prior destination fact.
+        } else {
+            // Drop/defer/match/foreach and future instructions do not expose a
+            // normal immediate evaluation point for their value operands.
+            self.block_value_root(self.m.instr_value(instr_id));
+            self.block_value_root(self.m.instr_lhs(instr_id));
+            self.block_value_root(self.m.instr_rhs(instr_id));
+        }
+        self.transfer_instr(instr_id);
+    }
+
+    public fn plan_terminator(self, block_id: i32) {
+        let kind = self.m.block_term_kind(block_id);
+        if (kind == mir_term_return() || kind == mir_term_branch()) {
+            self.record_value_root(self.m.block_term_value(block_id));
+            return;
+        }
+        self.block_value_root(self.m.block_term_value(block_id));
+        if (kind == mir_term_match()) {
+            var case_id = self.m.block_term_first_case(block_id);
+            var guard: i32 = 0;
+            while (case_id != mir_id_invalid() && guard <= self.m.case_count) {
+                self.block_value_root(self.m.case_pattern_value(case_id));
+                self.block_value_root(self.m.case_guard_value(case_id));
+                case_id = self.m.case_next(case_id);
+                guard = guard + 1;
+            }
+        }
+    }
+
+    public fn build_rewrite_plan(self) -> bool {
+        if (self.skipped || self.block_count == 0 || self.local_count == 0) { return true; }
+        var block_ordinal: i32 = 0;
+        while (block_ordinal < self.block_count) {
+            self.load_final_input(block_ordinal);
+            let block_id = mc_get_i32(self.block_ids, block_ordinal);
+            var instr_id = self.m.block_first_instr(block_id);
+            var guard: i32 = 0;
+            while (instr_id != mir_id_invalid()) {
+                self.plan_instruction(instr_id);
+                instr_id = self.m.instr_next(instr_id);
+                guard = guard + 1;
+                if (guard > self.m.instr_count + 1) {
+                    return self.set_error("cyclic instruction chain while planning copy propagation block #"
+                                          + mc_text(block_id));
+                }
+            }
+            self.plan_terminator(block_id);
+            block_ordinal = block_ordinal + 1;
+        }
+        return self.plan.ok;
+    }
+
+    public fn run(self) -> bool {
+        let rewrite_start = self.plan.rewrite_count;
+        if (!self.initialize()) { return false; }
+        if (!self.solve()) { return false; }
+        if (!self.build_rewrite_plan()) { return false; }
+        mir_analysis_audit("copy-prop function=" + mc_text(self.function_id)
+                           + " blocks=" + mc_text(self.block_count)
+                           + " locals=" + mc_text(self.local_count)
+                           + " rewrites=" + mc_text(self.plan.rewrite_count - rewrite_start)
+                           + " steps=" + policy_i64_to_string(self.work_steps)
+                           + " skipped=" + (if (self.skipped) { "1" } else { "0" }));
+        return true;
+    }
+
+    public fn dispose(self) {
+        if (self.block_ids != null) { free(self.block_ids); self.block_ids = null; }
+        if (self.block_slots != null) { free(self.block_slots); self.block_slots = null; }
+        if (self.local_ids != null) { free(self.local_ids); self.local_ids = null; }
+        if (self.local_slots != null) { free(self.local_slots); self.local_slots = null; }
+        if (self.in_sources != null) { free(self.in_sources); self.in_sources = null; }
+        if (self.out_sources != null) { free(self.out_sources); self.out_sources = null; }
+        if (self.work_sources != null) { free(self.work_sources); self.work_sources = null; }
+        if (self.worklist != null) { free(self.worklist); self.worklist = null; }
+        if (self.queued != null) { free(self.queued); self.queued = null; }
+        if (self.seen_values != null) { free(self.seen_values); self.seen_values = null; }
+    }
+}
+
+public fn mir_copy_build_plan(m: MirUnit,
+                              cache: MirAnalysisCache,
+                              function_filter: i32,
+                              local_mark: i32) -> MirCopyPlan {
+    let plan = MirCopyPlan.create(m);
+    if (!plan.ok || plan.proposal_states == null || plan.proposal_places == null) { return plan; }
+
+    // These values are evaluated through non-instruction ownership paths, so
+    // no single MIR program point can prove a stable replacement for them.
+    // Under streaming, only locals from this body's own scope (plus the
+    // closures its dependency walk created) can name its values; the unit
+    // path keeps the full-table walk.
+    if (function_filter != mir_id_invalid()) {
+        var chain_id: i32 = m.function_first_local(function_filter);
+        var chain_guard: i32 = 0;
+        while (chain_id != mir_id_invalid()
+               && chain_id >= 1
+               && chain_id <= m.local_count
+               && chain_guard <= m.local_count) {
+            mc_block_value_tree(m, plan, m.local_capture_init_value(chain_id), 0);
+            chain_id = m.local_next(chain_id);
+            chain_guard = chain_guard + 1;
+        }
+        var scan_id: i32 = local_mark + 1;
+        while (scan_id <= m.local_count) {
+            mc_block_value_tree(m, plan, m.local_capture_init_value(scan_id), 0);
+            scan_id = scan_id + 1;
+        }
+    } else {
+        var local_id: i32 = 1;
+        while (local_id <= m.local_count) {
+            mc_block_value_tree(m, plan, m.local_capture_init_value(local_id), 0);
+            local_id = local_id + 1;
+        }
+    }
+    var place_id: i32 = 1;
+    while (place_id <= m.place_count) {
+        if (m.place_index_value(place_id) != mir_id_invalid()) {
+            mc_block_value_tree(m, plan, m.place_index_value(place_id), 0);
+        }
+        place_id = place_id + 1;
+    }
+
+    var facts: MirCopyLocalFacts;
+    if (function_filter != mir_id_invalid()) {
+        facts = MirCopyLocalFacts.create_scoped(m, local_mark, function_filter);
+    } else {
+        facts = MirCopyLocalFacts.create(m);
+    }
+    if (!facts.ok) {
+        plan.set_error("cannot allocate copy propagation local facts");
+        facts.dispose();
+        return plan;
+    }
+    if (function_filter != mir_id_invalid()) {
+        let runner = MirCopyRunner.create(m, cache, plan, facts, function_filter);
+        runner.run();
+        runner.dispose();
+    } else {
+        var function_id: i32 = 1;
+        while (function_id <= m.function_count && plan.ok) {
+            let runner2 = MirCopyRunner.create(m, cache, plan, facts, function_id);
+            runner2.run();
+            runner2.dispose();
+            function_id = function_id + 1;
+        }
+    }
+    facts.dispose();
+    return plan;
+}

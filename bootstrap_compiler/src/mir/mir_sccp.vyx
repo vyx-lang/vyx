@@ -1,0 +1,1403 @@
+module bootstrap.mir_sccp;
+
+use bootstrap.ast;
+use bootstrap.hir_type_table;
+use bootstrap.mir_analysis;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memset(dst: rawptr, value: i32, size: u64) -> rawptr;
+}
+
+fn ms_state_undef() -> i32 { return 0; }
+fn ms_state_int() -> i32 { return 1; }
+fn ms_state_bool() -> i32 { return 2; }
+fn ms_state_null() -> i32 { return 3; }
+fn ms_state_overdefined() -> i32 { return 4; }
+fn ms_state_enum_tag() -> i32 { return 5; }
+
+fn ms_edge_none() -> i32 { return 0; }
+fn ms_edge_one() -> i32 { return 1; }
+fn ms_edge_all() -> i32 { return 2; }
+
+fn ms_max_cells() -> i64 { return 2000000; }
+fn ms_max_plan_records() -> i64 { return 4000000; }
+
+fn ms_text(value: i32) -> string {
+    return policy_i64_to_string(value as i64);
+}
+
+fn ms_alloc_i32(count: i32) -> rawptr {
+    var actual = count;
+    if (actual < 1) { actual = 1; }
+    if (actual > 536870911) { return null; }
+    let bytes = ((actual as i64) * 4) as u64;
+    let out = malloc(bytes);
+    if (out != null) { memset(out, 0, bytes); }
+    return out;
+}
+
+fn ms_alloc_i64(count: i32) -> rawptr {
+    var actual = count;
+    if (actual < 1) { actual = 1; }
+    if (actual > 268435455) { return null; }
+    let bytes = ((actual as i64) * 8) as u64;
+    let out = malloc(bytes);
+    if (out != null) { memset(out, 0, bytes); }
+    return out;
+}
+
+fn ms_get_i32(values: rawptr, index: i32) -> i32 {
+    if (values == null || index < 0) { return 0; }
+    return ast_read_i32(ptr_offset(values, index * 4));
+}
+
+fn ms_set_i32(values: rawptr, index: i32, value: i32) {
+    if (values != null && index >= 0) {
+        ast_write_i32(ptr_offset(values, index * 4), value);
+    }
+}
+
+fn ms_get_i64(values: rawptr, index: i32) -> i64 {
+    if (values == null || index < 0) { return 0; }
+    return ast_read_i64(ptr_offset(values, index * 8));
+}
+
+fn ms_set_i64(values: rawptr, index: i32, value: i64) {
+    if (values != null && index >= 0) {
+        ast_write_i64(ptr_offset(values, index * 8), value);
+    }
+}
+
+fn ms_integer_bits(kind: i32) -> i32 {
+    if (kind == ty_BOOL() || kind == ty_I8() || kind == ty_U8()) { return 8; }
+    if (kind == ty_I16() || kind == ty_U16()) { return 16; }
+    if (kind == ty_I32() || kind == ty_U32()) { return 32; }
+    if (kind == ty_I64() || kind == ty_U64()
+        || kind == ty_ISIZE() || kind == ty_USIZE()) { return 64; }
+    return 0;
+}
+
+fn ms_integer_signed(kind: i32) -> bool {
+    return kind == ty_I8() || kind == ty_I16() || kind == ty_I32()
+        || kind == ty_I64() || kind == ty_ISIZE();
+}
+
+fn ms_normalize_integer(value: i64, kind: i32) -> i64 {
+    let bits = ms_integer_bits(kind);
+    if (bits <= 0 || bits >= 64) { return value; }
+    let mask = ((1 as i64) << bits) - 1;
+    var out = value & mask;
+    if (ms_integer_signed(kind)) {
+        let sign_bit = (1 as i64) << (bits - 1);
+        if ((out & sign_bit) != 0) { out = out | (~mask); }
+    }
+    return out;
+}
+
+fn ms_type_is_pointer_like(m: MirUnit, type_id: i32) -> bool {
+    if (type_id == mir_id_invalid()) { return false; }
+    let kind = hir_type_table_kind(m.types, type_id);
+    return kind == ty_RAWPTR() || kind == ty_PTR()
+        || kind == ty_REF() || kind == ty_MUTREF();
+}
+
+fn ms_type_is_trackable(m: MirUnit, type_id: i32) -> bool {
+    if (type_id == mir_id_invalid()) { return false; }
+    let kind = hir_type_table_kind(m.types, type_id);
+    if (kind == ty_CHAR()) { return false; }
+    return ms_integer_bits(kind) > 0 || ms_type_is_pointer_like(m, type_id);
+}
+
+fn ms_valid_variant(m: MirUnit, variant_id: i32) -> bool {
+    return variant_id >= 1 && variant_id <= m.variant_count
+        && m.variant_record(variant_id) != null
+        && ast_read_i32(m.variant_record(variant_id)) == variant_id;
+}
+
+// A tag is only useful to SCCP when it names a direct, fully described enum
+// layout. Keep aliases, payload enums, and incomplete layout records outside
+// this domain rather than attempting backend-specific canonicalization.
+fn ms_type_is_plain_zero_payload_enum(m: MirUnit, type_id: i32) -> bool {
+    if (type_id == mir_id_invalid()
+        || hir_type_table_kind(m.types, type_id) != ty_CLASS()) { return false; }
+    let variant_total = m.variant_count_for_type(type_id);
+    if (variant_total < 1) { return false; }
+    var owned_total: i32 = 0;
+    var variant_id: i32 = 1;
+    while (variant_id <= m.variant_count) {
+        if (ms_valid_variant(m, variant_id)
+            && m.variant_owner_type(variant_id) == type_id) {
+            let tag = m.variant_tag(variant_id);
+            if (tag < 0 || tag >= variant_total
+                || m.variant_payload_count(variant_id) != 0) { return false; }
+            owned_total = owned_total + 1;
+        }
+        variant_id = variant_id + 1;
+    }
+    if (owned_total != variant_total) { return false; }
+    var tag2: i32 = 0;
+    while (tag2 < variant_total) {
+        let variant_for_tag = m.variant_id_for_type_tag(type_id, tag2);
+        if (!ms_valid_variant(m, variant_for_tag)
+            || m.variant_owner_type(variant_for_tag) != type_id
+            || m.variant_tag(variant_for_tag) != tag2
+            || m.variant_payload_count(variant_for_tag) != 0) { return false; }
+        tag2 = tag2 + 1;
+    }
+    return true;
+}
+
+// Deliberately accept only the direct, no-argument constructor representation.
+// Calls can carry effects or ABI-specific construction behavior and remain
+// overdefined even when their target happens to name an enum variant.
+fn ms_plain_enum_target_ref_tag(m: MirUnit, value_id: i32, type_id: i32) -> i32 {
+    if (value_id < 1 || value_id > m.value_count
+        || m.value_record(value_id) == null
+        || m.value_kind(value_id) != mir_value_target_ref()
+        || m.value_type(value_id) != type_id
+        || m.value_first_arg(value_id) != mir_id_invalid()
+        || m.value_target_kind(value_id) != mir_target_hir_variant()) {
+        return -1;
+    }
+    let variant_id = m.value_target_id(value_id);
+    if (!ms_valid_variant(m, variant_id)
+        || m.variant_owner_type(variant_id) != type_id
+        || m.variant_payload_count(variant_id) != 0) { return -1; }
+    let tag = m.variant_tag(variant_id);
+    if (tag < 0 || m.variant_id_for_type_tag(type_id, tag) != variant_id) { return -1; }
+    return tag;
+}
+
+fn ms_valid_local(m: MirUnit, local_id: i32) -> bool {
+    return local_id >= 1 && local_id <= m.local_count
+        && m.local_record(local_id) != null;
+}
+
+fn ms_valid_place(m: MirUnit, place_id: i32) -> bool {
+    return place_id >= 1 && place_id <= m.place_count
+        && m.place_record(place_id) != null;
+}
+
+fn ms_valid_case(m: MirUnit, case_id: i32) -> bool {
+    return case_id >= 1 && case_id <= m.case_count
+        && m.case_record(case_id) != null
+        && ast_read_i32(m.case_record(case_id)) == case_id;
+}
+
+fn ms_place_root_local(m: MirUnit, place_id: i32, depth: i32) -> i32 {
+    if (depth > 32 || !ms_valid_place(m, place_id)) { return mir_id_invalid(); }
+    let kind = m.place_kind(place_id);
+    if (kind == mir_place_local()) {
+        let local_id = m.place_local(place_id);
+        if (ms_valid_local(m, local_id)) { return local_id; }
+        return mir_id_invalid();
+    }
+    if (kind == mir_place_field() || kind == mir_place_index()) {
+        return ms_place_root_local(m, m.place_base(place_id), depth + 1);
+    }
+    return mir_id_invalid();
+}
+
+public class MirSccpPlan {
+    public ok: bool
+    public skipped: bool
+    public error_message: string
+    public block_count: i32
+    public instr_count: i32
+    public block_goto_target: rawptr
+    public block_constant_kind: rawptr
+    public block_constant_value: rawptr
+    public instr_constant_kind: rawptr
+    public instr_constant_value: rawptr
+    public enum_type_states: rawptr
+    public rewrite_count: i32
+
+    public static fn create(m: MirUnit) -> MirSccpPlan {
+        let record_count = (m.block_count as i64) + (m.instr_count as i64)
+            + (m.local_count as i64) + (m.types.count as i64);
+        if (m.block_count < 0 || m.instr_count < 0 || m.local_count < 0 || m.types.count < 0
+            || record_count < 0 || record_count > ms_max_plan_records()) {
+            return MirSccpPlan {
+                ok: true,
+                skipped: true,
+                error_message: "",
+                block_count: 0,
+                instr_count: 0,
+                block_goto_target: null,
+                block_constant_kind: null,
+                block_constant_value: null,
+                instr_constant_kind: null,
+                instr_constant_value: null,
+                enum_type_states: null,
+                rewrite_count: 0
+            };
+        }
+        var plan = MirSccpPlan {
+            ok: true,
+            skipped: false,
+            error_message: "",
+            block_count: m.block_count,
+            instr_count: m.instr_count,
+            block_goto_target: ms_alloc_i32(m.block_count + 1),
+            block_constant_kind: ms_alloc_i32(m.block_count + 1),
+            block_constant_value: ms_alloc_i64(m.block_count + 1),
+            instr_constant_kind: ms_alloc_i32(m.instr_count + 1),
+            instr_constant_value: ms_alloc_i64(m.instr_count + 1),
+            enum_type_states: ms_alloc_i32(m.types.count + 1),
+            rewrite_count: 0
+        };
+        if (plan.block_goto_target == null
+            || plan.block_constant_kind == null
+            || plan.block_constant_value == null
+            || plan.instr_constant_kind == null
+            || plan.instr_constant_value == null
+            || plan.enum_type_states == null) {
+            plan.set_error("cannot allocate SCCP rewrite plan");
+        }
+        return plan;
+    }
+
+    public fn set_error(self, message: string) {
+        if (self.ok) { self.error_message = message; }
+        self.ok = false;
+    }
+
+    public fn mark_skipped(self) {
+        self.skipped = true;
+    }
+
+    public fn set_instr_constant(self, instr_id: i32, kind: i32, value: i64) {
+        if (!self.ok || instr_id < 1 || instr_id > self.instr_count
+            || ms_get_i32(self.instr_constant_kind, instr_id) != 0) { return; }
+        ms_set_i32(self.instr_constant_kind, instr_id, kind);
+        ms_set_i64(self.instr_constant_value, instr_id, value);
+        self.rewrite_count = self.rewrite_count + 1;
+    }
+
+    public fn set_block_goto(self, block_id: i32, target: i32) {
+        if (!self.ok || block_id < 1 || block_id > self.block_count
+            || target == mir_id_invalid()
+            || ms_get_i32(self.block_goto_target, block_id) != mir_id_invalid()) { return; }
+        ms_set_i32(self.block_goto_target, block_id, target);
+        self.rewrite_count = self.rewrite_count + 1;
+    }
+
+    public fn set_block_constant(self, block_id: i32, kind: i32, value: i64) {
+        if (!self.ok || block_id < 1 || block_id > self.block_count
+            || ms_get_i32(self.block_constant_kind, block_id) != 0) { return; }
+        ms_set_i32(self.block_constant_kind, block_id, kind);
+        ms_set_i64(self.block_constant_value, block_id, value);
+        self.rewrite_count = self.rewrite_count + 1;
+    }
+
+    public fn instr_kind(self, instr_id: i32) -> i32 {
+        if (instr_id < 1 || instr_id > self.instr_count) { return 0; }
+        return ms_get_i32(self.instr_constant_kind, instr_id);
+    }
+
+    public fn instr_value(self, instr_id: i32) -> i64 {
+        if (instr_id < 1 || instr_id > self.instr_count) { return 0; }
+        return ms_get_i64(self.instr_constant_value, instr_id);
+    }
+
+    public fn block_target(self, block_id: i32) -> i32 {
+        if (block_id < 1 || block_id > self.block_count) { return mir_id_invalid(); }
+        return ms_get_i32(self.block_goto_target, block_id);
+    }
+
+    public fn block_kind(self, block_id: i32) -> i32 {
+        if (block_id < 1 || block_id > self.block_count) { return 0; }
+        return ms_get_i32(self.block_constant_kind, block_id);
+    }
+
+    public fn block_value(self, block_id: i32) -> i64 {
+        if (block_id < 1 || block_id > self.block_count) { return 0; }
+        return ms_get_i64(self.block_constant_value, block_id);
+    }
+
+    public fn dispose(self) {
+        if (self.block_goto_target != null) { free(self.block_goto_target); self.block_goto_target = null; }
+        if (self.block_constant_kind != null) { free(self.block_constant_kind); self.block_constant_kind = null; }
+        if (self.block_constant_value != null) { free(self.block_constant_value); self.block_constant_value = null; }
+        if (self.instr_constant_kind != null) { free(self.instr_constant_kind); self.instr_constant_kind = null; }
+        if (self.instr_constant_value != null) { free(self.instr_constant_value); self.instr_constant_value = null; }
+        if (self.enum_type_states != null) { free(self.enum_type_states); self.enum_type_states = null; }
+    }
+}
+
+class MirSccpValue {
+    public state: i32
+    public type_id: i32
+    public value: i64
+
+    public static fn unknown(type_id: i32) -> MirSccpValue {
+        return MirSccpValue { state: ms_state_overdefined(), type_id: type_id, value: 0 };
+    }
+
+    public static fn known(state: i32, type_id: i32, value: i64) -> MirSccpValue {
+        return MirSccpValue { state: state, type_id: type_id, value: value };
+    }
+}
+
+class MirSccpLocalFacts {
+    public blocked: rawptr
+    public local_count: i32
+    public ok: bool
+
+    public static fn create(m: MirUnit) -> MirSccpLocalFacts {
+        var facts = MirSccpLocalFacts {
+            blocked: ms_alloc_i32(m.local_count + 1),
+            local_count: m.local_count,
+            ok: true
+        };
+        if (facts.blocked == null) {
+            facts.ok = false;
+            return facts;
+        }
+        var local_id: i32 = 1;
+        while (local_id <= m.local_count) {
+            facts.scan_local(m, local_id);
+            local_id = local_id + 1;
+        }
+        facts.scan_live_records(m);
+        return facts;
+    }
+
+    /// Function-scoped variant for the streaming pipeline: the unit's local
+    /// table never rewinds after a streamed body is released, so a full-table
+    /// scan per pipeline call is quadratic in the number of lowered
+    /// functions.  The SCCP runner only consults blocked state for locals
+    /// owned by the filtered function, and a local created before this
+    /// function's body mark cannot capture one of its locals (capture
+    /// sources are recorded while the capturing local is created, before
+    /// those records existed), so scanning this function's own chain plus
+    /// every local created at or after `local_mark` -- the body and the
+    /// closure bodies its dependency walk materialized -- yields the same
+    /// block set for every local the runner can ask about.
+    public static fn create_scoped(m: MirUnit, local_mark: i32, function_filter: i32) -> MirSccpLocalFacts {
+        var facts = MirSccpLocalFacts {
+            blocked: ms_alloc_i32(m.local_count + 1),
+            local_count: m.local_count,
+            ok: true
+        };
+        if (facts.blocked == null) {
+            facts.ok = false;
+            return facts;
+        }
+        var local_id: i32 = m.function_first_local(function_filter);
+        var guard: i32 = 0;
+        while (local_id != mir_id_invalid()
+               && local_id >= 1
+               && local_id <= m.local_count
+               && guard <= m.local_count) {
+            facts.scan_local(m, local_id);
+            local_id = m.local_next(local_id);
+            guard = guard + 1;
+        }
+        var scan_id: i32 = local_mark + 1;
+        while (scan_id <= m.local_count) {
+            facts.scan_local(m, scan_id);
+            scan_id = scan_id + 1;
+        }
+        facts.scan_live_records(m);
+        return facts;
+    }
+
+    fn scan_local(self, m: MirUnit, local_id: i32) {
+        if (ms_valid_local(m, local_id)) {
+            let flags = m.local_flags(local_id);
+            if ((flags & mir_local_flag_capture()) != 0
+                || (flags & mir_local_flag_reference_capture()) != 0
+                || (flags & mir_local_flag_auto_drop()) != 0
+                || (flags & mir_local_flag_move_arg()) != 0) {
+                self.block(local_id);
+            }
+            self.block(m.local_capture_source(local_id));
+        }
+    }
+
+    fn scan_live_records(self, m: MirUnit) {
+        var place_id: i32 = 1;
+        while (place_id <= m.place_count) {
+            if (ms_valid_place(m, place_id)
+                && m.place_kind(place_id) != mir_place_local()) {
+                self.block(ms_place_root_local(m, place_id, 0));
+            }
+            place_id = place_id + 1;
+        }
+        var value_id: i32 = 1;
+        while (value_id <= m.value_count) {
+            if (m.value_record(value_id) != null) {
+                if (m.value_kind(value_id) == mir_value_address_of()) {
+                    self.block(ms_place_root_local(m, m.value_place(value_id), 0));
+                }
+                if (m.value_kind(value_id) == mir_value_read_place()
+                    && (m.value_flags(value_id) & mir_value_flag_move_arg()) != 0) {
+                    self.block(ms_place_root_local(m, m.value_place(value_id), 0));
+                }
+            }
+            value_id = value_id + 1;
+        }
+    }
+
+    public fn block(self, local_id: i32) {
+        if (self.blocked == null || local_id < 1 || local_id > self.local_count) { return; }
+        ms_set_i32(self.blocked, local_id, 1);
+    }
+
+    public fn is_blocked(self, local_id: i32) -> bool {
+        if (self.blocked == null || local_id < 1 || local_id > self.local_count) { return true; }
+        return ms_get_i32(self.blocked, local_id) != 0;
+    }
+
+    public fn dispose(self) {
+        if (self.blocked != null) { free(self.blocked); self.blocked = null; }
+    }
+}
+
+class MirSccpRunner {
+    public m: MirUnit
+    public cache: MirAnalysisCache
+    public plan: MirSccpPlan
+    public function_id: i32
+    public facts: MirSccpLocalFacts
+    public block_count: i32
+    public local_count: i32
+    public cell_count: i32
+    public block_ids: rawptr
+    public block_slots: rawptr
+    public local_ids: rawptr
+    public local_slots: rawptr
+    public block_executable: rawptr
+    public block_queued: rawptr
+    public edge_modes: rawptr
+    public edge_targets: rawptr
+    public worklist: rawptr
+    public worklist_count: i32
+    public in_states: rawptr
+    public in_values: rawptr
+    public out_states: rawptr
+    public out_values: rawptr
+    public work_states: rawptr
+    public work_values: rawptr
+    public initialized: bool
+    public skipped: bool
+
+    public static fn create(m: MirUnit,
+                            cache: MirAnalysisCache,
+                            plan: MirSccpPlan,
+                            function_id: i32,
+                            facts: MirSccpLocalFacts) -> MirSccpRunner {
+        return MirSccpRunner {
+            m: m,
+            cache: cache,
+            plan: plan,
+            function_id: function_id,
+            facts: facts,
+            block_count: 0,
+            local_count: 0,
+            cell_count: 0,
+            block_ids: null,
+            block_slots: null,
+            local_ids: null,
+            local_slots: null,
+            block_executable: null,
+            block_queued: null,
+            edge_modes: null,
+            edge_targets: null,
+            worklist: null,
+            worklist_count: 0,
+            in_states: null,
+            in_values: null,
+            out_states: null,
+            out_values: null,
+            work_states: null,
+            work_values: null,
+            initialized: false,
+            skipped: false
+        };
+    }
+
+    public fn set_error(self, message: string) -> bool {
+        self.plan.set_error(message);
+        return false;
+    }
+
+    public fn function_has_legacy_match_target(self) -> bool {
+        var block_id = self.m.function_first_block(self.function_id);
+        var guard: i32 = 0;
+        while (block_id != mir_id_invalid()) {
+            if (self.m.block_term_kind(block_id) == mir_term_match()
+                && self.m.block_term_target(block_id) != mir_id_invalid()) { return true; }
+            guard = guard + 1;
+            if (guard > self.m.block_count + 1) { return true; }
+            block_id = self.m.block_next(block_id);
+        }
+        return false;
+    }
+
+    // 0 = unknown, 1 = outside the plain enum domain, 2 = eligible plain
+    // enum. The plan owns this cache so every function shares one TypeId view.
+    public fn type_is_plain_zero_payload_enum(self, type_id: i32) -> bool {
+        if (type_id < 1 || type_id > self.m.types.count
+            || self.plan.enum_type_states == null) { return false; }
+        let cached = ms_get_i32(self.plan.enum_type_states, type_id);
+        if (cached == 1) { return false; }
+        if (cached == 2) { return true; }
+        let eligible = ms_type_is_plain_zero_payload_enum(self.m, type_id);
+        if (eligible) {
+            ms_set_i32(self.plan.enum_type_states, type_id, 2);
+        } else {
+            ms_set_i32(self.plan.enum_type_states, type_id, 1);
+        }
+        return eligible;
+    }
+
+    public fn type_is_sccp_trackable(self, type_id: i32) -> bool {
+        return ms_type_is_trackable(self.m, type_id)
+            || self.type_is_plain_zero_payload_enum(type_id);
+    }
+
+    public fn enum_target_ref_tag(self, value_id: i32, type_id: i32) -> i32 {
+        if (!self.type_is_plain_zero_payload_enum(type_id)) { return -1; }
+        return ms_plain_enum_target_ref_tag(self.m, value_id, type_id);
+    }
+
+    public fn local_is_eligible(self, local_id: i32) -> bool {
+        if (!ms_valid_local(self.m, local_id)
+            || self.m.local_function(local_id) != self.function_id
+            || self.facts.is_blocked(local_id)
+            || (self.m.local_flags(local_id) & mir_local_flag_self_receiver()) != 0
+            || !self.type_is_sccp_trackable(self.m.local_type(local_id))) { return false; }
+        let place_id = self.m.local_place(local_id);
+        return ms_valid_place(self.m, place_id)
+            && self.m.place_function(place_id) == self.function_id
+            && self.m.place_kind(place_id) == mir_place_local()
+            && self.m.place_local(place_id) == local_id
+            && self.m.place_type(place_id) == self.m.local_type(local_id);
+    }
+
+    public fn count_function_records(self) -> bool {
+        if (!self.facts.ok) { return self.set_error("cannot allocate SCCP local facts"); }
+        if (self.function_has_legacy_match_target()) {
+            self.skipped = true;
+            self.plan.mark_skipped();
+            return true;
+        }
+        var block_id = self.m.function_first_block(self.function_id);
+        var block_guard: i32 = 0;
+        while (block_id != mir_id_invalid()) {
+            if (block_id < 1 || block_id > self.m.block_count
+                || self.m.block_record(block_id) == null
+                || self.m.block_is_removed( block_id)
+                || self.m.block_function(block_id) != self.function_id) {
+                return self.set_error("invalid active block in SCCP function #" + ms_text(self.function_id));
+            }
+            self.block_count = self.block_count + 1;
+            block_guard = block_guard + 1;
+            if (block_guard > self.m.block_count + 1) {
+                return self.set_error("cyclic block chain in SCCP function #" + ms_text(self.function_id));
+            }
+            block_id = self.m.block_next(block_id);
+        }
+        var local_id = self.m.function_first_local(self.function_id);
+        var local_guard: i32 = 0;
+        while (local_id != mir_id_invalid()) {
+            if (!ms_valid_local(self.m, local_id)
+                || self.m.local_function(local_id) != self.function_id) {
+                return self.set_error("invalid local chain in SCCP function #" + ms_text(self.function_id));
+            }
+            if (self.local_is_eligible(local_id)) { self.local_count = self.local_count + 1; }
+            local_guard = local_guard + 1;
+            if (local_guard > self.m.local_count + 1) {
+                return self.set_error("cyclic local chain in SCCP function #" + ms_text(self.function_id));
+            }
+            local_id = self.m.local_next(local_id);
+        }
+        let cells64 = (self.block_count as i64) * (self.local_count as i64);
+        if (cells64 < 0 || cells64 > ms_max_cells()) {
+            self.skipped = true;
+            self.plan.mark_skipped();
+            mir_analysis_audit("sccp skip function=" + ms_text(self.function_id)
+                               + " blocks=" + ms_text(self.block_count)
+                               + " locals=" + ms_text(self.local_count)
+                               + " cells=" + policy_i64_to_string(cells64));
+            return true;
+        }
+        self.cell_count = cells64 as i32;
+        return true;
+    }
+
+    public fn allocate_storage(self) -> bool {
+        self.block_ids = ms_alloc_i32(self.block_count);
+        self.block_slots = ms_alloc_i32(self.m.block_count + 1);
+        self.local_ids = ms_alloc_i32(self.local_count);
+        self.local_slots = ms_alloc_i32(self.m.local_count + 1);
+        self.block_executable = ms_alloc_i32(self.block_count);
+        self.block_queued = ms_alloc_i32(self.block_count);
+        self.edge_modes = ms_alloc_i32(self.block_count);
+        self.edge_targets = ms_alloc_i32(self.block_count);
+        self.worklist = ms_alloc_i32(self.block_count);
+        self.in_states = ms_alloc_i32(self.cell_count);
+        self.in_values = ms_alloc_i64(self.cell_count);
+        self.out_states = ms_alloc_i32(self.cell_count);
+        self.out_values = ms_alloc_i64(self.cell_count);
+        self.work_states = ms_alloc_i32(self.local_count);
+        self.work_values = ms_alloc_i64(self.local_count);
+        if (self.block_ids == null || self.block_slots == null
+            || self.local_ids == null || self.local_slots == null
+            || self.block_executable == null || self.block_queued == null
+            || self.edge_modes == null || self.edge_targets == null
+            || self.worklist == null || self.in_states == null || self.in_values == null
+            || self.out_states == null || self.out_values == null
+            || self.work_states == null || self.work_values == null) {
+            return self.set_error("cannot allocate SCCP function scratch storage");
+        }
+        return true;
+    }
+
+    public fn index_records(self) -> bool {
+        var ordinal: i32 = 0;
+        var block_id = self.m.function_first_block(self.function_id);
+        while (block_id != mir_id_invalid() && ordinal < self.block_count) {
+            ms_set_i32(self.block_ids, ordinal, block_id);
+            ms_set_i32(self.block_slots, block_id, ordinal + 1);
+            ordinal = ordinal + 1;
+            block_id = self.m.block_next(block_id);
+        }
+        if (ordinal != self.block_count || block_id != mir_id_invalid()) {
+            return self.set_error("SCCP block count changed while indexing");
+        }
+        ordinal = 0;
+        var local_id = self.m.function_first_local(self.function_id);
+        while (local_id != mir_id_invalid()) {
+            if (self.local_is_eligible(local_id)) {
+                if (ordinal >= self.local_count) {
+                    return self.set_error("SCCP local count changed while indexing");
+                }
+                ms_set_i32(self.local_ids, ordinal, local_id);
+                ms_set_i32(self.local_slots, local_id, ordinal + 1);
+                ordinal = ordinal + 1;
+            }
+            local_id = self.m.local_next(local_id);
+        }
+        if (ordinal != self.local_count) {
+            return self.set_error("SCCP local count changed while indexing");
+        }
+        return true;
+    }
+
+    public fn initialize(self) -> bool {
+        if (!self.count_function_records()) { return false; }
+        if (self.skipped || self.block_count == 0 || self.local_count == 0) {
+            self.initialized = true;
+            return true;
+        }
+        if (!self.allocate_storage() || !self.index_records()) { return false; }
+        self.initialized = true;
+        return true;
+    }
+
+    public fn cell_index(self, block_ordinal: i32, local_ordinal: i32) -> i32 {
+        return block_ordinal * self.local_count + local_ordinal;
+    }
+
+    public fn local_ordinal_for_place(self, place_id: i32) -> i32 {
+        if (!ms_valid_place(self.m, place_id)
+            || self.m.place_kind(place_id) != mir_place_local()) { return -1; }
+        let local_id = self.m.place_local(place_id);
+        if (local_id < 1 || local_id > self.m.local_count) { return -1; }
+        return ms_get_i32(self.local_slots, local_id) - 1;
+    }
+
+    public fn state_is_constant(self, state: i32) -> bool {
+        return state == ms_state_int() || state == ms_state_bool() || state == ms_state_null();
+    }
+
+    // `enum_tag` is a dataflow fact only. It must never flow into the scalar
+    // constant materialization paths below.
+    public fn state_is_propagatable(self, state: i32) -> bool {
+        return self.state_is_constant(state) || state == ms_state_enum_tag();
+    }
+
+    public fn merge_state(self,
+                          left_state: i32,
+                          left_value: i64,
+                          right_state: i32,
+                          right_value: i64) -> MirSccpValue {
+        if (left_state == ms_state_undef()) {
+            return MirSccpValue.known(right_state, mir_id_invalid(), right_value);
+        }
+        if (right_state == ms_state_undef()) {
+            return MirSccpValue.known(left_state, mir_id_invalid(), left_value);
+        }
+        if (left_state == ms_state_overdefined() || right_state == ms_state_overdefined()) {
+            return MirSccpValue.known(ms_state_overdefined(), mir_id_invalid(), 0);
+        }
+        if (left_state == right_state && left_value == right_value) {
+            return MirSccpValue.known(left_state, mir_id_invalid(), left_value);
+        }
+        return MirSccpValue.known(ms_state_overdefined(), mir_id_invalid(), 0);
+    }
+
+    public fn merge_into(self,
+                         states: rawptr,
+                         values: rawptr,
+                         index: i32,
+                         incoming_state: i32,
+                         incoming_value: i64) -> bool {
+        let old_state = ms_get_i32(states, index);
+        let old_value = ms_get_i64(values, index);
+        let merged = self.merge_state(old_state, old_value, incoming_state, incoming_value);
+        if (merged.state == old_state && merged.value == old_value) { return false; }
+        ms_set_i32(states, index, merged.state);
+        ms_set_i64(values, index, merged.value);
+        return true;
+    }
+
+    public fn edge_is_executable(self, source_block_id: i32, target_block_id: i32) -> bool {
+        if (source_block_id < 1 || source_block_id > self.m.block_count) { return false; }
+        let source_ordinal = ms_get_i32(self.block_slots, source_block_id) - 1;
+        if (source_ordinal < 0 || ms_get_i32(self.block_executable, source_ordinal) == 0) {
+            return false;
+        }
+        let mode = ms_get_i32(self.edge_modes, source_ordinal);
+        if (mode == ms_edge_all()) { return true; }
+        return mode == ms_edge_one()
+            && ms_get_i32(self.edge_targets, source_ordinal) == target_block_id;
+    }
+
+    public fn enqueue(self, block_ordinal: i32) {
+        if (block_ordinal < 0 || block_ordinal >= self.block_count
+            || ms_get_i32(self.block_queued, block_ordinal) != 0) { return; }
+        if (self.worklist_count >= self.block_count) {
+            self.plan.set_error("SCCP worklist capacity exceeded");
+            return;
+        }
+        ms_set_i32(self.block_queued, block_ordinal, 1);
+        ms_set_i32(self.worklist, self.worklist_count, block_ordinal);
+        self.worklist_count = self.worklist_count + 1;
+    }
+
+    public fn activate_target(self, target_block_id: i32) {
+        if (target_block_id < 1 || target_block_id > self.m.block_count) { return; }
+        let target_ordinal = ms_get_i32(self.block_slots, target_block_id) - 1;
+        if (target_ordinal < 0) { return; }
+        if (ms_get_i32(self.block_executable, target_ordinal) == 0) {
+            ms_set_i32(self.block_executable, target_ordinal, 1);
+        }
+        self.enqueue(target_ordinal);
+    }
+
+    public fn enqueue_executable_successors(self, block_ordinal: i32) {
+        let block_id = ms_get_i32(self.block_ids, block_ordinal);
+        var ordinal: i32 = 0;
+        let count = self.cache.cfg_successor_count(block_id);
+        while (ordinal < count) {
+            let target = self.cache.cfg_successor_at(block_id, ordinal);
+            if (self.edge_is_executable(block_id, target)) { self.activate_target(target); }
+            ordinal = ordinal + 1;
+        }
+    }
+
+    public fn update_edge_mode(self, block_ordinal: i32, desired_mode: i32, desired_target: i32) {
+        let old_mode = ms_get_i32(self.edge_modes, block_ordinal);
+        var next_mode = old_mode;
+        var next_target = ms_get_i32(self.edge_targets, block_ordinal);
+        if (old_mode == ms_edge_none()) {
+            next_mode = desired_mode;
+            next_target = desired_target;
+        } else if (old_mode == ms_edge_one()) {
+            if (desired_mode == ms_edge_all()
+                || (desired_mode == ms_edge_one() && next_target != desired_target)) {
+                next_mode = ms_edge_all();
+                next_target = mir_id_invalid();
+            }
+        }
+        if (next_mode == old_mode && next_target == ms_get_i32(self.edge_targets, block_ordinal)) {
+            return;
+        }
+        ms_set_i32(self.edge_modes, block_ordinal, next_mode);
+        ms_set_i32(self.edge_targets, block_ordinal, next_target);
+        self.enqueue_executable_successors(block_ordinal);
+    }
+
+    public fn compute_input(self, block_ordinal: i32) -> bool {
+        var local_ordinal: i32 = 0;
+        while (local_ordinal < self.local_count) {
+            ms_set_i32(self.work_states, local_ordinal, ms_state_undef());
+            ms_set_i64(self.work_values, local_ordinal, 0);
+            local_ordinal = local_ordinal + 1;
+        }
+        let block_id = ms_get_i32(self.block_ids, block_ordinal);
+        let entry_id = self.m.function_first_block(self.function_id);
+        var saw_input = false;
+        if (block_id == entry_id) {
+            local_ordinal = 0;
+            while (local_ordinal < self.local_count) {
+                ms_set_i32(self.work_states, local_ordinal, ms_state_overdefined());
+                local_ordinal = local_ordinal + 1;
+            }
+            saw_input = true;
+        }
+        var pred_ordinal: i32 = 0;
+        let pred_count = self.cache.cfg_predecessor_count(block_id);
+        while (pred_ordinal < pred_count) {
+            let pred_id = self.cache.cfg_predecessor_at(block_id, pred_ordinal);
+            if (self.edge_is_executable(pred_id, block_id)) {
+                let pred_slot = ms_get_i32(self.block_slots, pred_id) - 1;
+                if (pred_slot >= 0) {
+                    local_ordinal = 0;
+                    while (local_ordinal < self.local_count) {
+                        let pred_index = self.cell_index(pred_slot, local_ordinal);
+                        self.merge_into(self.work_states,
+                                        self.work_values,
+                                        local_ordinal,
+                                        ms_get_i32(self.out_states, pred_index),
+                                        ms_get_i64(self.out_values, pred_index));
+                        local_ordinal = local_ordinal + 1;
+                    }
+                    saw_input = true;
+                }
+            }
+            pred_ordinal = pred_ordinal + 1;
+        }
+        if (!saw_input) { return false; }
+        local_ordinal = 0;
+        while (local_ordinal < self.local_count) {
+            let index = self.cell_index(block_ordinal, local_ordinal);
+            self.merge_into(self.in_states,
+                            self.in_values,
+                            index,
+                            ms_get_i32(self.work_states, local_ordinal),
+                            ms_get_i64(self.work_values, local_ordinal));
+            ms_set_i32(self.work_states, local_ordinal, ms_get_i32(self.in_states, index));
+            ms_set_i64(self.work_values, local_ordinal, ms_get_i64(self.in_values, index));
+            local_ordinal = local_ordinal + 1;
+        }
+        return true;
+    }
+
+    public fn eval_value(self, value_id: i32, depth: i32) -> MirSccpValue {
+        if (depth > 64 || value_id < 1 || value_id > self.m.value_count
+            || self.m.value_record(value_id) == null) {
+            return MirSccpValue.unknown(mir_id_invalid());
+        }
+        let type_id = self.m.value_type(value_id);
+        let kind = self.m.value_kind(value_id);
+        let type_kind = hir_type_table_kind(self.m.types, type_id);
+        if (kind == mir_value_const_int()) {
+            if (type_kind == ty_CHAR() || ms_integer_bits(type_kind) <= 0) {
+                return MirSccpValue.unknown(type_id);
+            }
+            return MirSccpValue.known(ms_state_int(), type_id,
+                                      ms_normalize_integer(self.m.value_int(value_id), type_kind));
+        }
+        if (kind == mir_value_const_bool()) {
+            var bool_value: i64 = 0;
+            if (self.m.value_int(value_id) != 0) { bool_value = 1; }
+            return MirSccpValue.known(ms_state_bool(), type_id, bool_value);
+        }
+        if (kind == mir_value_null() && ms_type_is_pointer_like(self.m, type_id)) {
+            return MirSccpValue.known(ms_state_null(), type_id, 0);
+        }
+        if (kind == mir_value_target_ref()) {
+            let enum_tag = self.enum_target_ref_tag(value_id, type_id);
+            if (enum_tag >= 0) {
+                return MirSccpValue.known(ms_state_enum_tag(), type_id, enum_tag as i64);
+            }
+            return MirSccpValue.unknown(type_id);
+        }
+        if (kind == mir_value_read_place()) {
+            let local_ordinal = self.local_ordinal_for_place(self.m.value_place(value_id));
+            if (local_ordinal < 0) { return MirSccpValue.unknown(type_id); }
+            let local_id = ms_get_i32(self.local_ids, local_ordinal);
+            if (self.m.local_type(local_id) != type_id) { return MirSccpValue.unknown(type_id); }
+            let state = ms_get_i32(self.work_states, local_ordinal);
+            if (!self.state_is_propagatable(state)) { return MirSccpValue.unknown(type_id); }
+            return MirSccpValue.known(state, type_id, ms_get_i64(self.work_values, local_ordinal));
+        }
+        if (kind == mir_value_cast()) {
+            let inner = self.eval_value(self.m.value_lhs(value_id), depth + 1);
+            if (!self.state_is_constant(inner.state)) { return MirSccpValue.unknown(type_id); }
+            let inner_kind = hir_type_table_kind(self.m.types, inner.type_id);
+            if (inner.state == ms_state_null()
+                && ms_type_is_pointer_like(self.m, inner.type_id)
+                && ms_type_is_pointer_like(self.m, type_id)) {
+                return MirSccpValue.known(ms_state_null(), type_id, 0);
+            }
+            if (inner.state == ms_state_bool() && type_kind == ty_BOOL()) {
+                return MirSccpValue.known(ms_state_bool(), type_id, inner.value);
+            }
+            if (inner.state == ms_state_int()
+                && inner_kind != ty_CHAR()
+                && type_kind != ty_CHAR()
+                && ms_integer_bits(inner_kind) > 0
+                && ms_integer_bits(type_kind) > 0
+                && type_kind != ty_BOOL()) {
+                return MirSccpValue.known(ms_state_int(), type_id,
+                                          ms_normalize_integer(inner.value, type_kind));
+            }
+            return MirSccpValue.unknown(type_id);
+        }
+        if (kind == mir_value_unary()) {
+            let inner2 = self.eval_value(self.m.value_lhs(value_id), depth + 1);
+            if (!self.state_is_constant(inner2.state)) { return MirSccpValue.unknown(type_id); }
+            let op = self.m.value_op(value_id);
+            if (op == tk_NOT() && type_kind == ty_BOOL()
+                && inner2.state == ms_state_bool()) {
+                var not_value: i64 = 0;
+                if (inner2.value == 0) { not_value = 1; }
+                return MirSccpValue.known(ms_state_bool(), type_id, not_value);
+            }
+            if (inner2.state != ms_state_int() || inner2.type_id != type_id
+                || ms_integer_bits(type_kind) <= 0 || type_kind == ty_BOOL()) {
+                return MirSccpValue.unknown(type_id);
+            }
+            if (op == tk_PLUS()) {
+                return MirSccpValue.known(ms_state_int(), type_id, inner2.value);
+            }
+            if (op == tk_MINUS()) {
+                return MirSccpValue.known(ms_state_int(), type_id,
+                                          ms_normalize_integer(0 - inner2.value, type_kind));
+            }
+            if (op == tk_TILDE()) {
+                return MirSccpValue.known(ms_state_int(), type_id,
+                                          ms_normalize_integer(~inner2.value, type_kind));
+            }
+            return MirSccpValue.unknown(type_id);
+        }
+        if (kind != mir_value_binary()) { return MirSccpValue.unknown(type_id); }
+        let lhs = self.eval_value(self.m.value_lhs(value_id), depth + 1);
+        let rhs = self.eval_value(self.m.value_rhs(value_id), depth + 1);
+        if (!self.state_is_constant(lhs.state) || !self.state_is_constant(rhs.state)
+            || lhs.type_id != rhs.type_id) { return MirSccpValue.unknown(type_id); }
+        let op2 = self.m.value_op(value_id);
+        if (op2 == tk_EQEQ() || op2 == tk_NEQ()) {
+            var comparable = lhs.state == rhs.state
+                && (lhs.state == ms_state_int() || lhs.state == ms_state_bool()
+                    || lhs.state == ms_state_null());
+            if (!comparable || type_kind != ty_BOOL()) { return MirSccpValue.unknown(type_id); }
+            var equal_value: i64 = 0;
+            if (lhs.value == rhs.value) { equal_value = 1; }
+            if (op2 == tk_NEQ()) { equal_value = 1 - equal_value; }
+            return MirSccpValue.known(ms_state_bool(), type_id, equal_value);
+        }
+        if (op2 == tk_AND() || op2 == tk_OR()) {
+            if (lhs.state != ms_state_bool() || rhs.state != ms_state_bool()
+                || type_kind != ty_BOOL()) { return MirSccpValue.unknown(type_id); }
+            var logical_value: i64 = 0;
+            if (op2 == tk_AND() && lhs.value != 0 && rhs.value != 0) { logical_value = 1; }
+            if (op2 == tk_OR() && (lhs.value != 0 || rhs.value != 0)) { logical_value = 1; }
+            return MirSccpValue.known(ms_state_bool(), type_id, logical_value);
+        }
+        if (lhs.state != ms_state_int() || rhs.state != ms_state_int()
+            || lhs.type_id != type_id || ms_integer_bits(type_kind) <= 0
+            || type_kind == ty_BOOL()) { return MirSccpValue.unknown(type_id); }
+        var result: i64 = 0;
+        if (op2 == tk_PLUS()) { result = lhs.value + rhs.value; }
+        else if (op2 == tk_MINUS()) { result = lhs.value - rhs.value; }
+        else if (op2 == tk_STAR()) { result = lhs.value * rhs.value; }
+        else if (op2 == tk_AMP()) { result = lhs.value & rhs.value; }
+        else if (op2 == tk_PIPE()) { result = lhs.value | rhs.value; }
+        else if (op2 == tk_CARET()) { result = lhs.value ^ rhs.value; }
+        else { return MirSccpValue.unknown(type_id); }
+        return MirSccpValue.known(ms_state_int(), type_id,
+                                  ms_normalize_integer(result, type_kind));
+    }
+
+    public fn kill_local_for_place(self, place_id: i32) {
+        let local_ordinal = self.local_ordinal_for_place(place_id);
+        if (local_ordinal < 0) { return; }
+        ms_set_i32(self.work_states, local_ordinal, ms_state_overdefined());
+        ms_set_i64(self.work_values, local_ordinal, 0);
+    }
+
+    public fn kill_all_locals(self) {
+        var local_ordinal: i32 = 0;
+        while (local_ordinal < self.local_count) {
+            ms_set_i32(self.work_states, local_ordinal, ms_state_overdefined());
+            ms_set_i64(self.work_values, local_ordinal, 0);
+            local_ordinal = local_ordinal + 1;
+        }
+    }
+
+    public fn transfer_instr(self, instr_id: i32) {
+        let kind = self.m.instr_kind(instr_id);
+        if (kind == mir_instr_assign()) {
+            let local_ordinal = self.local_ordinal_for_place(self.m.instr_place(instr_id));
+            if (local_ordinal < 0) { return; }
+            let local_id = ms_get_i32(self.local_ids, local_ordinal);
+            let resolved = self.eval_value(self.m.instr_value(instr_id), 0);
+            if (self.state_is_propagatable(resolved.state)
+                && resolved.type_id == self.m.local_type(local_id)) {
+                ms_set_i32(self.work_states, local_ordinal, resolved.state);
+                ms_set_i64(self.work_values, local_ordinal, resolved.value);
+            } else {
+                ms_set_i32(self.work_states, local_ordinal, ms_state_overdefined());
+                ms_set_i64(self.work_values, local_ordinal, 0);
+            }
+            return;
+        }
+        if (kind == mir_instr_storage_live()
+            || kind == mir_instr_storage_dead()
+            || kind == mir_instr_foreach_bind()
+            || kind == mir_instr_drop()) {
+            self.kill_local_for_place(self.m.instr_place(instr_id));
+            return;
+        }
+        if (kind == mir_instr_match_arm()) { self.kill_all_locals(); }
+    }
+
+    public fn transfer_block(self, block_ordinal: i32) -> bool {
+        let block_id = ms_get_i32(self.block_ids, block_ordinal);
+        var instr_id = self.m.block_first_instr(block_id);
+        var guard: i32 = 0;
+        while (instr_id != mir_id_invalid()) {
+            if (instr_id < 1 || instr_id > self.m.instr_count
+                || self.m.instr_record(instr_id) == null
+                || self.m.instr_block(instr_id) != block_id) {
+                return self.set_error("invalid instruction chain in SCCP block #" + ms_text(block_id));
+            }
+            self.transfer_instr(instr_id);
+            guard = guard + 1;
+            if (guard > self.m.instr_count + 1) {
+                return self.set_error("cyclic instruction chain in SCCP block #" + ms_text(block_id));
+            }
+            instr_id = self.m.instr_next(instr_id);
+        }
+        // `foreach_next` advances hidden iterator/index state in the backend,
+        // outside the ordinary instruction chain. Do not carry local facts
+        // across that implicit write.
+        if (self.m.block_term_kind(block_id) == mir_term_foreach_next()) {
+            self.kill_all_locals();
+        }
+        return true;
+    }
+
+    public fn store_output(self, block_ordinal: i32) -> bool {
+        var changed = false;
+        var local_ordinal: i32 = 0;
+        while (local_ordinal < self.local_count) {
+            let index = self.cell_index(block_ordinal, local_ordinal);
+            if (self.merge_into(self.out_states,
+                                self.out_values,
+                                index,
+                                ms_get_i32(self.work_states, local_ordinal),
+                                ms_get_i64(self.work_values, local_ordinal))) {
+                changed = true;
+            }
+            ms_set_i32(self.work_states, local_ordinal, ms_get_i32(self.out_states, index));
+            ms_set_i64(self.work_values, local_ordinal, ms_get_i64(self.out_values, index));
+            local_ordinal = local_ordinal + 1;
+        }
+        return changed;
+    }
+
+    public fn block_is_current_function(self, block_id: i32) -> bool {
+        if (block_id < 1 || block_id > self.m.block_count
+            || self.m.block_record(block_id) == null
+            || self.m.block_is_removed( block_id)
+            || self.m.block_function(block_id) != self.function_id) { return false; }
+        return ms_get_i32(self.block_slots, block_id) > 0;
+    }
+
+    public fn known_enum_tag_for_match_subject(self, block_id: i32) -> MirSccpValue {
+        let subject_id = self.m.block_term_value(block_id);
+        if (subject_id < 1 || subject_id > self.m.value_count
+            || self.m.value_record(subject_id) == null
+            || self.m.value_kind(subject_id) != mir_value_read_place()
+            || (self.m.value_flags(subject_id) & mir_value_flag_move_arg()) != 0) {
+            return MirSccpValue.unknown(mir_id_invalid());
+        }
+        let local_ordinal = self.local_ordinal_for_place(self.m.value_place(subject_id));
+        if (local_ordinal < 0) { return MirSccpValue.unknown(self.m.value_type(subject_id)); }
+        let local_id = ms_get_i32(self.local_ids, local_ordinal);
+        let type_id = self.m.value_type(subject_id);
+        if (!ms_valid_local(self.m, local_id)
+            || self.m.local_type(local_id) != type_id
+            || !self.type_is_plain_zero_payload_enum(type_id)) {
+            return MirSccpValue.unknown(type_id);
+        }
+        let resolved = self.eval_value(subject_id, 0);
+        if (resolved.state != ms_state_enum_tag() || resolved.type_id != type_id) {
+            return MirSccpValue.unknown(type_id);
+        }
+        return resolved;
+    }
+
+    // Match lowering creates one dispatch block per arm. Restrict rewrites to
+    // that exact form so a tag fact can only bypass a pure, zero-payload arm.
+    public fn select_known_plain_enum_match_target(self, block_id: i32) -> i32 {
+        if (self.m.block_term_kind(block_id) != mir_term_match()
+            || self.m.block_term_target(block_id) != mir_id_invalid()) { return -1; }
+        let known = self.known_enum_tag_for_match_subject(block_id);
+        if (known.state != ms_state_enum_tag()) { return -1; }
+        let case_id = self.m.block_term_first_case(block_id);
+        if (!ms_valid_case(self.m, case_id)
+            || self.m.case_owner_block(case_id) != block_id
+            || self.m.case_next(case_id) != mir_id_invalid()
+            || self.m.case_guard_value(case_id) != mir_id_invalid()) { return -1; }
+        let hit_target = self.m.case_target_block(case_id);
+        let miss_target = self.m.block_term_false(block_id);
+        if (!self.block_is_current_function(hit_target)
+            || !self.block_is_current_function(miss_target)) { return -1; }
+        let arm_instr = self.m.block_first_instr(hit_target);
+        if (arm_instr < 1 || arm_instr > self.m.instr_count
+            || self.m.instr_record(arm_instr) == null
+            || self.m.instr_block(arm_instr) != hit_target
+            || self.m.instr_kind(arm_instr) != mir_instr_match_arm()
+            || self.m.instr_next(arm_instr) != mir_id_invalid()
+            || self.m.instr_value(arm_instr) != self.m.case_pattern_value(case_id)
+            || self.m.instr_rhs(arm_instr) != self.m.block_term_value(block_id)
+            || self.m.block_term_kind(hit_target) != mir_term_goto()
+            || !self.block_is_current_function(self.m.block_term_target(hit_target))) {
+            return -1;
+        }
+        let pattern_tag = self.enum_target_ref_tag(self.m.case_pattern_value(case_id),
+                                                   known.type_id);
+        if (pattern_tag < 0) { return -1; }
+        if ((pattern_tag as i64) == known.value) { return hit_target; }
+        return miss_target;
+    }
+
+    public fn update_terminator_edges(self, block_ordinal: i32) {
+        let block_id = ms_get_i32(self.block_ids, block_ordinal);
+        let kind = self.m.block_term_kind(block_id);
+        if (kind == mir_term_goto()) {
+            self.update_edge_mode(block_ordinal, ms_edge_one(), self.m.block_term_target(block_id));
+            return;
+        }
+        if (kind == mir_term_branch()) {
+            let condition = self.eval_value(self.m.block_term_value(block_id), 0);
+            if (condition.state == ms_state_bool()) {
+                var target = self.m.block_term_false(block_id);
+                if (condition.value != 0) { target = self.m.block_term_target(block_id); }
+                self.update_edge_mode(block_ordinal, ms_edge_one(), target);
+            } else {
+                self.update_edge_mode(block_ordinal, ms_edge_all(), mir_id_invalid());
+            }
+            return;
+        }
+        if (kind == mir_term_match()) {
+            let selected = self.select_known_plain_enum_match_target(block_id);
+            if (selected != -1) {
+                self.update_edge_mode(block_ordinal, ms_edge_one(), selected);
+            } else {
+                self.update_edge_mode(block_ordinal, ms_edge_all(), mir_id_invalid());
+            }
+            return;
+        }
+        if (kind == mir_term_foreach_next()) {
+            self.update_edge_mode(block_ordinal, ms_edge_all(), mir_id_invalid());
+        }
+    }
+
+    public fn solve(self) -> bool {
+        if (!self.initialized || self.skipped || self.block_count == 0 || self.local_count == 0) {
+            return self.plan.ok;
+        }
+        ms_set_i32(self.block_executable, 0, 1);
+        self.enqueue(0);
+        while (self.worklist_count > 0 && self.plan.ok) {
+            self.worklist_count = self.worklist_count - 1;
+            let block_ordinal = ms_get_i32(self.worklist, self.worklist_count);
+            ms_set_i32(self.block_queued, block_ordinal, 0);
+            if (self.compute_input(block_ordinal)) {
+                if (!self.transfer_block(block_ordinal)) { return false; }
+                let output_changed = self.store_output(block_ordinal);
+                if (output_changed) { self.enqueue_executable_successors(block_ordinal); }
+                self.update_terminator_edges(block_ordinal);
+            }
+        }
+        return self.plan.ok;
+    }
+
+    public fn value_matches_constant(self, value_id: i32, resolved: MirSccpValue) -> bool {
+        if (value_id < 1 || value_id > self.m.value_count
+            || self.m.value_record(value_id) == null
+            || self.m.value_type(value_id) != resolved.type_id) { return false; }
+        let kind = self.m.value_kind(value_id);
+        if (resolved.state == ms_state_int()) {
+            return kind == mir_value_const_int()
+                && ms_normalize_integer(self.m.value_int(value_id),
+                                        hir_type_table_kind(self.m.types, resolved.type_id)) == resolved.value;
+        }
+        if (resolved.state == ms_state_bool()) {
+            var bool_value: i64 = 0;
+            if (self.m.value_int(value_id) != 0) { bool_value = 1; }
+            return kind == mir_value_const_bool() && bool_value == resolved.value;
+        }
+        return resolved.state == ms_state_null() && kind == mir_value_null();
+    }
+
+    public fn plan_constant_kind(self, resolved: MirSccpValue) -> i32 {
+        if (resolved.state == ms_state_int()) { return mir_value_const_int(); }
+        if (resolved.state == ms_state_bool()) { return mir_value_const_bool(); }
+        if (resolved.state == ms_state_null()) { return mir_value_null(); }
+        return 0;
+    }
+
+    public fn load_final_input(self, block_ordinal: i32) {
+        var local_ordinal: i32 = 0;
+        while (local_ordinal < self.local_count) {
+            let index = self.cell_index(block_ordinal, local_ordinal);
+            ms_set_i32(self.work_states, local_ordinal, ms_get_i32(self.in_states, index));
+            ms_set_i64(self.work_values, local_ordinal, ms_get_i64(self.in_values, index));
+            local_ordinal = local_ordinal + 1;
+        }
+    }
+
+    public fn build_rewrite_plan(self) -> bool {
+        if (!self.plan.ok || self.skipped || self.block_count == 0 || self.local_count == 0) {
+            return self.plan.ok;
+        }
+        var block_ordinal: i32 = 0;
+        while (block_ordinal < self.block_count) {
+            if (ms_get_i32(self.block_executable, block_ordinal) != 0) {
+                self.load_final_input(block_ordinal);
+                let block_id = ms_get_i32(self.block_ids, block_ordinal);
+                var instr_id = self.m.block_first_instr(block_id);
+                while (instr_id != mir_id_invalid()) {
+                    if (self.m.instr_kind(instr_id) == mir_instr_assign()) {
+                        let local_ordinal = self.local_ordinal_for_place(self.m.instr_place(instr_id));
+                        if (local_ordinal >= 0) {
+                            let local_id = ms_get_i32(self.local_ids, local_ordinal);
+                            let resolved = self.eval_value(self.m.instr_value(instr_id), 0);
+                            if (self.state_is_constant(resolved.state)
+                                && resolved.type_id == self.m.local_type(local_id)
+                                && !self.value_matches_constant(self.m.instr_value(instr_id), resolved)) {
+                                self.plan.set_instr_constant(instr_id,
+                                                             self.plan_constant_kind(resolved),
+                                                             resolved.value);
+                            }
+                        }
+                    }
+                    self.transfer_instr(instr_id);
+                    instr_id = self.m.instr_next(instr_id);
+                }
+                let term_kind = self.m.block_term_kind(block_id);
+                if (term_kind == mir_term_branch()
+                    && ms_get_i32(self.edge_modes, block_ordinal) == ms_edge_one()) {
+                    let condition = self.eval_value(self.m.block_term_value(block_id), 0);
+                    if (condition.state == ms_state_bool()) {
+                        var target = self.m.block_term_false(block_id);
+                        if (condition.value != 0) { target = self.m.block_term_target(block_id); }
+                        if (target == ms_get_i32(self.edge_targets, block_ordinal)) {
+                            self.plan.set_block_goto(block_id, target);
+                        }
+                    }
+                } else if (term_kind == mir_term_match()
+                    && ms_get_i32(self.edge_modes, block_ordinal) == ms_edge_one()) {
+                    let target2 = self.select_known_plain_enum_match_target(block_id);
+                    if (target2 != -1
+                        && target2 == ms_get_i32(self.edge_targets, block_ordinal)) {
+                        self.plan.set_block_goto(block_id, target2);
+                    }
+                } else if (term_kind == mir_term_return()) {
+                    let return_value_id = self.m.block_term_value(block_id);
+                    if (return_value_id != mir_id_invalid()) {
+                        let resolved_return = self.eval_value(return_value_id, 0);
+                        if (self.state_is_constant(resolved_return.state)
+                            && resolved_return.type_id == self.m.function_return_type(self.function_id)
+                            && !self.value_matches_constant(return_value_id, resolved_return)) {
+                            self.plan.set_block_constant(block_id,
+                                                         self.plan_constant_kind(resolved_return),
+                                                         resolved_return.value);
+                        }
+                    }
+                }
+            }
+            block_ordinal = block_ordinal + 1;
+        }
+        return self.plan.ok;
+    }
+
+    public fn executable_block_count(self) -> i32 {
+        var count: i32 = 0;
+        var ordinal: i32 = 0;
+        while (ordinal < self.block_count) {
+            if (ms_get_i32(self.block_executable, ordinal) != 0) { count = count + 1; }
+            ordinal = ordinal + 1;
+        }
+        return count;
+    }
+
+    public fn run(self) -> bool {
+        let rewrite_start = self.plan.rewrite_count;
+        if (!self.initialize()) { return false; }
+        if (!self.solve()) { return false; }
+        if (!self.build_rewrite_plan()) { return false; }
+        mir_analysis_audit("sccp function=" + ms_text(self.function_id)
+                           + " blocks=" + ms_text(self.block_count)
+                           + " locals=" + ms_text(self.local_count)
+                           + " executable=" + ms_text(self.executable_block_count())
+                           + " rewrites=" + ms_text(self.plan.rewrite_count - rewrite_start)
+                           + " skipped=" + (if (self.skipped) { "1" } else { "0" }));
+        return true;
+    }
+
+    public fn dispose(self) {
+        if (self.block_ids != null) { free(self.block_ids); self.block_ids = null; }
+        if (self.block_slots != null) { free(self.block_slots); self.block_slots = null; }
+        if (self.local_ids != null) { free(self.local_ids); self.local_ids = null; }
+        if (self.local_slots != null) { free(self.local_slots); self.local_slots = null; }
+        if (self.block_executable != null) { free(self.block_executable); self.block_executable = null; }
+        if (self.block_queued != null) { free(self.block_queued); self.block_queued = null; }
+        if (self.edge_modes != null) { free(self.edge_modes); self.edge_modes = null; }
+        if (self.edge_targets != null) { free(self.edge_targets); self.edge_targets = null; }
+        if (self.worklist != null) { free(self.worklist); self.worklist = null; }
+        if (self.in_states != null) { free(self.in_states); self.in_states = null; }
+        if (self.in_values != null) { free(self.in_values); self.in_values = null; }
+        if (self.out_states != null) { free(self.out_states); self.out_states = null; }
+        if (self.out_values != null) { free(self.out_values); self.out_values = null; }
+        if (self.work_states != null) { free(self.work_states); self.work_states = null; }
+        if (self.work_values != null) { free(self.work_values); self.work_values = null; }
+    }
+}
+
+public fn mir_sccp_build_plan(m: MirUnit,
+                              cache: MirAnalysisCache,
+                              function_filter: i32,
+                              local_mark: i32) -> MirSccpPlan {
+    let plan = MirSccpPlan.create(m);
+    if (!plan.ok) { return plan; }
+    if (plan.skipped) {
+        mir_analysis_audit("sccp skip unit records="
+                           + policy_i64_to_string((m.block_count as i64)
+                                                  + (m.instr_count as i64)
+                                                  + (m.local_count as i64)));
+        return plan;
+    }
+    var facts: MirSccpLocalFacts;
+    if (function_filter != mir_id_invalid()) {
+        facts = MirSccpLocalFacts.create_scoped(m, local_mark, function_filter);
+    } else {
+        facts = MirSccpLocalFacts.create(m);
+    }
+    if (!facts.ok) {
+        plan.set_error("cannot allocate SCCP local facts");
+        facts.dispose();
+        return plan;
+    }
+    if (function_filter != mir_id_invalid()) {
+        let runner = MirSccpRunner.create(m, cache, plan, function_filter, facts);
+        runner.run();
+        runner.dispose();
+    } else {
+        var function_id: i32 = 1;
+        while (function_id <= m.function_count && plan.ok) {
+            let runner2 = MirSccpRunner.create(m, cache, plan, function_id, facts);
+            runner2.run();
+            runner2.dispose();
+            function_id = function_id + 1;
+        }
+    }
+    facts.dispose();
+    return plan;
+}
