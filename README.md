@@ -166,4 +166,10 @@ fixed point, and the relevant project tests. Commands are in the
 [verification guide](docs/TESTING_GUIDE.md); parallel build measurements are
 in the [compiler pressure tests](probes/gates/compiler-industrial/README.md).
 
+## License
+
+Vyx is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
+at your option (`MIT OR Apache-2.0`). Third-party code and assets retain their
+own licenses and copyright notices. See [LICENSE](LICENSE).
+
 More: [Documentation index](docs/README.md) · [Contributing](CONTRIBUTING.md)

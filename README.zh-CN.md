@@ -144,4 +144,9 @@ JIT 的能力对齐是后续任务。
 具体命令见[验证指南](docs/TESTING_GUIDE_ZH.md)，并行构建测量见
 [编译器压力测试](probes/gates/compiler-industrial/README.md)。
 
+## 开源许可证
+
+Vyx 采用 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 双许可证，使用者可任选其一
+（`MIT OR Apache-2.0`）。第三方代码与资源保留各自的许可证和版权声明，详见 [LICENSE](LICENSE)。
+
 更多内容：[文档目录](docs/README.md) · [贡献指南](CONTRIBUTING.zh-CN.md)

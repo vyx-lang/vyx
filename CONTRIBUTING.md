@@ -7,6 +7,14 @@ Release SDK compiler as Stage 0, build this checkout, and run the narrowest test
 that proves the change. The
 archived C++ host and stale `out/` binaries are not acceptance paths.
 
+## Contribution licensing
+
+Unless you explicitly state otherwise, contributions intentionally submitted for
+inclusion in Vyx are licensed under the same `MIT OR Apache-2.0` terms as the
+project, without additional conditions. Preserve existing third-party license
+and copyright notices. The full license texts are [MIT](LICENSE-MIT) and
+[Apache-2.0](LICENSE-APACHE).
+
 ## Before changing code
 
 Read [language design](docs/LANGUAGE_DESIGN.md) (from `bootstrap_compiler/`)
