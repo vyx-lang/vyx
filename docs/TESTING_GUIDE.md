@@ -274,6 +274,10 @@ exit 77 is not a pass. Add the [DCI storage](../probes/gates/dci-storage/README.
 [raw C++ vector](../probes/gates/dci-vector/README.md),
 [Rust ecosystem](../probes/gates/dci-rust-ecosystem/README.md), and
 [C++ ecosystem](../probes/gates/dci-cpp-ecosystem/README.md) gates as applicable.
+With a Qt SDK, also run the [Qt Widgets counter](../probes/gates/dci-qt-counter/README.md).
+It is separate from the `tests/projects/dci_*` scan and checks nested pointer
+contracts, a real event loop, Qt-to-Vyx virtual dispatch, button/LCD state and
+clean shutdown.
 The old `dci_spdlog/run.sh` and `probes/gates/gate-c/` were retired on 2026-09-28;
 they are not current acceptance commands. `--verify-mir2` and a Vyx FFI-only
 program cannot replace DCI end-to-end execution.

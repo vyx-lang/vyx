@@ -99,7 +99,7 @@ fn main() -> i32 {
 }
 ```
 
-Run `vyxc --src=project . --run=aot` in the project directory. It prints 11 and 14.
+Run `vyxc build --run=aot` in the project directory. It prints 11 and 14.
 The unqualified call uses the locked version; the explicit version call uses
 the historical implementation.
 

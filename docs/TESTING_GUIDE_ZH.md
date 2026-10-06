@@ -257,6 +257,9 @@ foreach ($name in @('dci_cpp_trait', 'dci_rust_trait', 'dci_multilang', 'dci_zig
 [原始 C++ vector](../probes/gates/dci-vector/README.md)、
 [Rust 生态](../probes/gates/dci-rust-ecosystem/README.md)与
 [C++ 生态](../probes/gates/dci-cpp-ecosystem/README.md)门。
+有 Qt SDK 时另跑 [Qt Widgets counter](../probes/gates/dci-qt-counter/README.md)：
+它不包含在 `tests/projects/dci_*` 扫描中，验证多层指针契约、真实事件循环、
+Qt 到 Vyx 的虚方法派发、按钮与 LCD 状态及退出清理。
 旧 `dci_spdlog/run.sh` 与 `probes/gates/gate-c/` 已于 2026-09-28 退役，不能继续
 列作当前验收命令。`--verify-mir2` 或单纯 Vyx FFI 程序不能代替 DCI 端到端执行。
 

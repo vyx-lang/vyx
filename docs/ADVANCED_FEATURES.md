@@ -43,7 +43,7 @@ Mapped to tools:
 
 Member access is written as if you owned the value — the compiler handles the indirection:
 
-```vyx
+```vyx fragment
 fn bump(values: &mut Vec<i32>) {
     values[0] = values[0] + 1;
     values.push(9);
@@ -52,7 +52,7 @@ fn bump(values: &mut Vec<i32>) {
 
 With an explicit `*T`, members are read through `->`, and doing so does not move ownership out. `rawptr` is an untyped unsafe pointer and enjoys none of these rules.
 
-```vyx
+```vyx fragment
 class Pair { public value: i32; }
 fn read_pair(p: *Pair) -> i32 { return p->value; }
 ```
@@ -72,7 +72,7 @@ Ref   photocopied access cards. Everyone points at one room; the room is
 Weak  a photocopy that expires. upgrade() may find the room already gone.
 ```
 
-```vyx
+```vyx program
 use std.ref;
 
 fn main() -> i32 {
@@ -119,10 +119,11 @@ Once that is clear, `shared.deref()` printing `100` stops being a coincidence an
 
 A container has to be passable into a function and walkable by a loop.
 
-```vyx
+```vyx program
 use std.collections;
 
 fn sum(values: Vec<i32>) -> i32 {
+    defer { values.destroy(); }
     var total = 0;
     for (value in values) {
         total = total + value;
@@ -147,9 +148,30 @@ The reason is that the iterator remembers both "how far along we are" and "where
 
 This is the same trap as mutating a container while iterating it in C++, except here it is stated as an explicit rule: collect first, then modify, then iterate again.
 
-### Why a container can be passed by value
+### Passing by value transfers ownership
 
-`fn sum(values: Vec<i32>)` looks like it copies the whole container. It need not: the compiler can see the body never stores `values` anywhere else, so ownership of the underlying storage can be handed straight to the function.
+`Vec<i32>` owns its buffer. `sum(values)` transfers ownership to the parameter, so the caller cannot keep using the original binding. This is not an optimisation based on noticing that the function never stores it. Here `sum` uses `defer` to release the received buffer. If the caller needs to keep the container, use a borrowed parameter or an explicit clone; see lesson 34 for borrowing and moving.
+
+For read access, take `&Vec<T>`. The `for-in` loop reads the original container through the borrow; the caller can still use it after the function returns:
+
+```vyx program
+use std.collections;
+
+fn sum(values: &Vec<i32>) -> i32 {
+    var total = 0;
+    for (value in values) { total += value; }
+    return total;
+}
+
+fn main() -> i32 {
+    var values = Vec::<i32>.new();
+    values.push(10);
+    values.push(32);
+    print(sum(&values));  // 42
+    print(values.count());  // 2: the caller still owns the container
+    return 0;
+}
+```
 
 ### Recap
 
@@ -161,7 +183,7 @@ Pass a `Vec` into a function and accumulate with `for-in`; **never open the bag 
 
 Lesson 12 introduced the pipe-style closure. Here is the other form, which puts the captured names on the outside:
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let plus7 = |x: i32| { return x + 7; };
     print("35+7=${plus7(35)}");
@@ -200,7 +222,7 @@ Equality, cloning, hashing, ordering, printing — the implementations are entir
 
 `@[derive(...)]` hands the job to the compiler:
 
-```vyx
+```vyx program
 use std.hash;
 use std.clone;
 use std.fmt;
@@ -222,11 +244,11 @@ fn main() -> i32 {
 
 You should see equality hold, a non-zero hash, and a comparison result of 0.
 
-### Why `Clone` is a per-field deep copy
+### `Clone` follows each field's implementation
 
-`@[derive(Clone)]` calls `.clone()` on every field in turn. For a heap-backed field such as `Vec<T>`, that means **the underlying storage is copied too**, not shared by duplicating the pointer.
+`@[derive(Clone)]` combines the cloning behaviour of its fields. `Vec<T>.clone()` copies the buffer and elements; `Ref<T>.clone()` increments a strong reference count and shares the same object. Not every `clone()` is a deep copy.
 
-That choice is forced: sharing the pointer would leave two objects holding one allocation, and freeing from either leaves the other dangling. The deep copy is slower, but there is exactly one meaning.
+The field types determine which data remains shared. A resource type should specify whether cloning copies a resource or adds a shared reference, rather than copying an unmanaged pointer.
 
 Enums are rebuilt per variant via `match`; generic fields imply the corresponding trait bounds.
 
@@ -242,7 +264,7 @@ derive gives you **structural equality**: all fields equal means equal. If the d
 
 ### Recap
 
-derive synthesises from fields; `Clone` is deep; write pointer fields yourself.
+derive synthesises from fields; each field decides whether cloning shares data; handle raw pointer fields yourself.
 
 ---
 
@@ -262,7 +284,7 @@ start both, then await ──► log becomes 21 (2 first, then 1)
 await slow first, then start fast ──► log becomes 12 (nobody could cut in)
 ```
 
-```vyx
+```vyx program
 use std.vio;
 
 var log: i32 = 0;
@@ -306,7 +328,7 @@ So changing `main` to `await slow(); await fast();` makes `log` become `12` — 
 
 This also explains the awkward-looking `@[async] fn f() -> i32`: the signature says `i32`, but the call site receives a task, and only `await` produces the `i32`.
 
-```vyx
+```vyx program
 use std.vio;
 
 @[async]
@@ -344,7 +366,7 @@ Worth memorising: **using `vio_sleep` where tasks exist is equivalent to pressin
 
 `StartCoroutine` plus `yield WaitForNextTick()` uses operating-system fibers, which is a different mechanism from `@[async]` above. **Do not mix the two inside one function.** Only this road needs `vio_start()` / `vio_stop()`.
 
-```vyx
+```vyx program
 use std.vio;
 
 var steps: i32 = 0;
@@ -392,7 +414,7 @@ Signal::Stop          no extra data
 Signal::Go(42)        this branch carries an i32
 ```
 
-```vyx
+```vyx program
 enum Signal {
     Stop,
     Go(i32)
@@ -437,7 +459,7 @@ Build with `Type::Variant(value)` and take apart with `case Variant(value)`. Wit
 
 `trait` describes the capability directly, and `impl Trait for Type` supplies the answer for one type:
 
-```vyx
+```vyx program
 trait Shape { fn area(self) -> f64; }
 
 struct Circle { radius: f64; }
@@ -477,7 +499,7 @@ A trait is a list of capabilities; an impl is one type's answer sheet.
 
 The previous lesson assumed the type was known at compile time. With circles and squares in one bag, that assumption is gone, and `dyn Shape` is needed: `area` is looked up at run time.
 
-```vyx
+```vyx program
 use std.collections;
 
 trait Shape { fn area(self) -> f64; }
@@ -538,7 +560,7 @@ The conclusion is **try static first**. Introduce `dyn` only when the type genui
 
 `|>` feeds the value on the left into the **first** argument of the call on the right. It suits a chain of transforms that each take a single value.
 
-```vyx
+```vyx program
 fn double(value: i64) -> i64 { return value * 2; }
 fn add_ten(value: i64) -> i64 { return value + 10; }
 
@@ -578,7 +600,7 @@ The language that can be reached directly is still C. This lesson gathers the to
 
 Interop with richer compiled languages goes through DCI in [lesson 42](#Lesson 42) rather than another flavour of `extern`.
 
-```vyx
+```vyx linked
 @[repr(C)]
 class Point {
     public x: i32;
@@ -604,13 +626,13 @@ Both steps need a C side that provides `point_sum` / `call_cb`.
 
 ### Why `@[repr(C)]` cannot be omitted
 
-Vyx's own layout rules (alignment, field order, padding) are not C's. Passing `Point` by value into a C function means **both sides must agree on what those bytes mean**, otherwise C reads misaligned bytes. `@[repr(C)]` is the declaration "lay this type out by C's rules".
+Passing `Point` by value to C requires an agreed layout and ABI. `@[repr(C)]` declares layout according to C's rules; matching field type spellings alone does not establish that boundary contract.
 
 The compiler will not report this class of mistake, because from the C ABI's point of view the signature is perfectly legal. That is the typical shape of an unsafe boundary: **correctness is proved by you, not by the compiler.**
 
-### Why `fn` cannot be a C callback
+### C function pointers and function values
 
-A Vyx `fn` and a C function pointer do not share a calling convention. A `cfn` slot rejects a fat `fn` (E1000); the conversion must be explicit.
+`cfn(i32) -> i32` describes a C function pointer. A `fn(...)` function value can carry context and cannot be used directly as such a pointer. The example passes the named function `bump_c` and preserves its exported symbol with `@[no_mangle]`; this differs from a function value with captures. C callbacks must also match parameter types, return types, and calling convention.
 
 C variadics (`...`) are written on the last parameter of an `extern "C"` declaration.
 
@@ -628,7 +650,7 @@ C is the language FFI; layout uses `repr(C)`; callbacks use `cfn`.
 
 Lesson 10's `defer` registers a block of statements. A class can go further: define `drop()`, called automatically when an instance leaves its scope. That fits resources with a definite lifetime — file handles, connections, heap objects.
 
-```vyx
+```vyx program
 var resource_drops: i32 = 0;
 
 class Resource {
@@ -660,13 +682,13 @@ Note the inner `{ }` block. `drop()` hooks the **scope**, so leaving those brace
 The two do not conflict, but their jobs differ:
 
 - `drop` is the **language hook**: when it runs is decided by the scope.
-- Containers still require an explicit `destroy()`: **what to release** is decided by the container's API.
+- `Vec.drop()` calls `destroy()` to release the buffer, so an unmoved local container is cleaned up at scope exit; explicit `destroy()` can release it early.
 
-Two rules follow: do not use it after destroying, and do not destroy twice.
+`Vec.destroy()` clears its own state, so the later automatic `drop()` does not free it again. It does not destroy elements individually. Other resource APIs may have different rules for repeated destruction.
 
 ### Recap
 
-`drop()` follows the scope; standard-library containers additionally need `destroy()`.
+`drop()` is the scope cleanup entry; a container's `destroy()` performs its buffer release.
 
 ---
 
@@ -674,7 +696,7 @@ Two rules follow: do not use it after destroying, and do not destroy twice.
 
 `Either<L, R>` says "either the left or the right, with possibly different payload types". `<...Ts>` is a type pack, and `args...+` folds addition over every argument — the operator must hold for each one.
 
-```vyx
+```vyx program
 use std.core;
 
 enum Either<L, R> {
@@ -730,7 +752,7 @@ A small type used by only one other type is better off inside it than flattened 
 
 A `struct` / `class` may be written inside another record body, to any depth. Nested records are promoted to module scope under a **dotted name** (the `A` inside `FreqArray` is the record `FreqArray.A`). Their parameter list is the **parent's parameter list followed by their own**; when the two lists are **exactly identical**, that is treated as merely restating the parent's parameters and adds nothing.
 
-```vyx
+```vyx program
 struct FreqArray<T> {
     struct A<T> { public a: T; }        // same list as the parent: adds nothing
     struct B<U> { public b: U; }        // adds U
@@ -759,7 +781,7 @@ The rule looks verbose, and what it buys is the **absence of implicit capture**:
 
 The same rule applies in type position:
 
-```vyx
+```vyx fragment
 struct Holder {
     c: FreqArray<i32>::C<i32, f64>;
     deep: L1<i32>::L2<f64>::L3<i8>;      // any depth; arguments concatenate level by level
@@ -768,8 +790,8 @@ struct Holder {
 
 Nested `class` follows the ordinary `class` rules: `public` members, methods, constructors.
 
-```vyx
-class Box<T> {
+```vyx program
+class Envelope<T> {
     class Inner {
         public v: i64;
         Inner(n: i64) { self.v = n; }
@@ -779,7 +801,7 @@ class Box<T> {
 }
 
 fn main() -> i32 {
-    var b = Box<i32>::Inner(42);
+    var b = Envelope<i32>::Inner(42);
     print("${b.get()}");
     return 0;
 }
@@ -807,7 +829,7 @@ Some computations are already determined when you write the code, and putting th
 
 A `comptime` call with **constant integer** arguments is executed during compilation and folded to a literal.
 
-```vyx
+```vyx program
 @[comptime]
 fn triple(x: i32) -> i32 {
     let y = x + 1;
@@ -871,7 +893,7 @@ Compile from the repository root so the relative paths in the lesson resolve.
 
 Assigning heap ownership moves rather than copies. This rule makes "two owners of one heap allocation" impossible to express in the type system.
 
-```vyx
+```vyx program
 use std.collections;
 
 class Bag {
@@ -899,7 +921,7 @@ move is the third option: **hand over ownership and leave the source unusable**.
 
 Scalars and scalar-only classes marked `@[derive(Copy)]` may still be read at the source:
 
-```vyx
+```vyx program
 @[derive(Copy)]
 class Tiny {
     public n: i32;
@@ -916,7 +938,7 @@ fn main() -> i32 {
 
 The test is **whether a bitwise copy is equivalent to an independent value**. Integers and small pointer-width structs pass; types holding heap storage do not.
 
-`string` / `String` is not `Copy`; ask for a second copy with `.clone()`.
+Primitive `string` / `str` is treated as Copy. Uppercase `String` owns its text storage; assignment and passing it by value transfer ownership. Reading the source after a transfer reports `E3100` for both `let` and `var`. Use `.clone()` to keep an independent value, or `&String` for read access. A moved `var` can be assigned a new value and used again.
 
 ### Borrowing
 
@@ -943,7 +965,7 @@ Anything with a heap moves; want two copies and use `clone` or `Copy`.
 
 A subclass places its parent's fields **first, in declaration order**, and `override` replaces a parent method. `struct` can concatenate fields the same way (`struct Vec3 : Vec2`).
 
-```vyx
+```vyx program
 class Base {
     public x: i32;
     public fn get(self) -> i32 { return self.x; }
@@ -1008,7 +1030,7 @@ An `override` with no corresponding parent method is rejected. Like the visibili
 
 An interface may carry default method bodies; `impl` fills in only the required ones:
 
-```vyx
+```vyx program
 interface Greeter {
     fn greet(self) -> i32;
     fn hello(self) -> i32 { return self.greet() + 1; }
@@ -1057,7 +1079,7 @@ Default methods live in the interface; impls fill the gaps; dyn can call default
 
 `type Ptr<T> = *T` is just a shorter name. A `const MAX` on a trait is an associated constant, read as `T::MAX`.
 
-```vyx
+```vyx program
 type Ptr<T> = *T;
 
 trait Bounded {
@@ -1097,7 +1119,7 @@ fn main() -> i32 {
 
 An associated constant attaches the ceiling **to the type**: `T::MAX` reads the one `T` declared for itself. With `where T: Bounded`, the compiler knows any incoming `T` certainly has `MAX` and can use it freely.
 
-The test is exactly the same as for `where T: Add` (lesson 13): **whatever the generic body uses must be promised in the constraint.**
+Here `where T: Bounded` is required to resolve the associated constant `T::MAX`. Ordinary arithmetic in lesson 13 can be instantiated without an explicit constraint in the current compiler; the resolution requirements are different.
 
 ### Recap
 
@@ -1111,7 +1133,7 @@ The same job differs per operating system: path separators, system calls, availa
 
 `@[platform]` moves the choice to compile time: **the same name keeps one implementation per target OS, and Sema drops the non-matching ones**, so there is no duplicate-name clash.
 
-```vyx
+```vyx program
 @[platform("posix")]
 fn path_sep() -> i32 { return 47; }
 
@@ -1150,7 +1172,7 @@ Cross-linking Android from Windows is covered in the [testing guide](TESTING_GUI
 
 These are **type queries** folded to `i64`, not a C preprocessor. `repr_sizeof::<T>()` belongs to the same family.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     static_assert(1 + 1 == 2);
     static_assert(sizeof::<i32>() == 4, "i32 is 4 bytes");
@@ -1178,7 +1200,7 @@ Incidentally, `sizeof` and `alignof` are queries rather than macros, so they fol
 
 You can give a class `operator+`, `operator[]`, and friends, so a user-defined type reads like a built-in one.
 
-```vyx
+```vyx program
 class SymbolBox {
     public value: i32;
 
@@ -1355,7 +1377,7 @@ auto_discover = false
 
 `main.vyx`:
 
-```vyx
+```vyx program
 @[acme.entry(priority=10)]
 fn native_entry() -> i32 {
     return 42;

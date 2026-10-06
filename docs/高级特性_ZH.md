@@ -43,7 +43,7 @@ unsafe、rawptr、FFI     你自己证明：非空、对齐、没人抢着放
 
 成员访问跟拥有值一样写，不必先解引用——编译器替你处理：
 
-```vyx
+```vyx fragment
 fn bump(values: &mut Vec<i32>) {
     values[0] = values[0] + 1;
     values.push(9);
@@ -52,7 +52,7 @@ fn bump(values: &mut Vec<i32>) {
 
 显式写 `*T` 时用 `->` 读成员，而且不会搬走所有权。`rawptr` 是无类型 unsafe 指针，上面这些规则它一概不享受。
 
-```vyx
+```vyx fragment
 class Pair { public value: i32; }
 fn read_pair(p: *Pair) -> i32 { return p->value; }
 ```
@@ -71,7 +71,7 @@ Ref   门卡可以复印。大家都指同一间房；最后一张卡收回去�
 Weak  一张「过期作废」的复印件。upgrade() 时房子可能已经没了。
 ```
 
-```vyx
+```vyx program
 use std.ref;
 
 fn main() -> i32 {
@@ -118,10 +118,11 @@ fn main() -> i32 {
 
 容器要能当参数传进函数，也要能被循环走一遍。
 
-```vyx
+```vyx program
 use std.collections;
 
 fn sum(values: Vec<i32>) -> i32 {
+    defer { values.destroy(); }
     var total = 0;
     for (value in values) {
         total = total + value;
@@ -146,9 +147,30 @@ fn main() -> i32 {
 
 这和 C++ 里「边遍历边改容器」的坑是同一个，只是这里把它写成了一条明确的纪律：要改就先收集，改完再遍历。
 
-### 为什么容器可以按值传参
+### 按值传参会转移所有权
 
-`fn sum(values: Vec<i32>)` 看起来像是把整个容器复制了一份，实际不必如此——编译器知道函数体不会把 `values` 存到别处，可以把底层存储的所有权直接交给函数。
+`Vec<i32>` 是拥有缓冲的类型。`sum(values)` 把所有权交给形参，调用后不能继续使用原绑定；这不是“编译器发现没有保存它，所以省掉一次复制”的优化。本例由 `sum` 用 `defer` 释放收到的缓冲。如果调用方还要保留容器，应改用借用参数或显式克隆，借用与移动见第 34 课。
+
+只读取容器时，形参用 `&Vec<T>`。`for-in` 通过借用访问原容器，函数返回后调用方可以继续使用它：
+
+```vyx program
+use std.collections;
+
+fn sum(values: &Vec<i32>) -> i32 {
+    var total = 0;
+    for (value in values) { total += value; }
+    return total;
+}
+
+fn main() -> i32 {
+    var values = Vec::<i32>.new();
+    values.push(10);
+    values.push(32);
+    print(sum(&values));  // 42
+    print(values.count());  // 2，容器仍由调用方持有
+    return 0;
+}
+```
 
 ### 小结
 
@@ -160,7 +182,7 @@ fn main() -> i32 {
 
 第 12 课介绍了竖线形式的闭包。这里补上另一种写法，它把「依赖哪些外部名字」摆到明面上：
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let plus7 = |x: i32| { return x + 7; };
     print("35+7=${plus7(35)}");
@@ -199,7 +221,7 @@ fn main() -> i32 {
 
 `@[derive(...)]` 把这件事交给编译器：
 
-```vyx
+```vyx program
 use std.hash;
 use std.clone;
 use std.fmt;
@@ -221,11 +243,11 @@ fn main() -> i32 {
 
 你会看到相等为真、一个非零哈希、比较结果 0。
 
-### 为什么 `Clone` 是逐字段深拷贝
+### `Clone` 按字段的实现克隆
 
-`@[derive(Clone)]` 对每个字段再调一次 `.clone()`。对 `Vec<T>` 这种堆背衬字段，这意味着**底层存储也会被复制一份**，而不是把指针再贴一份。
+`@[derive(Clone)]` 组合各字段的克隆行为。`Vec<T>.clone()` 复制缓冲和元素；`Ref<T>.clone()` 增加强引用计数，与原值共享同一对象。不能把所有 `clone()` 都理解成深拷贝。
 
-这个选择是必须的：如果只贴指针，两个对象就会共享同一块堆存储，其中一个释放之后另一个立刻悬空。深拷贝慢一些，但语义唯一。
+克隆后的共享关系由字段类型决定。设计自己的资源类型时，应明确克隆是复制资源还是增加共享引用，而不是只复制一个未经管理的指针。
 
 enum 按变体 `match` 重建；泛型字段视为隐含对应 trait bound。
 
@@ -241,7 +263,7 @@ derive 给的是**结构相等**：字段全等则相等。如果业务上「同
 
 ### 小结
 
-derive 按字段合成；`Clone` 是深的；指针字段请手写。
+derive 按字段合成；克隆是否共享由字段的实现决定；裸指针字段需要手写。
 
 ---
 
@@ -261,7 +283,7 @@ fast:  [叫起来][立刻写 2]
 先 await slow 再叫 fast ──► log 变成 12（根本没人可插队）
 ```
 
-```vyx
+```vyx program
 use std.vio;
 
 var log: i32 = 0;
@@ -305,7 +327,7 @@ fn main() -> i32 {
 
 这也解释了 `@[async] fn f() -> i32` 那个看起来别扭的地方：签名写的是 `i32`，调用处拿到的却是任务；`await` 之后才是 `i32`。
 
-```vyx
+```vyx program
 use std.vio;
 
 @[async]
@@ -343,7 +365,7 @@ fn main() -> i32 {
 
 `StartCoroutine` + `yield WaitForNextTick()` 用的是操作系统 fiber，和上面这套 `@[async]` 是两回事。**不要在同一个函数里混用**。只有这条路需要 `vio_start()` / `vio_stop()`。
 
-```vyx
+```vyx program
 use std.vio;
 
 var steps: i32 = 0;
@@ -391,7 +413,7 @@ Signal::Stop          没有额外数据
 Signal::Go(42)        这一支带着一个 i32
 ```
 
-```vyx
+```vyx program
 enum Signal {
     Stop,
     Go(i32)
@@ -436,7 +458,7 @@ fn main() -> i32 {
 
 `trait` 直接描述能力，`impl Trait for Type` 为某个类型补上这份答卷：
 
-```vyx
+```vyx program
 trait Shape { fn area(self) -> f64; }
 
 struct Circle { radius: f64; }
@@ -476,7 +498,7 @@ trait 是能力清单；impl 是某类型的答卷。
 
 上一课的前提是「编译期知道类型」。当一袋子里既有圆又有正方形时，这个前提就不成立了，需要 `dyn Shape`：运行时再找 `area`。
 
-```vyx
+```vyx program
 use std.collections;
 
 trait Shape { fn area(self) -> f64; }
@@ -537,7 +559,7 @@ fn main() -> i32 {
 
 `|>` 把左边的值塞进右边调用的**第一个**参数。适合把一串「只吃一个值」的变换按阅读顺序排下来。
 
-```vyx
+```vyx program
 fn double(value: i64) -> i64 { return value * 2; }
 fn add_ten(value: i64) -> i64 { return value + 10; }
 
@@ -577,7 +599,7 @@ fn main() -> i32 {
 
 比 C 更富的编译型语言互操作走[第 42 课](#第42课)的 DCI，不是再写一种 `extern`。
 
-```vyx
+```vyx linked
 @[repr(C)]
 class Point {
     public x: i32;
@@ -603,13 +625,13 @@ fn main() -> i32 {
 
 ### 为什么 `@[repr(C)]` 不能省
 
-Vyx 自己的布局规则（对齐、字段顺序、填充）和 C 的不一样。把 `Point` 按返回值传给 C 函数时，**两边必须对同一块内存有一致的理解**，否则 C 那边读到的是错位的字节。`@[repr(C)]` 就是声明「这个类型按 C 的规则排」。
+把 `Point` 按值传给 C 函数时，两边必须约定相同的布局与 ABI。`@[repr(C)]` 声明按 C 的规则排布；仅仅把字段拼写成相同的类型，不能替代这个边界约定。
 
 这类错误编译器不会报，因为从 C ABI 的角度看签名完全合法。这正是 unsafe 边界的典型形态：**正确性由你证明，不由编译器证明**。
 
-### 为什么 `fn` 不能当 C 回调
+### C 函数指针与函数值
 
-Vyx 的 `fn` 和 C 函数指针的调用约定不是一回事。`cfn` 槽会拒绝脂肪 `fn`（E1000），必须显式转换。
+`cfn(i32) -> i32` 描述 C 函数指针；`fn(...)` 类型的函数值可以携带上下文，不能把这种值直接当作 C 函数指针。上例传入的是具名函数 `bump_c`，并用 `@[no_mangle]` 保留导出符号；它与一个带捕获的函数值不同。C 回调还必须匹配参数、返回类型和调用约定。
 
 C 的可变参数 `...` 写在 `extern "C"` 声明的最后一个形参上。
 
@@ -627,7 +649,7 @@ C 是语言 FFI；布局用 `repr(C)`；回调用 `cfn`。
 
 第 10 课的 `defer` 登记一块语句。类还可以更进一步：定义 `drop()`，实例离开作用域时自动调用。适合文件句柄、连接、堆对象这类「有确定生命周期」的资源。
 
-```vyx
+```vyx program
 var resource_drops: i32 = 0;
 
 class Resource {
@@ -659,13 +681,13 @@ fn main() -> i32 {
 两者不冲突，但职责不同：
 
 - `drop` 是**语言钩子**：什么时候调用由作用域决定。
-- 容器当前仍要你显式 `destroy()`：**要释放什么**由容器的 API 决定。
+- `Vec.drop()` 调用 `destroy()` 释放缓冲，因此未转移的局部容器会在作用域退出时清理；显式 `destroy()` 可以提前释放。
 
-两条纪律：销毁后不要再用，也不要销毁两次。
+`Vec.destroy()` 会清空自身状态，后续自动 `drop()` 不重复释放；它不逐个析构元素。其他资源类型是否允许重复销毁，要看各自的 API，不能套用容器的约定。
 
 ### 小结
 
-`drop()` 跟着作用域走；标准库容器另外还要 `destroy()`。
+`drop()` 是作用域清理入口；容器的 `destroy()` 是具体的缓冲释放操作。
 
 ---
 
@@ -673,7 +695,7 @@ fn main() -> i32 {
 
 `Either<L, R>` 表达「不是左就是右，两边类型可以不同」。`<...Ts>` 是类型包，`args...+` 对所有实参做加法折叠——运算符必须对每一个实参都成立。
 
-```vyx
+```vyx program
 use std.core;
 
 enum Either<L, R> {
@@ -729,7 +751,7 @@ fn main() -> i32 {
 
 `struct` / `class` 可以写在另一个记录体内，深度不限。嵌套记录按**点分名**提升到模块作用域（`FreqArray` 里的 `A` 就是记录 `FreqArray.A`），参数表是**父级参数表后面接自己的参数表**；两层参数表**完全相同**时视为只是在复述父级参数，不新增参数。
 
-```vyx
+```vyx program
 struct FreqArray<T> {
     struct A<T> { public a: T; }        // 与父级参数表相同：不新增参数
     struct B<U> { public b: U; }        // 新增 U
@@ -758,7 +780,7 @@ fn main() -> i32 {
 
 这条规则对类型位置同样成立：
 
-```vyx
+```vyx fragment
 struct Holder {
     c: FreqArray<i32>::C<i32, f64>;
     deep: L1<i32>::L2<f64>::L3<i8>;      // 任意深度，逐层实参依次拼接
@@ -767,8 +789,8 @@ struct Holder {
 
 嵌套 `class` 与普通 `class` 规则一致：可以有 `public` 成员、方法、构造函数。
 
-```vyx
-class Box<T> {
+```vyx program
+class Envelope<T> {
     class Inner {
         public v: i64;
         Inner(n: i64) { self.v = n; }
@@ -778,7 +800,7 @@ class Box<T> {
 }
 
 fn main() -> i32 {
-    var b = Box<i32>::Inner(42);
+    var b = Envelope<i32>::Inner(42);
     print("${b.get()}");
     return 0;
 }
@@ -806,7 +828,7 @@ fn main() -> i32 {
 
 带**常量整数**实参的 `comptime` 调用，会在编译期跑完，折成字面量。
 
-```vyx
+```vyx program
 @[comptime]
 fn triple(x: i32) -> i32 {
     let y = x + 1;
@@ -870,7 +892,7 @@ fn main() -> i32 {
 
 堆所有权赋值是搬走，不是复印。这条规则让「同一块堆存储有两个主人」在类型层面就不可能发生。
 
-```vyx
+```vyx program
 use std.collections;
 
 class Bag {
@@ -898,7 +920,7 @@ move 是第三条路：**把所有权交出去，源变成不可用**。代价�
 
 标量和 `@[derive(Copy)]` 的纯标量 class 可以再读源：
 
-```vyx
+```vyx program
 @[derive(Copy)]
 class Tiny {
     public n: i32;
@@ -915,7 +937,7 @@ fn main() -> i32 {
 
 判断标准是**按位复制是否等价于一份独立的值**。整数、指针宽度的小结构成立；持有堆存储的类型不成立。
 
-`string` / `String` 不是 Copy，要第二份请 `.clone()`。
+原生 `string` / `str` 被视为 Copy；大写 `String` 拥有文本存储，赋值或按值传参会转移所有权。转移后读取源绑定会报告 `E3100`，`let` 和 `var` 都遵守这条规则。需要保留原值时用 `.clone()`，只读参数用 `&String`；已移动的 `var` 可以重新赋值后继续使用。
 
 ### 借用
 
@@ -942,7 +964,7 @@ fn main() -> i32 {
 
 子类把父类字段**按声明顺序拼在前面**，再用 `override` 换掉父方法。`struct` 也可以这样拼字段（`struct Vec3 : Vec2`）。
 
-```vyx
+```vyx program
 class Base {
     public x: i32;
     public fn get(self) -> i32 { return self.x; }
@@ -1007,7 +1029,7 @@ fn main() -> i32 {
 
 接口可以带默认方法体；`impl` 只补必选方法：
 
-```vyx
+```vyx program
 interface Greeter {
     fn greet(self) -> i32;
     fn hello(self) -> i32 { return self.greet() + 1; }
@@ -1056,7 +1078,7 @@ fn main() -> i32 {
 
 `type Ptr<T> = *T` 只是换个短名字。trait 上的 `const MAX` 是关联常量，用 `T::MAX` 读。
 
-```vyx
+```vyx program
 type Ptr<T> = *T;
 
 trait Bounded {
@@ -1096,7 +1118,7 @@ fn main() -> i32 {
 
 关联常量把上限**挂在类型上**：`T::MAX` 读的是 `T` 自己声明的那一份。加上 `where T: Bounded`，编译器就知道任何传进来的 `T` 一定有 `MAX`，可以放心使用。
 
-判断标准和 `where T: Add`（第 13 课）完全一样：**泛型体里要用什么，就必须在约束里承诺什么。**
+这里必须写 `where T: Bounded`，让 `T::MAX` 能通过约束解析到关联常量。第 13 课的普通算术在当前编译器中可以没有显式约束；不要把两者的解析要求混为一条规则。
 
 ### 小结
 
@@ -1110,7 +1132,7 @@ fn main() -> i32 {
 
 `@[platform]` 把选择提前到编译期：**同一名字按目标操作系统留一份实现，Sema 丢掉不匹配的那份**，因此不会重名。
 
-```vyx
+```vyx program
 @[platform("posix")]
 fn path_sep() -> i32 { return 47; }
 
@@ -1149,7 +1171,7 @@ POSIX 上是 `47`（`/`），Windows 上是 `92`（`\`）。
 
 这些是**类型查询**，折成 `i64`，不是 C 预处理器。`repr_sizeof::<T>()` 是同一族。
 
-```vyx
+```vyx program
 fn main() -> i32 {
     static_assert(1 + 1 == 2);
     static_assert(sizeof::<i32>() == 4, "i32 is 4 bytes");
@@ -1177,7 +1199,7 @@ fn main() -> i32 {
 
 你可以给 class 写 `operator+`、`operator[]` 等方法，让自定义类型在语法上和内置类型一样好用。
 
-```vyx
+```vyx program
 class SymbolBox {
     public value: i32;
 
@@ -1350,7 +1372,7 @@ auto_discover = false
 
 `main.vyx`:
 
-```vyx
+```vyx program
 @[acme.entry(priority=10)]
 fn native_entry() -> i32 {
     return 42;

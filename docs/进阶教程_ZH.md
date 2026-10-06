@@ -10,16 +10,16 @@
 
 数组 `[T; N]` 的长度在编译期就定死了。但真实程序的数据量往往要跑起来才知道：读进来的行数、用户输入的数量。这就需要能在运行时增长的容器。
 
-```vyx
+```vyx program
 use std.collections;
 
 fn main() -> i32 {
-    // 类型实参写在方法上：先声明「容器里装什么」。
+    // i32 是 Vec 的类型实参，new 是这个类型上的构造方法。
     var values = Vec::<i32>.new();
     values.push(20);
     values.push(22);
     print(values.get(0) + values.get(1));
-    // 显式交还容器持有的存储。
+    // 提前释放缓冲；Vec.drop() 也会在局部值离开作用域时清理。
     values.destroy();
     return 0;
 }
@@ -27,20 +27,20 @@ fn main() -> i32 {
 
 输出 `42`。
 
-### 为什么 `destroy()` 必须自己写
+### 作用域清理与提前释放
 
-容器在堆上持有存储。Vyx 不安排隐藏的回收动作，所以在容器离开作用域之前，要把这块存储交还回去。
+标准库的 `Vec`、`Dict` 和 `Set` 定义了 `drop()`，未转移的局部值离开作用域时会自动调用它。它们的 `destroy()` 负责释放容器的缓冲；需要提前释放时可以显式调用。
 
-这不是「记得写就更安全」的礼貌建议，而是**忘写就等于泄漏**。好处是释放点完全可预测：决定内存何时被回收的是你的代码，不是某个后台线程的调度。代价就是这一行不能省。
+不要把缓冲清理等同于元素清理：当前 `Vec.destroy()` 不逐个调用元素的析构。元素持有独立资源时，按元素类型的 API 处理；释放或重新分配后，也不能继续使用此前取得的元素引用。
 
-`defer`（第十课）正好适合这种成对操作：
+对于需要显式配对的资源，也可以用 `defer`（第十课）安排清理：
 
-```vyx
+```vyx fragment
 var values = Vec::<i32>.new();
 defer { values.destroy(); }
 ```
 
-这样即使中途提前 `return`，清理也不会漏掉。
+这个写法在退出作用域时调用 `destroy()`。这里的容器会把自身状态清空，之后的 `drop()` 不再重复释放缓冲；不能将这种行为推广到所有资源 API。
 
 ### 三个容器的分工
 
@@ -50,9 +50,9 @@ defer { values.destroy(); }
 | `Dict<K, V>` | 按 key 找 value | `put` `get` `contains` |
 | `Set<T>` | 只关心「在不在」 | `add` `contains` `remove` |
 
-三个都要求 `use std.collections;`，三个也都要 `destroy()`。
+三个都通过 `use std.collections;` 导入，均提供 `destroy()` 和作用域清理。
 
-```vyx
+```vyx fragment
 var scores = Dict::<string, i32>.new();
 scores.put("alice", 42);
 if (scores.contains("alice")) { print(scores.get("alice")); }
@@ -76,14 +76,14 @@ tags.destroy();
 
 ### 常见错误
 
-- 用容器却忘了 `destroy()`，存储就留在那里了。
-- 记混容器的方法名：Set 用 `add` 不是 `insert`，Dict 用 `put` 不是 `set`。
+- 容器缓冲释放后继续使用元素引用，或把缓冲清理误认为元素资源也已清理。
+- 混用其他语言的容器 API；本教程统一使用 `Set.add` 和 `Dict.put`，`Dict.set` 也有别名支持。
 
 ## 第12课：闭包
 
 有时候你要传出去的不是一段固定的逻辑，而是「带上当前上下文的一段逻辑」。为此专门定义一个具名函数和一个结构体，代价太大。
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let offset = 7;
     // |参数列表| { 函数体 }；函数体里可以直接用 offset。
@@ -119,7 +119,7 @@ fn main() -> i32 {
 
 同一个操作，类型不同，实现完全一样。为每种类型各抄一遍，是纯粹的重复；而且以后改一处就得改一串。
 
-```vyx
+```vyx program
 fn identity<T>(value: T) -> T {
     return value;
 }
@@ -151,6 +151,14 @@ fn main() -> i32 {
 
 大多数时候类型实参能从参数推出来，`identity::<i32>(42)` 里的 `::<i32>` 其实可以省。需要显式写的场合是**推不出来**的时候，典型是泛型容器：`Vec::<i32>.new()` 没有任何参数能告诉你里面装什么，只能由你指定。
 
+| 写法 | 含义 |
+|---|---|
+| `fn identity<T>(value: T) -> T` | 声明泛型形参 `T` |
+| `let values: Vec<i32> = Vec::<i32>.new();` | 类型标注用 `<...>`，表达式显式给类型实参用 `::<...>` |
+| `identity::<i32>(42)` | 给函数的泛型形参传入 `i32` |
+| `values.push(42)` | 调用实例方法，`T` 已由容器类型确定 |
+| `T::MAX` | 读取类型的关联常量；这里的 `::` 不是实例方法调用 |
+
 ### 代价：单态化
 
 泛型不是运行时机制。每用一组具体类型实例化一次，就生成一份对应的机器码——`add::<i32>` 和 `add::<i64>` 是两份独立的函数。
@@ -166,7 +174,7 @@ fn main() -> i32 {
 
 一串 `if (x == 0) ... else if (x == 1) ... else ...` 能表达同样的意思，但读代码的人看不出两件事：**是不是每个情况都覆盖了**，以及**这里到底在判断哪一个值**。
 
-```vyx
+```vyx program
 fn label(value: i32) -> string {
     return match value {
         case 0 => "idle",
@@ -189,30 +197,30 @@ fn main() -> i32 {
 
 分支体也可以是多条语句的块：
 
-```vyx
+```vyx fragment
 case 1 => { let text = "running"; text; }
 ```
 
-块里最后那个表达式就是这一段的值（注意这里没有 `return`，也没有 `;`）。
+当前 `match` 分支块把最后一个表达式语句的值作为分支值，上例要保留 `text;` 的分号；不写 `return`。它与 `if` 表达式分支的 `{ text }` 写法不同，也不改变普通函数必须用 `return` 返回值的规则。
 
 ### 处理带载荷的情况
 
 `Result` 这类枚举带着数据，模式里可以把数据取出来：
 
-```vyx
-match (parse_plus_one("42")) {
+```vyx fragment
+match (parse_next("42")) {
     case Ok(value) => { print(value); }
     case Err(_) => { print("invalid number"); }
 }
 ```
 
-`case Ok(value)` 把成功值绑到 `value` 上；`case Err(_)` 里的 `_` 表示「这里我不关心具体是什么」。
+这是函数体内的片段，`parse_next` 的完整定义见第 16 课。`case Ok(value)` 把成功值绑到 `value` 上；`case Err(_)` 里的 `_` 表示“忽略载荷”，不是整个 `match` 的兜底分支。兜底写 `default`。
 
 ### guard：模式之外的附加条件
 
 模式匹配完之后还可以再补一个布尔条件：
 
-```vyx
+```vyx fragment
 return match parse_number(input) {
     case Ok(v) if v > 0 => v,
     case Ok(_) => 0,
@@ -232,7 +240,7 @@ return match parse_number(input) {
 
 字符串的处理需求高度集中在几个动作上：找、切、比大小写。
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let text = "Hello, Vyx!";
     print(text.contains("Vyx"));
@@ -253,7 +261,7 @@ fn main() -> i32 {
 | `starts_with(s)` / `ends_with(s)` | 前缀 / 后缀判断 | `bool` |
 | `substring(start, end)` | 取一段 | 文本 |
 | `to_upper()` / `to_lower()` | 大小写转换 | 文本 |
-| `len` | 长度 | 整数（字段，不是方法） |
+| `len` | 字节长度 | 整数，教程使用属性写法 |
 
 ### `substring` 也是左闭右开
 
@@ -261,15 +269,15 @@ fn main() -> i32 {
 
 一致的边界规则带来的好处和循环那里一样：要取「前 n 个」就写 `substring(0, n)`，长度就是 `n`，不用再算一次减一。
 
-### 长度是字段不是方法
+### 字符串长度的写法
 
-字符串的长度写作 `text.len`，不加括号。这一点在迁移时值得留意——不少语言的同类属性是方法调用，写错了编译器会直接告诉你。
+本教程统一写 `text.len`，表示字节长度，不能据此计算 Unicode 字符数量。原生字符串还支持 `size()`、`count()`、`length()` 等既有写法；不要把“教程选用属性”理解成其他写法都会编译失败。
 
 ### 插值仍然是最常用的
 
 需要把几个值拼成一句话时，插值比手工拼接更省事，也不用担心中间的类型转换：
 
-```vyx
+```vyx fragment
 let name = "Vyx";
 let score = 42;
 print("${name}: ${score}");
@@ -279,7 +287,7 @@ print("${name}: ${score}");
 
 「这个操作可能失败」是需要写进**类型**里的信息。写进类型之后，调用方在签名处就能看到，编译器也会盯着你别装作没看见。
 
-```vyx
+```vyx fragment
 use std.core;
 
 // 声明一组命名的失败原因。
@@ -308,7 +316,7 @@ fn parse_next(input: string) -> Result<i32, ParseError> {
 
 这一行替代的是：
 
-```vyx
+```vyx fragment
 let value = match parse_number(input) {
     case Ok(v) => v,
     case Err(e) => { fail e; }
@@ -321,7 +329,7 @@ let value = match parse_number(input) {
 
 失败在签名里：`-> Result<i32, ParseError>` 明明白白告诉你这个调用可能失败。任何调用点都能看到，不必去猜某个函数背后会不会抛出东西。
 
-代价也很直接：**错误必须被处理或者继续上抛**，不能悄悄忽略。这正是目的。
+调用方用 `match` 检查结果，或用 `?` 传播。当前编译器允许直接丢弃 `Result`，这里是 API 使用约定，不是已实现的强制处理诊断。外部语言异常的传播与清理另见 [DCI 规范](DCI_SPEC_ZH.md)。
 
 ### `Option<T>`：只有「有」和「没有」
 
@@ -340,7 +348,7 @@ let value = match parse_number(input) {
 
 `x = x + 5` 里，`x` 写了两次。左边一旦复杂起来（比如带下标），写两遍就是两遍出错的机会。
 
-```vyx
+```vyx program
 fn main() -> i32 {
     var count = 10;
     count += 5;      // 等价于 count = count + 5
@@ -369,7 +377,7 @@ fn main() -> i32 {
 | `~` | 按位取反 |
 | `<<` / `>>` | 左移 / 右移 |
 
-```vyx
+```vyx fragment
 print(0xFF & 0x0F);   // 15   取低四位
 print(1 << 4);        // 16   左移四位
 print(0xFF ^ 0x0F);   // 240  异或会翻转低四位
@@ -388,7 +396,7 @@ print(0xFF ^ 0x0F);   // 240  异或会翻转低四位
 
 同一个循环结构，可以驱动好几种不同的东西。
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let values: [i32; 3] = [10, 20, 30];
     var total: i32 = 0;
@@ -407,7 +415,7 @@ fn main() -> i32 {
 
 两种都能拿到数据，区别在于你要不要**位置**：
 
-```vyx
+```vyx fragment
 for (index in 0..3) { total += values[index]; }   // 需要下标时
 
 for (value in values) { total += value; }         // 只关心元素本身
@@ -417,7 +425,7 @@ for (value in values) { total += value; }         // 只关心元素本身
 
 容器同样可以直接遍历：
 
-```vyx
+```vyx fragment
 use std.collections;
 
 var values = Vec::<i32>.new();
@@ -450,7 +458,7 @@ squares/
 
 `src/math.vyx`：
 
-```vyx
+```vyx file=src/math.vyx
 module squares;
 
 public fn square(value: i32) -> i32 {
@@ -460,7 +468,7 @@ public fn square(value: i32) -> i32 {
 
 `src/main.vyx`：
 
-```vyx
+```vyx file=src/main.vyx
 module squares;
 
 public fn main() -> i32 {
@@ -479,6 +487,7 @@ entry = "src/main.vyx"
 
 [build]
 output_dir = "target"
+auto_sources = false
 
 [target.squares]
 type = "executable"
@@ -504,9 +513,9 @@ Windows 运行 `.\target\squares.exe`，Linux 运行 `./target/squares`，输出
 
 示例里的 `square` 用 `public` 对外开放，也可以写成 `@[vis(world)]`。
 如果辅助函数只供本包使用，用 `@[vis(package)]`；只供特定模块使用，用
-`@[vis(in(...))]`。`main` 作为构建入口仍保留 `public`。
+`@[vis(in(...))]`。示例中的 `main` 使用 `public`；可执行入口由清单选择，`public` 本身不决定它是不是入口。
 
-```vyx
+```vyx fragment
 module squares.math;
 
 @[vis(package)]
@@ -525,7 +534,7 @@ fn debug_square(value: i32) -> i32 { return square(value); }
 
 ### 为什么清单里要写 `sources`
 
-构建系统不会去猜哪些文件属于这个目标。`[target.squares]` 里的 `entry` 和 `sources` 就是**完整的输入清单**——谁被编译、谁被链接，一目了然，不需要在目录里做递归扫描。
+这里用 `auto_sources = false` 关闭自动扫描，显式列出目标入口和额外源码。编译器仍会处理源码里的项目导入依赖；不要把显式清单、自动扫描和 `use` 导入混为一件事。
 
 多写一行的代价，换来的是构建结果不随目录里意外多出来的文件而改变。
 
@@ -540,7 +549,7 @@ fn debug_square(value: i32) -> i32 { return square(value); }
 
 已经存在的 C 库不必重写。Vyx 能直接调用它们，代价是要把「这个函数的 ABI 长什么样」说清楚。
 
-```vyx
+```vyx program
 extern "C" {
     fn abs(x: i32) -> i32;
 }

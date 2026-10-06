@@ -10,16 +10,16 @@ Each lesson still starts from the problem and then states the trade-off. Install
 
 An array `[T; N]` has its length fixed at compile time. Real programs rarely know their data size ahead of time: the number of lines read in, the number of items a user enters. That calls for containers that can grow while the program runs.
 
-```vyx
+```vyx program
 use std.collections;
 
 fn main() -> i32 {
-    // The type argument goes on the method: declare what the container holds first.
+    // i32 is Vec's type argument; new is a constructor method on that type.
     var values = Vec::<i32>.new();
     values.push(20);
     values.push(22);
     print(values.get(0) + values.get(1));
-    // Hand the container's storage back explicitly.
+    // Release the buffer early; Vec.drop() also cleans up a local at scope exit.
     values.destroy();
     return 0;
 }
@@ -27,20 +27,20 @@ fn main() -> i32 {
 
 This prints `42`.
 
-### Why `destroy()` is yours to write
+### Scope cleanup and early release
 
-A container holds heap storage. Vyx schedules no hidden reclamation, so that storage must be returned before the container goes out of scope.
+The standard-library `Vec`, `Dict`, and `Set` define `drop()`, called when an unmoved local leaves its scope. Their `destroy()` method releases the container buffer and can be called to release it early.
 
-This is not a politeness suggestion — **forgetting it is a leak**. In exchange, the release point is fully predictable: your code decides when memory comes back, not some background thread's schedule. The price is that this line cannot be skipped.
+Buffer cleanup is separate from element cleanup: the current `Vec.destroy()` does not call each element's destructor. Handle independent element resources according to their API, and do not keep using element references after releasing or reallocating the buffer.
 
-`defer` (lesson 10) fits this pairing exactly:
+For resources that need an explicit paired operation, `defer` (lesson 10) can schedule it:
 
-```vyx
+```vyx fragment
 var values = Vec::<i32>.new();
 defer { values.destroy(); }
 ```
 
-Now an early `return` in the middle still cleans up.
+This calls `destroy()` when the scope exits. These containers clear their own state, so the later `drop()` does not free the buffer again; do not assume every resource API has that behaviour.
 
 ### What each container is for
 
@@ -50,9 +50,9 @@ Now an early `return` in the middle still cleans up.
 | `Dict<K, V>` | Looking a value up by key | `put` `get` `contains` |
 | `Set<T>` | Only caring whether something is present | `add` `contains` `remove` |
 
-All three require `use std.collections;`, and all three need `destroy()`.
+Import all three with `use std.collections;`; each provides `destroy()` and scope cleanup.
 
-```vyx
+```vyx fragment
 var scores = Dict::<string, i32>.new();
 scores.put("alice", 42);
 if (scores.contains("alice")) { print(scores.get("alice")); }
@@ -76,14 +76,14 @@ Two practical consequences follow:
 
 ### Common mistakes
 
-- Using a container and forgetting `destroy()`, leaving the storage behind.
-- Mixing up method names: `Set` uses `add`, not `insert`; `Dict` uses `put`, not `set`.
+- Using element references after buffer release, or assuming buffer cleanup also releases element resources.
+- Assuming another language's container API applies; this tutorial uses `Set.add` and `Dict.put` consistently. `Dict.set` is also supported as an alias.
 
 ## Lesson 12: closures
 
 Sometimes what you need to hand over is not a fixed piece of logic but "that logic, carrying the current context with it". Defining a named function plus a struct for that is far too much ceremony.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let offset = 7;
     // |parameters| { body }; the body can use offset directly.
@@ -119,7 +119,7 @@ Conversely, if a piece of logic will be reused, tested on its own, or called fro
 
 The same operation, for different types, with an identical implementation. Copying it once per type is pure duplication — and later, one change becomes a chain of changes.
 
-```vyx
+```vyx program
 fn identity<T>(value: T) -> T {
     return value;
 }
@@ -151,6 +151,14 @@ For capabilities like associated constants (lesson 37's `T::MAX`) the constraint
 
 Most of the time the type argument is inferable from the arguments, so the `::<i32>` in `identity::<i32>(42)` is optional. It becomes necessary when there is **nothing to infer from**, most notably generic containers: `Vec::<i32>.new()` has no argument that could tell you what goes inside, so you must say it.
 
+| Form | Meaning |
+|---|---|
+| `fn identity<T>(value: T) -> T` | Declare the generic parameter `T` |
+| `let values: Vec<i32> = Vec::<i32>.new();` | Type annotations use `<...>`; explicit type arguments in expressions use `::<...>` |
+| `identity::<i32>(42)` | Supply `i32` to the function's generic parameter |
+| `values.push(42)` | Call an instance method; the container type already determines `T` |
+| `T::MAX` | Read an associated constant; `::` here is not an instance method call |
+
 ### The cost: monomorphisation
 
 Generics are not a runtime mechanism. Each instantiation with concrete types produces its own machine code — `add::<i32>` and `add::<i64>` are two separate functions.
@@ -166,7 +174,7 @@ The upside is no indirection and no boxing; it runs exactly like the hand-writte
 
 A chain of `if (x == 0) ... else if (x == 1) ... else ...` can express the same thing, but it hides two facts from the reader: **whether every case is covered**, and **which value is actually being tested**.
 
-```vyx
+```vyx program
 fn label(value: i32) -> string {
     return match value {
         case 0 => "idle",
@@ -189,30 +197,30 @@ Note the `return match ... ;` — `match` produces a value, so it works both as 
 
 An arm may also be a block of statements:
 
-```vyx
+```vyx fragment
 case 1 => { let text = "running"; text; }
 ```
 
-The last expression in the block is the arm's value (note there is no `return` here, and no trailing `;`).
+A current `match` branch block yields the value of its last expression statement: keep the semicolon in `text;` above and omit `return`. This differs from an `if` expression branch written `{ text }` and does not give ordinary functions implicit tail returns.
 
 ### Handling cases that carry data
 
 Enums like `Result` carry data, and a pattern can pull it out:
 
-```vyx
-match (parse_plus_one("42")) {
+```vyx fragment
+match (parse_next("42")) {
     case Ok(value) => { print(value); }
     case Err(_) => { print("invalid number"); }
 }
 ```
 
-`case Ok(value)` binds the success value to `value`; the `_` in `case Err(_)` means "I do not care what is in here".
+This is a fragment inside a function; lesson 16 defines `parse_next`. `case Ok(value)` binds the success payload to `value`; `_` in `case Err(_)` ignores that payload. It is not a fallback for the entire `match`: use `default` for that.
 
 ### Guards: extra conditions beyond the pattern
 
 A pattern can be followed by a boolean condition:
 
-```vyx
+```vyx fragment
 return match parse_number(input) {
     case Ok(v) if v > 0 => v,
     case Ok(_) => 0,
@@ -232,7 +240,7 @@ return match parse_number(input) {
 
 String work clusters tightly around a few actions: finding, slicing, and changing case.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let text = "Hello, Vyx!";
     print(text.contains("Vyx"));
@@ -253,7 +261,7 @@ This prints `true`, then `Hello`, then `HELLO, VYX!`.
 | `starts_with(s)` / `ends_with(s)` | Prefix / suffix test | `bool` |
 | `substring(start, end)` | Extract a span | Text |
 | `to_upper()` / `to_lower()` | Change case | Text |
-| `len` | Length | An integer (a field, not a method) |
+| `len` | Byte length | An integer; the tutorial uses property syntax |
 
 ### `substring` is half-open too
 
@@ -261,15 +269,15 @@ This prints `true`, then `Hello`, then `HELLO, VYX!`.
 
 The consistency pays off the same way it does for loops: "the first n" is `substring(0, n)`, and its length is simply `n`, with no minus-one arithmetic.
 
-### Length is a field, not a method
+### String length syntax
 
-A string's length is written `text.len`, with no parentheses. This is worth noticing during migration — in many languages the equivalent is a call, and writing it that way here fails at compile time.
+This tutorial uses `text.len` for byte length, not Unicode character count. Primitive strings also support existing spellings such as `size()`, `count()`, and `length()`; choosing property syntax here does not mean the other forms fail to compile.
 
 ### Interpolation is still the default tool
 
 When several values have to become one sentence, interpolation beats manual concatenation and spares you the conversions in between:
 
-```vyx
+```vyx fragment
 let name = "Vyx";
 let score = 42;
 print("${name}: ${score}");
@@ -279,7 +287,7 @@ print("${name}: ${score}");
 
 "This operation can fail" is information that belongs in the **type**. Once it is there, callers see it in the signature, and the compiler holds you to not ignoring it.
 
-```vyx
+```vyx fragment
 use std.core;
 
 // Declare a set of named failure reasons.
@@ -308,7 +316,7 @@ fn parse_next(input: string) -> Result<i32, ParseError> {
 
 It replaces this:
 
-```vyx
+```vyx fragment
 let value = match parse_number(input) {
     case Ok(v) => v,
     case Err(e) => { fail e; }
@@ -321,7 +329,7 @@ Nested a few levels deep, what `?` saves is not just lines but the visual noise 
 
 Failure is in the signature: `-> Result<i32, ParseError>` states plainly that this call may fail. Every call site can see it, and nobody has to guess whether some function throws behind the curtain.
 
-The cost is equally direct: **an error must be handled or propagated**, never quietly ignored. That is the point.
+Inspect the result with `match` or propagate it with `?`. The current compiler permits discarded `Result` values; this is API guidance, not an implemented mandatory-handling diagnostic. See the [DCI specification](DCI_SPEC.md) for external exception propagation and cleanup.
 
 ### `Option<T>`: only "present" and "absent"
 
@@ -340,7 +348,7 @@ The test is the same as in lesson 9: **could the caller write a correct handler?
 
 In `x = x + 5` the name `x` appears twice. Once the left side grows complicated — an indexed element, say — writing it twice is two chances to get it wrong.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     var count = 10;
     count += 5;      // equivalent to count = count + 5
@@ -369,7 +377,7 @@ The family also includes `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>
 | `~` | Bitwise NOT |
 | `<<` / `>>` | Shift left / right |
 
-```vyx
+```vyx fragment
 print(0xFF & 0x0F);   // 15   keep the low nibble
 print(1 << 4);        // 16   shift left by four
 print(0xFF ^ 0x0F);   // 240  XOR flips the low nibble
@@ -388,7 +396,7 @@ The same fixed width means bits shifted out are genuinely gone — **the type do
 
 One loop construct, several different things to drive it with.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let values: [i32; 3] = [10, 20, 30];
     var total: i32 = 0;
@@ -407,7 +415,7 @@ This prints `60`.
 
 Both get you the data; the difference is whether you need the **position**:
 
-```vyx
+```vyx fragment
 for (index in 0..3) { total += values[index]; }   // when the index matters
 
 for (value in values) { total += value; }         // when only the element matters
@@ -417,7 +425,7 @@ You need the index to write back into the array, to pick elements by position, o
 
 Containers iterate the same way:
 
-```vyx
+```vyx fragment
 use std.collections;
 
 var values = Vec::<i32>.new();
@@ -450,7 +458,7 @@ squares/
 
 `src/math.vyx`:
 
-```vyx
+```vyx file=src/math.vyx
 module squares;
 
 public fn square(value: i32) -> i32 {
@@ -460,7 +468,7 @@ public fn square(value: i32) -> i32 {
 
 `src/main.vyx`:
 
-```vyx
+```vyx file=src/main.vyx
 module squares;
 
 public fn main() -> i32 {
@@ -479,6 +487,7 @@ entry = "src/main.vyx"
 
 [build]
 output_dir = "target"
+auto_sources = false
 
 [target.squares]
 type = "executable"
@@ -504,9 +513,9 @@ This separates two different things: splitting one module across files, and spli
 
 The example exposes `square` using `public`, which can also be written
 `@[vis(world)]`. Use `@[vis(package)]` for a package helper, or `@[vis(in(...))]`
-for selected modules. Keep `main` public as the build entry point.
+for selected modules. The example makes `main` public; the manifest selects the executable entry point, not the `public` modifier itself.
 
-```vyx
+```vyx fragment
 module squares.math;
 
 @[vis(package)]
@@ -527,7 +536,7 @@ for a project example.
 
 ### Why the manifest lists `sources`
 
-The build system does not guess which files belong to a target. `entry` and `sources` under `[target.squares]` are the **complete input list** — what gets compiled and what gets linked, with nothing left to discovery.
+Here `auto_sources = false` disables automatic scanning, and the target lists its entry and additional sources explicitly. The compiler still resolves project imports found in source code; explicit source lists, scanning, and `use` imports are separate mechanisms.
 
 One extra line buys a build result that does not change when an unexpected file shows up in the directory.
 
@@ -542,7 +551,7 @@ One extra line buys a build result that does not change when an unexpected file 
 
 Existing C libraries do not have to be rewritten. Vyx can call them directly; the price is stating exactly what the function's ABI looks like.
 
-```vyx
+```vyx program
 extern "C" {
     fn abs(x: i32) -> i32;
 }

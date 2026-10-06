@@ -2,11 +2,26 @@
 
 [简体中文](入门指南_ZH.md) · [Documentation](README.md) · [Fact Semantic Ownership System core features](MOSP.md)
 
-Ten lessons, from the first executable file to classes and scope cleanup. Every lesson follows the same line: first the problem, then why the obvious approach falls short, then the Vyx form and the trade-off behind it.
+Ten lessons covering compilation, bindings, control flow, functions, records, and scope cleanup.
 
 By the end you should be able to write a few dozen lines of single-file code without looking things up, and to read every line of `tests/cases/tutorial_beginner_core.vyx` and `tests/cases/tutorial_beginner_surface.vyx`.
 
 > **Tip** This tutorial assumes you already know roughly what variables, branches, loops, and functions are. No prior Vyx is needed, and no C, Rust, or C++ background either.
+
+### Examples and syntax conventions
+
+Code marked “Complete program” can be saved as one `.vyx` file and run. A “Code fragment” belongs inside an existing function or needs definitions from the surrounding lesson. Project examples with filenames must be built together with their manifest.
+
+| Form | Where it belongs |
+|---|---|
+| `let x: i32 = 1;` / `var x = 1;` | Bindings; use `var` when reassignment is needed. `let mut` is also supported; this tutorial uses `var` |
+| `fn f(x: i32) -> i32 { return x; }` | Parameter types follow `:`, the return type follows `->`; ordinary functions return values with `return` |
+| `struct Point { x: i32; }` / `Point { x: 1 }` | The first declares a type and field; the second constructs a value with an aggregate literal |
+| `if (ready) { work(); }` | Conditions have parentheses; control-flow blocks, function definitions, and type definitions need no extra semicolon |
+| `let x = if (ready) { 1 } else { 0 };` | An `if` expression produces a value; the final `;` ends the binding declaration |
+| `Vec<i32>` / `Vec::<i32>.new()` | A type annotation versus explicit type arguments in an expression; see lesson 13 |
+
+Binding declarations, assignments, calls, and `return` statements end with `;`. An `if` expression's branch yields its last expression without `return`; this does not give ordinary functions implicit tail returns. See lesson 14 for `match` branch blocks.
 
 ## Install the SDK
 
@@ -72,7 +87,7 @@ For real work, `--emit=exe` is the better habit. The value of `--run=aot` is tha
 
 Every program has to answer two questions: which line runs first, and how results leave the program. In Vyx those are `main` and `print`.
 
-```vyx
+```vyx program
 // Execution begins at main. -> i32 declares that it hands back a 32-bit integer.
 fn main() -> i32 {
     // print writes each argument as text and appends a newline after the last one.
@@ -87,7 +102,7 @@ Taking the function apart:
 - `fn` starts a function definition, followed by the name.
 - The `()` after `main` means it takes no parameters.
 - `-> i32` is the return type. **Whatever type you declare, you must actually return.**
-- The body lives inside `{ }`, and each statement ends with `;`.
+- The body lives inside `{ }`; the call and `return` statements here end with `;`.
 
 ### Why the return type is `i32`, not "nothing"
 
@@ -106,13 +121,13 @@ To join text, use string interpolation (lesson 2). To break lines, call `print` 
 
 - **Forgetting `return`.** A function that declares `-> i32` must hand back an `i32`. This is a compile error, not a warning.
 - Using single quotes for strings. Vyx strings use double quotes.
-- Dropping the trailing `;`.
+- Keep the `;` after calls, bindings, and `return`; do not add one after a function definition or control-flow block.
 
 ## Lesson 2: bindings and mutability
 
 Most values in a program change. The real question is **which ones are allowed to**. If any name could be rewritten at any time, you cannot tell what it holds at a given line just by reading.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     // let declares a binding: the name can never point at anything else.
     let name = "Vyx";
@@ -129,7 +144,7 @@ This prints `Vyx: 42`.
 
 ### Why `let` is the default
 
-Making immutability the default pays off on the reading side. Seeing `let`, you know the name refers to the same value for the whole scope and never need to scroll back hunting for a reassignment. Changing a value requires `var` explicitly, so **every mutable point is marked in the source**.
+Use `let` for a binding that does not need reassignment and `var` for one that does. This constrains the binding; fields and method receivers have separate rules, so it does not mean the whole object is immutable.
 
 When you get it wrong, the compiler hands you the way out:
 
@@ -140,14 +155,14 @@ note: N3000: change `let` to `var` / `let mut`, or write `mut` on the parameter
 
 ### `let` does not mean "the object is frozen"
 
-This is the most common misunderstanding. `let counter = Counter(41)` says the **name** may not point elsewhere; the object it points at can still change:
+`let` prevents reassignment of a binding; it is not C++'s type qualifier `const`. Lesson 8 declares the mutating method with `&mut self`, which requires a mutable receiver:
 
-```vyx
-let counter = Counter(41);
-counter.increment();   // legal: the object changes, not the binding
+```vyx fragment
+var counter = Counter(41); // Counter is defined in lesson 8
+counter.increment();      // increment receives &mut self
 ```
 
-In C++ vocabulary this is closer to `T* const` than to `const T*`. The binding is read-only; the thing it refers to is not.
+Records are not implicit pointers. Use `var` with `&mut self` for methods that change state and `&self` for read-only methods. Older methods with an omitted receiver remain supported; their mutation behaviour does not define the rules for explicit borrowed receivers.
 
 ### When you can omit the type
 
@@ -162,7 +177,7 @@ Lesson 3 continues with types.
 
 "Number" is never one thing in a machine. Width, signedness, and floating-point representation decide the range you can express and what each operation costs. Vyx insists this be explicit in the source — written by you, or derived from the initializer.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let count: i32 = 42;
     // as is an explicit numeric conversion.
@@ -178,11 +193,11 @@ fn main() -> i32 {
 
 This prints `42, 1.5, true, 20`.
 
-### Why conversions must be written as `as`
+### Explicit conversion with `as`
 
-`let total: i64 = count;` is not legal, even though widening `i32` to `i64` cannot lose data. The rule has to cover every case: narrowing `i64` to `i32` truncates, and converting a float to an integer drops the fraction. If only the "safe" conversions were implicit, readers would have to carry a mental list of which ones are free and which are not.
+`count as i64` explicitly selects the result type. The current compiler also accepts some implicit numeric conversions, including `let total: i64 = count;`. Requiring `as` for every numeric conversion is not a language rule.
 
-`as` costs three characters and buys you this: **every conversion that could lose information is visible in the source**.
+The tutorial writes `as` across widths and between integers and floats. Narrowing may truncate, and converting a float to an integer drops the fraction; `as` does not automatically check the value's range.
 
 ### How to write literals
 
@@ -211,7 +226,7 @@ This prints `42, 1.5, true, 20`.
 
 Branching is the most basic way for one function to behave differently under different inputs.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let temperature = 18;
     // The condition must be wrapped in parentheses.
@@ -248,7 +263,7 @@ Two characters buy consistency: `if`, `while`, and `for` all take their conditio
 
 `if` is an expression, so it can be handed back as a value:
 
-```vyx
+```vyx fragment
 fn choose(flag: i32) -> i32 {
     return if (flag == 1) { 10 } else { 20 };
 }
@@ -256,7 +271,7 @@ fn choose(flag: i32) -> i32 {
 
 For a plain either-or, `? :` is tighter:
 
-```vyx
+```vyx fragment
 let mood = age > 20 ? "adult" : "child";
 ```
 
@@ -271,7 +286,7 @@ Both branches must have compatible types; otherwise the compiler cannot give the
 
 A loop has to settle boundaries: where it starts, where it stops, and which rounds it skips. Vyx writes "where it stops" with a half-open range.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     var total: i64 = 0;
     // 0..6 is half-open: i takes 0, 1, 2, 3, 4, 5.
@@ -313,7 +328,7 @@ Lay the rounds out:
 
 When the number of rounds is unknown, use `while (condition) { ... }`. To leave an outer loop from inside a nested one, label it:
 
-```vyx
+```vyx fragment
 'outer: while (labeled < 10) {
     while (true) {
         break 'outer;   // not just the inner loop
@@ -327,7 +342,7 @@ An unlabelled `break` only affects the innermost loop. Past one level of nesting
 
 The second time the same logic appears, it should become a function. A function is also **a boundary you draw for your future self**: the inside can change freely as long as the signature holds.
 
-```vyx
+```vyx program
 // Parameters require types; b carries the default value 1.
 fn add(a: i32, b: i32 = 1) -> i32 {
     return a + b;
@@ -362,7 +377,7 @@ The two combine.
 
 Data that always travels together should be bound into one type, instead of being passed around as parallel variables.
 
-```vyx
+```vyx program
 struct Point {
     x: i32;
     y: i32;
@@ -387,37 +402,37 @@ Consider doing without it: a point needs `point_x` and `point_y`; a rectangle ne
 
 ### How it divides work with `class`
 
-A `struct` packs data without methods or constructors. Its fields are accessible by default and may be restricted with `@[vis(...)]`. A `class` adds behaviour and encapsulation on top. The rule of thumb:
+A `struct` body declares fields, accessible by default unless restricted with `@[vis(...)]`. Methods can be defined outside it in `impl Point { ... }`. A `class` also permits methods and constructors inside its type body. Choose according to how the type is organised:
 
 - If you only need to **carry several values as a unit**, use `struct`.
 - If the type has **behaviour and invariants of its own**, or must interoperate with a C++ or Rust class, use `class` (lesson 8).
 
 ### Field declarations end with `;`
 
-Note the difference from C and C++: fields are terminated with a semicolon, not a comma. In Vyx every *declaration* ends with `;`, and member declarations are no exception.
+Write a field declaration as `x: i32;` and an aggregate literal as `Point { x: 3, y: 4 }`. The declaration's `;` and the literal's `,` serve different purposes. Function and type definitions do not end with `;`.
 
 ## Lesson 8: classes and methods
 
 When data and behaviour have to be bound together, reach for `class`.
 
-```vyx
+```vyx program
 class Counter {
     // public makes this field visible outside the class.
     public value: i32;
 
-    // A constructor shares the class name and produces the object by returning an instance.
+    // A constructor shares the class name and initialises fields on self.
     public Counter(start: i32) {
-        return Counter { value: start };
+        self.value = start;
     }
 
-    public fn increment() {
+    public fn increment(&mut self) {
         // self refers to the current instance.
         self.value = self.value + 1;
     }
 }
 
 fn main() -> i32 {
-    let counter = Counter(41);
+    var counter = Counter(41);
     counter.increment();
     print(counter.value);
     return 0;
@@ -426,11 +441,11 @@ fn main() -> i32 {
 
 This prints `42`.
 
-### Why the constructor returns an instance
+### Constructors and aggregate literals
 
-There is no hidden "initialise `self`" magic in the constructor body. Instead you hand back an instance explicitly: `return Counter { value: start };`.
+`Counter(41)` calls the named constructor. Its body has a `self` value: initialise the fields and let the body end to return that instance. An explicit `return Counter { value: start };` is also valid. Constructors do not all require a handwritten `return`.
 
-The benefit is that where an object comes from is visible in the code. The same type may skip a constructor entirely and be built from field values — `Counter { value: 0 }` — because both paths use the same construction syntax. There is no second, hidden rule.
+`Counter { value: 0 }` is an aggregate literal: it supplies field values directly and does not call the `Counter(...)` constructor. Ordinary `fn ... -> i32` bodies still return values with `return`.
 
 ### Visibility: @[vis]
 
@@ -439,7 +454,7 @@ Use `@[vis(scope)]` to specify which callers may access a declaration.
 on the declaration. Vyx's visibility syntax does not use `protected`, `private`
 or `internal` access levels.
 
-```vyx
+```vyx fragment
 module counter.api;
 
 @[vis(world)]
@@ -474,25 +489,26 @@ accessible by default; an explicit `@[vis(...)]` can restrict them.
 See [lesson 19](INTERMEDIATE_TUTORIAL.md#lesson-19-multi-file-projects-and-vyxtoml)
 for module boundaries.
 
-### Methods can mutate while the binding stays `let`
+### Method receivers
 
-`counter.increment()` changes `counter.value`, yet `counter` was declared with `let`. The two rules do not conflict:
+| Declaration | Meaning |
+|---|---|
+| `fn current(&self) -> i32` | Shared borrowed receiver for reading state |
+| `fn increment(&mut self)` | Mutable borrowed receiver for changing state; the caller needs `var` or a mutable borrow |
+| `fn increment()` | Existing omitted-receiver form; the body can still use `self`. The tutorial prefers explicit borrowing |
 
-- `let` constrains the **binding**, not the object it points at.
-- What changes is state inside the object, which is the object's own business.
-
-Reach for `var` only when you need to **repoint the binding itself**.
+Call instance methods with `counter.method_name(...)`; do not pass `self` again as an argument. See lesson 34 for value receivers and ownership transfer.
 
 ### Common mistakes
 
-- Forgetting `public`, then failing to reach a field from outside.
-- Forgetting to `return` the instance in a constructor.
+- Accessing a declaration across compilation units without allowing the caller in its `@[vis(...)]` scope.
+- Expecting `Counter { value: 0 }` to execute the named constructor.
 
 ## Lesson 9: preconditions and `panic`
 
 Not every error can be handed back to the caller to solve. Some are calls that, logically, should never happen — passing zero as a divisor, for instance.
 
-```vyx
+```vyx program
 fn divide(a: i32, b: i32) -> i32 {
     // The precondition is violated; computing on makes no sense.
     if (b == 0) {
@@ -522,7 +538,7 @@ The test is **whether a correct handler is even writable**. A missing file can b
 
 `panic` must be **written explicitly**. Integer division by zero does not trigger the `panic` inside `divide`:
 
-```vyx
+```vyx fragment
 print(1 / 0);   // undefined result; do not expect it to report anything
 ```
 
@@ -537,7 +553,7 @@ So preconditions like "divisor is not zero" have to be checked by hand — that 
 
 If releasing a resource depends on human memory, it will be forgotten. Vyx puts "what to do when this scope exits" right next to the acquisition.
 
-```vyx
+```vyx program
 fn main() -> i32 {
     defer { print("finished"); }
     print("working");
@@ -551,7 +567,7 @@ This prints `working`, then `finished`.
 
 Register two and watch the order:
 
-```vyx
+```vyx fragment
 defer { print("first registered"); }
 defer { print("second registered"); }
 print("body");
@@ -568,7 +584,7 @@ That is not arbitrary. Resources naturally depend on earlier resources: you open
 ### Points to watch
 
 - Anything used inside a `defer` block must still be valid when it runs.
-- `defer` decides *when* a call happens, not *what* the right call is. Containers, for example, still require an explicit `destroy()` — `defer` helps you schedule it, it does not change it.
+- `defer` executes the block you write; it does not infer resource ownership. Standard containers already provide `drop()`; follow each resource API's contract for explicit cleanup.
 
 ## Create your first project
 

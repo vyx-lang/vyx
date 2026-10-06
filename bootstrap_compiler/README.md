@@ -40,6 +40,19 @@ fixed-point builds, runtime paths, and validation.
 
 ## Backend
 
+Project commands use one manifest builder:
+
+```sh
+vyxc --run=aot --src=project . --target app
+vyxc --emit=ir --src=project . --target app
+vyxc build --target app
+```
+
+`build` selects the current project. Both forms share target selection, dependencies,
+DCI preparation, hooks, caches and compilation options. IR output stops before
+executable linking and publishes `<output_dir>/<target>.ll`; `-o` overrides this path.
+`--src=file` uses the single-file driver.
+
 MIR2LLVM is the supported native and self-hosting backend.
 `--emit=cpp` is experimental and is not a release or fixed-point gate.
 Native AOT is the current development and regression baseline. JIT feature
@@ -102,6 +115,16 @@ connects the HIR, MIR, LLVM, and CGU stages below.
 `scripts/package_sdk.ps1` writes local packages under the Git-ignored repository
 `dist/` directory. Published packages are downloaded through Releases.
 See [distribution verification](../docs/TESTING_GUIDE.md#distribution-packages).
+
+For editor tools, first build the current SDK compiler and matching runtime,
+then use `out/boot[.exe] build --target vyxc-lsp` and `--target vyxc-dap`.
+Prepare the debugger bundle with `python scripts/prepare_debug_adapter.py`
+(Cargo/Rust, Git and clang++ are source-build dependencies). SDK packaging
+includes the patched engine, its matching LLDB/Python/formatters and notices.
+It checks the adapter manifest hashes and prefers the primary compiler artifact
+over an old alias held open by an IDE. See the
+[editor service gates](../probes/gates/editor-industrial/README.md) and
+[debugger build](../tools/debugger/README.md).
 
 ## 中文
 

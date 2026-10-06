@@ -5,9 +5,9 @@
 > This is a comparison map, not an ABI or ownership specification. For real
 > projects, go by the [language design](设计文档_ZH.md), `TESTING_GUIDE.md`, and
 > what the compiler actually accepts; for C / Rust / C++ interop, go by
-> `DCI_SPEC_ZH.md`, the current headers, and the project regressions. Every
-> claim below was measured with this repository's current compiler, but this
-> page is a migration aid, not a complete feature list.
+> `DCI_SPEC.md`, the current headers, and the project regressions. Fragments
+> show corresponding syntax; examples requiring multiple files or native
+> implementations cannot be run as standalone source files.
 
 You already know Rust or C++, so this page does not start at "what is a
 variable". It answers three questions:
@@ -22,9 +22,9 @@ order; this page does not repeat their lesson structure.
 
 Three anchors before you start:
 
-- **Value semantics are the default.** `class` and `struct` are inline records; assignment and argument passing copy bits. To share a heap object, say so with `Ref` / `Box`.
-- **Failure lives in the type.** `Result<T, E>` plus `?`; no exceptions, no unwinding.
-- **No GC and no hidden destruction.** Container heap storage is released with an explicit `destroy()`; `defer` and `drop()` decide **when** that call happens, not **what** it is.
+- **Record layout and copying are separate rules.** `class` / `struct` can be inline records; resource-owning types move, so do not assume all records copy bits. `Box<T>` owns a heap value exclusively; `Ref<T>` shares one.
+- **Recoverable errors use returned values.** Use `Result<T, E>`, `fail`, and `?`; DCI contracts describe exception propagation and cleanup for external C++, Rust, and other producers.
+- **Types and scopes determine resource cleanup.** Vyx has no GC. Locals with `drop()` are cleaned up on scope exit; `destroy()` can release resources early, and `defer` can schedule explicit cleanup.
 
 ---
 
@@ -36,7 +36,7 @@ Three anchors before you start:
 | Mutable | `let mut x = 0;` | `int x = 0;` | `var x = 0;` |
 | Type annotation | `let x: i32 = 42;` | `int x = 42;` | `let x: i32 = 42;` |
 | Function | `fn foo(x: i32) -> i32` | `int foo(int x)` | `fn foo(x: i32) -> i32` |
-| Strings | `String` / `&str` | `std::string` / `string_view` | `String` / `str` |
+| Strings | `String` / `&str` | `std::string` / `string_view` | primitive `string` (alias `str`); library type `String` |
 | Print | `println!("{x}")` | `std::cout << x` | `print("${x}")` |
 | Format | `format!("{} {}", a, b)` | `sprintf(buf, "%d %d", a, b)` | interpolation: `"${a} ${b}"` |
 
@@ -46,10 +46,9 @@ Rust marks mutability with a modifier (`let mut`); C++ uses a type qualifier
 (`const`). Vyx splits it into two keywords: `let` binds a name that cannot be
 reassigned, `var` declares one that can.
 
-The payoff is that **mutability is always the first word of the declaration.**
-You never scroll back looking for a `mut`, and you never have to work out
-whether a `const` is constraining an interface or an implementation. When you
-get it wrong the compiler hands you the action, not just a code:
+This tutorial uses `var` consistently for reassignable bindings; the compiler
+also accepts `let mut`. This constrains the binding, not Rust's entire mutability
+model or C++'s type qualifier `const`. Reassigning a `let` reports an error:
 
 ```text
 t10.vyx:3:7: error: E3000: cannot assign to immutable binding 'a'
@@ -60,7 +59,7 @@ help: change `let` to `var` / `let mut`, or write `mut` on the parameter
 
 Vyx folds formatting into the string literal itself:
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let a = 1;
     let b = 2;
@@ -81,27 +80,39 @@ Two things differ from `println!` and are easy to trip over:
 - **Arguments to `print` are concatenated with no separator, and a newline is appended.** To build one line out of several pieces you use interpolation, not commas.
 - **Interpolation uses ordinary expression syntax.** String literals can appear directly inside `${...}`; their quotes do not need escaping for the outer string:
 
-```vyx
+```vyx fragment
 print("has=${m.contains("a")}");
 ```
 
 Write `\${...}` to print `${...}` literally.
 
-### `str` and `String`
+Existing code may also write outer-escaped quotes, for example
+`"has=${m.contains(\"a\")}"`. The compiler decodes that outer escape layer only
+for the embedded quoted token. Ordinary expression literals keep their own escapes;
+braces inside either spelling do not close the interpolation.
 
-As in Rust these split into a borrowed view and an owned buffer, but the
-reading is looser:
+### `string`, `str`, and `String`
 
-```vyx
-var owned: String = "hi";   // owned
-owned = owned + "!";        // concatenation produces a new String
-let view: str = "abc";      // read-only view
-print("${view.len}");       // length is the field len, not a len() method
+Lowercase `string` and `str` name the same primitive type. The name `str`
+does not imply a Rust lifetime-checked borrow. Uppercase `String` is a buffer
+type from `std.string`, constructed and modified through library methods:
+
+```vyx program
+use std.string;
+
+fn main() -> i32 {
+    let text: string = "abc";
+    let alias: str = text;
+    var buffer = String.from("hi");
+    buffer.append("!");
+    print("${alias.len}, ${buffer.len}");
+    return 0;
+}
 ```
 
-Coming from C++, note the last line: **`str` length is the field `.len`.**
-Writing `.length()` or `.size()` is a type error, not a program that runs and
-prints the wrong number.
+Output: `3, 3`. The tutorial uses `.len` for byte length. Primitive strings also
+support `.size()`, `.count()`, and `.length()`. `String` has its own methods and
+`drop()`; do not apply one type's API or ownership rules to the other.
 
 ---
 
@@ -149,7 +160,7 @@ branches stay five siblings instead of five indent levels.
 
 ### `match` is an expression; the fallback is `default`
 
-```vyx
+```vyx fragment
 let code = match state {
     case 0 => 10,
     default => 20,
@@ -162,7 +173,7 @@ that arm's value (no semicolon, as in Rust).
 
 Payload-carrying arms bind with `case`, and an `if` suffix is a **guard**:
 
-```vyx
+```vyx fragment
 enum State { Idle; Busy(i32); Done }
 
 fn label(s: State) -> string {
@@ -200,7 +211,7 @@ lets you process multibyte text one byte at a time without noticing; Vyx writes
 
 ### Methods live in an `impl` or a `class` body
 
-```vyx
+```vyx program
 struct Point { x: f64; y: f64; }
 
 impl Point {
@@ -233,21 +244,20 @@ buys something a migrant notices immediately: **value semantics versus
 by-reference passing is visible in the signature.**
 
 ```text
-self: Point        by value (a copy)
+self: Point        by value; this scalar-only Point can be copied
 self: &Point       borrowed, read-only
 self: &mut Point   borrowed, writable
 ```
 
-In C++, `void f() const` tells you the method does not modify the object, but
-whether members are values or references depends on the field declarations. In
-Rust, `&self` says borrowed but not copied. Vyx puts "how many copies happen on
-the way in" at the front of the signature — and in a value-semantics language
-that is the expensive information.
+These are typed receiver parameters; `&self` / `&mut self` can also name the
+current type implicitly. A value receiver copies a copyable type but may
+transfer ownership for a resource-owning type. Calling an instance method
+does not require passing `self` again as an argument.
 
 Also: `struct` declarations separate fields with a **semicolon**, literals with
 a **comma**:
 
-```vyx
+```vyx fragment
 struct Point { x: f64; y: f64; }              // declaration: semicolons
 let p = Point { x: 1.0, y: 2.0 };             // literal: commas
 ```
@@ -261,7 +271,7 @@ let p = Point { x: 1.0, y: 2.0 };             // literal: commas
 | Interface | `trait Drawable { }` | `class I { virtual ... }` | `trait Drawable { fn draw(); }` |
 | Dynamic dispatch | `dyn Trait` (vtable) | `virtual` (vtable) | `dyn Trait` → vtable |
 
-```vyx
+```vyx program
 class Base {
     public x: i32;
     public fn get(self) -> i32 { return self.x; }
@@ -298,12 +308,11 @@ fn main() -> i32 {
 
 Output: `3+4=7, x is still 3` and `1+4+2=7`.
 
-**`class B : A` here is not C++ inheritance.** It is **layout concatenation**:
-`A`'s fields are laid out first in declaration order, `B`'s own fields follow,
-and the result is still one contiguous block that assigns and passes by
-copying bits. That is why a single literal can supply parent and child fields
-at once (`Child { x: 3, y: 4 }`), and why `Mix { a: 1, c: 2, b: 4 }` orders
-fields as "all of Left, all of Right, then Mix's own".
+The inline records in this example use layout concatenation: `A`'s fields come
+first, followed by `B`'s own fields. `Child { x: 3, y: 4 }` initialises parent
+and child fields in one aggregate literal; `Mix { a: 1, c: 2, b: 4 }` orders
+fields as Left, Right, then Mix. Layout does not decide whether copying is
+allowed; resource-owning fields still follow move and cleanup rules.
 
 This shapes the mental model you need to bring:
 
@@ -313,7 +322,7 @@ This shapes the mental model you need to bring:
 
 Runtime "one variable holding several types" is a separate road:
 
-```vyx
+```vyx fragment
 trait Shape { fn area(self) -> f64; }
 
 struct Circle { radius: f64; }
@@ -353,7 +362,7 @@ let v = risky()?;              let v = risky()?;               try { auto v = ri
 
 ### A runnable minimal example
 
-```vyx
+```vyx program
 error MyErr { NotFound }
 
 fn risky(bad: bool) -> Result<i32, MyErr> {
@@ -395,22 +404,20 @@ The correspondence with Rust is one line at a time:
 
 The two easiest mistakes:
 
-- **`fail` is a statement, not an expression.** It ends the current function immediately with a failure, so an arm ending in `if (bad) { fail ...; }` needs no trailing `return`. Copying Rust's `return Err(...)` into Vyx is a type error.
-- **The success path does not write `Ok(...)`.** In a function returning `-> Result<i32, MyErr>`, `return 42` is wrapped into `Ok` for you. Writing `return Ok(42)` yields a `Result` of a `Result`.
+- **`fail` is a statement.** `fail MyErr.NotFound;` immediately returns a failure from the current function; the following code does not execute.
+- **A success value can be returned directly.** In `-> Result<i32, MyErr>`, `return 42;` wraps a success value. The current compiler also accepts compatible `return Ok(42);` and `return Err(MyErr.NotFound);` without adding another `Result` layer. The tutorial consistently uses bare success values and `fail`.
 
-### Why not exceptions
+### Returned errors and external exceptions
 
-Failure shows up in the signature: `-> Result<i32, MyErr>`. Every call site can
-see that this function may fail, without guessing what it throws behind the
-scenes. The cost is equally explicit: **an error must be handled or propagated**,
-never silently ignored — which is the point.
+`-> Result<i32, MyErr>` declares a recoverable error in the signature. Inspect
+it with `match`, or propagate it with `?` from another function returning
+`Result`. The current compiler permits discarded results; this guidance does
+not mean mandatory handling of every `Result` is already enforced.
 
-C++'s `throw` escapes from arbitrary depth, leaving the caller to infer safety
-from documentation and `noexcept` annotations; Vyx turns that inference into a
-type check. The criterion for "return `Result` or `panic`" matches Rust:
-**could the caller plausibly write correct handling code?** A malformed input
-can be reported or replaced by the caller, so return `Result`; a broken internal
-invariant leaves the caller powerless, so `panic`.
+For external calls, exception models and cleanup obligations are described in
+the [DCI specification](DCI_SPEC.md); Vyx cannot be summarised as having no
+unwinding. In ordinary Vyx APIs, use `Result` for recoverable input failures
+and consider `panic` for a broken internal invariant.
 
 ---
 
@@ -418,27 +425,27 @@ invariant leaves the caller powerless, so `panic`.
 
 | | Rust | C++ | Vyx |
 |---|---|---|---|
-| Ownership | compiler-enforced | manual / convention | written into the type (`Ref` / `Box` / raw pointers) |
+| Ownership | moves and borrowing | values, RAII, and smart pointers | moves, local borrow checks, and resource types |
 | Reference count | `Arc<T>` | `shared_ptr<T>` | `Ref::<T>.new(val)` / `clone()` |
 | Exclusive heap value | `Box<T>` | `unique_ptr<T>` | `Box::<T>.new(val)` |
 | Weak reference | `Weak<T>` | `weak_ptr<T>` | `Weak::<T>.of(strong)` (`std.ref`) |
 | Scope cleanup | `Drop` | destructor | `fn drop()` |
 | Deferred cleanup | scope guard crate | RAII helper | `defer { cleanup(); }` |
 
-### What is deliberately absent
+### Move, borrow, and cleanup boundaries
 
-**Vyx has no borrow checker.** This is the first thing Rust developers look
-for: no aliasing rules enforced at compile time, no "borrowed value does not
-live long enough". Ownership here is a **choice written into the type**, not a
-whole-program conclusion.
+The compiler checks use after moving a resource-owning value (E3100), some
+overlapping borrows inside functions, and mutable borrowing of an immutable
+receiver (E3101). This is not Rust's complete lifetime system; raw pointers
+and external objects still need explicit lifetime constraints. See lesson 34.
 
-**Vyx has no GC and no implicit destruction.** This is the first thing C++ and
-Java developers look for: a `class` instance is an ordinary value copied bit by
-bit, with no "destruction point"; container heap storage is not released by
-anyone on your behalf.
+Locals with `drop()` are automatically cleaned up on scope exit. Standard
+`Vec`, `Dict`, `Set`, and `String` provide that hook; `destroy()` is the library's
+specific release operation. This does not imply recursive cleanup of every
+element, raw pointer, or resource transferred into a parameter.
 
-Together these fix the migration move: **decide who owns the heap block, then
-write it down.**
+Resource APIs should state who owns a resource, whether a call transfers it,
+and which layer performs cleanup.
 
 ### Three kinds of ownership
 
@@ -450,7 +457,7 @@ Weak  A photocopy stamped "void on expiry". It may already be gone
       by the time you call upgrade().
 ```
 
-```vyx
+```vyx program
 use std.ref;
 
 fn main() -> i32 {
@@ -492,7 +499,7 @@ never has to be copied in front of every `return`.
 
 **The order is last-in-first-out (LIFO):**
 
-```vyx
+```vyx program
 fn main() -> i32 {
     defer { print("first registered"); }
     defer { print("second registered"); }
@@ -508,13 +515,13 @@ open a file and then take a lock on it, so the lock must be released before the
 file closes. Writing in acquisition order makes "release order = mirror of
 acquisition order" hold automatically.
 
-Compared with C++ RAII, the difference is that **`defer` does not own
-anything** — it only decides **when** the cleanup call happens. What you call
-is still up to you. That is why container APIs requiring an explicit
-`destroy()` need `defer` to be complete:
+`defer` owns no resource; it executes the given operation at scope exit.
+The following fragment explicitly schedules a release. Local `Vec` values
+already have `drop()`, so not every container needs an additional `defer`.
+Follow each resource API's contract for paired release operations:
 
-```vyx
-let mut values = Vec::<i32>.new();
+```vyx fragment
+var values = Vec::<i32>.new();
 defer { values.destroy(); }
 // ... both the normal path and an early return reach this
 ```
@@ -542,7 +549,7 @@ fn max_of<T>(a: T, b: T) -> T               fn max_of<T: PartialOrd>(a: T, b: T)
 
 The Vyx side compiles as written:
 
-```vyx
+```vyx program
 fn max_of<T>(a: T, b: T) -> T {
     if (a > b) { return a; }
     return b;
@@ -574,7 +581,7 @@ in the wrong place.
 The moment you need something **only the trait knows** — an associated constant
 or an associated type — `where` stops being optional:
 
-```vyx
+```vyx program
 trait Bounded {
     const MAX: i32;
 }
@@ -623,24 +630,24 @@ trade-off: bounds in the signature, checked before instantiation.
 | Index | `v[i]` | `v[i]` | `v[i]`, or `v.get(i)` |
 | Length | `v.len()` | `v.size()` | `v.count()`, or the field `v.len` |
 
-```vyx
+```vyx program
 use std.collections;
 
 fn main() -> i32 {
-    let mut v = Vec::<i32>.new();
+    var v = Vec::<i32>.new();
     defer { v.destroy(); }
     v.push(3);
     v.push(9);
     print("count=${v.count()} first=${v.get(0)}");
 
-    let mut m = Dict::<string, i32>.new();
+    var m = Dict::<string, i32>.new();
     defer { m.destroy(); }
     m.put("a", 1);
     let has = m.contains("a");
     let value = m.get("a");
     print("has=${has} value=${value}");
 
-    let mut s = Set::<i32>.new();
+    var s = Set::<i32>.new();
     defer { s.destroy(); }
     s.add(7);
     s.add(7);
@@ -660,10 +667,10 @@ is a one-time fix that does not ripple into your structure.
 
 ### Three boundaries that affect correctness
 
-**① Containers do not free themselves.** With no GC and no implicit
-destruction, heap storage must be returned explicitly — `v.destroy()`, or
-`defer { v.destroy(); }`. This is **the single easiest step to miss** when
-coming from Rust or C++.
+**① Buffer cleanup is separate from element cleanup.** An unmoved local
+container cleans up its buffer through `drop()`; `destroy()` can release it
+early. The current `Vec.destroy()` does not destroy elements individually.
+Handle independently owned element resources according to their type's API.
 
 **② Length is available as a method and as a field, and it always means
 element count.** On `Vec`, `count()` / `size()` / `length()` are synonyms and
@@ -676,7 +683,7 @@ write `s.count()` on a `Set` and collect a "no such function" error.
 `v[i]` returns an element reference. Use `get(i)` or an explicit target type
 when you need a value copy.
 
-```vyx
+```vyx fragment
 let a: i32 = v[0];    // read an i32 value
 v[0] = 99;            // modify the element
 let b = v.get(0);     // read a value
@@ -694,15 +701,14 @@ Iteration is uniform: `Vec`, `Set`, and `Dict` all implement `Iterable`, so
 
 ## Concurrency
 
-```vyx
+```vyx program
 use std.sync;
 use std.vio;
 
 @[async]
-fn answer() -> i32 { vio_sleep(1); return 42; }
+fn answer() -> i32 { await Task::<i32>.sleep(1); return 42; }
 
 fn main() -> i32 {
-    vio_start();
     let value = await answer();
     let mtx = Mutex::<i32>.new(value);
     mtx.lock();
@@ -710,7 +716,6 @@ fn main() -> i32 {
     mtx.unlock();
     let result = mtx.get();
     mtx.destroy();
-    vio_stop();
     print("result=${result}");
     return result - 42;
 }
@@ -720,17 +725,17 @@ Output: `result=42`, exit code 0.
 
 ### `@[async]` and `await` are language features, not a library
 
-**Asynchrony is an attribute plus a keyword**, not a `Future` method chain.
-`@[async] fn` marks a function that may suspend; `await answer()` suspends the
-current task at the call site.
+The body of `@[async] fn answer() -> i32` returns `i32`; calling `answer()`
+produces `Task<i32>`. `await answer()` waits for and extracts the result.
+The `await` expression selects the wait point and may suspend the current task.
 
-The benefit is that **no runtime glue is required**: no `async fn` returning
-`impl Future` type gymnastics, no executor to pick, no `Pin` in the error
-messages. The cost is **coarser control**: you decide with `@[async]` which
-functions may suspend, rather than with `.await` which step suspends.
+The tutorial uses `@[async] fn` and prefix `await task`, rather than Rust's
+`async fn` / `task.await` spellings. An `await` in synchronous `main` drives
+the executor until the result is ready; async delays use `await Task::<T>.sleep(ms)`.
 
-`vio_start()` / `vio_stop()` bound the task runtime; async work executes
-between them.
+This stackless `Task` path does not need `vio_start()` / `vio_stop()`; those
+functions belong to the stackful `StartCoroutine` path. `vio_sleep()` blocks
+the thread and should not be used as an async delay. Lesson 25 shows both mechanisms.
 
 ### Shared mutable state uses `Mutex<T>`, never `Ref<T>`
 
@@ -742,7 +747,7 @@ using it for cross-thread sharing is a classic source of concurrency bugs.
 When you would rather not bracket locks by hand, `std.sync` also provides
 `RwLock`, `Condvar`, `Barrier`, `Once`, `Channel<T>`, and lock-free atomics:
 
-```vyx
+```vyx program
 use std.sync;
 
 fn main() -> i32 {
@@ -768,7 +773,7 @@ no hint at all; Vyx's hint is "is this a `Mutex` or a `Ref` in my hand".
 
 ## C interoperability and builds
 
-```vyx
+```vyx program
 extern "C" {
     fn abs(x: i32) -> i32;
 }
@@ -783,7 +788,7 @@ Output: `7`.
 
 ### `cfn`: why C callbacks need their own type
 
-```vyx
+```vyx fragment
 extern "C" {
     fn call_cb(cb: cfn(i32) -> i32, x: i32) -> i32;
 }

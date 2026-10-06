@@ -4,8 +4,7 @@
 
 > 这是一张对照地图，不是 ABI 或所有权规范。要动手写项目，以[设计文档](设计文档_ZH.md)、
 > `TESTING_GUIDE.md` 和实际编译结果为准；C / Rust / C++ 互操作以 `DCI_SPEC_ZH.md`、
-> 当前 headers 与项目回归为准。下面每个结论都在本仓库的当前编译器上实测过，
-> 但它是迁移指引，不是全功能清单。
+> 当前 headers 与项目回归为准。片段展示对应写法；需要多文件或原生实现的例子不能当作单文件程序运行。
 
 你已经会 Rust 或 C++，所以这份材料不从「什么是变量」讲起。它只回答三个问题：
 
@@ -17,9 +16,9 @@
 
 三句话先给你一个抓手：
 
-- **值语义是默认。** `class` 和 `struct` 都是内联记录，赋值与传参按位拷贝；要共享堆对象，显式用 `Ref` / `Box`。
-- **失败写进类型。** `Result<T, E>` + `?`，没有异常，也没有隐式展开。
-- **没有 GC，也没有隐藏的析构。** 容器的堆内存要显式 `destroy()`；`defer` 与 `drop()` 决定的是**什么时候**调，不是**调什么**。
+- **记录的布局与复制规则分开。** `class` / `struct` 可以是内联记录；拥有资源的类型会移动，不能据此推断所有记录都按位复制。`Box<T>` 独占堆值，`Ref<T>` 共享堆值。
+- **可恢复错误用返回值表示。** 使用 `Result<T, E>`、`fail` 和 `?`；外部 C++ / Rust 等的异常传播与清理由 DCI 契约描述。
+- **资源清理由类型与作用域共同决定。** Vyx 没有 GC；定义了 `drop()` 的局部值会在作用域退出时清理，`destroy()` 可用于提前释放，`defer` 可安排显式清理。
 
 ---
 
@@ -31,7 +30,7 @@
 | 可变 | `let mut x = 0;` | `int x = 0;` | `var x = 0;` |
 | 类型标注 | `let x: i32 = 42;` | `int x = 42;` | `let x: i32 = 42;` |
 | 函数 | `fn foo(x: i32) -> i32` | `int foo(int x)` | `fn foo(x: i32) -> i32` |
-| 字符串 | `String` / `&str` | `std::string` / `string_view` | `String` / `str` |
+| 字符串 | `String` / `&str` | `std::string` / `string_view` | 原生 `string`（别名 `str`）；库类型 `String` |
 | 打印 | `println!("{x}")` | `std::cout << x` | `print("${x}")` |
 | 格式化 | `format!("{} {}", a, b)` | `sprintf(buf, "%d %d", a, b)` | 字符串插值：`"${a} ${b}"` |
 
@@ -39,7 +38,7 @@
 
 Rust 用修饰符表达可变（`let mut`），C++ 用类型限定（`const`）。Vyx 把它拆成两个关键字：`let` 绑定不可再赋值，`var` 声明可变。
 
-效果是**可变性永远出现在声明的第一个词上**。读代码时不用回头找 `mut` 在哪，也不用分辨「这个 `const` 是约束接口还是约束实现」。写错了编译器直接给动作建议，而不是丢一句错误码：
+教程统一用 `var` 表示可重新赋值的绑定；编译器也接受 `let mut`。这约束绑定，不等于 Rust 的完整可变性规则或 C++ 的类型限定 `const`。重新给 `let` 赋值时会报错：
 
 ```text
 t10.vyx:3:7: error: E3000: cannot assign to immutable binding 'a'
@@ -50,7 +49,7 @@ help: change `let` to `var` / `let mut`, or write `mut` on the parameter
 
 Vyx 把格式化收进字符串字面量本身：
 
-```vyx
+```vyx program
 fn main() -> i32 {
     let a = 1;
     let b = 2;
@@ -68,24 +67,30 @@ fn main() -> i32 {
 - **`print` 的各实参之间不加分隔符，末尾补一个换行。** 所以一行里拼多段，靠插值而不是靠逗号。
 - **插值内使用普通表达式语法。** 字符串字面量可以直接写在 `${...}` 中，内层引号不需要为外层字符串转义：
 
-```vyx
+```vyx fragment
 print("has=${m.contains("a")}");
 ```
 
 要输出字面量 `${...}`，写 `\${...}`。
 
-### `str` 和 `String`
+### `string`、`str` 与 `String`
 
-和 Rust 一样分成「借用的视图」与「拥有的缓冲」，但读法更松：
+小写 `string` 与 `str` 是同一原生类型的两种名称，不能把 `str` 名称本身当作 Rust 的带生命周期借用。大写 `String` 是 `std.string` 提供的缓冲类型，构造和追加通过库方法完成：
 
-```vyx
-var owned: String = "hi";   // 拥有
-owned = owned + "!";        // 追加得到新的 String
-let view: str = "abc";      // 只读视图
-print("${view.len}");       // 长度是字段 len，不是方法 len()
+```vyx program
+use std.string;
+
+fn main() -> i32 {
+    let text: string = "abc";
+    let alias: str = text;
+    var buffer = String.from("hi");
+    buffer.append("!");
+    print("${alias.len}, ${buffer.len}");
+    return 0;
+}
 ```
 
-从 C++ 迁移时注意最后一行：**`str` 的长度是字段 `.len`**，写成 `.length()` / `.size()` 会得到类型错误，而不是一个能跑但结果不对的程序。
+输出 `3, 3`。教程统一用 `.len` 读取字节长度；原生字符串也支持 `.size()`、`.count()`、`.length()` 等写法。`String` 提供自己的方法与 `drop()`，不要把两种类型的 API 或所有权规则互相套用。
 
 ---
 
@@ -133,7 +138,7 @@ help: insert '(' before `x`
 
 ### `match` 是表达式，兜底写 `default`
 
-```vyx
+```vyx fragment
 let code = match state {
     case 0 => 10,
     default => 20,
@@ -144,7 +149,7 @@ let code = match state {
 
 带载荷的情况用 `case` 绑定，`if` 后缀是 **guard**：
 
-```vyx
+```vyx fragment
 enum State { Idle; Busy(i32); Done }
 
 fn label(s: State) -> string {
@@ -176,7 +181,7 @@ for (b in text.bytes()) { }   for b in text.bytes() { }
 
 ### 方法写在 `impl` 或 `class` 体内
 
-```vyx
+```vyx program
 struct Point { x: f64; y: f64; }
 
 impl Point {
@@ -204,16 +209,16 @@ fn main() -> i32 {
 `self: Point` 是普通的第一个参数，不是预先绑定好的关键字。这条规则换来一件对迁移者很实际的事：**值语义和按引用传递在签名上一眼看得出**：
 
 ```text
-self: Point        按值（拷贝）
+self: Point        按值；本例 Point 只有标量字段，可以复制
 self: &Point       借用，只读
 self: &mut Point   借用，可写
 ```
 
-C++ 里 `void f() const` 只告诉你方法不改对象，成员是值还是引用要看字段声明；Rust 里 `&self` 只说是借用，不说拷贝。Vyx 把「传的时候发生了多少次拷贝」提到了签名最前面——而这个信息在值语义语言里恰恰最贵。
+这里用带类型的接收者参数；同样可以写隐含当前类型的 `&self` / `&mut self`。按值接收者对可复制类型复制，对拥有资源的类型可能转移所有权，不能概括成“每次都复制”。调用实例方法时不再传入一个 `self` 实参。
 
 另外，`struct` 声明用**分号**分隔字段，字面量用**逗号**：
 
-```vyx
+```vyx fragment
 struct Point { x: f64; y: f64; }              // 声明：分号
 let p = Point { x: 1.0, y: 2.0 };             // 字面量：逗号
 ```
@@ -227,7 +232,7 @@ let p = Point { x: 1.0, y: 2.0 };             // 字面量：逗号
 | 接口 | `trait Drawable { }` | `class I { virtual ... }` | `trait Drawable { fn draw(); }` |
 | 虚分发 | dyn Trait (vtable) | virtual (vtable) | `dyn Trait` → vtable |
 
-```vyx
+```vyx program
 class Base {
     public x: i32;
     public fn get(self) -> i32 { return self.x; }
@@ -266,7 +271,7 @@ fn main() -> i32 {
 
 ### 这里的 `class B : A` 不是 C++ 的继承
 
-**它做的是布局拼接。** `A` 的字段按声明顺序铺在前面，`B` 自己的字段接在后面，仍然是一块连续内存，赋值和传参仍然按位拷贝。所以 `Child { x: 3, y: 4 }` 可以用一个字面量把父子字段一次给全；`Mix { a: 1, c: 2, b: 4 }` 的顺序是「先 Left 整段、再 Right 整段、再 Mix 自己的字段」。
+本例的内联记录使用布局拼接：`A` 的字段排在前面，`B` 自己的字段接在后面。`Child { x: 3, y: 4 }` 可以在一个聚合字面量中初始化父子字段；`Mix { a: 1, c: 2, b: 4 }` 的字段顺序是 Left、Right、Mix。布局规则不决定是否可以复制；拥有资源的字段仍遵循移动与清理规则。
 
 这一点决定了迁移时要改的心智模型：
 
@@ -278,7 +283,7 @@ fn main() -> i32 {
 
 「一个变量装多种类型」是另一条路：
 
-```vyx
+```vyx fragment
 trait Shape { fn area(self) -> f64; }
 
 struct Circle { radius: f64; }
@@ -313,7 +318,7 @@ let v = risky()?;              let v = risky()?;               try { auto v = ri
 
 ### 可运行的最小例子
 
-```vyx
+```vyx program
 error MyErr { NotFound }
 
 fn risky(bad: bool) -> Result<i32, MyErr> {
@@ -355,14 +360,14 @@ fn main() -> i32 {
 
 两个最容易写错的地方：
 
-- **`fail` 是语句，不是表达式。** 它当场结束当前函数并返回失败，所以 `if (bad) { fail ...; }` 这一支结尾不需要再写 `return`。照着 Rust 写 `return Err(...)` 会得到类型错误。
-- **成功路径不需要 `Ok(...)`。** `fn -> Result<i32, MyErr>` 里的 `return 42` 会被自动装进 `Ok`。写 `return Ok(42)` 得到的是「`Result` 的 `Result`」。
+- **`fail` 是语句。** `fail MyErr.NotFound;` 立即从当前函数返回失败；后面不再执行。
+- **成功值可以直接返回。** 在 `-> Result<i32, MyErr>` 中，`return 42;` 会包装成成功结果。当前编译器也接受相容的 `return Ok(42);` 与 `return Err(MyErr.NotFound);`，不会自动再嵌套一层 `Result`。教程统一用裸成功值和 `fail`。
 
-### 为什么不用异常
+### 返回错误与外部异常
 
-失败出现在签名里：`-> Result<i32, MyErr>`。任何调用点都能看到这个函数可能失败，不需要猜某个函数背后会不会抛。代价同样明确：**错误必须被处理，或者继续上抛**，不能悄悄忽略——这正是目的。
+`-> Result<i32, MyErr>` 在签名中声明可恢复错误。调用方用 `match` 检查，或在同样返回 `Result` 的函数中用 `?` 传播。当前编译器允许丢弃结果，不要把这里的使用建议理解成已经实现了强制处理所有 `Result` 的诊断。
 
-C++ 的 `throw` 可以在任意深度逃逸，调用方只能靠文档和 `noexcept` 注解推测；Vyx 把这份推测变成了类型检查。判断「返回 `Result` 还是直接 `panic`」的标准和 Rust 一样：**调用方有没有可能写出正确的处理代码**——输入格式不对，调用方能选择报错或换输入，用 `Result`；内部不变量被破坏，调用方无能为力，用 `panic`。
+调用外部语言时，异常模型与清理义务见 [DCI 规范](DCI_SPEC_ZH.md)，不能概括成“Vyx 不会展开”。普通 Vyx API 中，输入错误等可恢复失败用 `Result`；内部不变量被破坏时才考虑 `panic`。
 
 ---
 
@@ -370,20 +375,20 @@ C++ 的 `throw` 可以在任意深度逃逸，调用方只能靠文档和 `noexc
 
 | | Rust | C++ | Vyx |
 |---|------|-----|-----|
-| 所有权 | 编译器强制 | 无（需手动） | 显式写进类型（`Ref` / `Box` / 裸指针） |
+| 所有权 | 移动与借用规则 | 值、RAII 与智能指针 | 移动、局部借用检查与资源类型 |
 | 引用计数 | `Arc<T>` | `shared_ptr<T>` | `Ref::<T>.new(val)` / `clone()` |
 | 独占 | `Box<T>` | `unique_ptr<T>` | `Box::<T>.new(val)` |
 | 弱引用 | `Weak<T>` | `weak_ptr<T>` | `Weak::<T>.of(strong)`（`std.ref`） |
 | RAII | `Drop` trait | 析构函数 | `fn drop()` 自动调用 |
 | defer | 无 | 无（RAII 替代） | `defer { cleanup(); }` |
 
-### 先说清没有的东西
+### 移动、借用与清理的边界
 
-**Vyx 没有借用检查器。** 从 Rust 过来的人最容易先找这个：没有别名规则在编译期替你兜底，没有 "borrowed value does not live long enough"。所有权在这里是**写在类型里的选择**，不是全程序推导出来的结论。
+编译器检查拥有资源的值移动后再次使用（E3100），以及函数内的若干借用冲突和不可变接收者的可变借用（E3101）。这不等于 Rust 的完整生命周期系统；裸指针和外部对象仍需要明确的生命周期约束。接收者规则见第 34 课。
 
-**Vyx 也没有 GC，没有隐式析构。** 从 C++ / Java 过来的人最容易先找这个：`class` 实例是按位拷贝的普通值，没有「析构时机」；容器的堆缓冲不会有人替你释放。
+定义了 `drop()` 的局部值在作用域退出时自动清理。标准库 `Vec`、`Dict`、`Set`、`String` 已定义这个入口；`destroy()` 是库的具体释放操作。不要因此推断所有元素、裸指针或转移给形参的资源都会得到递归清理。
 
-这两件事合起来决定了迁移时的动作：**先想清楚「这块堆内存归谁」，然后把它写出来。**
+资源 API 应说明谁拥有资源、调用是否转移所有权，以及由哪一层执行清理。
 
 ### 三种归属
 
@@ -393,7 +398,7 @@ Ref   门卡可以复印。大家指同一间房；最后一张卡收回去，�
 Weak  一张「过期作废」的复印件。upgrade() 时房子可能已经没了。
 ```
 
-```vyx
+```vyx program
 use std.ref;
 
 fn main() -> i32 {
@@ -426,7 +431,7 @@ fn main() -> i32 {
 
 **顺序是后进先出（LIFO）**：
 
-```vyx
+```vyx program
 fn main() -> i32 {
     defer { print("first registered"); }
     defer { print("second registered"); }
@@ -439,10 +444,10 @@ fn main() -> i32 {
 
 这不是随便定的：资源天然是「后来的依赖先来的」。你先打开文件、再在它上面加锁，就必须先放锁、后关文件。按申请顺序写下去，「释放顺序 = 申请顺序的镜像」自动成立。
 
-和 C++ 的 RAII 相比，`defer` 的差异是**它不拥有资源**——只决定**什么时候**调清理函数，调什么仍然由你写。所以「必须显式 `destroy()`」的容器 API，配 `defer` 才是完整用法：
+`defer` 本身不拥有资源，只在作用域退出时执行给定操作。下面演示显式安排释放；局部 `Vec` 已有 `drop()`，不要求每个容器都额外写一份 `defer`。需要配对释放的其他资源应按各自 API 处理：
 
-```vyx
-let mut values = Vec::<i32>.new();
+```vyx fragment
+var values = Vec::<i32>.new();
 defer { values.destroy(); }
 // ... 正常路径和提前 return 都会走到这里
 ```
@@ -468,7 +473,7 @@ fn max_of<T>(a: T, b: T) -> T               fn max_of<T: PartialOrd>(a: T, b: T)
 
 上面这段 Vyx 直接编译：
 
-```vyx
+```vyx program
 fn max_of<T>(a: T, b: T) -> T {
     if (a > b) { return a; }
     return b;
@@ -490,7 +495,7 @@ Rust 的 `T: PartialOrd` 是**必需的**：没有它，`a > b` 里的 `>` 解�
 
 需要**关联常量或关联类型**这类「只有 trait 才知道」的能力时，`where` 就不是可选的：
 
-```vyx
+```vyx program
 trait Bounded {
     const MAX: i32;
 }
@@ -535,24 +540,24 @@ fn main() -> i32 {
 | 索引 | `v[i]` | `v[i]` | `v[i]`，或 `v.get(i)` |
 | 长度 | `v.len()` | `v.size()` | `v.count()`，或字段 `v.len` |
 
-```vyx
+```vyx program
 use std.collections;
 
 fn main() -> i32 {
-    let mut v = Vec::<i32>.new();
+    var v = Vec::<i32>.new();
     defer { v.destroy(); }
     v.push(3);
     v.push(9);
     print("count=${v.count()} first=${v.get(0)}");
 
-    let mut m = Dict::<string, i32>.new();
+    var m = Dict::<string, i32>.new();
     defer { m.destroy(); }
     m.put("a", 1);
     let has = m.contains("a");
     let value = m.get("a");
     print("has=${has} value=${value}");
 
-    let mut s = Set::<i32>.new();
+    var s = Set::<i32>.new();
     defer { s.destroy(); }
     s.add(7);
     s.add(7);
@@ -569,13 +574,13 @@ fn main() -> i32 {
 
 ### 三个会影响正确性的边界
 
-**① 容器不会自动释放。** 没有 GC，也没有隐式析构，堆缓冲必须显式还回去——`v.destroy()`，或者 `defer { v.destroy(); }`。这是从 Rust / C++ 迁移到 Vyx 时**最容易漏的一步**。
+**① 缓冲清理不等于元素清理。** 未转移的局部容器会通过 `drop()` 清理自身缓冲，也可以用 `destroy()` 提前释放。当前 `Vec.destroy()` 不逐个析构元素；元素独立拥有资源时，需要按元素类型的 API 处理。
 
 **② 长度有方法也有字段，但都是元素个数。** `Vec` 上 `count()` / `size()` / `length()` 是同义方法，字段 `len` 是同一份数据；`Set` 只有字段 `len`。**它们都不是容量**——容量是 `capacity()`。Rust 的 `len()` 同样不指容量，但字段与方法混用是 Vyx 特有的，容易在 `Set` 上写出 `s.count()` 拿到「没有这个函数」的错误。
 
 **③ 索引类型由容器的元素类型推断。** `Vec<T>` 的 `v[i]` 返回元素引用；需要值副本时使用 `get(i)` 或声明目标类型。
 
-```vyx
+```vyx fragment
 let a: i32 = v[0];    // 读取 i32 值
 v[0] = 99;            // 修改元素
 let b = v.get(0);     // 读取值
@@ -593,15 +598,14 @@ print("c=${c}");     // 打印元素值
 
 ## 并发
 
-```vyx
+```vyx program
 use std.sync;
 use std.vio;
 
 @[async]
-fn answer() -> i32 { vio_sleep(1); return 42; }
+fn answer() -> i32 { await Task::<i32>.sleep(1); return 42; }
 
 fn main() -> i32 {
-    vio_start();
     let value = await answer();
     let mtx = Mutex::<i32>.new(value);
     mtx.lock();
@@ -609,7 +613,6 @@ fn main() -> i32 {
     mtx.unlock();
     let result = mtx.get();
     mtx.destroy();
-    vio_stop();
     print("result=${result}");
     return result - 42;
 }
@@ -619,11 +622,11 @@ fn main() -> i32 {
 
 ### `@[async]` 与 `await` 是语言特性，不是库
 
-**异步是属性加关键字**，不是 `Future` + `.await` 的方法链。`@[async] fn` 标出可挂起的函数，`await answer()` 在调用点挂起当前任务。
+`@[async] fn answer() -> i32` 的函数体返回 `i32`，调用 `answer()` 得到 `Task<i32>`；`await answer()` 等待并取出结果。等待位置由 `await` 指定，可能挂起当前任务。
 
-好处是**不需要写运行时胶水**：没有 `async fn` 返回 `impl Future` 的类型体操，没有 executor 要挑，也没有 `Pin` 出现在错误信息里。代价是**控制粒度更粗**：你通过 `@[async]` 决定哪个函数可以挂起，而不是通过 `.await` 决定挂在哪一步。
+教程使用 `@[async] fn` 与前缀 `await task`，不要套用 Rust 的 `async fn` / `task.await` 拼写。同步 `main` 中的 `await` 驱动执行器等待结果；异步延时用 `await Task::<T>.sleep(ms)`。
 
-`vio_start()` / `vio_stop()` 是任务运行时的起止边界，异步工作在这两者之间执行。
+这条无栈 `Task` 路径不需要 `vio_start()` / `vio_stop()`；那两个函数用于 `StartCoroutine` 的栈式 coroutine 路径。`vio_sleep()` 会阻塞线程，不应当作异步延时；两套机制的例子见第 25 课。
 
 ### 共享可变状态用 `Mutex<T>`，不是 `Ref<T>`
 
@@ -631,7 +634,7 @@ fn main() -> i32 {
 
 不想手写加解锁时，`std.sync` 还提供 `RwLock`、`Condvar`、`Barrier`、`Once`、`Channel<T>`，以及无锁的原子量：
 
-```vyx
+```vyx program
 use std.sync;
 
 fn main() -> i32 {
@@ -653,7 +656,7 @@ Rust 的所有权系统让「跨线程共享」必须过 `Send` / `Sync` 两道�
 
 ## C 互操作
 
-```vyx
+```vyx program
 extern "C" {
     fn abs(x: i32) -> i32;
 }
@@ -668,7 +671,7 @@ fn main() -> i32 {
 
 ### `cfn`：为什么 C 回调要单独一个类型
 
-```vyx
+```vyx fragment
 extern "C" {
     fn call_cb(cb: cfn(i32) -> i32, x: i32) -> i32;
 }

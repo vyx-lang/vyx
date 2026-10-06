@@ -96,7 +96,11 @@ LD_LIBRARY_PATH=out ./out/vyxc help
 
 ### 门 A / B / C
 
-编译器修改前后都跑门 A 和 B。DCI / class ABI / lowerer 修改另跑门 C。
+大范围 bug fix 的迭代阶段，先单次构建 SDK 编译器，验证具体复现和相关真实项目路径。
+不因每个局部修复反复运行多代固定点；门 B 在修复批次收敛、涉及自举稳定性的问题
+或发布验收时集中执行。固定点通过不代表语义缺陷已经修完。
+门 A 用于检查 MIR 漂移；DCI / class ABI / lowerer 修改加入对应的门 C 项目。
+修复批次交付或发布验收时完整执行门 A / B / C（门 C 按修改范围）。
 纯文档、网站或忽略规则修改检查相关内容与产物范围，无需重跑编译器自举。
 
 - **门 A — hello**：使用含 `print("hello")` 和 `return 0` 的程序运行 `--dump-mir2`。

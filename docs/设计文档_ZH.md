@@ -144,6 +144,9 @@ standard library option type」）。用 `Option<T>`。
 
 - 插值字符串：`"… ${expr} …"` 和 `f"…"`（`parse_fstring_inner`）。
   字符串里单独的 `{expr}` **不是**插值。
+  插值表达式可包含字符串字面量，如 `"${s.contains("X")}"`；
+  兼容旧写法 `"${s.contains(\"X\")}"`。字面量内的花括号不结束插值，
+  字符串自己的转义仍按普通字符串处理。
 - `if (cond) { e } elif … else { e }` 作为**表达式**（`parse_if_expr`）。
   条件**必须**写 `(…)`。
 - 闭包：`fn (x: T) -> R { … }`、`|x: T| { … }`、`|| expr`，以及

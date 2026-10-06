@@ -97,7 +97,7 @@ fn main() -> i32 {
 }
 ```
 
-在项目目录执行 `vyxc --src=project . --run=aot`，输出 11 和 14。
+在项目目录执行 `vyxc build --run=aot`，输出 11 和 14。
 默认调用使用锁文件选定的版本，显式版本调用使用历史实现。
 
 字段改名可使用 `@[migrate(fromVer="1.0.0", fromField="旧字段名")]`。
