@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][string]$Compiler,
     [string]$RuntimeDir = '',
     [int[]]$OptimizationLevels = @(0, 2),
-    [int[]]$CodegenUnits = @(1, 4)
+    [int[]]$CodegenUnits = @(1, 4),
+    [string]$CaseFilter = ''
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
@@ -21,11 +22,16 @@ $cases = @(
     @{ Name = 'derived_multilevel'; Expected = "42`n" },
     @{ Name = 'index_print'; Expected = "-6789`ny=-6789 direct=-6789`n-6789`n-6789`nbeta`nword=beta direct=beta`nbeta`n12.5`nfraction=12.5`nflag=true`n1.25`nsmall=1.25`nunsigned=18446744073709551615`n" },
     @{ Name = 'interpolation'; Expected = "has=true`nbrace=} quote=`"`nnested=inside=ok`nescaped=`${literal} char=125 comment=3`n" },
+    @{ Name = 'interpolation_escaped'; Expected = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'interpolation_escaped.expected')).Replace("`r`n", "`n") },
     @{ Name = 'async_stream'; Expected = "42`n" },
     @{ Name = 'async_params'; Expected = "42`n" },
     @{ Name = 'async_values'; Expected = "42`n" },
     @{ Name = 'async_payload'; Expected = "42`n" }
 )
+if ($CaseFilter) {
+    $cases = @($cases | Where-Object { $_.Name -like "*$CaseFilter*" })
+    if ($cases.Count -eq 0) { throw "No usability fixtures match CaseFilter=$CaseFilter" }
+}
 $originalUnits = $env:VYX_CODEGEN_UNITS
 try {
     foreach ($opt in $OptimizationLevels) {

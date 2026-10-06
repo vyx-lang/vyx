@@ -5272,11 +5272,10 @@ public class LlvmMirLowerer {
         return self.build_pointer_handle(address, metadata, name);
     }
 
-    // Foreign C/DCI ABI pointers are one machine word. Re-entering Vyx `*T`
-    // only needs the address half of the two-word handle. Incoming parameters
-    // already wrap this way; returns and `as *T` must match. A borrowed
-    // region would only be consumed by safe `*p` / `p[i]`, which these
-    // handles never do (FFI, vtable, and field GEP all extract the address).
+    // Native DCI object pointers carry an address, without a Vyx allocation
+    // region. Do not fabricate bounds or ownership for producer storage.
+    // Native calls extract that address; consumer dereferences requiring a
+    // region must use unsafe and establish the object's lifetime themselves.
     public fn pointer_handle_from_foreign_raw(self, address: rawptr, name: string) -> rawptr {
         if (address == null) { return self.pointer_handle_null(); }
         return self.build_pointer_handle(
@@ -6532,7 +6531,11 @@ public class LlvmMirLowerer {
     public fn foreign_c_handle_uses_raw_pointer_abi(self,
                                                      function_id: i32,
                                                      type_id: i32) -> bool {
-        if (!self.function_is_foreign_c(function_id)
+        // Native subclass thunks declare Vyx overrides as extern C functions.
+        // Their pointer parameters and returns therefore carry one address,
+        // just like imported C functions, rather than a Vyx pointer handle.
+        if ((!self.function_is_foreign_c(function_id)
+             && !self.function_is_dci_vyx_override_callback(function_id))
             || type_id == mir_id_invalid()
             || type_id <= 0
             || type_id > self.m.types.count) {
@@ -10481,9 +10484,37 @@ public class LlvmMirLowerer {
         return dci_abi_type_object_name(type_obj);
     }
 
+    public fn dci_stub_state_field_addr(self, base_addr: rawptr, base_type_id: i32, field_id: i32) -> rawptr {
+        let canonical = self.canonical_record_type_id(base_type_id);
+        let derived = llvm_mir_type_text(&self.m, canonical);
+        let symbol = "__dci_stub_field_" + policy_mangle_part(derived)
+            + "_" + policy_mangle_part(mir_unit_field_name(&self.m, field_id));
+        let params = malloc(8);
+        ast_write_rawptr(params, self.ty_ptr);
+        let fty = vyx_rt_fn_type(self.mod, self.ty_ptr, params, 1, 0);
+        free(params);
+        let fnv = vyx_rt_add_function(self.mod, symbol.c_str(), symbol.len as u64, fty);
+        return vyx_rt_build_call1(self.mod, fty, fnv, base_addr, "dci.state".c_str(), 9);
+    }
+
     public fn dci_type_object_matches_type(self, type_obj: rawptr, type_id: i32) -> bool {
         if (type_obj == null || type_id == mir_id_invalid()) { return false; }
         if (!dci_abi_reference_kind_supported(type_obj)) { return false; }
+        if (self.dci_json_string(type_obj, "kind") == "function") {
+            if (llvm_mir_type_kind(&self.m, type_id) != ty_CFN() || !dci_abi_is_cfn_pointer(type_obj)) { return false; }
+            let signature = self.dci_json_item(type_obj, "signature");
+            let params = self.dci_json_item(signature, "params");
+            let count = cJSON_GetArraySize(params);
+            if (self.fn_type_param_count(type_id) != count) { return false; }
+            var i: i32 = 0;
+            while (i < count) {
+                if (!self.dci_type_object_matches_type(cJSON_GetArrayItem(params, i),
+                    self.fn_type_param_type_at(type_id, i))) { return false; }
+                i = i + 1;
+            }
+            return self.dci_type_object_matches_type(self.dci_json_item(signature, "return"),
+                self.fn_type_return_type(type_id));
+        }
         let lhs = self.dci_type_object_name(type_obj);
         let rhs = self.dci_normalized_type_for_type(type_id);
         if (self.dci_normalized_type_names_match(lhs, rhs)) { return true; }
@@ -13055,17 +13086,32 @@ public class LlvmMirLowerer {
         let factory = self.get_or_declare_dci_stub_factory(type_id);
         if (factory == null) { return null; }
         let fty = vyx_rt_fn_type(self.mod, self.ty_ptr, null, 0, 0);
-        let out = vyx_rt_build_call(self.mod,
+        let shared = self.dci_caller_participates_in_shared_unwind();
+        var out: rawptr = null;
+        if (shared) {
+            out = vyx_rt_build_invoke(self.mod, fty, factory, null, 0,
+                                       "dci.stub.new".c_str(), 12);
+        } else {
+            out = vyx_rt_build_call(self.mod,
                                     fty,
                                     factory,
                                     null,
                                     0,
                                     "dci.stub.new".c_str(),
                                     12);
+        }
         if (out == null) {
             self.report_error("cannot call DCI stub factory for "
                       + llvm_mir_type_text(&self.m, type_id)
                       + " runtime=" + self.runtime_last_error());
+        } elif (shared) {
+            let destroy = self.get_or_declare_dci_stub_destroy(type_id);
+            if (destroy == null || llvm_unwind_track_factory_owner(self.mod, out, destroy) != 0) {
+                self.report_error("cannot register DCI factory object cleanup for "
+                          + llvm_mir_type_text(&self.m, type_id)
+                          + " runtime=" + self.runtime_last_error());
+                return null;
+            }
         }
         return out;
     }
@@ -14600,7 +14646,11 @@ public class LlvmMirLowerer {
         if (malloc_params != null) {
             ast_write_rawptr(malloc_params, self.ty_i64);
             self.builtin_malloc_fty = vyx_rt_fn_type(self.mod, self.ty_ptr, malloc_params, 1, 0);
-            self.builtin_malloc_fn = vyx_rt_add_function(self.mod, "malloc".c_str(), 6, self.builtin_malloc_fty);
+            // Generated copies/substrings also allocate here. Route all Vyx
+            // allocation builtins through the executable's allocator so a
+            // long-running frontend can release a complete request scope.
+            // Outside a service scope these are ordinary CRT allocations.
+            self.builtin_malloc_fn = vyx_rt_add_function(self.mod, "vyx_runtime_malloc".c_str(), 18, self.builtin_malloc_fty);
             self.builtin_pooled_string_alloc_fty = self.builtin_malloc_fty;
             self.builtin_pooled_string_alloc_fn = vyx_rt_add_function(
                 self.mod,
@@ -14615,7 +14665,7 @@ public class LlvmMirLowerer {
         if (free_params != null) {
             ast_write_rawptr(free_params, self.ty_ptr);
             self.builtin_free_fty = vyx_rt_fn_type(self.mod, self.ty_void, free_params, 1, 0);
-            self.builtin_free_fn = vyx_rt_add_function(self.mod, "free".c_str(), 4, self.builtin_free_fty);
+            self.builtin_free_fn = vyx_rt_add_function(self.mod, "vyx_runtime_free".c_str(), 16, self.builtin_free_fty);
             self.builtin_pooled_string_free_fty = self.builtin_free_fty;
             self.builtin_pooled_string_free_fn = vyx_rt_add_function(
                 self.mod,
@@ -14799,7 +14849,7 @@ public class LlvmMirLowerer {
             ast_write_rawptr(realloc_params, self.ty_ptr);
             ast_write_rawptr(ptr_offset(realloc_params, 8), self.ty_i64);
             self.builtin_realloc_fty = vyx_rt_fn_type(self.mod, self.ty_ptr, realloc_params, 2, 0);
-            self.builtin_realloc_fn = vyx_rt_add_function(self.mod, "realloc".c_str(), 7, self.builtin_realloc_fty);
+            self.builtin_realloc_fn = vyx_rt_add_function(self.mod, "vyx_runtime_realloc".c_str(), 19, self.builtin_realloc_fty);
             free(realloc_params);
         } else {
             self.report_error("cannot allocate realloc signature");
@@ -14999,7 +15049,7 @@ public class LlvmMirLowerer {
             ast_write_rawptr(calloc_params, self.ty_i64);
             ast_write_rawptr(ptr_offset(calloc_params, 8), self.ty_i64);
             self.builtin_calloc_fty = vyx_rt_fn_type(self.mod, self.ty_ptr, calloc_params, 2, 0);
-            self.builtin_calloc_fn = vyx_rt_add_function(self.mod, "calloc".c_str(), 6, self.builtin_calloc_fty);
+            self.builtin_calloc_fn = vyx_rt_add_function(self.mod, "vyx_runtime_calloc".c_str(), 18, self.builtin_calloc_fty);
             free(calloc_params);
         } else {
             self.report_error("cannot allocate calloc signature");
@@ -18662,6 +18712,9 @@ public class LlvmMirLowerer {
             if (self.foreign_dci_field_record_type(field_base_type, field_id) != mir_id_invalid()) {
                 return self.dci_field_addr(field_base_addr, field_base_type, field_id);
             }
+            if (self.type_is_dci_stub_class(field_base_type)) {
+                return self.dci_stub_state_field_addr(field_base_addr, field_base_type, field_id);
+            }
             var base_ty = self.lower_type(field_base_type);
             if (llvm_mir_timing_enabled()) {
                 let now_type = vyx_bootstrap_now_ms();
@@ -19142,6 +19195,7 @@ public class LlvmMirLowerer {
             || dst_kind == ty_MUTREF();
         if (dst_bits <= 0 && !wants_pointer) { return null; }
         let target_fn = self.m.value_target_id(value_id);
+        self.declare_function_signature(target_fn);
         var fn_value = llvm_mir_map_get(self.function_values, target_fn);
         if (dst_bits > 0 && self.function_needs_raw_callback_adapter(target_fn)) {
             self.declare_raw_callback_adapter_for(target_fn);
@@ -19806,6 +19860,8 @@ public class LlvmMirLowerer {
             var field_ptr: rawptr = null;
             if (self.foreign_dci_field_record_type(owner_type, field_id) != mir_id_invalid()) {
                 field_ptr = self.dci_field_addr(obj, owner_type, field_id);
+            } else if (self.type_is_dci_stub_class(owner_type)) {
+                field_ptr = self.dci_stub_state_field_addr(obj, owner_type, field_id);
             } else {
                 field_ptr = vyx_rt_build_gep2(self.mod,
                                               record_ty,
@@ -19885,6 +19941,7 @@ public class LlvmMirLowerer {
         let obj = llvm_lifetime_allocate_class_storage(self.mod, size_bytes, "mir.class.alloc",
                                                         self.builtin_class_alloc_fty, self.builtin_class_alloc_fn,
                                                         self.builtin_malloc_fty, self.builtin_malloc_fn,
+                                                        self.builtin_free_fn,
                                                         self.type_is_foreign_dci(owner_type));
         if (obj == null) {
             self.report_error("cannot allocate class object " + llvm_mir_type_text(&self.m, type_id));
@@ -22098,6 +22155,10 @@ public class LlvmMirLowerer {
 
     public fn type_is_string_view_type(self, type_id: i32) -> bool {
         if (self.type_is_str_abi(type_id)) { return true; }
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (kind == ty_REF() || kind == ty_MUTREF()) {
+            return self.type_is_str_abi(hir_type_table_elem(self.m.types, type_id));
+        }
         return self.type_is_std_string_class(type_id);
     }
 
@@ -22332,6 +22393,15 @@ public class LlvmMirLowerer {
 
     public fn preferred_type_kind_for_text(self, text: string) -> i32 {
         let normalized = self.trim_type_text(text);
+        // Generic argument placeholders may share text with the concrete
+        // pointer type. Size/storage queries must select its structured kind.
+        if (normalized.startsWith("*")) { return ty_PTR(); }
+        if (normalized.startsWith("&mut ")) { return ty_MUTREF(); }
+        if (normalized.startsWith("&")) { return ty_REF(); }
+        let pointer_base = policy_generic_call_base(normalized.clone());
+        if (pointer_base == "ptr") { return ty_PTR(); }
+        if (pointer_base == "ref") { return ty_REF(); }
+        if (pointer_base == "mutref") { return ty_MUTREF(); }
         if (normalized.len >= 4 && normalized.substring(0, 4) == "cfn(") { return ty_CFN(); }
         if (normalized.len >= 10 && normalized.substring(0, 10) == "unsafe fn(") { return ty_CFN(); }
         if (normalized.len >= 3 && normalized.substring(0, 3) == "fn(") { return ty_FN(); }
@@ -23031,6 +23101,15 @@ public class LlvmMirLowerer {
 
     public fn normalize_type_text(self, text: string) -> string {
         if (llvm_mir_is_primitive_str_name(text)) { return "str"; }
+        if (text.startsWith("*")) {
+            return "ptr<" + self.normalize_type_text(text.substring(1, text.len).trim()) + ">";
+        }
+        if (text.startsWith("&mut ")) {
+            return "mutref<" + self.normalize_type_text(text.substring(5, text.len).trim()) + ">";
+        }
+        if (text.startsWith("&")) {
+            return "ref<" + self.normalize_type_text(text.substring(1, text.len).trim()) + ">";
+        }
         return text;
     }
 
@@ -26292,6 +26371,11 @@ public class LlvmMirLowerer {
         if (value_id == mir_id_invalid()) { return null; }
         let ty = self.m.value_type(value_id);
         if (self.type_is_str_abi(ty)) { return self.lower_value(value_id); }
+        let kind = llvm_mir_type_kind(&self.m, ty);
+        if ((kind == ty_REF() || kind == ty_MUTREF())
+            && self.type_is_str_abi(hir_type_table_elem(self.m.types, ty))) {
+            return self.reference_value_to_string(value_id, ty);
+        }
         if (self.type_is_std_string_class(ty)) { return self.lower_std_string_as_str_value(value_id); }
         self.report_error("value is not string-view compatible: " + llvm_mir_type_text(&self.m, ty));
         return null;
@@ -26314,10 +26398,10 @@ public class LlvmMirLowerer {
                 return self.lower_record_field_member_value(receiver_id, member_name);
             }
         }
-        if (!self.type_is_str_abi(self.m.value_type(receiver_id))) {
+        if (!self.type_is_string_view_type(self.m.value_type(receiver_id))) {
             return self.lower_record_field_member_value(receiver_id, member_name);
         }
-        let value = self.lower_value(receiver_id);
+        let value = self.lower_string_view_value(receiver_id);
         if (value == null) {
             self.report_error("cannot lower str receiver for member " + member_name);
             return null;
@@ -31367,7 +31451,57 @@ public class LlvmMirLowerer {
         return payload_type;
     }
 
+    public fn foreach_collection_type_id(self, type_id: i32) -> i32 {
+        var current = type_id;
+        var depth: i32 = 0;
+        while (current != mir_id_invalid() && depth <= self.m.types.count) {
+            let kind = llvm_mir_type_kind(&self.m, current);
+            if (kind != ty_REF() && kind != ty_MUTREF()) { return current; }
+            current = hir_type_table_elem(self.m.types, current);
+            depth = depth + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn indexed_iterable_record_address(self, iter_value: i32) -> rawptr {
+        var iter_type = self.m.value_type(iter_value);
+        let kind = llvm_mir_type_kind(&self.m, iter_type);
+        if (kind == ty_REF() || kind == ty_MUTREF()) {
+            var handle = self.lower_value_as(iter_value, iter_type);
+            var depth: i32 = 0;
+            while (depth <= self.m.types.count) {
+                let elem = hir_type_table_elem(self.m.types, iter_type);
+                if (elem == mir_id_invalid() || handle == null) { return null; }
+                let bytes = self.value_storage_size(elem);
+                if (bytes <= 0) {
+                    self.report_error("cannot measure borrowed foreach collection " + llvm_mir_type_text(&self.m, elem));
+                    return null;
+                }
+                let address = self.pointer_checked_address(handle,
+                                                            vyx_rt_const_int(self.mod, self.ty_i64, 0, 0),
+                                                            bytes,
+                                                            0,
+                                                            "mir.foreach.borrow");
+                let elem_kind = llvm_mir_type_kind(&self.m, elem);
+                if (elem_kind != ty_REF() && elem_kind != ty_MUTREF()) { return address; }
+                if (address == null) { return null; }
+                handle = vyx_rt_build_load(self.mod, self.lower_type(elem), address, llvm_mir_empty_name(), 0);
+                iter_type = elem;
+                depth = depth + 1;
+            }
+            self.report_error("cyclic borrowed foreach collection type");
+            return null;
+        }
+        let slot = self.foreach_iterator_slot_for_value(iter_value);
+        if (slot == null) { return null; }
+        if (self.type_is_class_pointer_abi(iter_type)) {
+            return vyx_rt_build_load(self.mod, self.ty_ptr, slot, "mir.foreach.iter.obj".c_str(), 20);
+        }
+        return slot;
+    }
+
     public fn type_is_standard_indexed_iterable_abi(self, type_id: i32) -> bool {
+        type_id = self.foreach_collection_type_id(type_id);
         if (type_id == mir_id_invalid()) { return false; }
         if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
         let canonical_type = self.canonical_record_type_id(type_id);
@@ -31382,6 +31516,7 @@ public class LlvmMirLowerer {
     }
 
     public fn standard_indexed_iterable_payload_type(self, type_id: i32) -> i32 {
+        type_id = self.foreach_collection_type_id(type_id);
         if (!self.type_is_standard_indexed_iterable_abi(type_id)) { return mir_id_invalid(); }
         var text = llvm_mir_type_text(&self.m, type_id);
         var args = policy_generic_call_args(text.clone());
@@ -31403,21 +31538,13 @@ public class LlvmMirLowerer {
                                               index_place: i32,
                                               body_bb: rawptr,
                                               exit_bb: rawptr) -> bool {
-        let iter_type = self.canonical_record_type_id(self.m.value_type(iter_value));
-        let iter_slot = self.foreach_iterator_slot_for_value(iter_value);
-        var iter_record_addr = iter_slot;
-        if (self.type_is_class_pointer_abi(self.m.value_type(iter_value))) {
-            iter_record_addr = vyx_rt_build_load(self.mod,
-                                                 self.ty_ptr,
-                                                 iter_slot,
-                                                 "mir.foreach.iter.obj".c_str(),
-                                                 20);
-        }
+        let iter_type = self.canonical_record_type_id(self.foreach_collection_type_id(self.m.value_type(iter_value)));
+        let iter_record_addr = self.indexed_iterable_record_address(iter_value);
         let len_value = self.load_record_field_from_addr(iter_record_addr, iter_type, "len");
         let index_addr = self.lower_place_addr(index_place);
         let index_type = self.m.place_type(index_place);
         let index_ll_ty = self.lower_type(index_type);
-        if (iter_slot == null || iter_record_addr == null || len_value == null || index_addr == null || index_ll_ty == null
+        if (iter_record_addr == null || len_value == null || index_addr == null || index_ll_ty == null
             || body_bb == null || exit_bb == null) {
             self.report_error("cannot lower indexed foreach condition");
             return false;
@@ -31461,17 +31588,9 @@ public class LlvmMirLowerer {
 
     public fn lower_indexed_iterable_bind_instr(self, instr_id: i32) -> bool {
         let iter_value = self.m.instr_value(instr_id);
-        let iter_value_type = self.m.value_type(iter_value);
+        let iter_value_type = self.foreach_collection_type_id(self.m.value_type(iter_value));
         let iter_type = self.canonical_record_type_id(iter_value_type);
-        let iter_slot = self.foreach_iterator_slot_for_value(iter_value);
-        var iter_record_addr = iter_slot;
-        if (self.type_is_class_pointer_abi(iter_value_type)) {
-            iter_record_addr = vyx_rt_build_load(self.mod,
-                                                 self.ty_ptr,
-                                                 iter_slot,
-                                                 "mir.foreach.iter.obj".c_str(),
-                                                 20);
-        }
+        let iter_record_addr = self.indexed_iterable_record_address(iter_value);
         let index_place = self.m.instr_aux(instr_id);
         let index_addr = self.lower_place_addr(index_place);
         let index_type = self.m.place_type(index_place);
@@ -31481,7 +31600,7 @@ public class LlvmMirLowerer {
         let dst_type = self.m.place_type(dst_place);
         let payload_type = self.standard_indexed_iterable_payload_type(iter_value_type);
         let payload_ll = self.lower_type(payload_type);
-        if (iter_slot == null || iter_record_addr == null || index_addr == null || index_ll_ty == null
+        if (iter_record_addr == null || index_addr == null || index_ll_ty == null
             || dst_addr == null || payload_type == mir_id_invalid() || payload_ll == null) {
             self.report_error("cannot lower indexed foreach bind in instr #"
                       + policy_i64_to_string(instr_id as i64));
@@ -32139,7 +32258,8 @@ public class LlvmMirLowerer {
                         if (struct_ty == null || loaded == null) {
                             self.report_error("cannot load byval parameter " + self.m.local_name(local));
                         } else {
-                            vyx_rt_build_store(self.mod, loaded, slot);
+                            let debug_store = vyx_rt_build_store(self.mod, loaded, slot);
+                            self.emit_debug_local_at_assignment(local, debug_store);
                         }
                     } else if (self.source_param_uses_c_sysv_coerce(function_id, source_idx)) {
                         let restored = self.c_sysv_uncoerce_value(param,
@@ -32149,7 +32269,8 @@ public class LlvmMirLowerer {
                             self.report_error("cannot uncoerce C SysV parameter "
                                       + self.m.local_name(local));
                         } else {
-                            vyx_rt_build_store(self.mod, restored, slot);
+                            let debug_store = vyx_rt_build_store(self.mod, restored, slot);
+                            self.emit_debug_local_at_assignment(local, debug_store);
                         }
                     } else {
                         var stored = param;
@@ -32164,7 +32285,8 @@ public class LlvmMirLowerer {
                             }
                         }
                         if (stored != null) {
-                            vyx_rt_build_store(self.mod, stored, slot);
+                            let debug_store = vyx_rt_build_store(self.mod, stored, slot);
+                            self.emit_debug_local_at_assignment(local, debug_store);
                         }
                     }
                 }
@@ -32195,7 +32317,8 @@ public class LlvmMirLowerer {
                             self.report_error("cannot bind packed DCI inalloca parameter "
                                       + self.m.local_name(packed_local));
                         } else {
-                            vyx_rt_build_store(self.mod, field_ptr, slot);
+                            let debug_store = vyx_rt_build_store(self.mod, field_ptr, slot);
+                            self.emit_debug_local_at_assignment(packed_local, debug_store);
                         }
                     }
                     packed_idx = packed_idx + 1;
@@ -32521,6 +32644,7 @@ public class LlvmMirLowerer {
         let obj = llvm_lifetime_allocate_class_storage(self.mod, size_bytes, "mir.class.zeroinit",
                                                         self.builtin_class_alloc_fty, self.builtin_class_alloc_fn,
                                                         self.builtin_malloc_fty, self.builtin_malloc_fn,
+                                                        self.builtin_free_fn,
                                                         self.type_is_foreign_dci(owner_type));
         if (obj == null) { return null; }
         if (self.builtin_memset_fn == null || self.builtin_memset_fty == null) {
@@ -33452,6 +33576,14 @@ public class LlvmMirLowerer {
             return;
         }
         var outgoing = ret_v;
+        if (self.foreign_c_handle_uses_raw_pointer_abi(
+                function_id, self.m.function_return_type(function_id))) {
+            outgoing = self.pointer_handle_address(ret_v, "c.abi.ptr.out");
+            if (outgoing == null) {
+                self.report_error("cannot extract native pointer return for " + self.m.function_name(function_id));
+                return;
+            }
+        }
         if (self.function_return_uses_c_sysv_coerce(function_id)) {
             outgoing = self.c_sysv_coerce_value(ret_v,
                                                self.m.function_return_type(function_id),

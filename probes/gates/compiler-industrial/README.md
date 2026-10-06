@@ -43,6 +43,31 @@ command above is a reproducible larger run, not a claim that it has passed in
 every environment. The report currently records the compiler path; retain its
 SHA-256, source commit, LLVM/runtime identity, and environment alongside it.
 
+## CGU queue progress
+
+`cgu_pool_test.cpp` drives the actual native CGU pool with 32 submissions at
+worker counts 1, 2 and 4. It checks bounded submission, completion and every
+unit result. The one-worker case catches a task arena that reserves its only
+slot for an external producer while queued emits have no worker to run them.
+
+From the repository root on Windows, with oneTBB staged by the current build:
+
+```powershell
+New-Item -ItemType Directory -Force .runs/cgu-pool | Out-Null
+& ./clang/bin/clang++.exe -std=c++17 -O2 `
+  -I runtime/vendor/oneTBB/include `
+  probes/gates/compiler-industrial/cgu_pool_test.cpp `
+  bootstrap_compiler/src/codegen/cgu_tbb.cpp `
+  bootstrap_compiler/out/tbb12.lib -o .runs/cgu-pool/check.exe
+Copy-Item bootstrap_compiler/out/tbb12.dll .runs/cgu-pool/
+$check = Start-Process .runs/cgu-pool/check.exe -WindowStyle Hidden -PassThru
+if (-not $check.WaitForExit(15000)) { $check.Kill(); throw 'CGU pool stalled' }
+if ($check.ExitCode -ne 0) { throw 'CGU pool check failed' }
+```
+
+This native regression supplements compiling and running a multi-CGU AOT
+application. It does not replace self-hosting or the project pressure matrix.
+
 ## Recorded smoke matrix — 2026-10-01
 
 Windows x64, repository LLVM 22, seed `424242`, **8 leaf modules**, `-Jobs 4`:

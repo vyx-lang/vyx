@@ -25,7 +25,10 @@ struct VyxCguTbbPool {
     bool finished = false;
 
     VyxCguTbbPool(int32_t units, int32_t workers, VyxCguEmit callback)
-        : arena(workers), results(static_cast<std::size_t>(units), -1),
+        // The producer lowers outside this arena while queued emits run. With
+        // the default reserved master slot, a one-slot arena has no worker to
+        // release the next submit's permit. Reserve no external-only slots.
+        : arena(workers, 0), results(static_cast<std::size_t>(units), -1),
           emit(callback), limit(workers) {}
 };
 

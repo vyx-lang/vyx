@@ -22,6 +22,7 @@ The actual unit count depends on the partition size.
 | `derived_multilevel.vyx` | Three inheritance levels and two trait implementations; integer and string field layout |
 | `index_print.vyx` | Inferred Vec index binding and direct indexing; direct print and interpolation for signed integers, u64, bool, f32/f64 and borrowed strings |
 | `interpolation.vyx` | Embedded string literals, nested interpolation, escaped quotes, literal `\${...}`, and braces inside character literals/comments |
+| `interpolation_escaped.vyx` | Legacy outer-escaped quoted tokens inside interpolation, mixed spelling, braces and escaped quotes/backslashes, nested expressions and characters |
 | `async_stream.vyx` | Two interleaved tasks, nested async call, yield/sleep and named locals across multiple awaits, repeated for 32 rounds |
 | `async_params.vyx` | Mutable integer, string and aggregate parameters across yield/sleep; native byval body calls and borrowed method receivers |
 | `async_values.vyx` | Mutable object, Vec and string locals across awaits; `defer` executes once per completed task |
@@ -37,8 +38,11 @@ alone did not reproduce the reference-to-C-string conversion defect.
 For a smaller reproduction:
 
 ```powershell
+./probes/gates/compiler-usability/run.ps1 -Compiler bootstrap_compiler/out/vyxc.exe -CaseFilter interpolation
 ./probes/gates/compiler-usability/run.ps1 -Compiler bootstrap_compiler/out/vyxc.exe `
     -OptimizationLevels 0 -CodegenUnits 4
 ```
+
+`-CaseFilter` selects executable fixtures by name; syntax rejection checks still run.
 
 This runner targets Windows. Linux execution and JIT are outside this gate.
