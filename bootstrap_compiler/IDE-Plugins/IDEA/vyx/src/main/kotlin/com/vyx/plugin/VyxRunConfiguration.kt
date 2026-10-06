@@ -23,7 +23,7 @@ import javax.swing.*
 class VyxConfigurationType : ConfigurationType {
     override fun getDisplayName() = "Vyx"
     override fun getConfigurationTypeDescription() =
-        "Run / build Vyx programs (vyxc --src=file/--src=project --run=aot or vyxc build)"
+        "Run / build Vyx programs (vyxc --src=project or vyxc --src=file, with --run=aot)"
     override fun getIcon(): Icon = VyxIcons.Vyx
     override fun getId() = "VYX_RUN"
     override fun getConfigurationFactories() = arrayOf(
@@ -140,42 +140,14 @@ class VyxRunConfig(project: Project, factory: ConfigurationFactory, name: String
                         }
                     }
                     Mode.BUILD_AND_RUN -> {
-                        // Prefer single integrated project run so console shows compile+program output.
-                        // For Debug we still use -g and then launch the produced exe if present after build,
-                        // so DAP/native debug can attach later; for Run, --src=project --run=aot is enough.
-                        if (isDebug) {
-                            // build -g then run exe
-                            val build = VyxCli.buildProject(project, wd, targetName, debug = true)
-                            applyEnv(build)
-                            val buildProc = build.createProcess()
-                            val code = buildProc.waitFor()
-                            if (code != 0) {
-                                // re-run build with handler so user sees full log
-                                val fail = VyxCli.buildProject(project, wd, targetName, debug = true)
-                                applyEnv(fail)
-                                val handler = OSProcessHandler(fail)
-                                ProcessTerminatedListener.attach(handler)
-                                return handler
-                            }
-                            val exe = VyxCli.resolveBuiltExe(wd, targetName)
-                            GeneralCommandLine(exe.absolutePath).also { c -> c.workDirectory = wd }
-                        } else {
-                            VyxCli.buildAndRunProject(project, wd, debug = false)
-                        }
+                        VyxCli.buildAndRunProject(project, wd, targetName)
                     }
                     Mode.BUILD_ONLY -> VyxCli.buildProject(project, wd, targetName, debug = isDebug)
                 }
 
                 if (arguments.isNotBlank() && mode != Mode.BUILD_ONLY) {
-                    // Extra program args only make sense when launching an exe directly.
-                    // For --run=aot path they go after the compiler args.
-                    if (mode == Mode.RUN_FILE || (mode == Mode.BUILD_AND_RUN && !isDebug)) {
-                        // leave as compiler-driven run; program args not forwarded by current CLI reliably
-                    } else {
-                        arguments.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }.forEach {
-                            cmd.addParameter(it)
-                        }
-                    }
+                    cmd.addParameter("--")
+                    cmd.addParameters(parsedArguments())
                 }
 
                 applyEnv(cmd)
@@ -193,22 +165,31 @@ class VyxRunConfig(project: Project, factory: ConfigurationFactory, name: String
             return File(File(wd, ".idea/vyx-debug"),
                 if (VyxToolPaths.isWindows()) "$name.exe" else name)
         }
-        return VyxCli.resolveBuiltExe(wd, targetName)
+        return VyxCli.readBuiltExe(debugArtifactFile())
     }
+
+    private var debugArtifact: File? = null
+
+    private fun debugArtifactFile(): File = debugArtifact
+        ?: throw IllegalStateException("Vyx debug build has not published an artifact")
 
     internal fun debugBuildCommand(): GeneralCommandLine {
         val wd = File(if (workDir.isNotEmpty()) workDir else (project.basePath ?: "."))
         val command = when (mode) {
             Mode.RUN_FILE -> VyxCli.compileFileForDebug(project, scriptPath, debugExecutable())
-            Mode.BUILD_AND_RUN, Mode.BUILD_ONLY ->
-                VyxCli.buildProject(project, wd, targetName, debug = true)
+            Mode.BUILD_AND_RUN, Mode.BUILD_ONLY -> {
+                debugArtifact?.delete()
+                val artifact = File.createTempFile("vyx-debug-artifact-", ".txt").apply { deleteOnExit() }
+                debugArtifact = artifact
+                VyxCli.buildProject(project, wd, targetName, debug = true, artifactFile = artifact)
+            }
         }
         applyEnv(command)
         return command
     }
 
     internal fun parsedArguments(): List<String> =
-        arguments.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        VyxCli.programArguments(arguments)
 
     internal fun environment(): Map<String, String> {
         val values = linkedMapOf<String, String>()
@@ -231,7 +212,7 @@ class VyxEditor : SettingsEditor<VyxRunConfig>() {
     private val modeCombo = JComboBox(
         arrayOf(
             "Run File (vyxc --src=file --run=aot)",
-            "Build & Run Project (vyxc --src=project --run=aot)",
+            "Build & Run Project (vyxc --src=project <dir> --run=aot)",
             "Build Only (vyxc build)"
         )
     )

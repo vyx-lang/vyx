@@ -135,9 +135,8 @@ object VyxToolPaths {
     }
 
     /**
-     * DAP is implemented by the self-hosted `vyxc-dap`, not by host
-     * `lldb-dap`. Prefer the project/compiler SDK and the bundled adapter so
-     * an unrelated host adapter can never silently replace Vyx behavior.
+     * The SDK entry point `vyxc-dap` selects its matching debug runtime.
+     * Prefer project/compiler SDK tools before a globally installed adapter.
      */
     fun resolveVyxDapForProject(project: Project?): String {
         val projectSettings = project?.let { VyxSettings.getInstance(it) }

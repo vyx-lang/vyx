@@ -1,0 +1,441 @@
+diff --git a/src/adapter-protocol/src/lib.rs b/src/adapter-protocol/src/lib.rs
+index d88738e..ee7afa0 100644
+--- a/src/adapter-protocol/src/lib.rs
++++ b/src/adapter-protocol/src/lib.rs
+@@ -1,6 +1,7 @@
+ #![allow(non_camel_case_types)]
+ 
+ mod dap;
++pub use dap::VariablesArgumentsFilter;
+ 
+ use serde_derive::*;
+ 
+diff --git a/src/codelldb/Cargo.toml b/src/codelldb/Cargo.toml
+index 32b96df..98e80e9 100644
+--- a/src/codelldb/Cargo.toml
++++ b/src/codelldb/Cargo.toml
+@@ -35,7 +35,7 @@ tokio-util = {version = "0.7.16", features = ["codec"]}
+ termios = "0.3.1"
+ 
+ [target.'cfg(windows)'.dependencies]
+-winapi = {version = "0.3.9", features = ["std", "fileapi", "namedpipeapi", "wincon", "errhandlingapi"]}
++winapi = {version = "0.3.9", features = ["std", "fileapi", "namedpipeapi", "wincon", "errhandlingapi", "handleapi", "processenv", "processthreadsapi", "winbase", "winnt"]}
+ 
+ [dev-dependencies]
+ ctor = "0.5.0"
+diff --git a/src/codelldb/src/debug_session.rs b/src/codelldb/src/debug_session.rs
+index 42bbe3a..0ccb8fe 100644
+--- a/src/codelldb/src/debug_session.rs
++++ b/src/codelldb/src/debug_session.rs
+@@ -4,6 +4,8 @@ mod disassemble;
+ mod launch;
+ mod step_in;
+ mod variables;
++#[cfg(windows)]
++mod internal_stdio;
+ 
+ use crate::debug_event_listener::DebugEventListener;
+ use crate::prelude::*;
+@@ -55,6 +57,10 @@ pub struct DebugSession {
+     current_cancellation: cancellation::Receiver, // Cancellation associated with the current request
+     configuration_done_sender: broadcast::Sender<()>,
+     console_pipe: std::fs::File,
++    #[cfg(windows)]
++    internal_output_tasks: Vec<tokio::task::JoinHandle<()>>,
++    #[cfg(windows)]
++    internal_stdio_paths: Vec<Option<String>>,
+ 
+     debugger: SBDebugger,
+     debugger_terminal: Option<DebuggerTerminal>,
+@@ -149,6 +155,10 @@ impl DebugSession {
+             current_cancellation: cancellation::dummy(),
+             configuration_done_sender: broadcast::channel(1).0,
+             console_pipe: con_writer,
++            #[cfg(windows)]
++            internal_output_tasks: vec![],
++            #[cfg(windows)]
++            internal_stdio_paths: vec![],
+ 
+             debugger: debugger,
+             target: target.clone(),
+@@ -1561,6 +1571,21 @@ impl DebugSession {
+             Exited => {
+                 let exit_code = process.exit_status() as i64;
+                 self.console_message(format!("Process exited with code {}.", exit_code));
++                #[cfg(windows)]
++                if !self.internal_output_tasks.is_empty() {
++                    let tasks = std::mem::take(&mut self.internal_output_tasks);
++                    let dap = self.dap_session.clone();
++                    tokio::spawn(async move {
++                        for mut task in tasks {
++                            if tokio::time::timeout(time::Duration::from_secs(5), &mut task).await.is_err() {
++                                task.abort();
++                            }
++                        }
++                        let _ = dap.send_event(EventBody::exited(ExitedEventBody { exit_code })).await;
++                        let _ = dap.send_event(EventBody::terminated(TerminatedEventBody { restart: None })).await;
++                    });
++                    return;
++                }
+                 self.send_event(EventBody::exited(ExitedEventBody { exit_code }));
+                 self.send_event(EventBody::terminated(TerminatedEventBody { restart: None }));
+             }
+@@ -1734,6 +1759,8 @@ impl DebugSession {
+ 
+ impl Drop for DebugSession {
+     fn drop(&mut self) {
++        #[cfg(windows)]
++        for task in &self.internal_output_tasks { task.abort(); }
+         debug!("DebugSession::drop()");
+     }
+ }
+diff --git a/src/codelldb/src/debug_session/launch.rs b/src/codelldb/src/debug_session/launch.rs
+index d0a37c6..f5ba748 100644
+--- a/src/codelldb/src/debug_session/launch.rs
++++ b/src/codelldb/src/debug_session/launch.rs
+@@ -91,7 +91,6 @@ impl super::DebugSession {
+                 launch_env.set(fold_key(k), v, true);
+             }
+         }
+-        debug!("launch env: {:?}", launch_env);
+         launch_info.set_environment(&launch_env, false);
+ 
+         if let Some(ref args) = args.args {
+@@ -151,6 +150,10 @@ impl super::DebugSession {
+             log_errors!(terminal.attach_console());
+         }
+ 
++        #[cfg(windows)]
++        let stdio_guard = if !self.internal_stdio_paths.is_empty() {
++            Some(super::internal_stdio::LaunchStdio::open(&self.internal_stdio_paths)?)
++        } else { None };
+         let launch_result: Result<SBProcess, Error> = (|| match &args.process_create_commands {
+             None => self.target.launch(&launch_info).map_err(|sberr| Box::new(sberr).into()),
+             Some(commands) => {
+@@ -163,6 +166,8 @@ impl super::DebugSession {
+                 Ok(process)
+             }
+         })();
++        #[cfg(windows)]
++        drop(stdio_guard);
+ 
+         #[cfg(windows)]
+         if let Some(terminal) = &self.debuggee_terminal {
+@@ -493,6 +498,7 @@ impl super::DebugSession {
+     }
+ 
+     fn configure_stdio(&mut self, args: &LaunchRequestArguments, launch_info: &mut SBLaunchInfo) -> Result<(), Error> {
++        log::debug!("Vyx stdio platform={} terminal={}", self.target.platform().name(), self.debuggee_terminal.is_some());
+         let mut stdio = match args.stdio {
+             None => vec![],
+             Some(Either::First(ref stdio)) => vec![Some(stdio.clone())], // A single string
+@@ -503,27 +509,33 @@ impl super::DebugSession {
+             stdio.push(None)
+         }
+ 
+-        if let Some(terminal) = &self.debuggee_terminal {
+-            for (fd, name) in stdio.iter().enumerate() {
++        #[cfg(windows)]
++        if self.debuggee_terminal.is_none() && self.target.platform().name() == "host" {
++            if stdio[0].is_none() { stdio[0] = Some("NUL".into()); }
++            if stdio[1].is_none() { stdio[1] = Some(self.internal_output_pipe("stdout")?); }
++            if stdio[2].is_none() { stdio[2] = Some(self.internal_output_pipe("stderr")?); }
++            self.internal_stdio_paths = stdio.clone();
++        }
++        for (fd, name) in stdio.iter().enumerate() {
+                 // Use file name specified in the launch config if available,
+                 // otherwise use the appropriate terminal device name.
+                 let name = match (name, fd) {
+                     (Some(name), _) => Some(&name[..]),
+-                    (None, 0) => terminal.input_devname(),
+-                    (None, _) => terminal.output_devname(),
++                    (None, 0) => self.debuggee_terminal.as_ref().and_then(|t| t.input_devname()),
++                    (None, _) => self.debuggee_terminal.as_ref().and_then(|t| t.output_devname()),
+                 };
+                 if let Some(name) = name {
+                     let path = Path::new(name);
+-                    let _ = match fd {
++                    log::debug!("Vyx stdio fd={fd} path={name}");
++                    let opened = match fd {
+                         0 => launch_info.add_open_file_action(fd as i32, &path, true, false),
+                         1 => launch_info.add_open_file_action(fd as i32, &path, false, true),
+                         2 => launch_info.add_open_file_action(fd as i32, &path, false, true),
+                         _ => launch_info.add_open_file_action(fd as i32, &path, true, true),
+                     };
++                    if !opened { bail!("Could not configure debuggee stdio fd {fd}"); }
+                 }
+             }
+-        }
+-
+         Ok(())
+     }
+ 
+diff --git a/src/codelldb/src/debug_session/variables.rs b/src/codelldb/src/debug_session/variables.rs
+index 8640e41..0564676 100644
+--- a/src/codelldb/src/debug_session/variables.rs
++++ b/src/codelldb/src/debug_session/variables.rs
+@@ -66,8 +66,19 @@ impl super::DebugSession {
+     }
+ 
+     pub(super) fn handle_variables(&mut self, args: VariablesArguments) -> Result<VariablesResponseBody, Error> {
++        let start = args.start.unwrap_or(0);
++        let count = args.count.unwrap_or(0);
++        if start < 0 || count < 0 {
++            return Err(str_error("Negative variable page offset or count"));
++        }
++        let indexed = matches!(args.filter.as_ref(), Some(VariablesArgumentsFilter::Indexed));
++        let named = matches!(args.filter.as_ref(), Some(VariablesArgumentsFilter::Named));
+         let container_handle = args.variables_reference;
+         let container = self.var_refs.get(container_handle).ok_or(str_error("Invalid variabes reference"))?;
++        if indexed && !matches!(container, Container::SBValue(_)) {
++            return Ok(VariablesResponseBody { variables: vec![] });
++        }
++        let page_count = if count == 0 { usize::MAX } else { count as usize };
+         let variables = match container {
+             Container::Locals(frame) => {
+                 let ret_val = frame.thread().stop_return_value();
+@@ -77,10 +88,13 @@ impl super::DebugSession {
+                     statics: false,
+                     in_scope_only: true,
+                 });
+-                let mut vars_iter = variables.iter();
++                let has_return = ret_val.is_some();
++                let value_start = start.saturating_sub(if has_return { 1 } else { 0 }) as usize;
++                let value_count = if has_return && start == 0 && count > 0 { page_count - 1 } else { page_count };
++                let mut vars_iter = variables.iter().skip(value_start).take(value_count);
+                 let mut variables = self.convert_scope_values(&mut vars_iter, "", Some(container_handle), true)?;
+                 // Prepend last function return value, if any.
+-                if let Some(ret_val) = ret_val {
++                if let Some(ret_val) = ret_val.filter(|_| start == 0) {
+                     let mut variable = self.var_to_variable(&ret_val, "", Some(container_handle));
+                     variable.name = "[return value]".to_owned();
+                     variables.insert(0, variable);
+@@ -94,7 +108,8 @@ impl super::DebugSession {
+                     statics: true,
+                     in_scope_only: true,
+                 });
+-                let mut vars_iter = variables.iter().filter(|v| v.value_type() == ValueType::VariableStatic);
++                let mut vars_iter = variables.iter().filter(|v| v.value_type() == ValueType::VariableStatic)
++                    .skip(start as usize).take(page_count);
+                 self.convert_scope_values(&mut vars_iter, "", Some(container_handle), false)?
+             }
+             Container::Globals(frame) => {
+@@ -104,22 +119,31 @@ impl super::DebugSession {
+                     statics: true,
+                     in_scope_only: true,
+                 });
+-                let mut vars_iter = variables.iter().filter(|v| v.value_type() == ValueType::VariableGlobal);
++                let mut vars_iter = variables.iter().filter(|v| v.value_type() == ValueType::VariableGlobal)
++                    .skip(start as usize).take(page_count);
+                 self.convert_scope_values(&mut vars_iter, "", Some(container_handle), false)?
+             }
+             Container::Registers(frame) => {
+                 let list = frame.registers();
+-                let mut vars_iter = list.iter();
++                let mut vars_iter = list.iter().skip(start as usize).take(page_count);
+                 self.convert_scope_values(&mut vars_iter, "", Some(container_handle), false)?
+             }
+             Container::SBValue(var) => {
+                 let container_eval_name = self.compose_container_eval_name(container_handle);
+                 let var = var.clone();
+-                let mut vars_iter = var.children();
++                let children = var.num_children() as i64;
++                let has_indexed = children > 0 && var.child_at_index(0).name().unwrap_or("").starts_with('[');
++                let raw_visible = var.is_synthetic() && !indexed;
++                let visible_children = if (named && has_indexed) || (indexed && !has_indexed) { 0 } else { children };
++                let total = visible_children + if raw_visible { 1 } else { 0 };
++                let end = if count == 0 { total } else { start.saturating_add(count).min(total) };
++                // Jump directly to the requested children; Iterator::skip would
++                // still materialize every preceding LLDB value.
++                let mut vars_iter = (start.min(visible_children)..end.min(visible_children)).map(|i| var.child_at_index(i as u32));
+                 let mut variables =
+                     self.convert_scope_values(&mut vars_iter, &container_eval_name, Some(container_handle), false)?;
+                 // If synthetic, add [raw] view.
+-                if var.is_synthetic() {
++                if raw_visible && start <= visible_children && end > visible_children {
+                     let raw_var = var.non_synthetic_value();
+                     let handle = self.var_refs.create(Some(container_handle), "[raw]", Container::SBValue(raw_var));
+                     let raw = Variable {
+@@ -135,7 +159,7 @@ impl super::DebugSession {
+             }
+             Container::StackFrame(_) => vec![],
+         };
+-        Ok(VariablesResponseBody { variables: variables })
++        Ok(VariablesResponseBody { variables })
+     }
+ 
+     fn compose_container_eval_name(&self, container_handle: Handle) -> String {
+@@ -257,6 +281,12 @@ impl super::DebugSession {
+             value: value,
+             type_: dtype.map(|v| v.to_owned()),
+             variables_reference: handle.unwrap_or(0),
++            indexed_variables: if var.num_children() > 0 && var.child_at_index(0).name().unwrap_or("").starts_with('[') {
++                Some(var.num_children() as i64)
++            } else { None },
++            named_variables: Some(if var.num_children() > 0 && !var.child_at_index(0).name().unwrap_or("").starts_with('[') {
++                var.num_children() as i64
++            } else { 0 } + if var.is_synthetic() { 1 } else { 0 }),
+             evaluate_name: eval_name,
+             memory_reference: mem_ref,
+             presentation_hint: if is_settable { None } else { Some(presentation_hint(&["readOnly"])) },
+diff --git a/src/codelldb/src/stdio_stream.rs b/src/codelldb/src/stdio_stream.rs
+index 29d22ea..9bc6aac 100644
+--- a/src/codelldb/src/stdio_stream.rs
++++ b/src/codelldb/src/stdio_stream.rs
+@@ -3,8 +3,14 @@ use std::task::{Context, Poll};
+ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+ 
+ pub struct StdioStream {
++    #[cfg(not(windows))]
+     std_in: tokio::io::Stdin,
++    #[cfg(not(windows))]
+     std_out: tokio::io::Stdout,
++    #[cfg(windows)]
++    std_in: tokio::fs::File,
++    #[cfg(windows)]
++    std_out: tokio::fs::File,
+ }
+ 
+ impl AsyncRead for StdioStream {
+@@ -29,6 +35,24 @@ impl AsyncWrite for StdioStream {
+ 
+ impl StdioStream {
+     pub fn new() -> Self {
++        #[cfg(windows)]
++        {
++            use std::os::windows::io::FromRawHandle;
++            use winapi::um::{handleapi::DuplicateHandle, processenv::GetStdHandle,
++                processthreadsapi::GetCurrentProcess, winbase::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
++                winnt::DUPLICATE_SAME_ACCESS};
++            fn capture(kind: u32) -> tokio::fs::File {
++                unsafe {
++                    let mut duplicate = std::ptr::null_mut();
++                    let process = GetCurrentProcess();
++                    assert_ne!(DuplicateHandle(process, GetStdHandle(kind), process,
++                        &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS), 0);
++                    tokio::fs::File::from_std(std::fs::File::from_raw_handle(duplicate))
++                }
++            }
++            return StdioStream { std_in: capture(STD_INPUT_HANDLE), std_out: capture(STD_OUTPUT_HANDLE) };
++        }
++        #[cfg(not(windows))]
+         StdioStream {
+             std_in: tokio::io::stdin(),
+             std_out: tokio::io::stdout(),
+diff --git a/src/lldb/build.rs b/src/lldb/build.rs
+index c896370..627141a 100644
+--- a/src/lldb/build.rs
++++ b/src/lldb/build.rs
+@@ -8,6 +8,7 @@ fn main() {
+     rerun_if_changed_in(Path::new("src"));
+ 
+     let mut build_config = cpp_build::Config::new();
++    build_config.flag("-std=c++17");
+ 
+     for dir in env::var("LLDB_INCLUDE").unwrap().split(';') {
+         build_config.include(dir);
+diff --git a/src/lldb/src/sb/sbcommandinterpreter.rs b/src/lldb/src/sb/sbcommandinterpreter.rs
+index 6462c9b..7d8b83c 100644
+--- a/src/lldb/src/sb/sbcommandinterpreter.rs
++++ b/src/lldb/src/sb/sbcommandinterpreter.rs
+@@ -1,12 +1,6 @@
+ use super::*;
+ 
+-cpp! {{
+-namespace std {
+-    // Prevent cpp from auto-deriving Default, which would use the default SBCommandInterpreter constructor
+-    // introduced in v18, causing codelldb to be incompatible with earlier versions.
+-    template<> struct is_default_constructible<lldb::SBCommandInterpreter> : std::false_type {};
+-}
+-}}
++// The Vyx SDK uses LLVM 22; the default constructor introduced in LLVM 18 is available.
+ cpp_class!(pub unsafe struct SBCommandInterpreter as "SBCommandInterpreter");
+ 
+ unsafe impl Send for SBCommandInterpreter {}
+diff --git a/src/codelldb/src/debug_session/internal_stdio.rs b/src/codelldb/src/debug_session/internal_stdio.rs
+new file mode 100644
+--- /dev/null
++++ b/src/codelldb/src/debug_session/internal_stdio.rs
+@@ -0,0 +1,82 @@
++//! Windows internal console uses named pipes, never the DAP transport handles.
++use super::*;
++use tokio::net::windows::named_pipe::ServerOptions;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++static PIPE_ID: AtomicU64 = AtomicU64::new(1);
++
++// The Windows LLDB launcher may inherit the process handles rather than its
++// file actions. Scope those handles around launch; the DAP stream has already
++// captured separate handles and cannot be redirected by this guard.
++pub(super) struct LaunchStdio { handles: Vec<(u32, winapi::shared::ntdef::HANDLE)>, files: Vec<std::fs::File> }
++impl LaunchStdio {
++    pub(super) fn open(paths: &[Option<String>]) -> Result<Self, Error> {
++        use std::os::windows::io::AsRawHandle;
++        use winapi::um::{processenv::{GetStdHandle, SetStdHandle}, handleapi::SetHandleInformation,
++            winbase::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE, HANDLE_FLAG_INHERIT}};
++        let mut guard = Self { handles: vec![], files: vec![] };
++        for (fd, kind) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].into_iter().enumerate() {
++            if let Some(path) = &paths[fd] {
++                let file = std::fs::OpenOptions::new().read(fd == 0).write(fd != 0).open(path)?;
++                unsafe {
++                    let handle = file.as_raw_handle();
++                    if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
++                        return Err(std::io::Error::last_os_error().into());
++                    }
++                    guard.handles.push((kind, GetStdHandle(kind)));
++                    if SetStdHandle(kind, handle) == 0 { return Err(std::io::Error::last_os_error().into()); }
++                }
++                guard.files.push(file);
++            }
++        }
++        Ok(guard)
++    }
++}
++impl Drop for LaunchStdio {
++    fn drop(&mut self) {
++        for (kind, handle) in &self.handles { unsafe { winapi::um::processenv::SetStdHandle(*kind, *handle); } }
++    }
++}
++
++impl DebugSession {
++    pub(super) fn internal_output_pipe(&mut self, category: &'static str) -> Result<String, Error> {
++        let name = format!(r"\\.\pipe\vyx-dap-{}-{}", std::process::id(), PIPE_ID.fetch_add(1, Ordering::Relaxed));
++        let mut pipe = ServerOptions::new().access_inbound(true).access_outbound(false)
++            .first_pipe_instance(true).create(&name)?;
++        let dap = self.dap_session.clone();
++        let task = tokio::spawn(async move {
++            if let Err(error) = pipe.connect().await { log::error!("output pipe connect: {error}"); return; }
++            log::debug!("output pipe connected {category}");
++            let mut buffer = [0u8; 16384];
++            let mut pending = Vec::with_capacity(16388);
++            loop {
++                let count = match pipe.read(&mut buffer).await { Ok(n) => n, Err(error) => {
++                    log::debug!("output pipe read {category}: {error}"); 0
++                }};
++                if count == 0 { break; }
++                pending.extend_from_slice(&buffer[..count]);
++                // Keep only an incomplete trailing UTF-8 codepoint between reads.
++                let complete = match std::str::from_utf8(&pending) {
++                    Ok(_) => pending.len(),
++                    Err(e) if e.error_len().is_none() => e.valid_up_to(),
++                    Err(_) => pending.len(),
++                };
++                if complete > 0 {
++                    let output = String::from_utf8_lossy(&pending[..complete]).into_owned();
++                    if dap.send_event(EventBody::output(OutputEventBody {
++                        category: Some(category.into()), output, ..Default::default()
++                    })).await.is_err() { return; }
++                    pending.drain(..complete);
++                }
++            }
++            if !pending.is_empty() {
++                let _ = dap.send_event(EventBody::output(OutputEventBody {
++                    category: Some(category.into()), output: String::from_utf8_lossy(&pending).into_owned(),
++                    ..Default::default()
++                })).await;
++            }
++        });
++        self.internal_output_tasks.push(task);
++        Ok(name)
++    }
++}

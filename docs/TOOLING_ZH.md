@@ -15,8 +15,32 @@ Gradle wrapper 与扩展打包配置保留在源码中。
 重命名、文档与工作区符号、签名提示、语义高亮、格式化、代码操作和折叠范围。
 模块补全包含 `std.collections` 等已注册的包。
 
+引用查找、文档高亮和重命名使用编译器解析出的声明与绑定。跨文件、跨模块查询
+区分同名局部变量、参数和不同类型的成员，包含导入别名、泛型类型参数、枚举、
+全局变量、闭包捕获与字符串插值。重载函数按同一模块和所属类型的声明族重命名。
+重命名导出的声明会更新导入目标并保留别名；重命名别名只更新别名及其使用位置。
+
+重命名先在临时源码覆盖层中重新分析，确认已有绑定没有被捕获、冲突或丢失后
+才返回编辑。未保存缓冲区参与分析；支持 `documentChanges` 的客户端收到文档版本。
+无法解析、存在语义错误、涉及 SDK 只读声明或外部 ABI 名称时拒绝重命名。
+项目夹具见[跨模块编辑器项目](../tests/projects/editor_semantic_rename/README.md)。
+
 在编辑器中打开包含 `Vyx.toml` 的项目目录，以便语言服务获取项目上下文。
 插件无法自动发现 SDK 时，手动配置工具路径。
+
+关闭的源码文件先建立声明索引；引用与重命名按候选文件逐个进行语义分析，
+只缓存源码位置和绑定事实。依赖提供声明签名，需要推导返回类型时保留函数体。
+标准库按显式 `VYX_STD_PACKAGES`、工作区规范包、SDK 的顺序选择一个完整来源；
+仅在没有规范包注册表时回退到旧 `std/`。其他副本保留导航索引，不合并进语义分析，
+SDK 源码保持只读。相对路径与绝对路径共享同一文件身份。
+打开的缓冲区另外提供完整诊断。每次请求和单个文件
+索引完成后释放临时分析存储。替换、关闭文档时回收旧文本、符号和诊断；拉取诊断
+复用当前结果。发现源码时跳过输出、缓存、依赖、IDE 产物和本地 seed 工程。
+大型符号和语义高亮响应使用可增长缓冲区构造，避免反复复制整份源码与 JSON 前缀。
+请求存储还覆盖编译器生成的子串、隐式复制与检查指针元数据。编辑器的 UTF-16
+位置在协议边界转换为源码字节位置。
+排队的修改在输入暂停后合并分析，请求处理前同步此前的修改，诊断携带文档版本。
+压力验证入口见[编辑器服务压力门](../probes/gates/editor-industrial/README.md)。
 
 ## VS Code 与 Cursor
 
@@ -83,13 +107,21 @@ Linux 去掉 `.exe`；如果已将 `build.output_dir` 改成 `out`，也要修�
 **Debug Current File** 是另一个入口，会先为当前文件生成调试产物，再启动调试。
 
 `vyxc-dap --stdio` 提供程序启动、行断点、单步执行、调用栈、作用域、变量和表达式求值。
-Linux 使用内置的 ptrace/DWARF 后端；其他宿主需要显式配置 LLDB：
-把 `VYX_LLDB` 设为 LLDB 可执行文件路径，或把 `LLVM_ROOT` 设为对应 LLVM 安装目录。
-也可以在启动配置中设置 `debuggerPath`，例如 `"C:/LLVM/bin/lldb.exe"`。
-VS Code 的 `vyx.llvmRoot` 设置可提供 LLVM 根目录。
+Windows 和 Linux 均将协议直接交给 CodeLLDB。调试器负责异步执行、
+调用栈分页、变量按需展开、输出流和会话清理；Vyx 入口不保存重复的作用域、变量或
+程序输出。具体能力以实际调试器 `initialize` 返回的 capabilities 为准。
 
-当前适配器声明不支持条件断点、函数断点和变量赋值。调试时使用普通行断点；
-需要改变源码中的值时，修改后重新构建。
+完整 SDK 提供 `bin/debugger/adapter/codelldb` 及其配套 LLDB 环境。从源码构建时，
+在 `bootstrap_compiler/` 执行 `python scripts/prepare_debug_adapter.py` 准备固定版本、
+SHA-256 校验的调试器源码与配套运行时。源码构建需要 Cargo/Rust、Git 与 clang++；
+SDK 使用者不需要这些构建工具。Vyx 补丁补充变量分页，并分离 Windows 内部控制台
+输出与 DAP 协议。打包检查补丁和可执行文件哈希，保留组件许可；详见
+[调试器构建说明](../tools/debugger/README.md)。需要指定其他 CodeLLDB 或 LLDB-DAP
+安装时，把 `VYX_DAP_ADAPTER` 设为适配器路径；旧的 `VYX_LLDB_DAP` 仍然接受。
+VS Code/Cursor 的启动配置可用 `debuggerPath` 指定同样的覆盖路径。
+旧配置中的 `lldb` CLI 路径会选择同目录的 `lldb-dap`。找不到适配器时明确报错。
+程序应使用 `-g -O0` 构建，以保留源码和局部变量调试信息。
+参见 [CodeLLDB](https://github.com/vadimcn/codelldb/blob/v1.12.3/MANUAL.md)。
 
 ## IntelliJ IDEA 与 CLion
 
@@ -111,12 +143,21 @@ cd bootstrap_compiler/IDE-Plugins/IDEA/vyx
 ./gradlew buildPlugin -PvyxIdePath=/path/to/compatible/ide
 ```
 
+给 `buildPlugin` 传入 `-PvyxSdkPath=/path/to/packaged/sdk`，可将完整 SDK 随插件
+打包，包括编译器、语言服务、调试适配器、运行时、标准包和 LLVM 驱动。
+未使用此选项时，在源码仓库外构建项目需要配置完整 SDK。
+
 在 **Settings → Plugins → Install Plugin from Disk** 中安装
 `build/distributions` 下生成的 ZIP。随后进入
 **Settings → Languages & Frameworks → Vyx**，配置 SDK 中的
 `vyxc`、`vyxc-lsp`、`vyxc-dap`。
 插件提供可执行程序、静态库和动态库项目创建、语言服务、Vyx 运行配置和 DAP 调试。
 调试程序与 LLDB 的要求同上。
+
+**Build & Run Project** 执行 `vyxc --run=aot --src=project <工作目录>`，
+并传入所选清单目标。程序参数放在 `--` 后面。
+Debug 使用 `-g -O0 --artifact-file <临时文件>` 构建，再启动编译器返回的
+可执行产物路径，支持目标独立设置的输出目录。
 
 ## 从仓库构建语言服务器与调试适配器
 

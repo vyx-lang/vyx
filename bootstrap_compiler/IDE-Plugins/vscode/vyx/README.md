@@ -5,7 +5,7 @@ Language support for the Vyx SDK toolchain (`vyxc`, `vyxc-lsp`, `vyxc-dap`).
 ## Features
 
 - **LSP** via `vyxc-lsp` (stdio): diagnostics with `Exxxx` codes, completion (including `use std.` package registry, prefix match, differential on `.`), hover, go to definition, find references, rename, document symbols, signature help, semantic tokens, folding, document formatting, code actions (quick fixes: similar-name, `use` insert, missing `;`, clone-before-move).
-- **DAP** via `vyxc-dap`: launch compiled programs, breakpoints, stack, variables, stepping. `Vyx: Debug Current File` compiles with `-g` then starts the adapter.
+- **DAP** via the SDK's CodeLLDB engine: launch compiled programs, breakpoints, stack, paged variables, streaming output and stepping. `Vyx: Debug Current File` compiles with `-g -O0` then starts `vyxc-dap`.
 - **Formatting**: LSP indent formatter (4 spaces). Bound as the default formatter for `[vyx]` and Format Document / Format on Save.
 - **Problems**: `$vyx` matcher for `file:line:col: error: E2000: …`.
 - **Tasks**: build project, compile current file, compile with debug info, run current file.
@@ -28,8 +28,8 @@ Toolchain resolution, in order: setting → extension sibling/`bin`/`toolchain` 
 ## Commands
 
 - `Vyx: Run Current File` → `vyxc --src=file <file> --run=aot`
-- `Vyx: Build Project` → `vyxc build`
-- `Vyx: Debug Current File` → compile `-g --emit=exe` then DAP
+- `Vyx: Build Project` → `vyxc --src=project <workspace-folder>`
+- `Vyx: Debug Current File` → compile `-g -O0 --emit=exe` then DAP
 - `Vyx: Format File` → `editor.action.formatDocument` (LSP)
 - `Vyx: Restart Language Server`
 
@@ -37,7 +37,7 @@ Toolchain resolution, in order: setting → extension sibling/`bin`/`toolchain` 
 
 ```text
 cd bootstrap_compiler/IDE-Plugins/vscode/vyx
-npm install
+npm ci
 npm run compile
 ```
 

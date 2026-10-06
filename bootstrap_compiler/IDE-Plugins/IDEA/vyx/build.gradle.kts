@@ -10,16 +10,27 @@ plugins {
 val bundledToolchainNames = listOf(
     "vyxc-lsp.exe",
     "vyxc-dap.exe",
+    "vyx_compiler_backend.dll",
+    "tbb12.dll",
+    "vyx_runtime.lib",
+    "tbb12.lib",
     "vyx_rt.dll",
     "vyx_run_rt.dll",
 )
 val bootstrapOut = layout.projectDirectory.dir("../../../out")
+val bundledSdk = providers.gradleProperty("vyxSdkPath").orNull?.let { raw ->
+    file(raw).apply {
+        require(resolve("SDK-MANIFEST.json").isFile && resolve("bin").isDirectory) {
+            "vyxSdkPath must point at a packaged Vyx SDK"
+        }
+    }
+}
 val targetIdePath = providers.gradleProperty("vyxIdePath")
     .orElse("D:/Jetbrains/CLion")
     .get()
 
 group = "com.vyx.plugin"
-version = "1.0.7"
+version = "1.0.8"
 
 repositories {
     mavenLocal()
@@ -48,6 +59,9 @@ intellijPlatform {
         }
 
         changeNotes = """
+            Project Build &amp; Run uses vyxc --src=project with --run=aot, with manifest
+            target selection and program arguments. Debug builds launch the
+            executable path reported by the compiler, including custom output directories.
             use/import package-registry completion with prefix match.
             LSP format, code actions, references and rename. Reformat Code
             uses vyxc-lsp with a local indent engine fallback.
@@ -69,6 +83,11 @@ kotlin {
 }
 
 tasks.withType<PrepareSandboxTask>().configureEach {
+    if (bundledSdk != null) {
+        // Preserve bin/lib/std_packages/debugger relationships, including the
+        // matching compiler runtime and bundled LLVM driver for compile actions.
+        from(bundledSdk) { into(pluginName.map { it }) }
+    } else {
     // `out/vyxc.exe` can be held open by the currently running IDE.  The
     // authoritative self-host result is `boot.exe`; package that exact binary
     // under the public `vyxc.exe` name so compiler/LSP/DAP are always one gen.
@@ -80,5 +99,13 @@ tasks.withType<PrepareSandboxTask>().configureEach {
     from(bootstrapOut) {
         include(bundledToolchainNames)
         into(pluginName.map { "$it/bin" })
+    }
+    from(bootstrapOut.dir("_debug_adapter")) {
+        into(pluginName.map { "$it/bin/debugger" })
+    }
+    from(layout.projectDirectory.dir("../../../std_packages")) {
+        exclude("**/.cache/**", "**/out/**", "**/target/**", "**/__pycache__/**")
+        into(pluginName.map { "$it/std_packages" })
+    }
     }
 }

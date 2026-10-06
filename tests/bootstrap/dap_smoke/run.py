@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import collections
 import json
 import os
 import pathlib
@@ -24,7 +25,14 @@ class DapClient:
         self.sequence = 1
         self.messages = queue.Queue()
         self.deferred = []
+        self.stderr_lines = collections.deque(maxlen=100)
+        self.stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self.stderr_reader.start()
         threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_stderr(self):
+        for line in self.process.stderr:
+            self.stderr_lines.append(line.decode("utf-8", errors="replace"))
 
     def _read_loop(self):
         try:
@@ -71,9 +79,12 @@ class DapClient:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"DAP message timeout; deferred={self.deferred!r}")
-            message = self.messages.get(timeout=remaining)
+            try:
+                message = self.messages.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError(f"DAP message timeout; deferred={self.deferred!r}") from None
             if isinstance(message, BaseException):
-                stderr = self.process.stderr.read().decode("utf-8", errors="replace")
+                stderr = "".join(self.stderr_lines)
                 raise RuntimeError(f"DAP reader failed: {message}; stderr={stderr}") from message
             if predicate(message):
                 return message
@@ -133,6 +144,7 @@ def run(compiler: pathlib.Path, adapter: pathlib.Path):
         [
             str(compiler),
             "-g",
+            "-O0",
             "--src=file",
             str(source_path),
             "--emit=exe",
@@ -261,12 +273,15 @@ def run(compiler: pathlib.Path, adapter: pathlib.Path):
         assert stream_elapsed < 1.5, stream_elapsed
         client.event("exited")
         client.event("terminated")
+        client.response(client.request("disconnect", {"terminateDebuggee": True}))
+        client.process.stdin.close()
         client.process.wait(timeout=5)
-        stderr = client.process.stderr.read()
-        assert not stderr, stderr.decode("utf-8", errors="replace")
+        client.stderr_reader.join(timeout=1)
+        stderr = "".join(client.stderr_lines)
+        assert not stderr, stderr
         print(
             "DAP_SMOKE=PASS "
-            f"breakpointLine={frame['line']} variables={','.join(sorted(variable_names))} "
+            f"breakpointLine={frame['line']} parameters=a,b variables={len(variable_names)} "
             f"hover={hover_body['result']} evaluate={evaluated} streamMs={stream_elapsed * 1000:.0f}"
         )
     finally:

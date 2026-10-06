@@ -18,8 +18,44 @@ hover, definition and reference lookup, rename, document and workspace symbols,
 signature help, semantic tokens, formatting, code actions, and folding ranges.
 Module completion includes registered packages such as `std.collections`.
 
+References, document highlights and rename use compiler-resolved declarations
+and bindings across files and modules. They distinguish shadowed locals,
+parameters and unrelated members, and include import aliases, generic type
+parameters, enums, globals, closure captures and string interpolation. Overloads
+are renamed as a declaration family within their exact module and owner type.
+Renaming an exported declaration updates import targets while preserving aliases;
+renaming an alias updates only that alias and its uses.
+
+Rename reanalyzes a temporary source overlay before returning edits, rejecting
+binding capture, conflicts and lost bindings. Unsaved buffers participate;
+clients supporting `documentChanges` receive document versions. Unresolved names,
+semantic errors, read-only SDK declarations and external ABI names are refused.
+See the [cross-module editor project](../tests/projects/editor_semantic_rename/README.md).
+
 Open the project directory containing `Vyx.toml` so the editor has the project
 context. Configure the executable path if the plugin cannot discover your SDK.
+
+Closed files first supply declaration indexes. References and rename analyze
+candidate files individually and retain only source positions and binding facts.
+Dependencies supply signatures; inferred return types still require function
+bodies. Standard imports select one complete provider: `VYX_STD_PACKAGES`, then
+the workspace's canonical packages, then the SDK. Legacy `std/` is a fallback
+only when no canonical registry exists. Other copies remain indexed for
+navigation but are not merged into semantic analysis; SDK sources stay read-only.
+Relative and absolute paths share one file identity.
+Open buffers also receive full diagnostics. Analysis allocations are released after each request and each
+indexed source. Replacing or closing a document releases its previous text,
+symbols and diagnostics. Repeated pull diagnostics reuse the current result.
+Generated directories (`out`, `target`, `build`, `dist`, caches, dependencies and
+local seed workspaces) are excluded from discovery; explicitly opened source
+files still receive analysis. This is source indexing, not a project build.
+
+Request ownership also covers compiler-generated substring/copy allocations and
+checked-pointer metadata. UTF-16 editor positions are converted at protocol
+boundaries. Queued edits share an analysis pass after input becomes quiet;
+requests flush preceding changes and diagnostics carry document versions.
+See the [editor pressure gates](../probes/gates/editor-industrial/README.md)
+for sustained edits, token responses, synchronization and memory failure guards.
 
 ## VS Code and Cursor
 
@@ -90,16 +126,26 @@ On Linux, remove `.exe`. If you changed `build.output_dir` to `out`, update
 does not itself invoke a build. **Debug Current File** is a separate command
 that compiles the selected file with debug information before launching it.
 
-`vyxc-dap --stdio` provides launch, line breakpoints, stepping, stack frames,
-scopes, variables, and expression evaluation. On Linux it has a native
-ptrace/DWARF backend. Other hosts use an explicitly configured LLDB:
-set `VYX_LLDB` to the LLDB executable or `LLVM_ROOT` to its LLVM installation.
-A launch configuration can also set `debuggerPath`, for example
-`"C:/LLVM/bin/lldb.exe"`. VS Code's `vyx.llvmRoot` setting supplies an LLVM root.
+`vyxc-dap --stdio` delegates the protocol directly to CodeLLDB, on both
+Windows and Linux. The debugger owns asynchronous target execution, paged stack
+frames, lazy variable expansion, output streaming and session cleanup. The Vyx
+entry point does not retain copies of scopes, variables or target output.
+Features are negotiated through the actual debugger's `initialize` response.
 
-The adapter currently declares conditional breakpoints, function breakpoints,
-and variable assignment unsupported. Use ordinary line breakpoints and rebuild
-the program when changing values in source.
+The complete SDK supplies `bin/debugger/adapter/codelldb` and its matching LLDB
+runtime. Source builds prepare this bundle with
+`python scripts/prepare_debug_adapter.py` from `bootstrap_compiler/`. The
+archives are version pinned and SHA-256 checked. Cargo/Rust, Git and clang++
+are required to build the adapter from source; SDK users do not need them.
+The Vyx patch adds variable paging and separates Windows internal-console output
+from DAP transport. Packaging verifies the patch and executable hashes and
+preserves component licenses. See [debugger build details](../tools/debugger/README.md).
+To select another CodeLLDB or LLDB-DAP installation, set `VYX_DAP_ADAPTER` to its
+executable. The older `VYX_LLDB_DAP` variable remains accepted. In VS Code/Cursor,
+`debuggerPath` in a launch configuration selects the same override. Old `lldb`
+CLI paths select the sibling `lldb-dap`. Missing adapters produce an explicit
+startup error. Build the program with `-g -O0` for source and local-variable debug
+information. See [CodeLLDB](https://github.com/vadimcn/codelldb/blob/v1.12.3/MANUAL.md).
 
 ## IntelliJ IDEA and CLion
 
@@ -121,12 +167,22 @@ cd bootstrap_compiler/IDE-Plugins/IDEA/vyx
 ./gradlew buildPlugin -PvyxIdePath=/path/to/compatible/ide
 ```
 
+Pass `-PvyxSdkPath=/path/to/packaged/sdk` to include a complete SDK in the plugin:
+compiler, language server, debug adapter, runtime, standard packages and LLVM
+driver. Without this option, configure a complete SDK for builds outside the
+source checkout.
+
 Install the resulting ZIP under `build/distributions` using **Settings → Plugins
 → Install Plugin from Disk**. In **Settings → Languages & Frameworks → Vyx**,
 configure `vyxc`, `vyxc-lsp`, and `vyxc-dap` from your SDK. The plugin provides
 project creation for executable, static-library, and shared-library projects,
 language-server integration, Vyx run configurations, and DAP debugging.
 The executable and LLDB requirements are the same as above.
+
+**Build & Run Project** invokes `vyxc --run=aot --src=project <dir>` in the configured working
+directory and forwards the selected manifest target. Program arguments go after
+`--`. Debug builds use `-g -O0 --artifact-file <temporary-file>` and launch the
+compiler-reported executable path, including target-specific output directories.
 
 ## Building the servers from the repository
 

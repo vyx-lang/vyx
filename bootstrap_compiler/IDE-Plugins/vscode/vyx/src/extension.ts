@@ -235,8 +235,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const buildCommand = vscode.commands.registerCommand('vyx.buildProject', async () => {
         const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         const cwd = folder ?? path.dirname(vscode.window.activeTextEditor?.document.fileName ?? '.');
-        sendToTerminal('Vyx Build', `${quote(getCompilerPath())} build`);
-        void cwd;
+        sendToTerminal('Vyx Build', `${quote(getCompilerPath())} --src=project ${quote(cwd)}`);
     });
 
     const testCommand = vscode.commands.registerCommand('vyx.testFile', async () => {
@@ -256,12 +255,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     });
 
     const debugAdapterFactory = vscode.debug.registerDebugAdapterDescriptorFactory('vyx', {
-        createDebugAdapterDescriptor(): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
+        createDebugAdapterDescriptor(session: vscode.DebugSession): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
             const dapPath = getDapPath();
+            const env = spawnEnv(dapPath) as { [key: string]: string };
+            const debuggerPath: unknown = session.configuration.debuggerPath;
+            if (typeof debuggerPath === 'string' && debuggerPath.trim()) {
+                // Existing configurations may select the CLI; use its sibling DAP.
+                const selected = debuggerPath.trim();
+                const name = path.basename(selected).toLowerCase();
+                env.VYX_DAP_ADAPTER = name === 'lldb' || name === 'lldb.exe'
+                    ? path.join(path.dirname(selected), name.endsWith('.exe') ? 'lldb-dap.exe' : 'lldb-dap')
+                    : selected;
+            }
             log(`Starting DAP: ${dapPath}`);
             return new vscode.DebugAdapterExecutable(dapPath, [], {
                 cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-                env: spawnEnv(dapPath) as { [key: string]: string }
+                env
             });
         }
     });
@@ -312,10 +321,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await editor.document.save();
         const file = editor.document.fileName;
         const exeName = file.replace(/\.vyx$/, exeSuffix());
-        log(`Compile for debug: ${getCompilerPath()} -g --src=file --emit=exe -o ${exeName}`);
+        log(`Compile for debug: ${getCompilerPath()} -g -O0 --src=file --emit=exe -o ${exeName}`);
         vscode.window.setStatusBarMessage('Vyx: compiling with debug info…', 5000);
         const result = await runCompiler(
-            ['-g', '--src=file', file, '--emit=exe', '-o', exeName],
+            ['-g', '-O0', '--src=file', file, '--emit=exe', '-o', exeName],
             path.dirname(file)
         );
         if (result.code !== 0 || !fileExists(exeName)) {
@@ -351,9 +360,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 return task;
             };
             return [
-                def('build project', ['build']),
+                def('build project', ['--src=project', '${workspaceFolder}']),
                 def('compile current file', ['--src=file', '${file}', '--emit=exe']),
-                def('compile current file (debug)', ['-g', '--src=file', '${file}', '--emit=exe', '-o', '${fileDirname}/${fileBasenameNoExtension}' + exeSuffix()]),
+                def('compile current file (debug)', ['-g', '-O0', '--src=file', '${file}', '--emit=exe', '-o', '${fileDirname}/${fileBasenameNoExtension}' + exeSuffix()]),
                 def('run current file', ['--src=file', '${file}', '--run=aot'])
             ];
         },

@@ -30,6 +30,24 @@ use bootstrap.diag;
 use bootstrap.sema;
 
 extern "C" {
+    fn vyx_lsp_bind_create(root: rawptr);
+    fn vyx_lsp_bind_destroy();
+    fn vyx_lsp_bind_package_root(root: rawptr, priority: i32);
+    fn vyx_lsp_bind_file(path: rawptr, source: rawptr, length: i64, version: i32, writable: i32);
+    fn vyx_lsp_bind_close(path: rawptr);
+    fn vyx_lsp_bind_file_symbols(path: rawptr, unit: rawptr);
+    fn vyx_lsp_bind_metadata_next() -> rawptr;
+    fn vyx_lsp_bind_query(path: rawptr, line: i32, character: i32, mode: i32, new_name: rawptr, declarations: i32, versioned: i32);
+    fn vyx_lsp_bind_next() -> rawptr;
+    fn vyx_lsp_bind_registry() -> rawptr;
+    fn vyx_lsp_bind_result() -> rawptr;
+    fn vyx_lsp_bind_error() -> rawptr;
+    fn vyx_lsp_bind_validate_begin() -> i32;
+    fn vyx_lsp_bind_validate_end() -> i32;
+    fn vyx_lsp_bind_parse_push(path: rawptr);
+    fn vyx_lsp_bind_parse_pop();
+    fn vyx_lsp_bind_failed();
+
     fn getchar() -> i32;
     fn putchar(c: i32) -> i32;
     fn fflush(stream: rawptr) -> i32;
@@ -39,6 +57,18 @@ extern "C" {
     fn calloc(count: i64, size: i64) -> rawptr;
     fn getenv(name: rawptr) -> rawptr;
     fn cJSON_Delete(item: rawptr);
+    fn cJSON_ParseWithLengthOpts(text: rawptr, length: u64, end: rawptr, require_end: i32) -> rawptr;
+    fn cJSON_GetStringValue(item: rawptr) -> rawptr;
+    fn vyx_frontend_service_begin() -> rawptr;
+    fn vyx_frontend_service_end(mark: rawptr);
+    fn vyx_lsp_input_ready(timeout_ms: i32) -> i32;
+    fn vyx_runtime_memory_keep(ptr: rawptr);
+    fn vyx_frontend_free(ptr: rawptr);
+    fn vyx_forget_string_len(ptr: rawptr);
+    fn vyx_lsp_uri_equal(a: rawptr, b: rawptr) -> i32;
+    fn vyx_lsp_json_key(text: rawptr, len: i64, key: rawptr, key_len: i64, start: i64, end: i64) -> i64;
+    fn vyx_lsp_line_start(text: rawptr, len: i64, line: i32) -> i64;
+    fn vyx_lsp_utf16_column(text: rawptr, len: i64, line: i32, col: i32) -> i32;
 }
 
 @[platform("windows")]
@@ -68,9 +98,7 @@ public fn lsp_kind_keyword() -> i32 { return 14; }
 public fn lsp_kind_enum_member() -> i32 { return 20; }
 public fn lsp_kind_struct() -> i32 { return 22; }
 
-fn lsp_symbol_limit() -> i64 { return 32768; }
-
-class LspSymbol {
+struct LspSymbol {
     public name: string;
     public kind: i32;
     public detail: string;
@@ -87,13 +115,13 @@ class LspSymbol {
     public is_static: bool;
 }
 
-class LspScanState {
+struct LspScanState {
     public in_block: bool;
     public in_string: bool;
     public in_char: bool;
 }
 
-class LspUsePath {
+struct LspUsePath {
     public active: bool;
     public path: string;
     public start_col: i32;
@@ -103,6 +131,9 @@ class LspUsePath {
 class LspServer {
     public document_uris: Vec<string>;
     public document_texts: Vec<string>;
+    public document_versions: Vec<i32>;
+    public document_dirty: Vec<i32>;
+    public has_pending_analysis: bool;
     public symbols: Vec<LspSymbol>;
     public packages: Vec<string>;
     public diag_uris: Vec<string>;
@@ -115,11 +146,19 @@ class LspServer {
     public exe_dir: string;
     public initialized: bool;
     public shutdown_requested: bool;
+    public declaration_only: bool;
+    public lookup_ready: bool;
+    public rename_document_changes: bool;
+    public symbol_heads: Dict<string, i64>;
+    public symbol_next: Vec<i64>;
 
     public static fn create() -> LspServer {
         return LspServer {
             document_uris: Vec::<string>.new(),
             document_texts: Vec::<string>.new(),
+            document_versions: Vec::<i32>.new(),
+            document_dirty: Vec::<i32>.new(),
+            has_pending_analysis: false,
             symbols: Vec::<LspSymbol>.new(),
             packages: Vec::<string>.new(),
             diag_uris: Vec::<string>.new(),
@@ -131,9 +170,138 @@ class LspServer {
             workspace_root: "",
             exe_dir: "",
             initialized: false,
-            shutdown_requested: false
+            shutdown_requested: false,
+            declaration_only: false,
+            lookup_ready: false,
+            rename_document_changes: false,
+            symbol_heads: Dict::<string, i64>.new(),
+            symbol_next: Vec::<i64>.new()
         };
     }
+}
+
+// Persistent server text must not borrow the request's string arena.
+fn lsp_hold(text: string) -> string {
+    if (text.len == 0) { return ""; }
+    let buf = malloc(text.len + 1);
+    if (buf == null) { panic("LSP persistent text allocation failed"); }
+    memcpy(buf, text.c_str(), text.len);
+    var zero: i32 = 0;
+    memcpy(buf + text.len, to_rawptr(&zero), 1);
+    vyx_runtime_memory_keep(buf);
+    return str_from_parts(buf, text.len, text.len + 1, 0);
+}
+
+fn lsp_release(text: string) {
+    if (text.len == 0) { return; }
+    vyx_forget_string_len(text.c_str());
+    free(text.c_str());
+}
+
+fn lsp_release_symbol(s: LspSymbol) {
+    lsp_release(s.name); lsp_release(s.detail); lsp_release(s.owner);
+    lsp_release(s.type_name); lsp_release(s.uri);
+}
+
+// Internal index reads copy records as bytes. Returning a typed element
+// pointer here would allocate checked-pointer metadata for every candidate in
+// every symbol walk. These records borrow text owned by the server.
+fn lsp_symbol_at(data: rawptr, index: i64) -> LspSymbol {
+    var out: LspSymbol;
+    memcpy(to_rawptr(&out), data + index * sizeof::<LspSymbol>(), sizeof::<LspSymbol>());
+    return out;
+}
+fn lsp_text_at(data: rawptr, index: i64) -> string {
+    var out: string;
+    memcpy(to_rawptr(&out), data + index * sizeof::<string>(), sizeof::<string>());
+    return out;
+}
+
+// Name buckets preserve declaration order and the existing scope resolution.
+// They live only for a semantic-token request; no stale indices survive edits.
+fn lsp_lookup_begin(server: &mut LspServer) {
+    var tails = Dict::<string, i64>.new();
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let sym = lsp_symbol_at(server.symbols.data, i);
+        server.symbol_next.push(-1);
+        if (tails.contains(sym.name)) {
+            let previous = tails.get(sym.name);
+            memcpy(server.symbol_next.data + previous * 8, to_rawptr(&i), 8);
+        } else { server.symbol_heads.put(sym.name, i); }
+        tails.put(sym.name, i);
+        i = i + 1;
+    }
+    tails.destroy();
+    server.lookup_ready = true;
+}
+fn lsp_lookup_first(server: &mut LspServer, name: string) -> i64 {
+    if (!server.lookup_ready) { return 0; }
+    if (!server.symbol_heads.contains(name)) { return -1; }
+    return server.symbol_heads.get(name);
+}
+fn lsp_lookup_next(server: &mut LspServer, index: i64) -> i64 {
+    if (!server.lookup_ready) { return index + 1; }
+    var out: i64 = -1;
+    memcpy(to_rawptr(&out), server.symbol_next.data + index * 8, 8);
+    return out;
+}
+fn lsp_lookup_end(server: &mut LspServer) {
+    server.lookup_ready = false;
+    server.symbol_heads.destroy();
+    server.symbol_next.destroy();
+    server.symbol_heads = Dict::<string, i64>.new();
+    server.symbol_next = Vec::<i64>.new();
+}
+
+fn lsp_remove_uri_symbols(server: &mut LspServer, uri: string) {
+    var kept = Vec::<LspSymbol>.new();
+    var i: i64 = 0;
+    while (i < server.symbols.len) {
+        let s = lsp_symbol_at(server.symbols.data, i);
+        if (lsp_same_uri(s.uri, uri)) { lsp_release_symbol(s); }
+        else { kept.push(s); }
+        i = i + 1;
+    }
+    server.symbols.destroy();
+    server.symbols = kept;
+}
+
+fn lsp_service_end(server: &mut LspServer, mark: rawptr) {
+    // Server vectors own storage across requests; their elements already
+    // use lsp_hold. Everything else allocated by the runtime is temporary.
+    vyx_runtime_memory_keep(to_rawptr(server.document_uris));
+    vyx_runtime_memory_keep(server.document_uris.data);
+    vyx_runtime_memory_keep(to_rawptr(server.document_texts));
+    vyx_runtime_memory_keep(server.document_texts.data);
+    vyx_runtime_memory_keep(to_rawptr(server.document_versions));
+    vyx_runtime_memory_keep(server.document_versions.data);
+    vyx_runtime_memory_keep(to_rawptr(server.document_dirty));
+    vyx_runtime_memory_keep(server.document_dirty.data);
+    vyx_runtime_memory_keep(to_rawptr(server.symbols));
+    vyx_runtime_memory_keep(server.symbols.data);
+    vyx_runtime_memory_keep(to_rawptr(server.packages));
+    vyx_runtime_memory_keep(server.packages.data);
+    vyx_runtime_memory_keep(to_rawptr(server.diag_uris));
+    vyx_runtime_memory_keep(server.diag_uris.data);
+    vyx_runtime_memory_keep(to_rawptr(server.diag_codes));
+    vyx_runtime_memory_keep(server.diag_codes.data);
+    vyx_runtime_memory_keep(to_rawptr(server.diag_msgs));
+    vyx_runtime_memory_keep(server.diag_msgs.data);
+    vyx_runtime_memory_keep(to_rawptr(server.diag_lines));
+    vyx_runtime_memory_keep(server.diag_lines.data);
+    vyx_runtime_memory_keep(to_rawptr(server.diag_cols));
+    vyx_runtime_memory_keep(server.diag_cols.data);
+    vyx_runtime_memory_keep(to_rawptr(server.diag_jsons));
+    vyx_runtime_memory_keep(server.diag_jsons.data);
+
+    vyx_runtime_memory_keep(to_rawptr(server.symbol_heads));
+    vyx_runtime_memory_keep(server.symbol_heads.data);
+    vyx_runtime_memory_keep(to_rawptr(server.symbol_next));
+    vyx_runtime_memory_keep(server.symbol_next.data);
+    sema_service_dispose();
+    diag_service_dispose();
+    vyx_frontend_service_end(mark);
 }
 
 fn lsp_write_raw(text: string) {
@@ -259,19 +427,36 @@ fn lsp_read_message() -> string {
 }
 
 fn json_escape(s: string) -> string {
-    var out = "\"";
+    let buf = malloc(s.len * 6 + 3);
+    if (buf == null) { panic("LSP JSON allocation failed"); }
+    var n: i64 = 0;
+    var quote: i32 = 34;
+    memcpy(buf + n, to_rawptr(&quote), 1); n = n + 1;
     var i: i64 = 0;
+    let hex = "0123456789abcdef";
     while (i < s.len) {
-        let c = s.charAt(i);
-        if (c == 34) { out = out + "\\\""; }
-        else if (c == 92) { out = out + "\\\\"; }
-        else if (c == 10) { out = out + "\\n"; }
-        else if (c == 13) { out = out + "\\r"; }
-        else if (c == 9) { out = out + "\\t"; }
-        else if (c >= 32) { out = out + s.substring(i, i + 1); }
+        let c = s.charAt(i) & 255;
+        if (c == 34 || c == 92) {
+            var slash: i32 = 92;
+            memcpy(buf + n, to_rawptr(&slash), 1); n = n + 1;
+            memcpy(buf + n, to_rawptr(&c), 1); n = n + 1;
+        } else if (c < 32) {
+            memcpy(buf + n, "\\u00".c_str(), 4); n = n + 4;
+            var hi = hex.charAt((c >> 4) & 15);
+            var lo = hex.charAt(c & 15);
+            memcpy(buf + n, to_rawptr(&hi), 1); n = n + 1;
+            memcpy(buf + n, to_rawptr(&lo), 1); n = n + 1;
+        } else {
+            memcpy(buf + n, to_rawptr(&c), 1); n = n + 1;
+        }
         i = i + 1;
     }
-    return out + "\"";
+    memcpy(buf + n, to_rawptr(&quote), 1); n = n + 1;
+    var zero: i32 = 0;
+    memcpy(buf + n, to_rawptr(&zero), 1);
+    let out = from_cstr_len(buf, n).clone();
+    free(buf);
+    return out;
 }
 
 fn json_i32(n: i32) -> string {
@@ -289,18 +474,7 @@ fn json_find_key(json: string, key: string) -> i64 {
 }
 
 fn json_find_key_from(json: string, key: string, from: i64, to: i64) -> i64 {
-    let needle = "\"" + key + "\"";
-    var i = from;
-    if (i < 0) { i = 0; }
-    var end = to;
-    if (end < 0 || end > json.len) { end = json.len; }
-    while (i + needle.len <= end) {
-        if (json.substring(i, i + needle.len) == needle) {
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
+    return vyx_lsp_json_key(json.c_str(), json.len, key.c_str(), key.len, from, to);
 }
 
 fn json_extract_string(json: string, key: string) -> string {
@@ -319,24 +493,12 @@ fn json_extract_string_from(json: string, key: string, from: i64, to: i64) -> st
     }
     if (i >= json.len || json.charAt(i) != 34) { return ""; }
     i = i + 1;
+    let parsed = cJSON_ParseWithLengthOpts(json.c_str() + i - 1, (to - i + 1) as u64, null, 0);
+    if (parsed == null) { return ""; }
+    let value = cJSON_GetStringValue(parsed);
     var out = "";
-    while (i < json.len) {
-        let c = json.charAt(i);
-        if (c == 34) { break; }
-        if (c == 92 && i + 1 < json.len) {
-            let n = json.charAt(i + 1);
-            if (n == 110) { out = out + "\n"; }
-            else if (n == 114) { out = out + "\r"; }
-            else if (n == 116) { out = out + "\t"; }
-            else if (n == 34) { out = out + "\""; }
-            else if (n == 92) { out = out + "\\"; }
-            else { out = out + json.substring(i + 1, i + 2); }
-            i = i + 2;
-        } else {
-            out = out + json.substring(i, i + 1);
-            i = i + 1;
-        }
-    }
+    if (value != null) { out = from_cstr(value).clone(); }
+    cJSON_Delete(parsed);
     return out;
 }
 
@@ -622,13 +784,14 @@ fn lsp_uri_key(uri: string) -> string {
 }
 
 fn lsp_same_uri(a: string, b: string) -> bool {
-    return lsp_uri_key(a) == lsp_uri_key(b);
+    if (a == b) { return true; }
+    return vyx_lsp_uri_equal(a.c_str(), b.c_str()) != 0;
 }
 
 fn uri_path_clean(uri: string) -> string {
     var path = uri;
     if (path.startsWith("file:///")) {
-        path = path.substring(8, path.len);
+        path = path.substring(7, path.len);
     } else if (path.startsWith("file://")) {
         path = path.substring(7, path.len);
     }
@@ -885,7 +1048,6 @@ fn lsp_push_typed_symbol(server: &mut LspServer, name: string, kind: i32, detail
                          semantic_type: i32, is_static: bool) {
     if (name.len == 0) { return; }
     if (kind == lsp_kind_module()) { lsp_register_package(server, name); }
-    if (server.symbols.len >= lsp_symbol_limit()) { return; }
     var actual_end_line = end_line;
     var actual_end_col = end_col;
     if (actual_end_line < line || (actual_end_line == line && actual_end_col <= col)) {
@@ -893,12 +1055,12 @@ fn lsp_push_typed_symbol(server: &mut LspServer, name: string, kind: i32, detail
         actual_end_col = col + (name.len as i32);
     }
     let sym = LspSymbol {
-        name: name.clone(),
+        name: lsp_hold(name),
         kind: kind,
-        detail: detail.clone(),
-        owner: owner.clone(),
-        type_name: type_name.clone(),
-        uri: uri.clone(),
+        detail: lsp_hold(detail),
+        owner: lsp_hold(owner),
+        type_name: lsp_hold(type_name),
+        uri: lsp_hold(uri),
         line: line,
         col: col,
         end_line: actual_end_line,
@@ -1116,9 +1278,33 @@ fn lsp_index_dcib_file(server: &mut LspServer, path: string) {
 
 fn lsp_index_vyx_file(server: &mut LspServer, path: string) {
     if (!fileExists(path)) { return; }
+    let frame = vyx_frontend_service_begin();
     let text = readFile(path);
-    if (text.len == 0) { return; }
-    lsp_analyze_buffer(server, lsp_path_to_uri(path), text);
+    vyx_lsp_bind_file(path.c_str(), text.c_str(), text.len, -1, 1);
+    let uri = lsp_path_to_uri(path);
+    lsp_remove_uri_symbols(server, uri);
+    server.declaration_only = true;
+    diag_set_enabled(false);
+    lsp_trace("source-lex " + path);
+    let lex = lex_source(text);
+    if (lex != null) {
+        lsp_trace("source-parse " + path);
+        let unit = parse_unit(lex);
+        vyx_lsp_bind_file_symbols(path.c_str(), unit);
+        lsp_trace("source-index " + path);
+        if (unit != null) {
+            var decl = unit_get_decls(unit);
+            while (decl != null) {
+                lsp_index_decl_tree(server, decl, "", uri, text);
+                decl = decl_get_next(decl);
+            }
+        }
+        lsp_index_lexical_declarations(server, lex, uri, text);
+        lexer_dispose(lex);
+    }
+    diag_set_enabled(true);
+    server.declaration_only = false;
+    lsp_service_end(server, frame);
 }
 
 fn lsp_should_skip_dirname(name: string) -> bool {
@@ -1130,7 +1316,10 @@ fn lsp_should_skip_dirname(name: string) -> bool {
     if (name == "target") { return true; }
     if (name == ".idea") { return true; }
     if (name == ".vs") { return true; }
-    if (name == "probes") { return true; }
+    if (name == ".runs" || name == ".worktrees" || name == ".vscode") { return true; }
+    if (name == ".gradle" || name == ".intellijPlatform" || name == ".kotlin") { return true; }
+    if (name == "build" || name == "dist" || name == "deprecated_seeds") { return true; }
+    if (name == "seed" || name.startsWith("seed_")) { return true; }
     if (name == "out") { return true; }
     return false;
 }
@@ -1178,7 +1367,7 @@ fn lsp_register_package(server: &mut LspServer, name: string) {
         if (server.packages.get(j) == pkg) { return; }
         j = j + 1;
     }
-    server.packages.push(pkg.clone());
+    server.packages.push(lsp_hold(pkg));
 }
 
 fn lsp_module_name_from_text(content: string) -> string {
@@ -1242,8 +1431,20 @@ fn lsp_module_name_from_text(content: string) -> string {
 
 fn lsp_index_package_file(server: &mut LspServer, path: string) {
     if (!fileExists(path)) { return; }
-    let name = lsp_module_name_from_text(readFile(path));
+    let text = readFile(path);
+    vyx_lsp_bind_file(path.c_str(), text.c_str(), text.len, -1, 0);
+    let name = lsp_module_name_from_text(text);
     lsp_register_package(server, name);
+    let frame = vyx_frontend_service_begin();
+    diag_set_enabled(false);
+    let lexer = lex_source(text);
+    if (lexer != null) {
+        let unit = parse_unit(lexer);
+        vyx_lsp_bind_file_symbols(path.clone().c_str(), unit);
+        lexer_dispose(lexer);
+    }
+    diag_set_enabled(true);
+    lsp_service_end(server, frame);
 }
 
 fn lsp_scan_package_tree(server: &mut LspServer, root: string) {
@@ -1285,32 +1486,36 @@ fn lsp_scan_package_tree(server: &mut LspServer, root: string) {
     depths.destroy();
 }
 
-fn lsp_try_scan_package_root(server: &mut LspServer, root: string) {
+fn lsp_try_scan_package_root(server: &mut LspServer, root: string, priority: i32) {
     if (root.len == 0) { return; }
     if (isDir(root)) {
+        // Canonical providers require their registry. Legacy std directories
+        // are fallback providers, never additions to a canonical package tree.
+        if (priority < 100 && !fileExists(lsp_join_path(root, "registry"))) { return; }
+        vyx_lsp_bind_package_root(root.c_str(), priority);
         lsp_scan_package_tree(server, root);
     }
 }
 
 fn lsp_scan_registered_packages(server: &mut LspServer) {
-    lsp_try_scan_package_root(server, lsp_env_value("VYX_STD_PACKAGES"));
-    if (server.exe_dir.len > 0 && server.exe_dir != ".") {
-        lsp_try_scan_package_root(server, lsp_join_path(server.exe_dir, "std_packages"));
-        let parent = lsp_dirname(server.exe_dir);
-        lsp_try_scan_package_root(server, lsp_join_path(parent, "std_packages"));
-        lsp_try_scan_package_root(server, lsp_join_path(parent, "std"));
-    }
+    lsp_try_scan_package_root(server, lsp_env_value("VYX_STD_PACKAGES"), 0);
     if (server.workspace_root.len > 0) {
-        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "std_packages"));
-        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "std"));
-        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "bootstrap_compiler/std_packages"));
-        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "bootstrap_compiler/std"));
+        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "std_packages"), 1);
+        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "bootstrap_compiler/std_packages"), 2);
+        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "std"), 101);
+        lsp_try_scan_package_root(server, lsp_join_path(server.workspace_root, "bootstrap_compiler/std"), 102);
     }
-    lsp_try_scan_package_root(server, "std_packages");
-    lsp_try_scan_package_root(server, "bootstrap_compiler/std_packages");
+    if (server.exe_dir.len > 0 && server.exe_dir != ".") {
+        lsp_try_scan_package_root(server, lsp_join_path(server.exe_dir, "std_packages"), 3);
+        let parent = lsp_dirname(server.exe_dir);
+        lsp_try_scan_package_root(server, lsp_join_path(parent, "std_packages"), 4);
+        lsp_try_scan_package_root(server, lsp_join_path(parent, "std"), 104);
+    }
+    lsp_try_scan_package_root(server, "std_packages", 5);
+    lsp_try_scan_package_root(server, "bootstrap_compiler/std_packages", 6);
     var si: i64 = 0;
     while (si < server.symbols.len) {
-        let s = server.symbols.get(si);
+        let s = lsp_symbol_at(server.symbols.data, si);
         if (s.kind == lsp_kind_module()) {
             lsp_register_package(server, s.name);
         }
@@ -1327,7 +1532,6 @@ fn lsp_scan_workspace(server: &mut LspServer, root: string) {
     }
     var dirs = Vec::<string>.new();
     var depths = Vec::<i32>.new();
-    var vyx_paths = Vec::<string>.new();
     dirs.push(root);
     depths.push(0);
     var cursor: i64 = 0;
@@ -1344,7 +1548,6 @@ fn lsp_scan_workspace(server: &mut LspServer, root: string) {
             lsp_trace("scan-file " + lsp_join_path(dir, name));
             let full = lsp_join_path(dir, name);
             if (lsp_ends_with(name, ".vyx")) {
-                vyx_paths.push(full.clone());
                 lsp_index_vyx_file(server, full);
             } else if (lsp_ends_with(name, ".vyi")) {
                 lsp_index_vyi_file(server, full);
@@ -1365,14 +1568,6 @@ fn lsp_scan_workspace(server: &mut LspServer, root: string) {
         files.destroy();
         subdirs.destroy();
     }
-    // A second source pass resolves locals whose initializer refers to a type
-    // or method declared in a file encountered later during directory walk.
-    var vi: i64 = 0;
-    while (vi < vyx_paths.len) {
-        lsp_index_vyx_file(server, vyx_paths.get(vi));
-        vi = vi + 1;
-    }
-    vyx_paths.destroy();
     dirs.destroy();
     depths.destroy();
 }
@@ -1557,9 +1752,9 @@ fn lsp_find_visible_symbol(server: &mut LspServer, name: string, uri: string, li
     if (name.len == 0) { return empty; }
     var found = empty;
     var best_line: i32 = -1;
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let s = server.symbols.get(i);
+    var i: i64 = lsp_lookup_first(server, name);
+    while (i >= 0 && i < server.symbols.len) {
+        let s = lsp_symbol_at(server.symbols.data, i);
         if (s.name == name && lsp_same_uri(s.uri, uri)
             && s.scope_start_line >= 0
             && line >= s.scope_start_line && line <= s.scope_end_line
@@ -1567,48 +1762,48 @@ fn lsp_find_visible_symbol(server: &mut LspServer, name: string, uri: string, li
             found = s;
             best_line = s.line;
         }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
     if (found.name.len > 0) { return found; }
-    i = 0;
-    while (i < server.symbols.len) {
-        let s2 = server.symbols.get(i);
+    i = lsp_lookup_first(server, name);
+    while (i >= 0 && i < server.symbols.len) {
+        let s2 = lsp_symbol_at(server.symbols.data, i);
         if (s2.name == name && lsp_same_uri(s2.uri, uri) && s2.owner.len == 0
             && s2.scope_start_line < 0) { return s2; }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
-    i = 0;
-    while (i < server.symbols.len) {
-        let s_method = server.symbols.get(i);
+    i = lsp_lookup_first(server, name);
+    while (i >= 0 && i < server.symbols.len) {
+        let s_method = lsp_symbol_at(server.symbols.data, i);
         if (s_method.name == name && lsp_same_uri(s_method.uri, uri)
             && s_method.scope_start_line < 0) { return s_method; }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
-    i = 0;
-    while (i < server.symbols.len) {
-        let s3 = server.symbols.get(i);
+    i = lsp_lookup_first(server, name);
+    while (i >= 0 && i < server.symbols.len) {
+        let s3 = lsp_symbol_at(server.symbols.data, i);
         if (s3.name == name && s3.owner.len == 0 && s3.scope_start_line < 0) { return s3; }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
-    i = 0;
-    while (i < server.symbols.len) {
-        let s4 = server.symbols.get(i);
+    i = lsp_lookup_first(server, name);
+    while (i >= 0 && i < server.symbols.len) {
+        let s4 = lsp_symbol_at(server.symbols.data, i);
         if (s4.name == name && s4.scope_start_line < 0) { return s4; }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
     return empty;
 }
 
 fn lsp_find_member_symbol(server: &mut LspServer, owner_type: string, name: string) -> LspSymbol {
     let empty = lsp_empty_symbol();
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let s = server.symbols.get(i);
+    var i: i64 = lsp_lookup_first(server, name);
+    while (i >= 0 && i < server.symbols.len) {
+        let s = lsp_symbol_at(server.symbols.data, i);
         if (s.name == name && lsp_owner_matches(s.owner, owner_type)
             && (s.kind == lsp_kind_method() || s.kind == lsp_kind_field())) {
             return s;
         }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
     return empty;
 }
@@ -1741,6 +1936,7 @@ fn lsp_decl_value_type(server: &mut LspServer, decl: rawptr, uri: string) -> str
         return decl_get_name(decl);
     }
     if ((kind == de_FN() || kind == de_METHOD()) && decl_get_body(decl) != null) {
+        if (server.declaration_only) { return ""; }
         let inferred = lsp_infer_return_type_from_stmt(server, decl_get_body(decl), decl, uri);
         if (inferred.len > 0) { return inferred; }
         return "void";
@@ -1922,7 +2118,7 @@ fn lsp_index_decl_tree(server: &mut LspServer, decl: rawptr, owner: string,
                               decl_get_is_static(decl));
     }
 
-    if (kind == de_FN() || kind == de_EXTERN_FN() || kind == de_METHOD()) {
+    if (!server.declaration_only && (kind == de_FN() || kind == de_EXTERN_FN() || kind == de_METHOD())) {
         var scope_end_line = end_line;
         if (decl_get_body(decl) != null) {
             scope_end_line = lsp_decl_body_end_line(text, line);
@@ -1959,13 +2155,16 @@ fn lsp_index_decl_tree(server: &mut LspServer, decl: rawptr, owner: string,
 
 fn lsp_has_symbol_at(server: &mut LspServer, uri: string, name: string,
                      line: i32, col: i32) -> bool {
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let sym = server.symbols.get(i);
+    // The current file's declarations form the suffix of the index. The
+    // lexical supplement must not search every previously indexed file.
+    var i = server.symbols.len;
+    while (i > 0) {
+        i = i - 1;
+        let sym = lsp_symbol_at(server.symbols.data, i);
+        if (!lsp_same_uri(sym.uri, uri)) { break; }
         if (lsp_same_uri(sym.uri, uri) && sym.name == name && sym.line == line && sym.col == col) {
             return true;
         }
-        i = i + 1;
     }
     return false;
 }
@@ -2007,7 +2206,11 @@ fn lsp_index_lexical_declarations(server: &mut LspServer, lex: rawptr,
         }
         if (kind == tk_SEMI() && pending_owner.len > 0) { pending_owner = ""; }
         let next = lex_token_at(lex, i + 1);
-        if (token_kind(next) == tk_IDENT()) {
+        if (token_kind(next) == tk_IDENT() &&
+            (kind == tk_KEYWORD_FN() || kind == tk_KEYWORD_CLASS()
+            || kind == tk_KEYWORD_STRUCT() || kind == tk_KEYWORD_ENUM()
+            || kind == tk_KEYWORD_INTERFACE() || kind == tk_KEYWORD_TYPE()
+            || kind == tk_KEYWORD_MODULE())) {
             let name = token_lexeme(next);
             let line = lsp_to_zero_based(token_line(next));
             let col = lsp_to_zero_based(token_col(next));
@@ -2125,13 +2328,16 @@ fn lsp_note_ident_type(server: &mut LspServer, name: string, type_name: string,
     if (name.len == 0 || type_name.len == 0) { return; }
     var i: i64 = 0;
     while (i < server.symbols.len) {
-        var s = server.symbols.get(i);
+        var s = lsp_symbol_at(server.symbols.data, i);
         if (lsp_same_uri(s.uri, uri) && s.name == name
             && (s.line == line || s.type_name.len == 0)) {
             if (s.type_name.len == 0 || s.line == line) {
-                s.type_name = type_name.clone();
+                lsp_release(s.type_name);
+                s.type_name = lsp_hold(type_name);
                 if (!s.detail.contains(type_name)) {
-                    s.detail = s.detail + " : " + type_name;
+                    let detail = s.detail + " : " + type_name;
+                    lsp_release(s.detail);
+                    s.detail = lsp_hold(detail);
                 }
                 server.symbols.set(i, s);
                 return;
@@ -2146,6 +2352,22 @@ fn lsp_note_ident_type(server: &mut LspServer, name: string, type_name: string,
 
 fn lsp_walk_sema_expr(server: &mut LspServer, e: rawptr, uri: string) {
     if (e == null) { return; }
+    let expr_kind = expr_get_kind(e);
+    if (expr_kind == ex_CLOSURE()) {
+        lsp_walk_sema_stmt(server, expr_get_lhs(e), uri);
+        lsp_walk_sema_stmt(server, expr_get_captures(e), uri);
+        return;
+    }
+    if (expr_kind == ex_IF_EXPR()) {
+        lsp_walk_sema_expr(server, expr_get_lhs(e), uri);
+        lsp_walk_sema_stmt(server, expr_get_rhs(e), uri);
+        let otherwise = expr_get_args(e);
+        if (otherwise != null && expr_get_kind(otherwise) == ex_IF_EXPR()) {
+            lsp_walk_sema_expr(server, otherwise, uri);
+        } else { lsp_walk_sema_stmt(server, otherwise, uri); }
+        return;
+    }
+    if (expr_kind == ex_TERNARY()) { lsp_walk_sema_expr(server, expr_get_args(e), uri); }
     if (expr_get_kind(e) == ex_IDENT()) {
         let ty = expr_get_ty(e);
         if (ty != null) {
@@ -2156,6 +2378,7 @@ fn lsp_walk_sema_expr(server: &mut LspServer, e: rawptr, uri: string) {
     lsp_walk_sema_expr(server, expr_get_lhs(e), uri);
     lsp_walk_sema_expr(server, expr_get_rhs(e), uri);
     var arg = expr_get_args(e);
+    if (expr_kind == ex_TERNARY()) { arg = null; }
     while (arg != null) {
         lsp_walk_sema_expr(server, stmt_get_init(arg), uri);
         arg = stmt_get_next(arg);
@@ -2165,7 +2388,9 @@ fn lsp_walk_sema_expr(server: &mut LspServer, e: rawptr, uri: string) {
 fn lsp_walk_sema_stmt(server: &mut LspServer, sp: rawptr, uri: string) {
     var cur = sp;
     while (cur != null) {
-        lsp_walk_sema_expr(server, stmt_get_init(cur), uri);
+        if (stmt_get_kind(cur) == st_FOR() || stmt_get_kind(cur) == st_DEFER()) {
+            lsp_walk_sema_stmt(server, stmt_get_init(cur), uri);
+        } else { lsp_walk_sema_expr(server, stmt_get_init(cur), uri); }
         lsp_walk_sema_expr(server, stmt_get_cond(cur), uri);
         lsp_walk_sema_stmt(server, stmt_get_then_blk(cur), uri);
         lsp_walk_sema_stmt(server, stmt_get_else_blk(cur), uri);
@@ -2192,13 +2417,18 @@ fn lsp_clear_uri_diags(server: &mut LspServer, uri: string) {
     var nj = Vec::<string>.new();
     var i: i64 = 0;
     while (i < server.diag_uris.len) {
-        if (!lsp_same_uri(server.diag_uris.get(i), uri)) {
-            nu.push(server.diag_uris.get(i));
-            nc.push(server.diag_codes.get(i));
-            nm.push(server.diag_msgs.get(i));
+        if (!lsp_same_uri(lsp_text_at(server.diag_uris.data, i), uri)) {
+            nu.push(lsp_text_at(server.diag_uris.data, i));
+            nc.push(lsp_text_at(server.diag_codes.data, i));
+            nm.push(lsp_text_at(server.diag_msgs.data, i));
             nl.push(server.diag_lines.get(i));
             nco.push(server.diag_cols.get(i));
-            nj.push(server.diag_jsons.get(i));
+            nj.push(lsp_text_at(server.diag_jsons.data, i));
+        } else {
+            lsp_release(lsp_text_at(server.diag_uris.data, i));
+            lsp_release(lsp_text_at(server.diag_codes.data, i));
+            lsp_release(lsp_text_at(server.diag_msgs.data, i));
+            lsp_release(lsp_text_at(server.diag_jsons.data, i));
         }
         i = i + 1;
     }
@@ -2292,28 +2522,33 @@ fn lsp_publish_diagnostics(server: &mut LspServer, uri: string, text: string) {
         if (end_line == line && end_col <= col + 1) {
             end_col = lsp_extend_diag_end_col(text, line, col);
         }
-        server.diag_uris.push(uri.clone());
-        server.diag_codes.push(code.clone());
-        server.diag_msgs.push(msg.clone());
+        server.diag_uris.push(lsp_hold(uri));
+        server.diag_codes.push(lsp_hold(code));
+        server.diag_msgs.push(lsp_hold(msg));
         server.diag_lines.push(line);
         server.diag_cols.push(col);
         var item = "{\"range\":{\"start\":{\"line\":" + json_i32(line)
-            + ",\"character\":" + json_i32(col)
+            + ",\"character\":" + json_i32(lsp_source_col(text, line, col))
             + "},\"end\":{\"line\":" + json_i32(end_line)
-            + ",\"character\":" + json_i32(end_col)
+            + ",\"character\":" + json_i32(lsp_source_col(text, end_line, end_col))
             + "}},\"severity\":" + json_i32(lsp_sev)
             + ",\"code\":" + json_escape(code)
             + ",\"source\":\"vyxc\""
             + ",\"message\":" + json_escape(msg) + "}";
-        server.diag_jsons.push(item.clone());
+        server.diag_jsons.push(lsp_hold(item));
         if (n > 0) { items = items + ","; }
         items = items + item;
         n = n + 1;
         i = i + 1;
     }
     items = items + "]";
+    let document_idx = lsp_document_index(server, uri);
+    var version_json = "";
+    if (document_idx >= 0) {
+        version_json = ",\"version\":" + json_i32(server.document_versions.get(document_idx));
+    }
     lsp_send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":"
-        + json_escape(uri) + ",\"diagnostics\":" + items + "}}");
+        + json_escape(uri) + version_json + ",\"diagnostics\":" + items + "}}");
 }
 
 fn lsp_stored_diagnostics_json(server: &mut LspServer, uri: string) -> string {
@@ -2344,11 +2579,9 @@ fn lsp_handle_text_document_diagnostic(server: &mut LspServer, id_json: string, 
             text = readFile(path);
             if (text.len > 0) {
                 lsp_store_document(server, uri, text);
+                lsp_analyze_buffer(server, uri, text);
             }
         }
-    }
-    if (text.len > 0) {
-        lsp_analyze_buffer(server, uri, text);
     }
     return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
         + ",\"result\":{\"kind\":\"full\",\"items\":"
@@ -2356,6 +2589,7 @@ fn lsp_handle_text_document_diagnostic(server: &mut LspServer, id_json: string, 
 }
 
 fn lsp_analyze_buffer(server: &mut LspServer, uri: string, text: string) {
+    lsp_trace("buffer-lex " + uri);
     diag_set_source_context(uri_path_clean(uri), text);
     diag_capture_begin();
     diag_set_enabled(true);
@@ -2367,18 +2601,10 @@ fn lsp_analyze_buffer(server: &mut LspServer, uri: string, text: string) {
         return;
     }
     let unit = parse_unit(lex);
+    vyx_lsp_bind_file_symbols(uri_path_clean(uri).c_str(), unit);
+    lsp_trace("buffer-index " + uri);
 
-    var kept = Vec::<LspSymbol>.new();
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let s = server.symbols.get(i);
-        if (!lsp_same_uri(s.uri, uri)) {
-            kept.push(s);
-        }
-        i = i + 1;
-    }
-    server.symbols.destroy();
-    server.symbols = kept;
+    lsp_remove_uri_symbols(server, uri);
 
     if (unit != null) {
         var decl = unit_get_decls(unit);
@@ -2390,11 +2616,13 @@ fn lsp_analyze_buffer(server: &mut LspServer, uri: string, text: string) {
     lsp_index_lexical_declarations(server, lex, uri, text);
 
     if (unit != null) {
+        lsp_trace("buffer-sema " + uri);
         let handle = analyze_unit_with_registry_options(unit, "", false);
-        if (handle != null) { free(handle); }
+        if (handle != null) { vyx_frontend_free(handle); }
         lsp_walk_sema_decl(server, unit_get_decls(unit), uri);
     }
     lsp_publish_diagnostics(server, uri, text);
+    lsp_trace("buffer-done " + uri);
     diag_capture_end();
     diag_set_enabled(true);
     lexer_dispose(lex);
@@ -2424,26 +2652,13 @@ fn lsp_add_keywords(prefix: string) -> Vec<LspSymbol> {
 }
 
 fn lsp_line_at(text: string, line0: i32) -> string {
-    var line_no: i32 = 0;
-    var i: i64 = 0;
-    var start: i64 = 0;
-    while (i <= text.len) {
-        let at_end = i == text.len;
-        let is_nl = (!at_end) && text.charAt(i) == 10;
-        if (at_end || is_nl) {
-            if (line_no == line0) {
-                var line = text.substring(start, i);
-                if (line.len > 0 && line.charAt(line.len - 1) == 13) {
-                    line = line.substring(0, line.len - 1);
-                }
-                return line.clone();
-            }
-            line_no = line_no + 1;
-            start = i + 1;
-        }
-        i = i + 1;
-    }
-    return "";
+    let start = vyx_lsp_line_start(text.c_str(), text.len, line0);
+    if (start < 0) { return ""; }
+    let next = vyx_lsp_line_start(text.c_str(), text.len, line0 + 1);
+    var end = text.len;
+    if (next >= 0) { end = next - 1; }
+    if (end > start && text.charAt(end - 1) == 13) { end = end - 1; }
+    return text.substring(start, end);
 }
 
 fn lsp_utf16_len(s: string) -> i64 {
@@ -2604,7 +2819,7 @@ fn lsp_is_ident_char(c: i32) -> bool {
 fn lsp_word_at(text: string, line0: i32, col0: i32) -> string {
     let line = lsp_line_at(text, line0);
     if (line.len == 0) { return ""; }
-    var c = col0 as i64;
+    var c = lsp_utf16_to_byte(line, col0 as i64);
     if (c > line.len) { c = line.len; }
     var left = c;
     while (left > 0 && lsp_is_ident_char(line.charAt(left - 1))) {
@@ -2621,7 +2836,7 @@ fn lsp_word_at(text: string, line0: i32, col0: i32) -> string {
 fn lsp_prefix_at(text: string, line0: i32, col0: i32) -> string {
     let line = lsp_line_at(text, line0);
     if (line.len == 0) { return ""; }
-    var c = col0 as i64;
+    var c = lsp_utf16_to_byte(line, col0 as i64);
     if (c > line.len) { c = line.len; }
     var left = c;
     while (left > 0 && lsp_is_ident_char(line.charAt(left - 1))) {
@@ -2634,7 +2849,7 @@ fn lsp_prefix_at(text: string, line0: i32, col0: i32) -> string {
 fn lsp_receiver_before_member(text: string, line0: i32, col0: i32) -> string {
     let line = lsp_line_at(text, line0);
     if (line.len == 0) { return ""; }
-    var cursor = col0 as i64;
+    var cursor = lsp_utf16_to_byte(line, col0 as i64);
     if (cursor > line.len) { cursor = line.len; }
     while (cursor > 0 && lsp_is_ident_char(line.charAt(cursor - 1))) {
         cursor = cursor - 1;
@@ -2797,7 +3012,7 @@ fn lsp_collect_package_completions(server: &mut LspServer, prefix: string) -> Ve
         }
         var si: i64 = 0;
         while (si < server.symbols.len) {
-            let s = server.symbols.get(si);
+            let s = lsp_symbol_at(server.symbols.data, si);
             if (s.kind == lsp_kind_module()) {
                 let is_std2 = s.name == "std" || s.name.startsWith("std.");
                 if ((pass == 0 && is_std2) || (pass == 1 && !is_std2)) {
@@ -3228,7 +3443,7 @@ fn lsp_handle_formatting(server: &mut LspServer, id_json: string, body: string) 
 
 fn lsp_word_range_json(text: string, line0: i32, col0: i32) -> string {
     let line = lsp_line_at(text, line0);
-    var c = col0 as i64;
+    var c = lsp_utf16_to_byte(line, col0 as i64);
     if (c > line.len) { c = line.len; }
     var left = c;
     while (left > 0 && lsp_is_ident_char(line.charAt(left - 1))) { left = left - 1; }
@@ -3238,8 +3453,8 @@ fn lsp_word_range_json(text: string, line0: i32, col0: i32) -> string {
         return "{\"start\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(col0)
             + "},\"end\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(col0 + 1) + "}}";
     }
-    return "{\"start\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(left as i32)
-        + "},\"end\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(right as i32) + "}}";
+    return "{\"start\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(lsp_source_col(text, line0, left as i32))
+        + "},\"end\":{\"line\":" + json_i32(line0) + ",\"character\":" + json_i32(lsp_source_col(text, line0, right as i32)) + "}}";
 }
 
 fn lsp_collect_word_edits(text: string, word: string, replacement: string) -> string {
@@ -3267,9 +3482,9 @@ fn lsp_collect_word_edits(text: string, word: string, replacement: string) -> st
             if (ident == word) {
                 if (n > 0) { out = out + ","; }
                 out = out + "{\"range\":{\"start\":{\"line\":" + json_i32(line)
-                    + ",\"character\":" + json_i32(start_col)
+                    + ",\"character\":" + json_i32(lsp_source_col(text, line, start_col))
                     + "},\"end\":{\"line\":" + json_i32(line)
-                    + ",\"character\":" + json_i32(col)
+                    + ",\"character\":" + json_i32(lsp_source_col(text, line, col))
                     + "}},\"newText\":" + json_escape(replacement) + "}";
                 n = n + 1;
             }
@@ -3307,7 +3522,7 @@ fn lsp_occurrence_locations_json(text: string, uri: string, word: string) -> str
             }
             if (text.substring(start, k) == word) {
                 if (n > 0) { out = out + ","; }
-                out = out + lsp_location_json(uri, line, start_col, line, col);
+                out = out + lsp_location_json(uri, line, lsp_source_col(text, line, start_col), line, lsp_source_col(text, line, col));
                 n = n + 1;
             }
             continue;
@@ -3318,53 +3533,106 @@ fn lsp_occurrence_locations_json(text: string, uri: string, word: string) -> str
     return out + "]";
 }
 
-fn lsp_handle_references(server: &mut LspServer, id_json: string, body: string) -> string {
+// Binding queries analyze candidate source files one at a time. Registry and
+// unsaved source overlays are native value-owned data; no frontend AST survives.
+fn lsp_binding_response(server: &mut LspServer, id_json: string, body: string, mode: i32) -> string {
     let uri = json_extract_string(body, "uri");
+    let path = uri_path_clean(uri);
     let packed = json_position(body);
-    var line: i32 = 0;
-    var character: i32 = 0;
-    if (packed >= 0) {
-        line = (packed / 1000000) as i32;
-        character = (packed % 1000000) as i32;
-    }
-    let text = lsp_doc_text(server, uri);
-    let word = lsp_word_at(text, line, character);
-    if (word.len == 0) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":[]}"; }
-    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":" + lsp_occurrence_locations_json(text, uri, word) + "}";
-}
-
-fn lsp_handle_prepare_rename(server: &mut LspServer, id_json: string, body: string) -> string {
-    let uri = json_extract_string(body, "uri");
-    let packed = json_position(body);
-    var line: i32 = 0;
-    var character: i32 = 0;
-    if (packed >= 0) {
-        line = (packed / 1000000) as i32;
-        character = (packed % 1000000) as i32;
-    }
-    let text = lsp_doc_text(server, uri);
-    let word = lsp_word_at(text, line, character);
-    if (word.len == 0) { return lsp_response_null(id_json); }
-    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
-        + ",\"result\":" + lsp_word_range_json(text, line, character) + "}";
-}
-
-fn lsp_handle_rename(server: &mut LspServer, id_json: string, body: string) -> string {
-    let uri = json_extract_string(body, "uri");
-    let packed = json_position(body);
-    var line: i32 = 0;
-    var character: i32 = 0;
-    if (packed >= 0) {
-        line = (packed / 1000000) as i32;
-        character = (packed % 1000000) as i32;
-    }
+    if (packed < 0) { return lsp_response_null(id_json); }
+    let line = (packed / 1000000) as i32;
+    let character = (packed % 1000000) as i32;
     let new_name = json_extract_string(body, "newName");
-    let text = lsp_doc_text(server, uri);
-    let word = lsp_word_at(text, line, character);
-    if (word.len == 0 || new_name.len == 0) { return lsp_response_null(id_json); }
-    let edits = lsp_collect_word_edits(text, word, new_name);
-    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
-        + ",\"result\":{\"changes\":{" + json_escape(uri) + ":" + edits + "}}}";
+    if (mode == 2) {
+        let name_lexer = lex_source(new_name);
+        var valid = false;
+        if (name_lexer != null) {
+            let token = lex_token_at(name_lexer, 0);
+            valid = token_kind(token) == tk_IDENT() && token_lexeme(token) == new_name
+                && token_kind(lex_token_at(name_lexer, 1)) == tk_EOF();
+            lexer_dispose(name_lexer);
+        }
+        if (!valid) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"error\":{\"code\":-32602,\"message\":\"newName must be one Vyx identifier, excluding keywords.\"}}"; }
+    }
+    var include_decl: i32 = 0;
+    if (json_true(body, "includeDeclaration")) { include_decl = 1; }
+    var versioned: i32 = 0;
+    if (server.rename_document_changes) { versioned = 1; }
+    vyx_lsp_bind_query(path.c_str(), line, character, mode, new_name.c_str(), include_decl, versioned);
+    lsp_binding_refresh_metadata(server);
+    lsp_binding_analyze_candidates(server);
+    let result = from_cstr(vyx_lsp_bind_result()).clone();
+    if (mode == 2 && vyx_lsp_bind_validate_begin() != 0) {
+        lsp_binding_analyze_candidates(server);
+        vyx_lsp_bind_validate_end();
+    }
+    let binding_error = from_cstr(vyx_lsp_bind_error());
+    if (binding_error.len > 0) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"error\":{\"code\":-32803,\"message\":" + json_escape(binding_error) + "}}"; }
+    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":" + result + "}";
+}
+fn lsp_binding_refresh_metadata(server: &mut LspServer) {
+    var path_ptr = vyx_lsp_bind_metadata_next();
+    while (path_ptr != null) {
+        let frame = vyx_frontend_service_begin();
+        let path = from_cstr(path_ptr);
+        diag_set_enabled(false);
+        let lex = lex_source(sema_source_read(path));
+        if (lex != null) {
+            let unit = parse_unit(lex);
+            vyx_lsp_bind_file_symbols(path.c_str(), unit);
+            lexer_dispose(lex);
+        }
+        diag_set_enabled(true);
+        lsp_service_end(server, frame);
+        path_ptr = vyx_lsp_bind_metadata_next();
+    }
+}
+fn lsp_binding_analyze_candidates(server: &mut LspServer) {
+    var path_ptr = vyx_lsp_bind_next();
+    while (path_ptr != null) {
+        let frame = vyx_frontend_service_begin();
+        let path = from_cstr(path_ptr);
+        let source = sema_source_read(path);
+        diag_capture_begin();
+        diag_set_enabled(true);
+        diag_set_source_context(path, source);
+        let lex = lex_source(source);
+        if (lex != null) {
+            vyx_lsp_bind_parse_errors(lex_error_count(lex));
+            vyx_lsp_bind_parse_push(path.c_str());
+            let unit = parse_unit(lex);
+            vyx_lsp_bind_parse_pop();
+            if (unit != null) {
+                let registry = from_cstr(vyx_lsp_bind_registry());
+                let handle = analyze_unit_with_registry_options_codegen(unit, registry, false, false, false);
+                if (handle != null) { vyx_frontend_free(handle); }
+            } else {
+                vyx_lsp_bind_failed();
+            }
+            lexer_dispose(lex);
+        } else {
+            vyx_lsp_bind_failed();
+        }
+        var diagnostic: i32 = 0;
+        while (diagnostic < diag_capture_count()) {
+            lsp_trace("binding-diagnostic " + path + ":" + json_i32(diag_capture_line(diagnostic))
+                + " " + diag_capture_message(diagnostic));
+            diagnostic = diagnostic + 1;
+        }
+        diag_capture_end();
+        diag_set_enabled(true);
+        lsp_service_end(server, frame);
+        path_ptr = vyx_lsp_bind_next();
+    }
+}
+fn lsp_handle_references(server: &mut LspServer, id_json: string, body: string) -> string {
+    return lsp_binding_response(server, id_json, body, 0);
+}
+fn lsp_handle_prepare_rename(server: &mut LspServer, id_json: string, body: string) -> string {
+    return lsp_binding_response(server, id_json, body, 1);
+}
+fn lsp_handle_rename(server: &mut LspServer, id_json: string, body: string) -> string {
+    return lsp_binding_response(server, id_json, body, 2);
 }
 
 fn lsp_handle_folding(server: &mut LspServer, id_json: string, body: string) -> string {
@@ -3519,7 +3787,7 @@ fn lsp_handle_code_action(server: &mut LspServer, id_json: string, body: string)
         if (code == "E2000" && ident.len > 0) {
             var si: i64 = 0;
             while (si < server.symbols.len) {
-                let cand = server.symbols.get(si);
+                let cand = lsp_symbol_at(server.symbols.data, si);
                 if (lsp_similar_name(ident, cand.name)) {
                     if (n > 0) { out = out + ","; }
                     let wr = lsp_word_range_json(text, dline, dcol);
@@ -3580,10 +3848,13 @@ fn lsp_handle_initialize(server: &mut LspServer, id_json: string, body: string) 
     if (ws.len == 0) { ws = json_extract_string(body, "rootPath"); }
     if (ws.len == 0) { ws = json_extract_string(body, "uri"); }
     if (ws.len > 0) {
-        server.workspace_root = uri_path_clean(ws);
+        lsp_release(server.workspace_root);
+        server.workspace_root = lsp_hold(uri_path_clean(ws));
+        vyx_lsp_bind_create(server.workspace_root.c_str());
         lsp_scan_workspace(server, server.workspace_root);
     }
     lsp_scan_registered_packages(server);
+    server.rename_document_changes = json_true(body, "documentChanges");
     server.initialized = true;
     return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
         + ",\"result\":{"
@@ -3628,18 +3899,41 @@ fn lsp_document_index(server: &mut LspServer, uri: string) -> i64 {
 fn lsp_doc_text(server: &mut LspServer, uri: string) -> string {
     let idx = lsp_document_index(server, uri);
     if (idx < 0) { return ""; }
-    let slot = server.document_texts.get_ptr(idx);
-    return (*slot).clone();
+    // Borrow until the current handler replaces/closes the document. Full-file
+    // copies here multiply memory by the number of symbols and tokens queried.
+    return lsp_text_at(server.document_texts.data, idx);
 }
 
 fn lsp_store_document(server: &mut LspServer, uri: string, text: string) {
     let idx = lsp_document_index(server, uri);
+    let held_uri = lsp_hold(uri);
+    let held_text = lsp_hold(text);
     if (idx >= 0) {
-        let removed_uri = server.document_uris.remove(idx);
-        let removed_text = server.document_texts.remove(idx);
+        lsp_release(lsp_text_at(server.document_uris.data, idx));
+        lsp_release(lsp_text_at(server.document_texts.data, idx));
+        server.document_uris.set(idx, held_uri);
+        server.document_texts.set(idx, held_text);
+        return;
     }
-    server.document_uris.push(uri.clone());
-    server.document_texts.push(text.clone());
+    server.document_uris.push(held_uri);
+    server.document_texts.push(held_text);
+    server.document_versions.push(-1);
+    server.document_dirty.push(0);
+}
+
+fn lsp_flush_pending(server: &mut LspServer) {
+    if (!server.has_pending_analysis) { return; }
+    server.has_pending_analysis = false;
+    var i: i64 = 0;
+    while (i < server.document_uris.len) {
+        if (server.document_dirty.get(i) != 0) {
+            server.document_dirty.set(i, 0);
+            let uri = lsp_text_at(server.document_uris.data, i);
+            let text = lsp_text_at(server.document_texts.data, i);
+            lsp_analyze_buffer(server, uri, text);
+        }
+        i = i + 1;
+    }
 }
 
 fn lsp_handle_did_open(server: &mut LspServer, body: string) {
@@ -3647,38 +3941,54 @@ fn lsp_handle_did_open(server: &mut LspServer, body: string) {
     let text = json_extract_string(body, "text");
     if (uri.len == 0) { return; }
     lsp_store_document(server, uri, text);
-    lsp_analyze_buffer(server, uri, text);
+    let version = json_extract_int(body, "version") as i32;
+    server.document_versions.set(lsp_document_index(server, uri), version);
+    let source_path = uri_path_clean(uri);
+    vyx_lsp_bind_file(source_path.c_str(), text.c_str(), text.len, version, 1);
+    server.document_dirty.set(lsp_document_index(server, uri), 1);
+    server.has_pending_analysis = true;
 }
 
 fn lsp_handle_did_change(server: &mut LspServer, body: string) {
+    lsp_trace("change-begin");
     let uri = json_extract_string(body, "uri");
     if (uri.len == 0) { return; }
+    let document_idx = lsp_document_index(server, uri);
+    let version = json_extract_int(body, "version") as i32;
+    if (document_idx >= 0 && version <= server.document_versions.get(document_idx)) { return; }
     var text = lsp_doc_text(server, uri);
-    if (text.len == 0) {
+    if (document_idx < 0 && text.len == 0) {
         let path = uri_path_clean(uri);
         if (fileExists(path)) { text = readFile(path); }
     }
     text = lsp_apply_content_changes(text, body);
+    lsp_trace("change-text-decoded");
     lsp_store_document(server, uri, text);
-    lsp_analyze_buffer(server, uri, text);
+    server.document_versions.set(lsp_document_index(server, uri), version);
+    let source_path = uri_path_clean(uri);
+    vyx_lsp_bind_file(source_path.c_str(), text.c_str(), text.len, version, 1);
+    server.document_dirty.set(lsp_document_index(server, uri), 1);
+    server.has_pending_analysis = true;
 }
 
 fn lsp_handle_did_save(server: &mut LspServer, body: string) {
     let uri = json_extract_string(body, "uri");
     if (uri.len == 0) { return; }
     var text = "";
-    if (json_has_key(body, "text")) {
+    let has_text = json_has_key(body, "text");
+    if (has_text) {
         text = json_extract_string(body, "text");
     }
-    if (text.len == 0) {
+    if (!has_text && text.len == 0) {
         text = lsp_doc_text(server, uri);
     }
-    if (text.len == 0) {
+    if (!has_text && text.len == 0 && lsp_document_index(server, uri) < 0) {
         let path = uri_path_clean(uri);
         if (fileExists(path)) { text = readFile(path); }
     }
-    if (text.len == 0) { return; }
+    if (lsp_document_index(server, uri) >= 0 && text == lsp_doc_text(server, uri)) { return; }
     lsp_store_document(server, uri, text);
+    server.document_dirty.set(lsp_document_index(server, uri), 0);
     lsp_analyze_buffer(server, uri, text);
 }
 
@@ -3686,22 +3996,16 @@ fn lsp_handle_did_close(server: &mut LspServer, body: string) {
     let uri = json_extract_string(body, "uri");
     if (uri.len == 0) { return; }
     let document_idx = lsp_document_index(server, uri);
+    let source_path = uri_path_clean(uri);
+    vyx_lsp_bind_close(source_path.c_str());
     if (document_idx >= 0) {
         let removed_uri = server.document_uris.remove(document_idx);
         let removed_text = server.document_texts.remove(document_idx);
+        let removed_version = server.document_versions.remove(document_idx);
+        let removed_dirty = server.document_dirty.remove(document_idx);
+        lsp_release(removed_uri); lsp_release(removed_text);
     }
-    var kept = Vec::<LspSymbol>.new();
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let s = server.symbols.get(i);
-        let is_index = lsp_symbol_is_interface(s);
-        if (!lsp_same_uri(s.uri, uri) || is_index) {
-            kept.push(s);
-        }
-        i = i + 1;
-    }
-    server.symbols.destroy();
-    server.symbols = kept;
+    lsp_remove_uri_symbols(server, uri);
     lsp_clear_uri_diags(server, uri);
     lsp_send_message("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":"
         + json_escape(uri) + ",\"diagnostics\":[]}}");
@@ -3729,7 +4033,7 @@ fn lsp_completion_items_json(server: &mut LspServer, prefix: string, uri: string
         }
         var mi: i64 = 0;
         while (mi < server.symbols.len && count < 256) {
-            let member = server.symbols.get(mi);
+            let member = lsp_symbol_at(server.symbols.data, mi);
             if (lsp_owner_matches(member.owner, receiver_type)
                 && (member.kind == lsp_kind_method() || member.kind == lsp_kind_field())
                 && (prefix.len == 0 || member.name.startsWith(prefix))) {
@@ -3749,7 +4053,7 @@ fn lsp_completion_items_json(server: &mut LspServer, prefix: string, uri: string
 
     var i: i64 = 0;
     while (i < server.symbols.len && count < 256) {
-        let s = server.symbols.get(i);
+        let s = lsp_symbol_at(server.symbols.data, i);
         if (lsp_same_uri(s.uri, uri) && s.owner.len == 0
             && line >= s.scope_start_line && line <= s.scope_end_line
             && (s.scope_start_line < 0 || s.line <= line)
@@ -3767,7 +4071,7 @@ fn lsp_completion_items_json(server: &mut LspServer, prefix: string, uri: string
 
     i = 0;
     while (i < server.symbols.len && count < 256) {
-        let s = server.symbols.get(i);
+        let s = lsp_symbol_at(server.symbols.data, i);
         if (!lsp_same_uri(s.uri, uri) && s.owner.len == 0
             && (prefix.len == 0 || s.name.startsWith(prefix))) {
             let seen_key3 = lsp_completion_seen_key(s);
@@ -3828,17 +4132,17 @@ fn lsp_handle_completion(server: &mut LspServer, id_json: string, body: string) 
 fn lsp_find_symbol(server: &mut LspServer, name: string, prefer_uri: string) -> LspSymbol {
     let empty = lsp_empty_symbol();
     if (name.len == 0) { return empty; }
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let s = server.symbols.get(i);
+    var i: i64 = lsp_lookup_first(server, name);
+    while (i >= 0 && i < server.symbols.len) {
+        let s = lsp_symbol_at(server.symbols.data, i);
         if (s.name == name && lsp_same_uri(s.uri, prefer_uri)) { return s; }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
-    i = 0;
-    while (i < server.symbols.len) {
-        let s = server.symbols.get(i);
+    i = lsp_lookup_first(server, name);
+    while (i >= 0 && i < server.symbols.len) {
+        let s = lsp_symbol_at(server.symbols.data, i);
         if (s.name == name) { return s; }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
     return empty;
 }
@@ -3890,14 +4194,14 @@ fn lsp_semantic_token_type(server: &mut LspServer, uri: string, lex: rawptr, idx
     if (prev_kind == tk_KEYWORD_MODULE() || prev_kind == tk_KEYWORD_USE()
         || prev_kind == tk_KEYWORD_IMPORT()) { return 0; }
 
-    var si: i64 = 0;
-    while (si < server.symbols.len) {
-        let declared = server.symbols.get(si);
+    var si: i64 = lsp_lookup_first(server, word);
+    while (si >= 0 && si < server.symbols.len) {
+        let declared = lsp_symbol_at(server.symbols.data, si);
         if (lsp_same_uri(declared.uri, uri) && declared.name == word
             && declared.line == token_line0 && declared.col == token_col0) {
             return declared.semantic_type;
         }
-        si = si + 1;
+        si = lsp_lookup_next(server, si);
     }
 
     if (prev_kind == tk_DOT()) {
@@ -3934,9 +4238,9 @@ fn lsp_semantic_token_modifiers(server: &mut LspServer, uri: string,
     let word = token_lexeme(tok);
     let line = lsp_to_zero_based(token_line(tok));
     let col = lsp_to_zero_based(token_col(tok));
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let declared = server.symbols.get(i);
+    var i: i64 = lsp_lookup_first(server, word);
+    while (i >= 0 && i < server.symbols.len) {
+        let declared = lsp_symbol_at(server.symbols.data, i);
         if (lsp_same_uri(declared.uri, uri) && declared.name == word
             && declared.line == line && declared.col == col) {
             var modifiers: i32 = 1; // declaration
@@ -3944,7 +4248,7 @@ fn lsp_semantic_token_modifiers(server: &mut LspServer, uri: string,
             if (declared.is_static) { modifiers = modifiers | 8; }
             return modifiers;
         }
-        i = i + 1;
+        i = lsp_lookup_next(server, i);
     }
     let visible = lsp_find_visible_symbol(server, word, uri, line);
     var usage_modifiers: i32 = 0;
@@ -3964,7 +4268,9 @@ fn lsp_semantic_tokens_json(server: &mut LspServer, uri: string, text: string) -
         diag_set_enabled(true);
         return "[]";
     }
-    var data = "[";
+    lsp_lookup_begin(server);
+    var data = String.withCapacity(4096);
+    data.append("[");
     var emitted: i32 = 0;
     var last_line: i32 = 0;
     var last_col: i32 = 0;
@@ -3979,7 +4285,7 @@ fn lsp_semantic_tokens_json(server: &mut LspServer, uri: string, text: string) -
         if (kind != tk_EOF() && kind != tk_INVALID() && token_type >= 0 && lexeme.len > 0
             && !lexeme.contains("\n") && !lexeme.contains("\r")) {
             let line = lsp_to_zero_based(token_line(tok));
-            let col = lsp_to_zero_based(token_col(tok));
+            let col = lsp_source_col(text, line, lsp_to_zero_based(token_col(tok)));
             var delta_line = line;
             var delta_col = col;
             if (emitted > 0) {
@@ -3987,10 +4293,10 @@ fn lsp_semantic_tokens_json(server: &mut LspServer, uri: string, text: string) -
                 if (delta_line == 0) { delta_col = col - last_col; }
             }
             if (delta_line >= 0 && delta_col >= 0) {
-                if (emitted > 0) { data = data + ","; }
-                data = data + json_i32(delta_line) + "," + json_i32(delta_col)
-                    + "," + policy_i64_to_string(lexeme.len) + ","
-                    + json_i32(token_type) + "," + json_i32(token_modifiers);
+                if (emitted > 0) { data.append(","); }
+                data.append(json_i32(delta_line) + "," + json_i32(delta_col)
+                    + "," + policy_i64_to_string(lsp_utf16_len(lexeme)) + ","
+                    + json_i32(token_type) + "," + json_i32(token_modifiers));
                 last_line = line;
                 last_col = col;
                 emitted = emitted + 1;
@@ -3999,8 +4305,12 @@ fn lsp_semantic_tokens_json(server: &mut LspServer, uri: string, text: string) -
         i = i + 1;
     }
     lexer_dispose(lex);
+    lsp_lookup_end(server);
     diag_set_enabled(true);
-    return data + "]";
+    data.append("]");
+    let result = data.raw().clone();
+    data.destroy();
+    return result;
 }
 
 fn lsp_handle_semantic_tokens(server: &mut LspServer, id_json: string, body: string) -> string {
@@ -4009,7 +4319,7 @@ fn lsp_handle_semantic_tokens(server: &mut LspServer, id_json: string, body: str
     // Open documents are authoritative.  Reading disk first makes semantic
     // highlighting lag behind unsaved editor changes.
     var text = lsp_doc_text(server, uri);
-    if (text.len == 0 && fileExists(path)) { text = readFile(path); }
+    if (lsp_document_index(server, uri) < 0 && text.len == 0 && fileExists(path)) { text = readFile(path); }
     return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
         + ",\"result\":{\"data\":" + lsp_semantic_tokens_json(server, uri, text) + "}}";
 }
@@ -4026,24 +4336,12 @@ fn lsp_handle_signature_help(server: &mut LspServer, id_json: string, body: stri
     let document_path = uri_path_clean(uri);
     // Signature help must use the current editor buffer before the saved file.
     var document_text = lsp_doc_text(server, uri);
-    if (document_text.len == 0 && fileExists(document_path)) {
+    if (lsp_document_index(server, uri) < 0 && document_text.len == 0 && fileExists(document_path)) {
         document_text = readFile(document_path);
     }
     let line_text = lsp_line_at(document_text, line);
-    var cursor = character as i64;
+    var cursor = lsp_utf16_to_byte(line_text, character as i64);
     if (cursor > line_text.len) { cursor = line_text.len; }
-    if (cursor <= 0 && line_text.len > 0) {
-        // Recover when the bootstrap JSON extractor retained `line` but lost
-        // the nested `character` field. Signature help is requested inside a
-        // call, so the last closing parenthesis is the safest local boundary.
-        var p: i64 = 0;
-        var last_close: i64 = -1;
-        while (p < line_text.len) {
-            if (line_text.charAt(p) == 41) { last_close = p; }
-            p = p + 1;
-        }
-        if (last_close > 0) { cursor = last_close; }
-    }
     var active: i32 = 0;
     var call_name = "";
     var paren_depth: i32 = 0;
@@ -4098,7 +4396,7 @@ fn lsp_handle_signature_help(server: &mut LspServer, id_json: string, body: stri
     var signature = lsp_signature_from_text(document_text, call_name);
     var i: i64 = 0;
     while (signature.len == 0 && i < server.symbols.len) {
-        let candidate = server.symbols.get(i);
+        let candidate = lsp_symbol_at(server.symbols.data, i);
         if (candidate.name == call_name && lsp_same_uri(candidate.uri, uri)
             && (candidate.kind == lsp_kind_function() || candidate.kind == lsp_kind_method())) {
             signature = candidate.detail.clone();
@@ -4108,7 +4406,7 @@ fn lsp_handle_signature_help(server: &mut LspServer, id_json: string, body: stri
     }
     i = 0;
     while (signature.len == 0 && i < server.symbols.len) {
-        let candidate = server.symbols.get(i);
+        let candidate = lsp_symbol_at(server.symbols.data, i);
         if (candidate.name == call_name
             && (candidate.kind == lsp_kind_function() || candidate.kind == lsp_kind_method())) {
             signature = candidate.detail.clone();
@@ -4150,25 +4448,7 @@ fn lsp_symbol_kind(kind: i32) -> i32 {
 }
 
 fn lsp_line_char_len(text: string, line: i32) -> i32 {
-    if (line < 0) { return 0; }
-    var current: i32 = 0;
-    var i: i64 = 0;
-    var start: i64 = 0;
-    while (i <= text.len) {
-        let at_end = i == text.len;
-        if (at_end || text.charAt(i) == 10) {
-            if (current == line) {
-                var end = i;
-                if (end > start && text.charAt(end - 1) == 13) { end = end - 1; }
-                return (end - start) as i32;
-            }
-            current = current + 1;
-            start = i + 1;
-        }
-        if (at_end) { break; }
-        i = i + 1;
-    }
-    return 0;
+    return lsp_utf16_len(lsp_line_at(text, line)) as i32;
 }
 
 // CLion sticky lines use selectionRange.start as the text offset and range.end
@@ -4177,24 +4457,28 @@ fn lsp_line_char_len(text: string, line: i32) -> i32 {
 // highlighting pass and leaves the IDE indicator at "analyzing". Columns past
 // the real line are clamped first: the IDE clamps them too, and an unclamped
 // pair can collapse to the same document offset.
+fn lsp_source_col(text: string, line: i32, col: i32) -> i32 {
+    return vyx_lsp_utf16_column(text.c_str(), text.len, line, col);
+}
+fn lsp_source_range_json(text: string, start_line: i32, start_col: i32, end_line: i32, end_col: i32) -> string {
+    return lsp_range_json(start_line, lsp_source_col(text, start_line, start_col),
+                          end_line, lsp_source_col(text, end_line, end_col));
+}
 fn lsp_clamp_symbol_col(text: string, line: i32, col: i32) -> i32 {
-    let limit = lsp_line_char_len(text, line);
-    if (col < 0 || col > limit) { return limit; }
-    return col;
+    return lsp_source_col(text, line, col);
 }
 
-fn lsp_symbol_enclosing_end(server: &mut LspServer, sym: LspSymbol) -> i64 {
+fn lsp_symbol_enclosing_end(server: &mut LspServer, sym: LspSymbol, first: i64, end: i64) -> i64 {
     var best_line = sym.scope_end_line;
     var best_col: i32 = 0;
     if (best_line == 2147483647 || best_line < sym.line) {
         best_line = sym.end_line;
         best_col = sym.end_col;
     }
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let other = server.symbols.get(i);
-        if (lsp_same_uri(other.uri, sym.uri)
-            && other.scope_start_line == sym.line
+    var i = first;
+    while (i < end) {
+        let other = lsp_symbol_at(server.symbols.data, i);
+        if (other.scope_start_line == sym.line
             && other.scope_end_line > best_line
             && other.scope_end_line != 2147483647) {
             best_line = other.scope_end_line;
@@ -4224,19 +4508,28 @@ fn lsp_range_json(start_line: i32, start_col: i32, end_line: i32, end_col: i32) 
 
 fn lsp_handle_document_symbols(server: &mut LspServer, id_json: string, body: string) -> string {
     let uri = json_extract_string(body, "uri");
-    var out = "[";
+    let text = lsp_doc_text(server, uri);
+    var out = String.withCapacity(4096);
+    out.append("[");
     var count: i32 = 0;
-    var i: i64 = 0;
-    while (i < server.symbols.len) {
-        let sym = server.symbols.get(i);
+    var first: i64 = 0;
+    while (first < server.symbols.len && !lsp_same_uri(lsp_symbol_at(server.symbols.data, first).uri, uri)) {
+        first = first + 1;
+    }
+    var end = first;
+    while (end < server.symbols.len && lsp_same_uri(lsp_symbol_at(server.symbols.data, end).uri, uri)) {
+        end = end + 1;
+    }
+    var i = first;
+    while (i < end) {
+        let sym = lsp_symbol_at(server.symbols.data, i);
         if (lsp_same_uri(sym.uri, uri) && !lsp_symbol_is_interface(sym)) {
-            if (count > 0) { out = out + ","; }
-            let text = lsp_doc_text(server, uri);
+            if (count > 0) { out.append(","); }
             var start_line = sym.line;
             var start_col = lsp_clamp_symbol_col(text, start_line, sym.col);
             let line_len = lsp_line_char_len(text, start_line);
             if (start_col >= line_len && line_len > 0) { start_col = line_len - 1; }
-            let packed = lsp_symbol_enclosing_end(server, sym);
+            let packed = lsp_symbol_enclosing_end(server, sym, first, end);
             var range_end_line = (packed / 1000000) as i32;
             var range_end_col = lsp_clamp_symbol_col(text, range_end_line, (packed % 1000000) as i32);
             var sel_end_col = start_col + (sym.name.len as i32);
@@ -4254,17 +4547,20 @@ fn lsp_handle_document_symbols(server: &mut LspServer, id_json: string, body: st
             }
             let range = lsp_range_json(start_line, start_col, range_end_line, range_end_col);
             let selection = lsp_range_json(start_line, start_col, start_line, sel_end_col);
-            out = out + "{\"name\":" + json_escape(sym.name)
+            out.append("{\"name\":" + json_escape(sym.name)
                 + ",\"detail\":" + json_escape(sym.detail)
                 + ",\"kind\":" + json_i32(lsp_symbol_kind(sym.kind))
                 + ",\"range\":" + range
-                + ",\"selectionRange\":" + selection + "}";
+                + ",\"selectionRange\":" + selection + "}");
             count = count + 1;
         }
         i = i + 1;
     }
-    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
-        + ",\"result\":" + out + "]}";
+    out.append("]");
+    let result = "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
+        + ",\"result\":" + out.raw() + "}";
+    out.destroy();
+    return result;
 }
 
 fn lsp_handle_hover(server: &mut LspServer, id_json: string, body: string) -> string {
@@ -4357,8 +4653,8 @@ fn lsp_handle_definition(server: &mut LspServer, id_json: string, body: string) 
     }
     return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json
         + ",\"result\":{\"targetUri\":" + json_escape(sym.uri)
-        + ",\"targetRange\":" + lsp_range_json(sym.line, sym.col, target_end_line, target_end_col)
-        + ",\"targetSelectionRange\":" + lsp_range_json(sym.line, sym.col, sym.line, sym.col + (sym.name.len as i32))
+        + ",\"targetRange\":" + lsp_source_range_json(target_text, sym.line, sym.col, target_end_line, target_end_col)
+        + ",\"targetSelectionRange\":" + lsp_source_range_json(target_text, sym.line, sym.col, sym.line, sym.col + (sym.name.len as i32))
         + ",\"originSelectionRange\":" + origin + "}}";
 }
 
@@ -4371,64 +4667,7 @@ fn lsp_query_matches(name: string, query: string) -> bool {
 }
 
 fn lsp_handle_document_highlight(server: &mut LspServer, id_json: string, body: string) -> string {
-    let uri = json_extract_string(body, "uri");
-    let packed = json_position(body);
-    var line: i32 = 0;
-    var character: i32 = 0;
-    if (packed >= 0) {
-        line = (packed / 1000000) as i32;
-        character = (packed % 1000000) as i32;
-    }
-    let text = lsp_doc_text(server, uri);
-    let word = lsp_word_at(text, line, character);
-    if (word.len == 0) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":[]}"; }
-    var out = "[";
-    var n: i32 = 0;
-    var line2: i32 = 0;
-    var col2: i32 = 0;
-    var k: i64 = 0;
-    while (k < text.len) {
-        let ch = text.charAt(k);
-        if (ch == 10) {
-            line2 = line2 + 1;
-            col2 = 0;
-            k = k + 1;
-            continue;
-        }
-        if (lsp_is_ident_char(ch)) {
-            let start = k;
-            let start_col = col2;
-            while (k < text.len && lsp_is_ident_char(text.charAt(k))) {
-                k = k + 1;
-                col2 = col2 + 1;
-            }
-            let ident = text.substring(start, k).clone();
-            if (ident == word) {
-                var kind: i32 = 2;
-                var si: i64 = 0;
-                while (si < server.symbols.len) {
-                    let sym = server.symbols.get(si);
-                    if (lsp_same_uri(sym.uri, uri) && sym.name == word
-                        && sym.line == line2 && sym.col == start_col) {
-                        kind = 3;
-                        break;
-                    }
-                    si = si + 1;
-                }
-                if (n > 0) { out = out + ","; }
-                out = out + "{\"range\":{\"start\":{\"line\":" + json_i32(line2)
-                    + ",\"character\":" + json_i32(start_col)
-                    + "},\"end\":{\"line\":" + json_i32(line2)
-                    + ",\"character\":" + json_i32(col2)
-                    + "}},\"kind\":" + json_i32(kind) + "}";
-                n = n + 1;
-            }
-            continue;
-        }
-        col2 = col2 + 1;
-        k = k + 1;
-    }
-    return "{\"jsonrpc\":\"2.0\",\"id\":" + id_json + ",\"result\":" + out + "]}";
+    return lsp_binding_response(server, id_json, body, 4);
 }
 
 fn lsp_handle_workspace_symbol(server: &mut LspServer, id_json: string, body: string) -> string {
@@ -4437,12 +4676,12 @@ fn lsp_handle_workspace_symbol(server: &mut LspServer, id_json: string, body: st
     var n: i32 = 0;
     var i: i64 = 0;
     while (i < server.symbols.len) {
-        let sym = server.symbols.get(i);
+        let sym = lsp_symbol_at(server.symbols.data, i);
         if (sym.name.len > 0 && lsp_query_matches(sym.name, query)) {
             if (n > 0) { out = out + ","; }
             var item = "{\"name\":" + json_escape(sym.name)
                 + ",\"kind\":" + json_i32(lsp_symbol_kind(sym.kind))
-                + ",\"location\":" + lsp_location_json(sym.uri, sym.line, sym.col, sym.end_line, sym.end_col);
+                + ",\"location\":" + lsp_location_json(sym.uri, sym.line, lsp_source_col(lsp_doc_text(server, sym.uri), sym.line, sym.col), sym.end_line, lsp_source_col(lsp_doc_text(server, sym.uri), sym.end_line, sym.end_col));
             if (sym.owner.len > 0) {
                 item = item + ",\"containerName\":" + json_escape(sym.owner);
             }
@@ -4458,6 +4697,9 @@ fn lsp_handle_workspace_symbol(server: &mut LspServer, id_json: string, body: st
 fn lsp_dispatch(server: &mut LspServer, body: string) -> i32 {
     let method = json_extract_string(body, "method");
     let id_json = json_extract_id_json(body);
+    // Every request sees all preceding edits. Notifications can coalesce until
+    // the input becomes quiet without retaining old ASTs or running Sema per key.
+    if (id_json.len > 0 && id_json != "null") { lsp_flush_pending(server); }
 
     if (method == "initialize") {
         lsp_send_message(lsp_handle_initialize(server, id_json, body));
@@ -4539,21 +4781,36 @@ fn main() -> i32 {
     }
 
     var server = LspServer.create();
+    vyx_lsp_bind_create("".c_str());
     if (argCount() > 0) {
         server.exe_dir = lsp_dirname(getArg(0));
     }
     while (true) {
+        let frame = vyx_frontend_service_begin();
         let msg = lsp_read_message();
-        if (msg.len == 0) { break; }
+        if (msg.len == 0) { lsp_service_end(&mut server, frame); break; }
         let cont = lsp_dispatch(&mut server, msg);
+        if (cont != 0 && server.has_pending_analysis && vyx_lsp_input_ready(20) == 0) {
+            lsp_flush_pending(&mut server);
+        }
+        lsp_service_end(&mut server, frame);
         if (cont == 0) { break; }
     }
     while (server.document_uris.len > 0) {
         let uri = server.document_uris.pop();
         let text = server.document_texts.pop();
+        lsp_release(uri); lsp_release(text);
     }
+    vyx_lsp_bind_destroy();
     server.document_uris.destroy();
     server.document_texts.destroy();
+    server.document_versions.destroy();
+    server.document_dirty.destroy();
+    var si: i64 = 0;
+    while (si < server.symbols.len) { lsp_release_symbol(lsp_symbol_at(server.symbols.data, si)); si = si + 1; }
+    var pi: i64 = 0;
+    while (pi < server.packages.len) { lsp_release(lsp_text_at(server.packages.data, pi)); pi = pi + 1; }
+    lsp_release(server.workspace_root);
     server.symbols.destroy();
     server.packages.destroy();
     server.diag_uris.destroy();
@@ -4563,4 +4820,13 @@ fn main() -> i32 {
     server.diag_cols.destroy();
     server.diag_jsons.destroy();
     return 0;
+}
+
+fn json_true(body: string, key: string) -> bool {
+    let position = json_find_key_from(body, key, 0, body.len);
+    if (position < 0) { return false; }
+    var cursor = position + key.len + 2;
+    while (cursor < body.len && body.charAt(cursor) != 58) { cursor = cursor + 1; }
+    cursor = json_skip_ws(body, cursor + 1);
+    return cursor + 4 <= body.len && body.substring(cursor, cursor + 4) == "true";
 }

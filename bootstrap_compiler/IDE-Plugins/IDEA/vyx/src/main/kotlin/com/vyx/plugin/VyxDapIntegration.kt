@@ -42,8 +42,6 @@ import com.intellij.xdebugger.breakpoints.XBreakpointType
 import com.intellij.xdebugger.breakpoints.XLineBreakpointType
 import com.intellij.xdebugger.XDebuggerUtil
 import com.intellij.xdebugger.XSourcePosition
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.io.File
 import com.intellij.openapi.util.TextRange
 import com.intellij.xdebugger.frame.XInlineDebuggerDataCallback
@@ -104,28 +102,12 @@ private class VyxDebugAdapterDescriptor(private val project: Project) :
         executionResult: ExecutionResult?,
         sessionId: String,
     ): DebugAdapterHandle {
-        val config = environment.runProfile as? VyxRunConfig
-        if (config != null) {
-            val output = withContext(Dispatchers.IO) {
-                CapturingProcessHandler(config.debugBuildCommand()).runProcess()
-            }
-            if (output.exitCode != 0) {
-                val message = (output.stderr + "\n" + output.stdout).trim()
-                throw ExecutionException(if (message.isEmpty()) "Vyx debug build failed" else message)
-            }
-            val program = config.debugExecutable().absoluteFile
-            if (!program.isFile) {
-                throw ExecutionException("Vyx debug executable was not produced: ${program.path}")
-            }
-        }
-
         val executable = resolveAdapterExecutable(project)
         val debugger = resolveDebuggerExecutable()
         val command = GeneralCommandLine(executable)
             .withWorkDirectory(project.basePath)
         configureLldbRuntime(command, executable)
         if (debugger != null) command.environment["VYX_LLDB"] = debugger
-        command.environment["VYX_DAP_TRACE"] = "1"
         return CommandLineDebugAdapterHandle(command)
     }
 
@@ -229,6 +211,24 @@ class VyxDapLaunchArgumentsProvider : DapLaunchArgumentsProvider {
 
     override fun getLaunchArguments(project: Project, profile: RunProfile): LaunchRequestArguments {
         val config = profile as VyxRunConfig
+        // Resolve the artifact before constructing launch arguments. The
+        // adapter descriptor is started separately and must not guess a path
+        // before the compiler has selected and built the executable target.
+        var output: com.intellij.execution.process.ProcessOutput? = null
+        val completed = com.intellij.openapi.progress.ProgressManager.getInstance()
+            .runProcessWithProgressSynchronously({
+                output = CapturingProcessHandler(config.debugBuildCommand())
+                    .runProcessWithProgressIndicator(
+                        com.intellij.openapi.progress.ProgressManager.getInstance().progressIndicator)
+            }, "Building Vyx debug target", true, project)
+        if (!completed || output?.isCancelled == true) {
+            throw com.intellij.openapi.progress.ProcessCanceledException()
+        }
+        val built = output ?: throw ExecutionException("Vyx debug build did not start")
+        if (built.exitCode != 0) {
+            val message = (built.stderr + "\n" + built.stdout).trim()
+            throw ExecutionException(if (message.isEmpty()) "Vyx debug build failed" else message)
+        }
         val program = config.debugExecutable().absoluteFile
         val cwd = File(config.workDir.ifBlank { project.basePath ?: "." }).absolutePath
         val arguments = linkedMapOf<String, Any>(
