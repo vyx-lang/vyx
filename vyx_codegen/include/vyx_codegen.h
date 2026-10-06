@@ -427,9 +427,30 @@ VYX_API int64_t vyx_bootstrap_process_spawn(const char* command,
                                             const char* stderr_path,
                                             const char* env_name,
                                             const char* env_value);
+/* Exact argv: concatenated decimal-byte-length ':' UTF-8 argument records.
+ * No shell parsing or environment expansion is applied to argv or cwd. */
+VYX_API int64_t vyx_bootstrap_process_spawn_args(const char* args,
+                                                 const char* cwd,
+                                                 const char* stdout_path,
+                                                 const char* stderr_path,
+                                                 const char* env_name,
+                                                 const char* env_value);
 VYX_API int32_t vyx_bootstrap_process_is_running(int64_t id);
 VYX_API int32_t vyx_bootstrap_process_exit_code(int64_t id);
 VYX_API int32_t vyx_bootstrap_process_wait(int64_t id);
+// Explicit temporary lifetimes for LSP frontend analysis. Must close LIFO.
+VYX_API void* vyx_rt_service_begin();
+VYX_API void  vyx_rt_service_end(void* mark);
+VYX_API void* vyx_rt_service_alloc(uint64_t size);
+VYX_API void  vyx_rt_service_free(void* ptr);
+VYX_API void  vyx_rt_service_track(void* ptr, void (*release)(void*));
+VYX_API void  vyx_rt_service_untrack(void* ptr);
+VYX_API int64_t vyx_lsp_json_key(const char*, int64_t, const char*, int64_t, int64_t, int64_t);
+VYX_API int64_t vyx_lsp_line_start(const char*, int64_t, int32_t);
+VYX_API int32_t vyx_lsp_utf16_column(const char*, int64_t, int32_t, int32_t);
+VYX_API int32_t vyx_lsp_input_ready(int32_t timeout_ms);
+VYX_API int32_t vyx_dap_run_adapter(const char* executable);
+VYX_API int32_t vyx_lsp_uri_equal(const char* a, const char* b);
 VYX_API void    vyx_bootstrap_process_close(int64_t id);
 VYX_API int32_t vyx_bootstrap_copy_file(const char* src, const char* dst);
 VYX_API int32_t vyx_bootstrap_copy_tree(const char* src, const char* dst);
@@ -546,6 +567,8 @@ VYX_API void*   vyx_rt_array_elem_type(void* arr_ty);  /* element Type*  */
 /* ------------------------------------------------------------------- */
 /*  17. Native DAP engine (Linux ptrace + DWARF)                        */
 /* ------------------------------------------------------------------- */
+/* Merge verified project IR units using the bundled LLVM backend. */
+VYX_API int32_t vyx_bootstrap_link_ir_files(const char* inputs, const char* output);
 VYX_API int32_t vyx_dap_engine_available(void);
 VYX_API int32_t vyx_dap_launch(const char* exe, const char* cwd);
 VYX_API int32_t vyx_dap_set_breakpoint(const char* file, int32_t line);

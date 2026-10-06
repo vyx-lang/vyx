@@ -29,6 +29,11 @@
 #include <utility>
 #include <vector>
 
+extern "C" void* vyx_rt_service_alloc(uint64_t size);
+extern "C" void vyx_rt_service_free(void* ptr);
+extern "C" int32_t vyx_rt_service_active();
+extern "C" void vyx_rt_service_string_alias(void* base, void* text);
+
 #pragma warning(push, 0)
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Config/llvm-config.h>
@@ -40,6 +45,7 @@
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/DynamicLibrary.h>
 #include <llvm/Support/SHA256.h>
@@ -77,6 +83,48 @@
 #  include <pthread.h>
 #  define VYX_RT_ABI __attribute__((visibility("default")))
 #endif
+
+extern "C" VYX_RT_ABI int32_t vyx_bootstrap_link_ir_files(const char* inputs, const char* output) {
+    if (!inputs || !output || !*output) return 1;
+    llvm::LLVMContext context;
+    std::unique_ptr<llvm::Module> merged;
+    std::string rows(inputs);
+    size_t start = 0;
+    while (start < rows.size()) {
+        const size_t end = rows.find('\n', start);
+        std::string path = rows.substr(start, end == std::string::npos ? end : end - start);
+        start = end == std::string::npos ? rows.size() : end + 1;
+        if (!path.empty() && path.back() == '\r') path.pop_back();
+        if (path.empty()) continue;
+        llvm::SMDiagnostic diagnostic;
+        auto unit = llvm::parseIRFile(path, diagnostic, context);
+        if (!unit) {
+            diagnostic.print("vyxc project IR", llvm::errs());
+            return 1;
+        }
+        if (!merged) {
+            merged = std::move(unit);
+        } else {
+            if (merged->getTargetTriple() != unit->getTargetTriple() ||
+                merged->getDataLayoutStr() != unit->getDataLayoutStr()) {
+                llvm::errs() << "vyxc project IR: incompatible target or data layout: " << path << "\n";
+                return 1;
+            }
+            if (llvm::Linker::linkModules(*merged, std::move(unit))) return 1;
+        }
+    }
+    if (!merged || llvm::verifyModule(*merged, &llvm::errs())) return 1;
+    std::error_code error;
+    llvm::raw_fd_ostream stream(output, error);
+    if (error) {
+        llvm::errs() << "vyxc project IR: " << output << ": " << error.message() << "\n";
+        return 1;
+    }
+    merged->print(stream, nullptr);
+    stream.flush();
+    if (stream.has_error()) return 1;
+    return 0;
+}
 
 #define VYX_POINTER_RT_ABI VYX_RT_ABI // pointer-handle ABI v3: module-owned release
 #include "vyx_pointer_handle_rt.inc"
@@ -548,7 +596,10 @@ static void vyx_intern_unlock_excl() {
 
 static void vyx_rt_note_string_len_cached(const char* s, uint64_t len);
 
+static char* vyx_rt_dup_bytes(const char* s, uint64_t len);
+
 static VyxInternedStr vyx_rt_intern_bytes(const char* s, uint64_t len) {
+    if (vyx_rt_service_active()) return VyxInternedStr{vyx_rt_dup_bytes(s, len), len};
     VyxInternedStr out;
     VyxInternKey probe{s, len};
     vyx_intern_lock_shared();
@@ -725,6 +776,7 @@ extern "C" VYX_RT_ABI char* vyx_string_alloc_abi(int64_t capacity) {
         ? kVyxRtPooledStringClasses[class_index]
         : requested;
     const auto bytes = sizeof(VyxRtPooledStringNode) + payload;
+    if (vyx_rt_service_active()) { class_index = static_cast<uint32_t>(kVyxRtPooledStringClasses.size()); }
     auto& state = vyx_rt_pooled_string_state();
     if (class_index < kVyxRtPooledStringClasses.size()) {
         auto*& head = state.free_lists[class_index];
@@ -740,7 +792,7 @@ extern "C" VYX_RT_ABI char* vyx_string_alloc_abi(int64_t capacity) {
             return data;
         }
     }
-    auto* node = static_cast<VyxRtPooledStringNode*>(std::malloc(bytes));
+    auto* node = static_cast<VyxRtPooledStringNode*>(vyx_rt_service_alloc(bytes));
     if (!node) {
         std::fprintf(stderr,
                      "[vyx-rt] pooled string malloc failed bytes=%zu\n",
@@ -752,6 +804,7 @@ extern "C" VYX_RT_ABI char* vyx_string_alloc_abi(int64_t capacity) {
     node->class_index = class_index;
     node->reserved = 0;
     auto* data = reinterpret_cast<char*>(node + 1);
+    vyx_rt_service_string_alias(node, data);
     data[0] = '\0';
     return data;
 }
@@ -772,7 +825,7 @@ extern "C" VYX_RT_ABI void vyx_free_pooled_string(char* data) {
         state.counts[node->class_index] += 1u;
         return;
     }
-    std::free(node);
+    vyx_rt_service_free(node);
 }
 
 static VyxRtStringLenCache& vyx_rt_string_len_cache() {
@@ -1463,7 +1516,7 @@ extern "C" VYX_RT_ABI void vyx_free_runtime_string(char* s) {
         return;
     }
     (void)vyx_rt_forget_string_len(s);
-    std::free(s);
+    vyx_rt_service_free(s);
 }
 
 extern "C" VYX_RT_ABI void* vyx_rt_string_arena_alloc(int64_t bytes) {
@@ -2662,6 +2715,11 @@ extern "C" VYX_RT_ABI int32_t vyx_bootstrap_copy_files_with_ext(const char* src_
         return 1;
     }
 
+    // Local manifest dependencies can already share the consumer's directory.
+    // Compare filesystem identity, including symlinks and case on Windows.
+    if (std::filesystem::equivalent(src_root, dst_root, ec)) return 0;
+    if (ec) return 1;
+
     int32_t errors = 0;
     const auto opts = std::filesystem::directory_options::skip_permission_denied;
     std::filesystem::recursive_directory_iterator it(src_root, opts, ec);
@@ -2716,6 +2774,9 @@ extern "C" VYX_RT_ABI int32_t vyx_bootstrap_copy_runtime_assets(const char* src_
     if (ec) {
         return 1;
     }
+
+    if (std::filesystem::equivalent(src_root, dst_root, ec)) return 0;
+    if (ec) return 1;
 
     int32_t errors = 0;
     const auto opts = std::filesystem::directory_options::skip_permission_denied;
@@ -2968,14 +3029,14 @@ static std::string vyx_bootstrap_expand_path_env(std::string_view value) {
 
 static char* vyx_rt_dup_malloc_bytes(const char* s, uint64_t len) {
     if (!s || len == 0) {
-        auto* out = static_cast<char*>(std::malloc(1));
+        auto* out = static_cast<char*>(vyx_rt_service_alloc(1));
         if (out) {
             out[0] = '\0';
             vyx_rt_note_string_len_cached(out, 0);
         }
         return out;
     }
-    auto* out = static_cast<char*>(std::malloc(static_cast<std::size_t>(len + 1)));
+    auto* out = static_cast<char*>(vyx_rt_service_alloc(static_cast<std::size_t>(len + 1)));
     if (!out) { return nullptr; }
     std::memcpy(out, s, static_cast<std::size_t>(len));
     out[len] = '\0';
@@ -3831,21 +3892,18 @@ static bool vyx_bootstrap_open_output_fd(const char* path, int& fd) {
 }
 #endif
 
-extern "C" VYX_RT_ABI int64_t vyx_bootstrap_process_spawn(const char* command,
+static int64_t vyx_bootstrap_process_spawn_impl(std::vector<std::string> argv,
                                                           const char* cwd,
                                                           const char* stdout_path,
                                                           const char* stderr_path,
                                                           const char* env_name,
                                                           const char* env_value) {
-    if (!command || !command[0]) {
+    if (argv.empty() || argv[0].empty()) {
         return 0;
     }
 
     auto proc = std::make_unique<VyxBootstrapProcess>();
-    const std::string expanded_command = vyx_bootstrap_expand_environment_variables(command);
-    const std::string expanded_cwd = (cwd && cwd[0])
-        ? vyx_bootstrap_expand_environment_variables(cwd)
-        : std::string();
+    const std::string expanded_cwd = cwd ? cwd : "";
 
 #ifdef _WIN32
     auto vyx_bootstrap_utf8_to_wide = [](const std::string& s) -> std::vector<wchar_t> {
@@ -3860,7 +3918,6 @@ extern "C" VYX_RT_ABI int64_t vyx_bootstrap_process_spawn(const char* command,
         MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), needed);
         return out;
     };
-    std::vector<std::string> argv = vyx_bootstrap_split_command_line(expanded_command);
     if (argv.empty()) {
         return 0;
     }
@@ -4018,7 +4075,6 @@ extern "C" VYX_RT_ABI int64_t vyx_bootstrap_process_spawn(const char* command,
     proc->pi = pi;
     proc->job = child_job;
 #else
-    std::vector<std::string> argv = vyx_bootstrap_split_command_line(expanded_command);
     if (argv.empty()) {
         return 0;
     }
@@ -4096,6 +4152,46 @@ extern "C" VYX_RT_ABI int64_t vyx_bootstrap_process_spawn(const char* command,
     vyx_bootstrap_next_process_id() = id + 1;
     vyx_bootstrap_processes().emplace(id, std::move(proc));
     return id;
+}
+
+extern "C" VYX_RT_ABI int64_t vyx_bootstrap_process_spawn(const char* command,
+    const char* cwd, const char* stdout_path, const char* stderr_path,
+    const char* env_name, const char* env_value) {
+    if (!command) return 0;
+    const std::string expanded_cwd = cwd
+        ? vyx_bootstrap_expand_environment_variables(cwd) : "";
+    return vyx_bootstrap_process_spawn_impl(
+        vyx_bootstrap_split_command_line(vyx_bootstrap_expand_environment_variables(command)),
+        expanded_cwd.c_str(), stdout_path, stderr_path, env_name, env_value);
+}
+
+extern "C" VYX_RT_ABI int64_t vyx_bootstrap_process_spawn_args(const char* args,
+    const char* cwd, const char* stdout_path, const char* stderr_path,
+    const char* env_name, const char* env_value) {
+    if (!args) return 0;
+    const std::string_view packed(args);
+    std::vector<std::string> argv;
+    std::size_t offset = 0;
+    while (offset < packed.size()) {
+        std::size_t length = 0;
+        const std::size_t start = offset;
+        while (offset < packed.size() && packed[offset] >= '0' && packed[offset] <= '9') {
+            const unsigned digit = packed[offset++] - '0';
+            if (length > packed.size() / 10 ||
+                (length == packed.size() / 10 && digit > packed.size() % 10)) return 0;
+            length = length * 10 + digit;
+        }
+        if (offset == start || offset == packed.size() || packed[offset++] != ':' ||
+            length > packed.size() - offset) return 0;
+        argv.emplace_back(packed.substr(offset, length));
+        offset += length;
+    }
+    // On Windows compiler printf is exported by this DLL and uses its CRT.
+    // Flush that stream before the child inherits stdout; flushing only the
+    // executable's CRT would leave the build log behind the program output.
+    std::fflush(nullptr);
+    return vyx_bootstrap_process_spawn_impl(std::move(argv), cwd, stdout_path,
+                                           stderr_path, env_name, env_value);
 }
 
 // Caller holds vyx_bootstrap_process_mutex(), which also guards handle close.

@@ -4,6 +4,8 @@
 #   include/vyx_codegen.h      — current C ABI surface (112 VYX_API exports)
 #   src/vyx_codegen.cpp        — LLVM bridge implementation
 #   src/vyx_bootstrap_rt.cpp   — bootstrap runtime string/time helpers
+#   src/vyx_service_memory.cpp — compiler service allocation scopes
+#   src/vyx_dap_launcher.cpp   — SDK debugger process launcher
 #
 # Outputs:
 #   <build>/vyx_compiler_backend.dll         (Windows)
@@ -46,6 +48,9 @@ add_library(vyx_compiler_backend SHARED
     include/vyx_codegen.h
     src/vyx_codegen.cpp
     src/vyx_bootstrap_rt.cpp
+    src/vyx_service_memory.cpp
+    src/vyx_lsp_bindings.cpp
+    src/vyx_dap_launcher.cpp
 )
 
 target_compile_definitions(vyx_compiler_backend PRIVATE VYX_CODEGEN_BUILD)
