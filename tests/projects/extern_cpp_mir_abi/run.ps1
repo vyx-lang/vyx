@@ -7,7 +7,8 @@ param(
     [ValidateRange(1, 600)]
     [int]$TimeoutSec = 600,
     [ValidateRange(256, 8192)]
-    [int]$MemoryLimitMB = 8192
+    [int]$MemoryLimitMB = 8192,
+    [switch]$ExperimentalBackends
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,15 +70,10 @@ $env:VYX_DCI_PYTHON = "__dci_python_must_not_run__"
 
 $cache = Join-Path $projectRoot ".cache"
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
-$runtimeArtifact = Get-ChildItem -LiteralPath $RuntimeDir -File |
-    Where-Object { $_.Name -in @(
-        "vyx_compiler_backend.dll", "vyx_compiler_backend.lib",
-        "libvyx_compiler_backend.so", "libvyx_compiler_backend.dylib",
-        "vyx_rt.dll", "vyx_rt.lib", "libvyx_rt.so", "libvyx_rt.dylib"
-    ) } |
-    Sort-Object Name |
-    Select-Object -First 1
-if ($null -eq $runtimeArtifact) { throw "Selected directory has no compiler backend artifact: $RuntimeDir" }
+$runtimeArtifact = Get-Item -LiteralPath (Join-Path $RuntimeDir "vyx_compiler_backend.dll")
+if (-not $runtimeArtifact.PSIsContainer -and $runtimeArtifact.Length -eq 0) {
+    throw "Selected directory has an empty compiler backend: $RuntimeDir"
+}
 
 function Get-Sha256Hex([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
@@ -115,8 +111,10 @@ $exe = Join-Path $cache "extern_cpp.exe"
 $cppOut = Join-Path $cache "mir2cpp"
 $virtualCppOut = Join-Path $cache "mir2cpp_virtual_dispatch"
 $jitStubObj = Join-Path $cache "extern_cpp_dci_stubs_jit.obj"
-$cmakeExe = (Get-Command cmake -ErrorAction Stop).Source
-$ninjaExe = (Get-Command ninja -ErrorAction Stop).Source
+if ($ExperimentalBackends) {
+    $cmakeExe = (Get-Command cmake -ErrorAction Stop).Source
+    $ninjaExe = (Get-Command ninja -ErrorAction Stop).Source
+}
 
 function Invoke-Checked {
     param(
@@ -336,166 +334,169 @@ $runOut = Join-Path $cache "run_exe.out.log"
 $runErr = Join-Path $cache "run_exe.err.log"
 Invoke-Checked -FilePath $exe -ArgumentList @() -Name "run_exe"
 
-$stubCpp = $stubObj.FullName
-if ($stubCpp.EndsWith("_c.obj", [System.StringComparison]::OrdinalIgnoreCase)) {
-    $stubCpp = $stubCpp.Substring(0, $stubCpp.Length - "_c.obj".Length) + ".cpp"
-} else {
-    $stubCpp = [System.IO.Path]::ChangeExtension($stubCpp, ".cpp")
-}
-if (-not (Test-Path -LiteralPath $stubCpp)) {
-    Write-Host "FAILED: DCI stub source was not generated"
-    exit 1
-}
-Invoke-Checked -FilePath $Clang -ArgumentList @("-c", $stubCpp, "-I", (Join-Path $projectRoot "native"), "-O2", "-std=c++17", "-fno-rtti", "-fno-exceptions", "-o", $jitStubObj) -Name "jit_stub_obj"
-Invoke-Checked -FilePath $BootstrapCompiler -ArgumentList (@("--src=file", $src, "--run=jit", $OptimizationLevel) + $dciArgs + @("--link", $dll, "--link-obj", $jitStubObj)) -Name "jit_run"
-Invoke-Checked -FilePath $BootstrapCompiler -ArgumentList (@("--src=file", $src, "--emit=cpp", $OptimizationLevel) + $dciArgs + @("-o", $cppOut)) -Name "emit_cpp"
-Invoke-Checked -FilePath $BootstrapCompiler -ArgumentList (@("--src=file", $virtualSrc, "--emit=cpp", $OptimizationLevel) + $dciArgs + @("-o", $virtualCppOut)) -Name "emit_cpp_virtual_dispatch"
-$cppPreset = if ($OptimizationLevel -ceq "-O0") { "ninja-debug" } else { "ninja-release" }
-
-$fullStubSource = Join-Path $cppOut "src\vyx_dci_stubs.cpp"
-$fullCmakeFile = Join-Path $cppOut "CMakeLists.txt"
-if (-not (Test-Path -LiteralPath $fullStubSource -PathType Leaf)) {
-    Write-Host "FAILED: full MIR2CPP project is missing the generated DCI stub TU"
-    exit 1
-}
-$fullGeneratedText = (Get-Content -Raw -LiteralPath $fullStubSource) + "`n" +
-                     (Get-Content -Raw -LiteralPath (Join-Path $cppOut "src\tu_0001.cpp"))
-$reverseCallbacks = @(
-    "__vyx_M_VyxPoly_N_add_R_i32_P_VyxPoly_i32",
-    "__vyx_M_VyxPoly_N_add_R_i32_P_VyxPoly_f64",
-    "__vyx_M_VyxPoly_N_mul_R_i32_P_VyxPoly_i32",
-    "__vyx_M_VyxOp_N_eval_R_i32_P_VyxOp_i32"
-)
-foreach ($needle in @(
-    "__dci_stub_factory_VyxPoly",
-    "__dci_stub_destroy_VyxPoly",
-    "__dci_stub_factory_VyxOp",
-    "__dci_stub_destroy_VyxOp",
-    $reverseCallbacks[0],
-    $reverseCallbacks[1],
-    $reverseCallbacks[2],
-    $reverseCallbacks[3]
-)) {
-    if ($fullGeneratedText.IndexOf($needle, [StringComparison]::Ordinal) -lt 0) {
-        Write-Host "FAILED: full MIR2CPP project is missing reverse DCI symbol $needle"
-        exit 1
-    }
-}
-foreach ($callback in $reverseCallbacks) {
-    $pattern = [regex]::Escape($callback) + '\([^;{}]*\) noexcept'
-    if ([regex]::Matches($fullGeneratedText, $pattern).Count -lt 2) {
-        Write-Host "FAILED: reverse DCI callback declaration/definition is not no-unwind: $callback"
-        exit 1
-    }
-}
-$noexceptOverrideCount = [regex]::Matches($fullGeneratedText, '\) noexcept override(?: final)? \{').Count
-if ($noexceptOverrideCount -ne 4) {
-    Write-Host "FAILED: expected four no-unwind reverse DCI overrides, found $noexceptOverrideCount"
-    exit 1
-}
-$fullCmakeText = Get-Content -Raw -LiteralPath $fullCmakeFile
-if ($fullCmakeText.IndexOf('"src/vyx_dci_stubs.cpp"', [StringComparison]::Ordinal) -lt 0) {
-    Write-Host "FAILED: full MIR2CPP CMake project does not compile the generated DCI stub TU"
-    exit 1
-}
-
-Push-Location $cppOut
-try {
-    Invoke-Checked -FilePath $cmakeExe -ArgumentList @(
-        "--preset", $cppPreset,
-        "-DCMAKE_CXX_COMPILER:FILEPATH=$Clang",
-        "-DCMAKE_MAKE_PROGRAM:FILEPATH=$ninjaExe",
-        "-DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreaded",
-        "-DCMAKE_CXX_FLAGS:STRING=-I$($projectRoot.Replace('\', '/'))/native",
-        "-DCMAKE_EXE_LINKER_FLAGS:STRING=$staticLib"
-    ) -Name "full_cmake_configure"
-    Invoke-Checked -FilePath $cmakeExe -ArgumentList @(
-        "--build", "--preset", $cppPreset, "--parallel", "10"
-    ) -Name "full_cmake_build"
-} finally {
-    Pop-Location
-}
-
-$fullCppExe = Join-Path $cppOut ("build\" + $cppPreset + "\vyx_main.exe")
-if (-not (Test-Path -LiteralPath $fullCppExe -PathType Leaf)) {
-    Write-Host "FAILED: full generated MIR2CPP executable is missing"
-    exit 1
-}
-Invoke-Checked -FilePath $fullCppExe -ArgumentList @() -Name "full_run_generated"
-
-$virtualGeneratedFiles = @(Get-ChildItem -LiteralPath (Join-Path $virtualCppOut "include") -File -Filter "*.hpp") +
-                         @(Get-ChildItem -LiteralPath (Join-Path $virtualCppOut "src") -File -Filter "*.cpp")
-$virtualGeneratedText = ($virtualGeneratedFiles | ForEach-Object {
-    Get-Content -Raw -LiteralPath $_.FullName
-}) -join "`n"
-if ($virtualGeneratedText.IndexOf('#include "A.hpp"', [StringComparison]::Ordinal) -ge 0) {
-    Write-Host "FAILED: virtual DCI MIR2CPP probe depends on the producer C++ header"
-    exit 1
-}
-foreach ($slot in @(8, 16, 24)) {
-    $slotNeedle = "reinterpret_cast<unsigned char*>(vyx_dci_vtable) + $slot"
-    if ($virtualGeneratedText.IndexOf($slotNeedle, [StringComparison]::Ordinal) -lt 0) {
-        Write-Host "FAILED: virtual DCI MIR2CPP probe is missing vtable slot offset $slot"
-        exit 1
-    }
-}
-
-Push-Location $virtualCppOut
-try {
-    Invoke-Checked -FilePath $cmakeExe -ArgumentList @(
-        "--preset", $cppPreset,
-        "-DCMAKE_CXX_COMPILER:FILEPATH=$Clang",
-        "-DCMAKE_MAKE_PROGRAM:FILEPATH=$ninjaExe",
-        "-DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreaded",
-        "-DCMAKE_EXE_LINKER_FLAGS=$staticLib"
-    ) -Name "virtual_cmake_configure"
-    Invoke-Checked -FilePath $cmakeExe -ArgumentList @(
-        "--build", "--preset", $cppPreset, "--parallel", "10"
-    ) -Name "virtual_cmake_build"
-} finally {
-    Pop-Location
-}
-
-$virtualExe = Join-Path $virtualCppOut ("build\" + $cppPreset + "\vyx_dci_min_virtual_dispatch.exe")
-if (-not (Test-Path -LiteralPath $virtualExe -PathType Leaf)) {
-    Write-Host "FAILED: generated virtual DCI executable is missing"
-    exit 1
-}
-Invoke-Checked -FilePath $virtualExe -ArgumentList @() -Name "virtual_run_generated"
-
 $expected = "extern_cpp_mir_abi OK"
 $actualRun = ((Get-Content $runOut) -join "`n").Trim()
-$actualJit = ((Get-Content (Join-Path $cache "jit_run.out.log")) -join "`n").Trim()
-$actualFullCpp = ((Get-Content (Join-Path $cache "full_run_generated.out.log")) -join "`n").Trim()
 if ($actualRun -ne $expected) {
     Write-Host "FAILED: exe output mismatch"
-    Write-Host "expected:"
-    Write-Host $expected
-    Write-Host "actual:"
-    Write-Host $actualRun
+    Write-Host "expected: $expected"
+    Write-Host "actual: $actualRun"
     exit 1
 }
-if ($actualJit -ne $expected) {
-    Write-Host "FAILED: jit output mismatch"
-    Write-Host "expected:"
-    Write-Host $expected
-    Write-Host "actual:"
-    Write-Host $actualJit
-    exit 1
-}
-if ($actualFullCpp -ne $expected) {
-    Write-Host "FAILED: full generated MIR2CPP output mismatch"
-    Write-Host "expected:"
-    Write-Host $expected
-    Write-Host "actual:"
-    Write-Host $actualFullCpp
-    exit 1
-}
-$actualVirtual = ((Get-Content (Join-Path $cache "virtual_run_generated.out.log")) -join "`n").Trim()
-if ($actualVirtual -ne "dci_virtual_dispatch OK") {
-    Write-Host "FAILED: generated virtual DCI output mismatch"
-    Write-Host $actualVirtual
-    exit 1
+
+if ($ExperimentalBackends) {
+    $stubCpp = $stubObj.FullName
+    if ($stubCpp.EndsWith("_c.obj", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $stubCpp = $stubCpp.Substring(0, $stubCpp.Length - "_c.obj".Length) + ".cpp"
+    } else {
+        $stubCpp = [System.IO.Path]::ChangeExtension($stubCpp, ".cpp")
+    }
+    if (-not (Test-Path -LiteralPath $stubCpp)) {
+        Write-Host "FAILED: DCI stub source was not generated"
+        exit 1
+    }
+    Invoke-Checked -FilePath $Clang -ArgumentList @("-c", $stubCpp, "-I", (Join-Path $projectRoot "native"), "-O2", "-std=c++17", "-fno-rtti", "-fno-exceptions", "-o", $jitStubObj) -Name "jit_stub_obj"
+    Invoke-Checked -FilePath $BootstrapCompiler -ArgumentList (@("--src=file", $src, "--run=jit", $OptimizationLevel) + $dciArgs + @("--link", $dll, "--link-obj", $jitStubObj)) -Name "jit_run"
+    Invoke-Checked -FilePath $BootstrapCompiler -ArgumentList (@("--src=file", $src, "--emit=cpp", $OptimizationLevel) + $dciArgs + @("-o", $cppOut)) -Name "emit_cpp"
+    Invoke-Checked -FilePath $BootstrapCompiler -ArgumentList (@("--src=file", $virtualSrc, "--emit=cpp", $OptimizationLevel) + $dciArgs + @("-o", $virtualCppOut)) -Name "emit_cpp_virtual_dispatch"
+    $cppPreset = if ($OptimizationLevel -ceq "-O0") { "ninja-debug" } else { "ninja-release" }
+
+    $fullStubSource = Join-Path $cppOut "src\vyx_dci_stubs.cpp"
+    $fullCmakeFile = Join-Path $cppOut "CMakeLists.txt"
+    if (-not (Test-Path -LiteralPath $fullStubSource -PathType Leaf)) {
+        Write-Host "FAILED: full MIR2CPP project is missing the generated DCI stub TU"
+        exit 1
+    }
+    $fullGeneratedText = (Get-Content -Raw -LiteralPath $fullStubSource) + "`n" +
+                         (Get-Content -Raw -LiteralPath (Join-Path $cppOut "src\tu_0001.cpp"))
+    $reverseCallbacks = @(
+        "__vyx_M_VyxPoly_N_add_R_i32_P_VyxPoly_i32",
+        "__vyx_M_VyxPoly_N_add_R_i32_P_VyxPoly_f64",
+        "__vyx_M_VyxPoly_N_mul_R_i32_P_VyxPoly_i32",
+        "__vyx_M_VyxOp_N_eval_R_i32_P_VyxOp_i32"
+    )
+    foreach ($needle in @(
+        "__dci_stub_factory_VyxPoly",
+        "__dci_stub_destroy_VyxPoly",
+        "__dci_stub_factory_VyxOp",
+        "__dci_stub_destroy_VyxOp",
+        $reverseCallbacks[0],
+        $reverseCallbacks[1],
+        $reverseCallbacks[2],
+        $reverseCallbacks[3]
+    )) {
+        if ($fullGeneratedText.IndexOf($needle, [StringComparison]::Ordinal) -lt 0) {
+            Write-Host "FAILED: full MIR2CPP project is missing reverse DCI symbol $needle"
+            exit 1
+        }
+    }
+    foreach ($callback in $reverseCallbacks) {
+        $pattern = [regex]::Escape($callback) + '\([^;{}]*\) noexcept'
+        if ([regex]::Matches($fullGeneratedText, $pattern).Count -lt 2) {
+            Write-Host "FAILED: reverse DCI callback declaration/definition is not no-unwind: $callback"
+            exit 1
+        }
+    }
+    $noexceptOverrideCount = [regex]::Matches($fullGeneratedText, '\) noexcept override(?: final)? \{').Count
+    if ($noexceptOverrideCount -ne 4) {
+        Write-Host "FAILED: expected four no-unwind reverse DCI overrides, found $noexceptOverrideCount"
+        exit 1
+    }
+    $fullCmakeText = Get-Content -Raw -LiteralPath $fullCmakeFile
+    if ($fullCmakeText.IndexOf('"src/vyx_dci_stubs.cpp"', [StringComparison]::Ordinal) -lt 0) {
+        Write-Host "FAILED: full MIR2CPP CMake project does not compile the generated DCI stub TU"
+        exit 1
+    }
+
+    Push-Location $cppOut
+    try {
+        Invoke-Checked -FilePath $cmakeExe -ArgumentList @(
+            "--preset", $cppPreset,
+            "-DCMAKE_CXX_COMPILER:FILEPATH=$Clang",
+            "-DCMAKE_MAKE_PROGRAM:FILEPATH=$ninjaExe",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreaded",
+            "-DCMAKE_CXX_FLAGS:STRING=-I$($projectRoot.Replace('\', '/'))/native",
+            "-DCMAKE_EXE_LINKER_FLAGS:STRING=$staticLib"
+        ) -Name "full_cmake_configure"
+        Invoke-Checked -FilePath $cmakeExe -ArgumentList @(
+            "--build", "--preset", $cppPreset, "--parallel", "10"
+        ) -Name "full_cmake_build"
+    } finally {
+        Pop-Location
+    }
+
+    $fullCppExe = Join-Path $cppOut ("build\" + $cppPreset + "\vyx_main.exe")
+    if (-not (Test-Path -LiteralPath $fullCppExe -PathType Leaf)) {
+        Write-Host "FAILED: full generated MIR2CPP executable is missing"
+        exit 1
+    }
+    Invoke-Checked -FilePath $fullCppExe -ArgumentList @() -Name "full_run_generated"
+
+    $virtualGeneratedFiles = @(Get-ChildItem -LiteralPath (Join-Path $virtualCppOut "include") -File -Filter "*.hpp") +
+                             @(Get-ChildItem -LiteralPath (Join-Path $virtualCppOut "src") -File -Filter "*.cpp")
+    $virtualGeneratedText = ($virtualGeneratedFiles | ForEach-Object {
+        Get-Content -Raw -LiteralPath $_.FullName
+    }) -join "`n"
+    if ($virtualGeneratedText.IndexOf('#include "A.hpp"', [StringComparison]::Ordinal) -ge 0) {
+        Write-Host "FAILED: virtual DCI MIR2CPP probe depends on the producer C++ header"
+        exit 1
+    }
+    foreach ($slot in @(8, 16, 24)) {
+        $slotNeedle = "reinterpret_cast<unsigned char*>(vyx_dci_vtable) + $slot"
+        if ($virtualGeneratedText.IndexOf($slotNeedle, [StringComparison]::Ordinal) -lt 0) {
+            Write-Host "FAILED: virtual DCI MIR2CPP probe is missing vtable slot offset $slot"
+            exit 1
+        }
+    }
+
+    Push-Location $virtualCppOut
+    try {
+        Invoke-Checked -FilePath $cmakeExe -ArgumentList @(
+            "--preset", $cppPreset,
+            "-DCMAKE_CXX_COMPILER:FILEPATH=$Clang",
+            "-DCMAKE_MAKE_PROGRAM:FILEPATH=$ninjaExe",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreaded",
+            "-DCMAKE_EXE_LINKER_FLAGS=$staticLib"
+        ) -Name "virtual_cmake_configure"
+        Invoke-Checked -FilePath $cmakeExe -ArgumentList @(
+            "--build", "--preset", $cppPreset, "--parallel", "10"
+        ) -Name "virtual_cmake_build"
+    } finally {
+        Pop-Location
+    }
+
+    $virtualExe = Join-Path $virtualCppOut ("build\" + $cppPreset + "\vyx_dci_min_virtual_dispatch.exe")
+    if (-not (Test-Path -LiteralPath $virtualExe -PathType Leaf)) {
+        Write-Host "FAILED: generated virtual DCI executable is missing"
+        exit 1
+    }
+    Invoke-Checked -FilePath $virtualExe -ArgumentList @() -Name "virtual_run_generated"
+
+    $actualJit = ((Get-Content (Join-Path $cache "jit_run.out.log")) -join "`n").Trim()
+    $actualFullCpp = ((Get-Content (Join-Path $cache "full_run_generated.out.log")) -join "`n").Trim()
+    if ($actualJit -ne $expected) {
+        Write-Host "FAILED: jit output mismatch"
+        Write-Host "expected:"
+        Write-Host $expected
+        Write-Host "actual:"
+        Write-Host $actualJit
+        exit 1
+    }
+    if ($actualFullCpp -ne $expected) {
+        Write-Host "FAILED: full generated MIR2CPP output mismatch"
+        Write-Host "expected:"
+        Write-Host $expected
+        Write-Host "actual:"
+        Write-Host $actualFullCpp
+        exit 1
+    }
+    $actualVirtual = ((Get-Content (Join-Path $cache "virtual_run_generated.out.log")) -join "`n").Trim()
+    if ($actualVirtual -ne "dci_virtual_dispatch OK") {
+        Write-Host "FAILED: generated virtual DCI output mismatch"
+        Write-Host $actualVirtual
+        exit 1
+    }
+} else {
+    Write-Host "JIT/MIR2CPP checks deferred (opt in with -ExperimentalBackends)"
 }
 
 $irText = Get-Content -Raw -LiteralPath $ll

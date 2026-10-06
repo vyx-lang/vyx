@@ -42,8 +42,8 @@ $runRoot = Join-Path $projectRoot (".cache\run_{0}_{1}" -f $PID, [DateTime]::Utc
 $logsRoot = Join-Path $runRoot "logs"
 $irRoot = Join-Path $runRoot "ir"
 $objRoot = Join-Path $runRoot "obj"
-$cppRoot = Join-Path $runRoot "cpp"
-foreach ($dir in @($logsRoot, $irRoot, $objRoot, $cppRoot)) {
+$platformIrRoot = Join-Path $runRoot "platform-ir"
+foreach ($dir in @($logsRoot, $irRoot, $objRoot, $platformIrRoot)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
 
@@ -182,111 +182,46 @@ foreach ($target in $objectTargets) {
     Write-Host "[obj] $($target.Requested)"
 }
 
-$linuxSysroot = Join-Path $runRoot "sdk\linux sysroot"
-$androidSysroot = Join-Path $runRoot "sdk\android sysroot"
+$linuxSysroot = Join-Path $runRoot "sdk/linux sysroot"
+$androidSysroot = Join-Path $runRoot "sdk/android sysroot"
 $platformTargets = @(
-    @{ Name = "aarch64_windows_msvc"; Requested = "aarch64-windows-msvc"; Canonical = "aarch64-unknown-windows-msvc"; System = "Windows"; Processor = "aarch64"; Value = 1; Abi = ""; Sysroot = "" },
-    @{ Name = "aarch64_linux_gnu"; Requested = "aarch64-linux-gnu"; Canonical = "aarch64-unknown-linux-gnu"; System = "Linux"; Processor = "aarch64"; Value = 2; Abi = ""; Sysroot = $linuxSysroot },
-    @{ Name = "aarch64_linux_android23"; Requested = "aarch64-linux-android23"; Canonical = "aarch64-unknown-linux-android23"; System = "Android"; Processor = "aarch64"; Value = 3; Abi = "arm64-v8a"; Sysroot = $androidSysroot },
-    @{ Name = "aarch64_apple_darwin"; Requested = "aarch64-apple-darwin"; Canonical = "aarch64-apple-darwin"; System = "Darwin"; Processor = "aarch64"; Value = 4; Abi = ""; Sysroot = "" }
+    @{ Name = "aarch64_windows_msvc"; Requested = "aarch64-windows-msvc"; Canonical = "aarch64-unknown-windows-msvc"; Value = 1; Posix = 0; Sysroot = "" },
+    @{ Name = "aarch64_linux_gnu"; Requested = "aarch64-linux-gnu"; Canonical = "aarch64-unknown-linux-gnu"; Value = 2; Posix = 10; Sysroot = $linuxSysroot },
+    @{ Name = "aarch64_linux_android23"; Requested = "aarch64-linux-android23"; Canonical = "aarch64-unknown-linux-android23"; Value = 3; Posix = 10; Sysroot = $androidSysroot },
+    @{ Name = "aarch64_apple_darwin"; Requested = "aarch64-apple-darwin"; Canonical = "aarch64-apple-darwin"; Value = 4; Posix = 10; Sysroot = "" }
 )
-
 foreach ($target in $platformTargets) {
-    $outDir = Join-Path $cppRoot $target.Name
-    $args = @(
-        "--src=file", $platformSource,
-        "--emit=cpp",
-        "-O2",
-        ("--target=" + $target.Requested),
-        "-o", $outDir
-    )
-    if (-not [string]::IsNullOrWhiteSpace($target.Sysroot)) {
-        $args += ("--sysroot=" + $target.Sysroot)
+    $output = Join-Path $platformIrRoot ($target.Name + ".ll")
+    $arguments = @("--src=file", $platformSource, "--emit=ir", "-O2",
+                   ("--target=" + $target.Requested), "-o", $output)
+    if ($target.Sysroot) { $arguments += ("--sysroot=" + $target.Sysroot) }
+    [void](Invoke-Compiler -Name ("platform_ir_" + $target.Name) -Arguments $arguments)
+    $ir = Get-Content -LiteralPath $output -Raw
+    Assert-Contains -Text $ir -Expected ('target triple = "' + $target.Canonical + '"') -Context $target.Name
+    if ($ir -notmatch ('ret i32 ' + $target.Value + '(?:\s|$)') -or
+        $ir -notmatch ('ret i32 ' + $target.Posix + '(?:\s|$)')) {
+        throw "$($target.Name) selected the wrong platform/posix branch"
     }
-    [void](Invoke-Compiler -Name ("cpp_" + $target.Name) -Arguments $args)
-
-    $toolchainPath = Join-Path $outDir "cmake\vyx-target.cmake"
-    $toolchain = Get-Content -Raw -LiteralPath $toolchainPath
-    Assert-Contains -Text $toolchain -Expected ('set(VYX_TARGET_TRIPLE "' + $target.Canonical + '"') -Context $target.Requested
-    Assert-Contains -Text $toolchain -Expected ('set(CMAKE_SYSTEM_NAME "' + $target.System + '")') -Context $target.Requested
-    Assert-Contains -Text $toolchain -Expected ('set(CMAKE_SYSTEM_PROCESSOR "' + $target.Processor + '")') -Context $target.Requested
-    if (-not [string]::IsNullOrWhiteSpace($target.Abi)) {
-        Assert-Contains -Text $toolchain -Expected ('set(CMAKE_ANDROID_ARCH_ABI "' + $target.Abi + '")') -Context $target.Requested
+    if ($target.Posix -eq 0 -and $ir -match 'ret i32 10(?:\s|$)') {
+        throw "$($target.Name) retained the POSIX-only definition"
     }
-    if (-not [string]::IsNullOrWhiteSpace($target.Sysroot)) {
-        $normalizedToolchain = $toolchain.Replace('\', '/')
-        $normalizedSysroot = ([IO.Path]::GetFullPath($target.Sysroot)).Replace('\', '/')
-        Assert-Contains -Text $normalizedToolchain -Expected ('set(CMAKE_SYSROOT "' + $normalizedSysroot + '"') -Context $target.Requested
-    }
-
-    $generatedCpp = (Get-ChildItem -LiteralPath (Join-Path $outDir "src") -Filter "*.cpp" -File |
-        ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
-    $match = [regex]::Match($generatedCpp, 'int32_t vyx_fn_platform_value_\d+\(\)\s*\{(?<body>[\s\S]*?)\n\}')
-    if (-not $match.Success -or $match.Groups['body'].Value -notmatch ('=\s*' + $target.Value + '\s*;')) {
-        throw "$($target.Requested) selected the wrong @[platform] branch"
-    }
-    $posixMatch = [regex]::Match($generatedCpp, 'int32_t vyx_fn_posix_value_\d+\(\)\s*\{(?<body>[\s\S]*?)\n\}')
-    $expectedPosixValue = if ($target.System -eq "Windows") { 0 } else { 10 }
-    if (-not $posixMatch.Success -or
-        $posixMatch.Groups['body'].Value -notmatch ('=\s*' + $expectedPosixValue + '\s*;')) {
-        throw "$($target.Requested) selected the wrong @[platform(``posix``)] branch"
-    }
-    $presets = Get-Content -Raw -LiteralPath (Join-Path $outDir "CMakePresets.json")
-    Assert-Contains -Text $presets -Expected 'CMAKE_TOOLCHAIN_FILE' -Context $target.Requested
-    $readme = Get-Content -Raw -LiteralPath (Join-Path $outDir "README.md")
-    Assert-Contains -Text $readme -Expected $target.Canonical -Context $target.Requested
-    Write-Host "[cpp] $($target.Requested) -> $($target.System)/$($target.Processor)"
+    Write-Host "[platform-ir] $($target.Requested)"
 }
-
-# Project selection is independent from LLVM target selection: --target names
-# the manifest target, while --triplet selects the backend triple.
-$projectOut = Join-Path $cppRoot "project_android"
-[void](Invoke-Compiler -Name "cpp_project_android" -Arguments @(
-    "--src=project", $projectRoot,
-    "--emit=cpp",
-    "-O2",
-    "--target=aarch64-linux-android23",
-    ("--sysroot=" + $androidSysroot),
-    "-o", $projectOut
+# Manifest target names and LLVM triples are separate options, including IR.
+$projectIr = Join-Path $irRoot "project_android.ll"
+[void](Invoke-Compiler -Name "project_android_ir" -Arguments @(
+    "--src=project", $projectRoot, "--emit=ir", "-O2",
+    "--target=llvm_target_matrix", "--triplet=aarch64-linux-android23",
+    ("--sysroot=" + $androidSysroot), "-o", $projectIr
 ))
-$projectToolchain = Get-Content -Raw -LiteralPath (Join-Path $projectOut "cmake\vyx-target.cmake")
-Assert-Contains -Text $projectToolchain -Expected 'set(VYX_TARGET_TRIPLE "aarch64-unknown-linux-android23"' -Context "project target"
-Assert-Contains -Text $projectToolchain -Expected 'set(CMAKE_SYSTEM_NAME "Android")' -Context "project target"
-$projectCmake = Get-Content -Raw -LiteralPath (Join-Path $projectOut "CMakeLists.txt")
-$repoPathNeedle = $repoRoot.Replace('\', '/').TrimEnd('/') + '/'
-if ($projectCmake.IndexOf($repoPathNeedle, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-    throw "cross-target MIR2CPP project contains a host-absolute repository path"
-}
-Assert-Contains -Text $projectCmake -Expected 'native/src/0_native.c' -Context "project native source bundle"
-Assert-Contains -Text $projectCmake -Expected 'native/include/0' -Context "project include bundle"
-if (-not (Test-Path -LiteralPath (Join-Path $projectOut "native\src\0_native.c")) -or
-    -not (Test-Path -LiteralPath (Join-Path $projectOut "native\include\0\target_matrix.h"))) {
-    throw "cross-target MIR2CPP project did not bundle native source/include files"
-}
-Write-Host "[cpp-project] aarch64-linux-android23"
-
-$hostOut = Join-Path $cppRoot "host_default"
-[void](Invoke-Compiler -Name "cpp_host_default" -Arguments @(
-    "--src=file", $simpleSource,
-    "--emit=cpp",
-    "-O2",
-    "-o", $hostOut
-))
-if (Test-Path -LiteralPath (Join-Path $hostOut "cmake\vyx-target.cmake")) {
-    throw "host MIR2CPP export unexpectedly emitted a target toolchain"
-}
-$hostPresets = Get-Content -Raw -LiteralPath (Join-Path $hostOut "CMakePresets.json")
-if ($hostPresets.IndexOf("CMAKE_TOOLCHAIN_FILE", [StringComparison]::Ordinal) -ge 0) {
-    throw "host MIR2CPP preset unexpectedly references a target toolchain"
-}
+$projectIrText = Get-Content -LiteralPath $projectIr -Raw
+Assert-Contains -Text $projectIrText -Expected 'target triple = "aarch64-unknown-linux-android23"' -Context "project IR"
+Write-Host "[project-ir] aarch64-linux-android23"
 
 # A static target exercises the manifest build path without requiring the
 # target platform's C runtime or linker SDK on the host. Build directly in the
 # project directory so the artifact lands where the manifest build puts it.
 $projectTarget = Join-Path $projectRoot "target"
-if (Test-Path -LiteralPath $projectTarget) {
-    Remove-Item -LiteralPath $projectTarget -Recurse -Force
-}
 [void](Invoke-Compiler -Name "build_aarch64_linux" -WorkingDirectory $projectRoot -Arguments @(
     "build",
     "-j", "2",
@@ -317,14 +252,6 @@ $invalidLog = Invoke-Compiler -Name "invalid_target" -ExpectedExit 1 -Arguments 
     "-o", (Join-Path $irRoot "invalid.ll")
 )
 Assert-Contains -Text $invalidLog -Expected "unsupported LLVM target triple" -Context "invalid target diagnostic"
-
-$invalidCppLog = Invoke-Compiler -Name "invalid_target_cpp" -ExpectedExit 1 -Arguments @(
-    "--src=file", $simpleSource,
-    "--emit=cpp",
-    "--target=not-a-real-backend",
-    "-o", (Join-Path $cppRoot "invalid")
-)
-Assert-Contains -Text $invalidCppLog -Expected "unsupported LLVM target triple" -Context "invalid MIR2CPP target diagnostic"
 
 $invalidBuildLog = Invoke-Compiler -Name "invalid_target_build" -ExpectedExit 1 -Arguments @(
     "build",

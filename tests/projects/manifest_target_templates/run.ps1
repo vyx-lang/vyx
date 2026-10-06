@@ -4,7 +4,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$project = Split-Path -Parent $MyInvocation.MyCommand.Path
+$fixtureRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$project = $fixtureRoot
 $repo = (Resolve-Path (Join-Path $project '..\..\..')).Path
 $isWindowsPlatform = $env:OS -eq 'Windows_NT'
 $exeSuffix = if ($isWindowsPlatform) { '.exe' } else { '' }
@@ -19,18 +20,40 @@ function Remove-GeneratedArtifacts {
     @('.cache', '.cpp_export', 'target', 'out') | ForEach-Object {
         $path = Join-Path $project $_
         if (Test-Path -LiteralPath $path) {
-            Remove-Item -LiteralPath $path -Recurse -Force
+            $resolved = (Resolve-Path -LiteralPath $path).Path
+                if (-not $resolved.StartsWith($project + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "refusing cleanup outside owned fixture: $resolved"
+                }
+                Remove-Item -LiteralPath $resolved -Recurse -Force
         }
     }
     Get-ChildItem -LiteralPath (Join-Path $project 'deps') -Directory | ForEach-Object {
         foreach ($name in @('.cache', 'target', 'out')) {
             $path = Join-Path $_.FullName $name
             if (Test-Path -LiteralPath $path) {
-                Remove-Item -LiteralPath $path -Recurse -Force
+                $resolved = (Resolve-Path -LiteralPath $path).Path
+                if (-not $resolved.StartsWith($project + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "refusing cleanup outside owned fixture: $resolved"
+                }
+                Remove-Item -LiteralPath $resolved -Recurse -Force
             }
         }
     }
 }
+
+# Work in an owned copy, preserving other runs' caches and artifacts.
+$runRoot = Join-Path $repo ("tests/.cache/template_run_{0}_{1}" -f $PID, [DateTime]::UtcNow.Ticks)
+function Copy-FixtureTree([string]$Source, [string]$Destination) {
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {
+        if ($item.Name -in @('.cache', '.cpp_export', 'target', 'out')) { continue }
+        $destinationItem = Join-Path $Destination $item.Name
+        if ($item.PSIsContainer) { Copy-FixtureTree $item.FullName $destinationItem }
+        else { Copy-Item -LiteralPath $item.FullName -Destination $destinationItem }
+    }
+}
+Copy-FixtureTree $fixtureRoot $runRoot
+$project = (Resolve-Path -LiteralPath $runRoot).Path
 
 # A prior interrupted run must not turn a stale output directory into evidence
 # that the selected manifest target built an unselected dependency.
@@ -54,14 +77,13 @@ function Invoke-Target([string]$Name) {
 }
 
 try {
-    $cppOut = Join-Path $project '.cpp_export'
-    & $Compiler --src=project $project --emit=cpp -o $cppOut
-    if ($LASTEXITCODE -ne 0) { throw "direct MIR2CPP export failed: $LASTEXITCODE" }
-    $cmake = Get-Content -Raw -LiteralPath (Join-Path $cppOut 'CMakeLists.txt')
-    if ($cmake.Contains('template_link_must_be_removed') -or
-        $cmake.Contains('template_path_must_be_removed')) {
-        throw 'direct MIR2CPP path ignored template link removals'
-    }
+    # A real AOT link proves removed template libraries/search paths do not
+    # reach the linker. IR emission exercises the same manifest resolver.
+    Invoke-Target manifest_target_templates
+    $irOut = Join-Path $project 'template-probe.ll'
+    & $Compiler --src=project $project --emit=ir -o $irOut
+    if ($LASTEXITCODE -ne 0) { throw "manifest LLVM IR export failed: $LASTEXITCODE" }
+    if (-not (Test-Path -LiteralPath $irOut -PathType Leaf)) { throw 'missing template IR output' }
 
     Invoke-Target app_a
     if (-not (Test-Path -LiteralPath (Join-Path $project ('target\prepare' + $exeSuffix)))) {

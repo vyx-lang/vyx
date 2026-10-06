@@ -2,6 +2,11 @@
 param(
     [string]$Triplet = "x86_64-unknown-linux-gnu",
     [string]$RecordsPath = "",
+    # Where crate_boot.o and its scratch files land. Each cross target needs its
+    # own directory: the container link and the smoke scripts read
+    # out/linux/crate_*.o by name, so emitting an aarch64 object over the
+    # x86_64 one would silently cross-link two architectures.
+    [string]$OutDir = "",
     [switch]$DryRun
 )
 
@@ -17,11 +22,25 @@ $records = if ([string]::IsNullOrWhiteSpace($RecordsPath)) {
     [IO.Path]::GetFullPath($RecordsPath)
 }
 $llvmNm = Join-Path $repoRoot "clang\bin\llvm-nm.exe"
-$outDir = Join-Path $projectRoot "out\linux"
+$outDir = if ([string]::IsNullOrWhiteSpace($OutDir)) {
+    Join-Path $projectRoot "out\linux"
+} else {
+    [IO.Path]::GetFullPath($OutDir)
+}
 $sourceList = Join-Path $outDir "crate_boot.sources"
 $object = Join-Path $outDir "crate_boot.o"
 $candidate = Join-Path $outDir "crate_boot.new.o"
 $log = Join-Path $outDir "crate_boot.emit.log"
+
+# ELF e_machine. x86-64 is 62, AArch64 is 183. The magic check alone cannot tell
+# two cross targets apart, so a stale or mistyped --triplet would sail through
+# and produce an SDK whose compiler cannot run on the machine it was named for.
+$expectedMachine = switch -Regex ($Triplet) {
+    '^aarch64' { 183 }
+    '^riscv64' { 243 }
+    '^i[3-6]86' { 3 }
+    default     { 62 }
+}
 
 foreach ($required in @($compiler, $records, $llvmNm)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
@@ -87,7 +106,11 @@ foreach ($path in $sources) {
     }
 }
 
-[IO.File]::WriteAllLines($sourceList, $sources)
+# WriteAllLines uses Environment.NewLine, so on Windows the list lands as CRLF.
+# --project-unit-sources splits on "\n" and keeps the "\r" as part of each path,
+# so every entry resolves to a file that does not exist: the compiler exits 127
+# with an empty log and no diagnostic, which reads like a crash in the emit.
+[IO.File]::WriteAllText($sourceList, (($sources -join "`n") + "`n"))
 Write-Host "Linux boot crate: $($sources.Count) compiler sources, target=$Triplet"
 if ($DryRun) { return }
 
@@ -126,11 +149,18 @@ if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
 }
 $stream = [IO.File]::OpenRead($candidate)
 try {
-    $magic = [byte[]]::new(4)
-    if ($stream.Read($magic, 0, 4) -ne 4 -or
-        $magic[0] -ne 0x7f -or $magic[1] -ne 0x45 -or
-        $magic[2] -ne 0x4c -or $magic[3] -ne 0x46) {
+    $header = [byte[]]::new(20)
+    if ($stream.Read($header, 0, 20) -ne 20 -or
+        $header[0] -ne 0x7f -or $header[1] -ne 0x45 -or
+        $header[2] -ne 0x4c -or $header[3] -ne 0x46) {
         throw "Linux crate_boot output is not ELF: $candidate"
+    }
+    if ($header[4] -ne 2) {
+        throw "Linux crate_boot output is not ELF64: $candidate (EI_CLASS=$($header[4]))"
+    }
+    $machine = [int]$header[18] -bor ([int]$header[19] -shl 8)
+    if ($machine -ne $expectedMachine) {
+        throw "Linux crate_boot e_machine=$machine but --triplet=$($Triplet) expects $expectedMachine`: $candidate"
     }
 } finally {
     $stream.Dispose()

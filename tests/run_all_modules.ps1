@@ -36,6 +36,7 @@ param(
     [string]$LogPath = "",
     [string]$RuntimeDir = "",
     [string]$RuntimeLib = "",
+    [string[]]$NativeRuntimeDirs = @(),
     [switch]$ListOnly
 )
 
@@ -51,6 +52,19 @@ if (Get-Variable -Name IsWindows -ErrorAction SilentlyContinue) {
 # tests/ ->仓库根
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $testsRoot = $PSScriptRoot
+
+# Native dependency DLL/shared-library directories are explicit test inputs.
+# Never guess a machine's vcpkg/Conda installation or mask loader failures.
+foreach ($nativeRuntimeDir in $NativeRuntimeDirs) {
+    $resolvedNativeRuntimeDir = (Resolve-Path -LiteralPath $nativeRuntimeDir -ErrorAction Stop).Path
+    if (-not (Test-Path -LiteralPath $resolvedNativeRuntimeDir -PathType Container)) {
+        throw "NativeRuntimeDirs requires a directory: $resolvedNativeRuntimeDir"
+    }
+    $env:PATH = $resolvedNativeRuntimeDir + [IO.Path]::PathSeparator + $env:PATH
+    if (-not $script:RunAllModulesIsWindows) {
+        $env:LD_LIBRARY_PATH = $resolvedNativeRuntimeDir + ':' + $env:LD_LIBRARY_PATH
+    }
+}
 
 function Resolve-TestPathFilter {
     param([string]$Filter)
@@ -951,3 +965,6 @@ if ($failed -gt 0) {
 }
 Write-RunLine "run_all_modules: $passedRuns passed, $skippedRuns skipped ($doneRuns total)."
 Write-RunLine ("完整日志: " + $LogPath)
+# Expected negative checks can leave a nonzero native LASTEXITCODE. Return the
+# suite's result explicitly so callers do not mistake that residue for failure.
+exit 0

@@ -51,6 +51,16 @@ tests/
 
 ## Commands
 
+DCI schema checks require the Python `jsonschema` package. Install the DCI SDK's
+`validate` extra in your chosen interpreter and set `VYX_DCI_PYTHON` to its executable.
+The `dci_rust_generic` runner also accepts `-Python` explicitly.
+
+Native dependencies may need DLL/shared-library search directories at execution time.
+Pass `-NativeRuntimeDirs <directory>` to the module/project runner; this is separate
+from `-RuntimeDir`, which selects the matching Vyx SDK runtime. For a vcpkg build,
+the native directory is typically `$env:VCPKG_ROOT/installed/x64-windows/bin`.
+Missing native libraries remain test failures.
+
 Run these from the repository root.
 
 ~~~powershell

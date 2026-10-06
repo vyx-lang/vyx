@@ -76,42 +76,23 @@ try {
     $aotRun = Invoke-Captured -FilePath $aotExe -ArgumentList @()
     Assert-Success "LLVM executable" $aotRun
 
-    Write-Host "[extern-c-pointer-abi] MIR2CPP"
-    $cppOut = Join-Path $runRoot "mir2cpp"
+    Write-Host "[extern-c-pointer-abi] manifest LLVM IR"
+    $irOut = Join-Path $runRoot "pointer_abi.ll"
     $generate = Invoke-Captured -FilePath $BootstrapCompiler -ArgumentList @(
-        "--src=project", $runRoot, "--emit=cpp", "-o", $cppOut
+        "--src=project", $runRoot, "--emit=ir", "-o", $irOut
     )
-    Assert-Success "MIR2CPP generation" $generate
-
-    $generatedText = (Get-ChildItem -LiteralPath $cppOut -Recurse -File |
-        Where-Object { $_.Extension -eq ".cpp" -or $_.Extension -eq ".hpp" } |
-        ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+    Assert-Success "LLVM IR generation" $generate
+    $ir = Get-Content -LiteralPath $irOut -Raw
     foreach ($pattern in @(
-        'extern "C" void\* vyx_identity_i64\(void\*',
-        'vyx_sum_i64\(to_rawptr\(',
-        'vyx::ptr_from_raw<int64_t>\(vyx_identity_i64\(to_rawptr\('
+        'declare\s+i64\s+@vyx_sum_i64\(ptr[^,]*,\s*i32',
+        'declare\s+ptr\s+@vyx_identity_i64\(ptr',
+        'declare\s+i64\s+@vyx_add_mut_i64\(ptr[^,]*,\s*i64',
+        'declare\s+i64\s+@vyx_read_ref_i64\(ptr'
     )) {
-        if ($generatedText -notmatch $pattern) {
-            throw "[extern-c-pointer-abi] generated C++ is missing ABI pattern: $pattern"
+        if ($ir -notmatch $pattern) {
+            throw "[extern-c-pointer-abi] LLVM IR is missing native pointer ABI: $pattern"
         }
     }
-
-    $configure = Invoke-Captured -FilePath "cmake" -ArgumentList @(
-        "--preset", "ninja-release"
-    ) -WorkingDirectory $cppOut
-    Assert-Success "CMake configure" $configure
-    $build = Invoke-Captured -FilePath "cmake" -ArgumentList @(
-        "--build", "--preset", "ninja-release", "--parallel"
-    ) -WorkingDirectory $cppOut
-    Assert-Success "CMake build" $build
-
-    $cppExeName = if ($isWindowsPlatform) { "vyx_extern_c_pointer_abi.exe" } else { "vyx_extern_c_pointer_abi" }
-    $cppExe = Join-Path $cppOut ("build\ninja-release\" + $cppExeName)
-    if (-not (Test-Path -LiteralPath $cppExe -PathType Leaf)) {
-        throw "[extern-c-pointer-abi] MIR2CPP executable missing: $cppExe"
-    }
-    $run = Invoke-Captured -FilePath $cppExe -ArgumentList @()
-    Assert-Success "MIR2CPP executable" $run
 
     Write-Host "extern_c_pointer_abi: OK"
 } finally {

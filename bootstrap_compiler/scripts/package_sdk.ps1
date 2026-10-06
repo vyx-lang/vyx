@@ -4,6 +4,20 @@ param(
     [switch]$BundleLlvm,
     [switch]$BundleLldb,
     [string]$LldbBundleRoot = "",
+    [string]$DebugAdapterRoot = "",
+    [string]$CompilerPath = "",
+    # Architecture segment of the default package name. The container build that
+    # produces an AArch64 SDK runs on an x86_64 host, so host introspection would
+    # name that package "linux-x86_64" -- an archive whose contents cannot run on
+    # the machine its own directory claims to target.
+    [string]$Arch = "",
+    # Directory the compiler/backend/runtime binaries are read from. Defaults to
+    # <BootstrapRoot>/out, which is where the x86_64 Linux SDK's artifacts live.
+    # A cross SDK must not reuse that directory: its container build links
+    # AArch64 objects into the very same paths, so packaging an arm64 SDK out of
+    # the default directory would either pick up x86_64 binaries or silently
+    # replace them for the next x86_64 package.
+    [string]$OutDir = "",
     [switch]$Archive,
     [switch]$Force
 )
@@ -16,7 +30,11 @@ if ([string]::IsNullOrWhiteSpace($BootstrapRoot)) {
     $BootstrapRoot = Join-Path $repoRoot "bootstrap_compiler"
 }
 $bootstrap = (Resolve-Path -LiteralPath $BootstrapRoot).Path
-$out = Join-Path $bootstrap "out"
+if ([string]::IsNullOrWhiteSpace($OutDir)) {
+    $out = Join-Path $bootstrap "out"
+} else {
+    $out = (Resolve-Path -LiteralPath $OutDir).Path
+}
 $runningOnWindows = $env:OS -eq "Windows_NT"
 if ($BundleLlvm -and [string]::IsNullOrWhiteSpace($env:LLVM_ROOT)) {
     throw "-BundleLlvm requires LLVM_ROOT"
@@ -27,9 +45,16 @@ if ($BundleLlvm -and [string]::IsNullOrWhiteSpace($env:LLVM_ROOT)) {
 # convention -- it exists purely so a shell launcher can export LLVM_ROOT/PATH.
 $useLauncherLayout = $BundleLlvm -and -not $runningOnWindows
 
+if ([string]::IsNullOrWhiteSpace($Arch)) {
+    $Arch = "x86_64"
+}
+if ($Arch -notmatch '^[a-z0-9_]+$') {
+    throw "-Arch must be a plain architecture token (got '$Arch')"
+}
+
 if ([string]::IsNullOrWhiteSpace($Destination)) {
-    $platform = if ($runningOnWindows) { "windows-x86_64" } else { "linux-x86_64" }
-    $Destination = Join-Path (Join-Path $repoRoot "dist") ("vyx-sdk-{0}-llvm22" -f $platform)
+    $platform = if ($runningOnWindows) { "windows" } else { "linux" }
+    $Destination = Join-Path (Join-Path $repoRoot "dist") ("vyx-sdk-{0}-{1}-llvm22" -f $platform, $Arch)
 }
 $destinationPath = [System.IO.Path]::GetFullPath($Destination)
 $destinationParent = Split-Path -Parent $destinationPath
@@ -65,8 +90,17 @@ $backendName = if ($runningOnWindows) {
 }
 $runtimeName = if ($runningOnWindows) { "vyx_runtime.lib" } else { "libvyx_runtime.a" }
 
+if ([string]::IsNullOrWhiteSpace($CompilerPath)) {
+    $primaryTarget = [regex]::Match((Get-Content -LiteralPath (Join-Path $bootstrap 'Vyx.toml') -Raw),
+        '(?m)^name\s*=\s*"([^"]+)"').Groups[1].Value
+    $primaryArtifact = Join-Path $out ($primaryTarget + $(if ($runningOnWindows) { '.exe' } else { '' }))
+    $CompilerPath = if ($primaryTarget -and (Test-Path -LiteralPath $primaryArtifact -PathType Leaf)) {
+        $primaryArtifact
+    } else { Join-Path $out $compilerName }
+}
+
 $required = [ordered]@{
-    Compiler = Join-Path $out $compilerName
+    Compiler = [System.IO.Path]::GetFullPath($CompilerPath)
     Backend = Join-Path $out $backendName
     Runtime = Join-Path $out $runtimeName
 }
@@ -105,6 +139,9 @@ try {
     $bin = New-Item -ItemType Directory -Force -Path (Join-Path $stage "bin")
     $lib = New-Item -ItemType Directory -Force -Path (Join-Path $stage "lib")
     $share = New-Item -ItemType Directory -Force -Path (Join-Path $stage "share\vyx")
+    foreach ($notice in @('LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE')) {
+        Copy-Item -LiteralPath (Join-Path $repoRoot $notice) -Destination (Join-Path $stage $notice)
+    }
 
     $compilerPayloadName = if ($useLauncherLayout) { ".vyxc-bin" } else { $compilerName }
     Copy-Item -LiteralPath $required.Compiler -Destination (Join-Path $bin.FullName $compilerPayloadName)
@@ -122,6 +159,31 @@ try {
             Copy-Item -LiteralPath $tool -Destination (Join-Path $bin.FullName $payloadName)
             $packagedTools.Add($toolName)
         }
+    }
+
+    # Editor tools use a complete, matching adapter runtime. No network access
+    # during packaging: prepare_debug_adapter.py installs the pinned bundle.
+    $debugAdapter = if ([string]::IsNullOrWhiteSpace($DebugAdapterRoot)) {
+        Join-Path $out "_debug_adapter"
+    } else { [System.IO.Path]::GetFullPath($DebugAdapterRoot) }
+    $adapterExecutable = if ($runningOnWindows) { "adapter/codelldb.exe" } else { "adapter/codelldb" }
+    $hasDebugAdapter = Test-Path -LiteralPath (Join-Path $debugAdapter $adapterExecutable) -PathType Leaf
+    $dapToolName = if ($runningOnWindows) { "vyxc-dap.exe" } else { "vyxc-dap" }
+    if ($packagedTools.Contains($dapToolName) -and -not $hasDebugAdapter) {
+        throw "vyxc-dap requires CodeLLDB; run scripts/prepare_debug_adapter.py or pass -DebugAdapterRoot"
+    }
+    if ($hasDebugAdapter) {
+        $adapterManifestPath = Join-Path $debugAdapter 'MANIFEST.json'
+        if (-not (Test-Path -LiteralPath $adapterManifestPath -PathType Leaf)) {
+            throw "missing verified CodeLLDB MANIFEST.json: $debugAdapter"
+        }
+        $adapterManifest = Get-Content -LiteralPath $adapterManifestPath -Raw | ConvertFrom-Json
+        $expectedPatch = (Get-FileHash -LiteralPath (Join-Path $repoRoot 'tools/debugger/patches/codelldb-1.12.3-vyx.patch') -Algorithm SHA256).Hash
+        $actualBinary = (Get-FileHash -LiteralPath (Join-Path $debugAdapter $adapterExecutable) -Algorithm SHA256).Hash
+        if ($adapterManifest.patch_sha256 -ne $expectedPatch -or $adapterManifest.binary_sha256 -ne $actualBinary) {
+            throw "CodeLLDB source patch or executable hash differs; rerun prepare_debug_adapter.py"
+        }
+        Copy-CleanTree -Source $debugAdapter -DestinationPath (Join-Path $bin.FullName "debugger")
     }
 
     foreach ($directory in @("std", "std_packages", "tools")) {
@@ -375,6 +437,7 @@ exec "$VYX_HOME/bin/$executable" "$@"
         llvm_required_by_applications = $false
         bundled_compiler_llvm_toolchain = [bool]$BundleLlvm
         bundled_lldb = [bool]$BundleLldb
+        debug_adapter = if ($hasDebugAdapter) { "CodeLLDB" } else { $null }
     }
     $manifest | ConvertTo-Json -Depth 4 |
         Set-Content -LiteralPath (Join-Path $stage "SDK-MANIFEST.json") -Encoding utf8NoBOM

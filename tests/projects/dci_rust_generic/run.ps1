@@ -1,7 +1,8 @@
 param(
     [string]$BootstrapCompiler = "",
     [string]$RuntimeDir = "",
-    [string]$Rustc = ""
+    [string]$Rustc = "",
+    [string]$Python = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +48,14 @@ if ([string]::IsNullOrWhiteSpace($BootstrapCompiler)) {
     $BootstrapCompiler = Join-Path $repoRoot "bootstrap_compiler\out\boot.exe"
 }
 $BootstrapCompiler = (Resolve-Path $BootstrapCompiler).Path
+
+if ([string]::IsNullOrWhiteSpace($Python)) { $Python = $env:VYX_DCI_PYTHON }
+if ([string]::IsNullOrWhiteSpace($Python)) { $Python = (Get-Command python -ErrorAction Stop).Source }
+$Python = (Resolve-Path -LiteralPath $Python).Path
+& $Python -c "import jsonschema"
+if ($LASTEXITCODE -ne 0) {
+    throw "DCI fixture requires jsonschema in $Python; install tools/dci[validate] or select -Python/VYX_DCI_PYTHON"
+}
 
 if ([string]::IsNullOrWhiteSpace($Rustc)) {
     $rustCommand = Get-Command rustc -ErrorAction Stop
@@ -145,7 +154,7 @@ function Convert-DciJsonToDcib {
     Assert-Test ([IO.Path]::GetExtension($JsonPath) -eq ".dci") `
         "DCIB fixture source must be a .dci diagnostic document: $JsonPath"
     $dcibPath = [IO.Path]::ChangeExtension($JsonPath, ".dcib")
-    Invoke-Checked -FilePath "python" `
+    Invoke-Checked -FilePath $Python `
         -ArgumentList @($dcibTool, "encode", $JsonPath, $dcibPath) `
         -Name ("encode_" + [IO.Path]::GetFileNameWithoutExtension($JsonPath))
     return $dcibPath
@@ -187,23 +196,23 @@ Assert-Test ($rustVersion -match '^rustc 1\.92\.0(?:\s|$)') "fixture requires ru
 Assert-Test ($rustVerbose -match '(?m)^host:\s*x86_64-pc-windows-msvc\s*$') `
     "fixture requires the x86_64-pc-windows-msvc rustc host"
 
-Invoke-Checked -FilePath "python" `
+Invoke-Checked -FilePath $Python `
     -ArgumentList @($validator, "--strict", $dciFile) `
     -Name "validate_dci"
 
-Invoke-Checked -FilePath "python" `
+Invoke-Checked -FilePath $Python `
     -ArgumentList @($validator, "--strict", $directDciFile) `
     -Name "validate_direct_contracts_dci"
 
-Invoke-Checked -FilePath "python" `
+Invoke-Checked -FilePath $Python `
     -ArgumentList @($validator, "--strict", $zstDciFile) `
     -Name "validate_zst_contract_dci"
 
-Invoke-Checked -FilePath "python" `
+Invoke-Checked -FilePath $Python `
     -ArgumentList @($validator, "--strict", $classValueDciFile) `
     -Name "validate_class_value_contract_dci"
 
-Invoke-Checked -FilePath "python" `
+Invoke-Checked -FilePath $Python `
     -ArgumentList @($validator, "--strict", $stubDciFile) `
     -Name "validate_rust_stub_backend_dci"
 
@@ -355,7 +364,7 @@ foreach ($case in $variantCases) {
     # validator so the Core Consumer's own fail-closed rejection is what gets
     # exercised (same pattern as the malformed bitfield/ABI variants below).
     if ($case.Name -ne "shared_abi") {
-        Invoke-Checked -FilePath "python" `
+        Invoke-Checked -FilePath $Python `
             -ArgumentList @($validator, "--strict", $variantPath) `
             -Name ("validate_" + $case.Name)
     }
@@ -677,7 +686,7 @@ $lifecycleFold[0].abi.parameters[0] | Add-Member -NotePropertyName "alignment" -
 $lifecycleFold[0].abi.parameters[0] | Add-Member -NotePropertyName "attributes" -NotePropertyValue @("by_value")
 $lifecycleValuePath = Join-Path $cache "unsupported_lifecycle_value_parameter.dci"
 Write-JsonUtf8 -Document $lifecycleValue -Path $lifecycleValuePath
-Invoke-Checked -FilePath "python" `
+Invoke-Checked -FilePath $Python `
     -ArgumentList @($validator, "--strict", $lifecycleValuePath) `
     -Name "validate_unsupported_lifecycle_value_parameter"
 Invoke-ExpectedFailure -FilePath $BootstrapCompiler `
@@ -719,7 +728,7 @@ $lifecyclePacket[0].lifecycle.operations | Add-Member `
     -NotePropertyValue $lifecyclePacket[0].lifecycle.operations.destroy
 $unsupportedLifecycle = Join-Path $cache "unsupported_lifecycle_release.dci"
 Write-JsonUtf8 -Document $lifecycleVariant -Path $unsupportedLifecycle
-Invoke-Checked -FilePath "python" `
+Invoke-Checked -FilePath $Python `
     -ArgumentList @($validator, "--strict", $unsupportedLifecycle) `
     -Name "validate_unsupported_lifecycle_release"
 # `release` destruction is a supported contract now (shared ownership);
@@ -744,7 +753,7 @@ $missingRuntimeCast.exports.runtime_type_operations = @(
 )
 $missingRuntimeCastPath = Join-Path $cache "missing_runtime_cast.dci"
 Write-JsonUtf8 -Document $missingRuntimeCast -Path $missingRuntimeCastPath
-Invoke-Checked -FilePath "python" `
+Invoke-Checked -FilePath $Python `
     -ArgumentList @($validator, "--strict", $missingRuntimeCastPath) `
     -Name "validate_missing_runtime_cast"
 Invoke-ExpectedFailure -FilePath $BootstrapCompiler `
@@ -1083,7 +1092,7 @@ $cacheProbeOriginalInfo = Get-Item -LiteralPath $cacheProbeBackend
 $cacheProbeOriginalLength = $cacheProbeOriginalInfo.Length
 $cacheProbeOriginalWriteTime = $cacheProbeOriginalInfo.LastWriteTimeUtc
 try {
-    $env:VYX_DCI_STUB_BACKEND_TOOL = "python"
+    $env:VYX_DCI_STUB_BACKEND_TOOL = $Python
     $env:VYX_DCI_STUB_BACKEND_TOOL_ARGS = '"' + $cacheProbeBackend + '"'
     $env:VYX_DCI_STUB_BACKEND_DEPENDENCIES = $cacheProbeBackend
     $env:VYX_DCI_STUB_BACKEND_VERSION = "rust-stub-fixture-1"
@@ -1093,7 +1102,7 @@ try {
     Push-Location $projectRoot
     try {
         Invoke-Checked -FilePath $BootstrapCompiler `
-            -ArgumentList @("build", "-j", "4") `
+            -ArgumentList @("build", "-j", "1") `
             -Name "external_stub_project_build"
     } finally {
         Pop-Location
@@ -1128,7 +1137,7 @@ try {
     Push-Location $projectRoot
     try {
         Invoke-Checked -FilePath $BootstrapCompiler `
-            -ArgumentList @("build", "-j", "4") `
+            -ArgumentList @("build", "-j", "1") `
             -Name "external_stub_project_rebuild_after_dependency_change"
     } finally {
         Pop-Location

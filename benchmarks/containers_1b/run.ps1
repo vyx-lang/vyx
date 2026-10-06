@@ -547,7 +547,7 @@ if (-not $SkipBuild) {
     ) | ForEach-Object { Join-Path $root (Join-Path "bootstrap_compiler" $_) }
     $vyxOpt = if ($Profile -eq "native-release") { "-O3" } else { "-O2" }
     $vyxArgs = @("--src=file", (Join-Path $vyxDir "main.vyx"), "--emit=exe",
-        $vyxOpt, "-o", $vyxExe, "-L", $runtimeDir, "-l", "vyx_runtime")
+        $vyxOpt, "-o", $vyxExe)
     foreach ($source in $moduleSources) { $vyxArgs += @("--module-source", $source) }
     # This is an application build. The compiler backend is intentionally not linked.
     $vyxLog = Join-Path $outDir "build_vyx.log"
