@@ -46,3 +46,26 @@ struct SinkG {
     virtual ~SinkG() = default;
     virtual T consume(T value) = 0;
 };
+
+// Pointer arguments and returns on a native virtual thunk are one address.
+// The producer keeps the pointed-to bytes alive throughout each callback.
+struct PointerSink {
+    virtual ~PointerSink() = default;
+    virtual char* echo(char* value) noexcept = 0;
+};
+
+extern "C" int pointer_roundtrip(PointerSink* sink) noexcept;
+extern "C" int pointer_roundtrip(PointerSink* sink) noexcept {
+    char bytes[] = "native pointer";
+    for (int i = 0; i < 1000; ++i) {
+        if (sink->echo(bytes) != bytes || sink->echo(nullptr) != nullptr) return 1;
+    }
+    return 0;
+}
+
+/* dci-ownership
+{
+  "PointerSink::echo(char*)": {"parameters": {"0": "borrow"}, "return": "borrow"},
+  "pointer_roundtrip(PointerSink*)": {"parameters": {"0": "borrow"}}
+}
+dci-ownership-end */

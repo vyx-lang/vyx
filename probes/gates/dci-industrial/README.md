@@ -18,6 +18,9 @@ pinned ICU files and locked Cargo registry dependencies must be available for
 the corresponding cases.
 The default set has 11 named cases; Linux shared propagation is a separate
 `dci-exceptions/run-linux.ps1` WSL gate and is not included in the default set.
+The [Qt Widgets counter](../dci-qt-counter/README.md) is a separate Windows gate
+requiring a Qt SDK; it is not included in either this default set or the
+`tests/projects/dci_*` scan.
 
 The workload is reproducible with `--repeat`, `--scale`, `--parallel`, and a
 fixed seed (`20261001`).  `--scale N` runs every selected case `N` times. Repeated runs of one fixture

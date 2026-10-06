@@ -2,7 +2,7 @@
 
 [English](README.md) · [文档目录](../../docs/README.md) · [DCI 规范](../../docs/DCI_SPEC_ZH.md) · [事实语义所有权系统](../../docs/MOSP_ZH.md)
 
-本目录包含生产端 Adapter、契约校验与编码、Active Adapter 会话和 Stub 后端。
+本目录包含生产端 Adapter、契约到 Vyx 的 Converter、契约校验与编码、Active Adapter 会话和 Stub 后端。
 统一命令为 `python tools/dci/dci.py`；`vyxc dci` 从 SDK 邻近目录或
 `VYX_DCI_TOOLS` 查找同一套工具。
 
@@ -95,7 +95,7 @@ python tools/dci/dci.py encode contracts/native.dci.json contracts/native.dcib
 
 各语言另外还声明只有自己懂的参数：C++ 有 `--toolchain`、`--std`、`-j`、
 `--include`、`-I`、`--project-root`、`--scan-public-root`、`--cmake-build-path`、
-`--compile-flags`；Rust 有 `--edition`、`--deny-rejected`、
+`--compile-flags`、`--boundary`；Rust 有 `--edition`、`--deny-rejected`、
 `--export-active-requests`、`--export-instance`；Zig 有 `--deny-rejected`。
 用错别的语言的参数会直接报错并指出归属，不会被静默忽略：
 
@@ -109,6 +109,127 @@ dci: error: adapter option(s) belong to another language adapter:
 写法见 [EXTENDING.md](EXTENDING.md)。
 
 ### C++ 配置
+
+#### 独立 Adapter 与 Converter
+
+DCI 使用独立工具链。先由生产端 Adapter 测量并验证契约，再显式转换成可查看的 Vyx 定义：
+
+```sh
+vyx-dci adapter --language cpp include/Api.hpp --toolchain clang -o contracts/Api.dcib
+vyx-dci convert contracts/Api.dcib --module native.api --header Api.hpp -o src/native_api.vyx
+```
+
+未安装工具时，使用 `python tools/dci/dci.py` 的相同命令。
+`converter` 和 `convertor` 是 `convert` 的别名。输出是普通 Vyx 模块，使用
+`@[dci_import(...)]` 和 `extern "dci"`，保留类型身份、公开基类、构造/析构函数、
+方法、const 和 virtual 签名。Vyx 派生类依据这些签名实现 `override`；Consumer
+将人工维护的声明与原始契约交叉验证。转换不测量或改变 ABI、ownership、lifecycle。
+已有定义文件只有显式传入 `--force` 才能覆写。`--report` 保存不能表达的声明诊断；
+`--deny-rejected` 使转换在这些诊断存在时失败。当前自动声明覆盖全局 C++ 类名和
+可表达的方法/自由函数签名，未覆盖全部 C++ 语法。
+
+ownership 的提取和规范化属于 Adapter。标量、引用和实测生命周期操作可以自动提供
+部分事实；裸指针的保留、转移与释放需要生产端语义或库协议的权威声明。
+事实缺失由 Adapter 拒绝，Converter 只消费契约，不推断所有权。
+Qt 协议由 Adapter 的 SDK profile 提供。布局、继承偏移、虚表和 ABI 符号继续由
+生产端编译器实测。导出范围由用户声明：`--export-type` / `--export-function`
+选择精确实体；不带筛选的 Adapter 调用表示用户显式选择输入的公共头文件范围。
+消费端调用、inline 定义不会选择或扩张范围。范围内可表达的实体全部输出，不能
+表达的实体记录诊断；布局和基类依赖由 Adapter 测量以验证所选 API。
+
+标量/null 默认参数是原始签名上的声明事实。Converter 生成可支持的 Vyx 默认参数，
+Consumer 在调用处补齐参数，仍直接调用原生符号。内置常量表达式和枚举常量交由
+生产端编译器求值。未知或动态默认值记录诊断，要求调用者显式提供参数，不生成
+省略参数的包装重载。`cpp_include` 引用原始 API 头文件。
+提取器与生产端编译器或配置不一致时，也不采用其展开的默认值；原生完整签名仍可
+通过显式参数调用。
+
+[Qt 门](../../probes/gates/dci-qt-counter/README.md) 在 `src/qt_widgets.vyx` 维护可见定义，
+在项目构建时准备契约。`cpp-import Vyx.toml --target app --import widgets`
+可以独立准备一个库，不要求目标启用自动源码导入。
+
+#### 可选的声明范围构建准备
+
+目标中的可选 `dci_imports` 将生产端原始头文件接入普通 `vyxc build`。
+每个库只配置模块、头文件和工具链：
+
+```toml
+[target.app]
+type = "executable"
+entry = "src/main.vyx"
+dci_imports = ["widgets"]
+dci_stub_backend = "clang-cpp"
+# cxx、cxxflags 和 include_paths 使用正常的原生工具链配置。
+
+[dci.import.widgets]
+module = "qt.widgets"
+contract = "contracts/qt_widgets.dcib"
+# 可选：使用已维护的 Converter 定义文件，不生成第二份缓存模块。
+definitions = "src/qt_widgets.vyx"
+headers = ["native/widgets.hpp"]
+export_types = ["QWidget", "QPushButton"]
+ownership_headers = ["native/widgets_ownership.hpp"]
+# 可选 Qt 连接操作，需要显式选择：
+qt_connections = ["QAbstractButton::clicked(bool)"]
+profile = "qt"
+boundary = "shared_abi"
+```
+
+编译器在收集源码之前运行 `dci cpp-import Vyx.toml --target app`，把选定的
+Vyx 定义文件和准备好的原生源码纳入构建图。`contract` 默认输出到项目的
+`contracts/<导入名>.dcib`。设置 `definitions` 时，这个 Vyx 文件必须已存在，
+Adapter 不覆写它，也不生成第二份模块；省略时才使用缓存生成的 Converter 模块，
+其中引用的仍是项目契约。类型身份、签名、基类和重载来自生产端实测事实。
+构建系统传入已解析的模板与平台配置，适配器复用原生编译的 C++ 参数和头文件路径。
+用户必须声明 `export_types` / `export_functions`，或显式选择 `export_all = true`
+覆盖输入公共头文件的范围。不扫描应用源码决定导出。所选类输出所有可表达成员，
+包括未被应用使用的成员，并测量基类/布局依赖。原始声明提供签名、重载及可支持
+的默认参数。Qt 协议只为 `qt_connections` 明确列出的原生信号生成有类型的
+`on_<signal>` 连接操作；看到信号本身不会触发导出。这是可选适配操作，与原生
+信号方法分开。状态地址必须存活到
+连接结束；sender/context 析构会断开连接。未知载荷生命周期会拒绝适配。
+`ownership_headers` 显式选择可复用的库事实声明，例如 SDK 的
+`profiles/qt_widgets.hpp`，不会仅因 profile 名称而自动启用。也可以在公共头文件
+的 `dci-ownership` 中手写一次。未知指针生命周期记录诊断并拒绝，不猜测补全。
+
+项目契约保存在 `contracts/`；生成定义、原生物化源码、依赖戳和拒绝原因保存在
+`.cache/dci/<导入名>/`。删除缓存不删除项目契约或用户定义，下一次普通构建会
+从已有契约重建缺失产物，不重新提取 AST。离线 Adapter 契约会检查 schema、
+目标 ABI、异常边界和所选导出，并保留原文件。缺少已测量的 Qt 连接操作会明确
+报错；无效或不兼容的输入契约不会被擅自替换。
+
+契约缺失、用户显式执行 `cpp-import --force`，或已生成契约记录的生产端输入
+发生变化时才重新测量。生成契约携带可选的 `source.preparation_inputs`，记录
+头文件内容哈希和原生配置，不依赖 `.cache`。编译器版本注释和 DCI 工具更新
+不会让这些事实自动失效。普通离线契约可以没有此元信息，其库版本由提供者管理。
+无法从 C++ 类型推断的指针所有权仍由库的权威事实声明提供。
+ABI 缺失或不同原生重载坍缩为同一个消费端签名时记录诊断，不生成可执行绑定。
+缓存身份包含传递头文件内容、用户声明的导出范围、生产端编译器与工具内容。
+应用源码变化不会扩张范围，也不会使未变化的生产端事实失效。
+
+普通 C++ 库默认使用 `profile = "cpp"`。Python 3.11 自带 TOML 读取器；
+Python 3.10 使用 SDK 的 `tomli` 依赖。
+缓存生成定义是可选的。维护显式 Converter 定义的项目通过 `definitions` 指定文件，
+普通构建仍负责准备契约。独立 Adapter / Converter 命令继续可用。见
+[普通 C++ 工程](../../tests/projects/dci_auto_import/README.md)。
+另见[导出准备门](../../probes/gates/dci-auto-import/README.md)，覆盖内容失效、
+生成产物修复和用户控制的导出范围。
+
+`--boundary shared_abi` 声明共同的 C++ 异常传播 ABI，保留原异常身份，由 Vyx
+生成传播与栈对象清理代码；该模式不生成 `translate_unwind.cpp`。
+当前目标限于已实现的 x86_64 MSVC / System V ABI，调用双方必须使用兼容的
+展开机制。默认 `--boundary no_unwind` 保留边界内捕获和显式错误转换路径。
+
+该选项通用于 C++ 项目。输入库的原始公开头文件，例如：
+
+```powershell
+python tools/dci/dci.py adapter --language cpp include/Api.hpp --boundary shared_abi --triplet windows_x64 -o contracts/Api.dcib
+```
+
+Vyx 消费契约时生成异常传播、对象清理和所需的原生桥接。接入不要求手写
+`watch`、`throw` 或 `call_visible` 等测试辅助函数，也不要求创建名为
+`exception_probe.hpp` 的文件；Qt 回归夹具中的这些函数只用于制造异常和观测清理。
+库的所有权事实、析构声明和构建/链接配置仍需正确提供。
 
 | 选项 | 作用 |
 |---|---|

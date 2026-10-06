@@ -18,6 +18,25 @@ closure. Legacy `depends_on` edges remain accepted as build-only edges.
 `--triplet` selects the LLVM/backend target. Omitting `--target` retains the
 manifest-wide build used by compiler bootstrap projects.
 
+`vyxc --src=project <dir>` reads that directory's `Vyx.toml` and uses the same
+builder as `vyxc build`, the shorthand for the current directory. Target selection,
+dependencies, hooks, DCI contracts, optimization and parallel compilation options
+are shared. `--src=file <path>` compiles an individual file.
+
+`vyxc --run=aot --src=project <dir>` selects one executable and builds its dependency
+closure before running it. With no `--target`, it prefers an executable named
+after the package, then a unique executable; ambiguous selections are errors.
+Library and cross-platform targets cannot be launched this way. Arguments after
+`--` belong to the program and do not change build options.
+
+`--emit=ir` publishes the selected target's Vyx LLVM modules as `<output_dir>/<target>.ll`;
+`--emit=obj` publishes one object or a `<target>.objects` directory when several
+objects are needed. Dependencies are built normally; the selected target is not
+linked into an executable. `-o <path>` overrides the artifact path. Paths supplied
+for `-o` are relative to the caller; manifest paths are relative to the project.
+Select `--target` when the manifest has multiple targets and no package-named target.
+These output modes cannot be combined with `--run=aot` or `--artifact-file`.
+
 `vyx publish`, `vyx install`, `vyx search`, and `vyx lock` talk to a local
 `file://` registry (`VYX_REGISTRY`, default `./.vyx-registry`). `publish`
 copies the current package into `pkgs/<name>/<version>/` and updates
@@ -502,3 +521,32 @@ libs = ["user32", "SDL3"]
 ```
 
 Values are trimmed and surrounding quotes are removed.
+
+## Preparing declared C++ DCI exports
+
+`dci_imports = ["name"]` in a build target enables import preparation before
+source discovery. `[dci.import.name]` supplies `module`, `headers`, explicit
+`export_types` / `export_functions` (or `export_all = true`), optional
+`profile` (`cpp` or `qt`), `project_roots`, `triplet`, `boundary`, `std` and
+`toolchain`, `contract` and `definitions`. Native `cxx`, `cxxflags` and `include_paths` come from the target
+and its build defaults.
+
+The compiler invokes the SDK DCI tools before source discovery. `contract`
+defaults to `contracts/name.dcib`, outside `.cache`. Optional `definitions`
+selects an existing maintained Vyx file, which is never overwritten; otherwise
+the compiler adds `.cache/dci/name/import.vyx`. Both modes add prepared native
+`producer.cpp`. An existing offline contract is validated and reused without
+AST extraction or rewriting it. Deleting the cache rebuilds disposable artifacts
+from that contract. Missing contracts and known changes to producer inputs
+recorded in `source.preparation_inputs` trigger measurement; invalid or
+incompatible supplied contracts fail. `cpp-import --force` explicitly requests
+regeneration. Without preparation provenance, the provider manages contract
+version freshness. Do not maintain
+cache files. Standalone preparation and editable Converter output remain
+available. Application usage never selects exports; all representable members
+of selected classes remain available. `ownership_headers` explicitly selects
+authored library lifetime facts, and unknown ownership is rejected.
+`qt_connections` lists exact optional signal-connection operations; a signal or
+inline definition alone does not select an operation.
+See [the DCI tools](../tools/dci/README.md#optional-build-preparation-for-declared-exports)
+and [the Qt project](../probes/gates/dci-qt-counter/README.md).

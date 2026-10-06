@@ -11,9 +11,11 @@ This guide creates a project, adds files, and changes its build configuration.
 vyxc new hello_app
 cd hello_app
 vyxc build --target hello_app
+vyxc --run=aot --src=project . --target hello_app
 ```
 
-Windows:
+The second command builds and runs the selected target using its configured
+output path. You can also launch the artifact separately. Windows:
 
 ```powershell
 .\target\hello_app.exe
@@ -78,6 +80,26 @@ auto_sources = false
 `--target hello_app` selects a manifest target. `--triplet` selects a platform;
 without it, the compiler builds for the host.
 Omitting `--target` builds the manifest's target set rather than selecting just one entry.
+
+`--run=aot --src=project .` builds and runs one executable target. It prefers an executable
+with the package name, otherwise the only executable target. Multiple candidates
+require `--target`; library targets cannot run. Dependencies, DCI stubs, caching
+and build hooks use the same manifest builder. Failed builds never launch an old
+artifact. The command returns the program's exit code. Cross-compiled outputs
+are not automatically launched on the host.
+
+Put program arguments after `--`:
+
+```sh
+vyxc --run=aot --src=project . --target hello_app -- "two words" --config app.json
+```
+
+`vyxc build` is shorthand for `vyxc --src=project .`. Every project selector uses
+the manifest pipeline, including `vyxc --emit=ir --src=project . --target hello_app`.
+IR output uses the target's output directory, dependencies and DCI contracts.
+`--src=file` compiles an individual file; manifest scripts use `vyxc run <script>`.
+Debug integrations can use `vyxc build --target hello_app -g -O0 --artifact-file launch.txt`.
+After a successful build, `launch.txt` contains the executable's absolute path in UTF-8.
 
 ## 3. Add a source file
 

@@ -408,6 +408,41 @@ Converter **MUST**：
 
 Converter **MAY** 是自动工具、IDE 功能或人工流程。人工绑定仍必须由 Consumer 与 `.dcib` 交叉验证。
 
+Vyx SDK 的独立工具入口为 `vyx-dci convert`（别名 `converter` / `convertor`）：
+
+```sh
+vyx-dci convert contracts/Api.dcib --module native.api --header Api.hpp -o src/native_api.vyx
+```
+
+输出保留 `extern "dci"` 的可见类型和方法签名，供查看、维护及派生覆写；已有文件
+需要显式 `--force` 才能覆写。构建期生成是可选模式。ownership 与 lifecycle 的提取、
+验证和生成属于 Adapter；Converter 不得由指针拼写猜测借用、保留或转移关系。
+可自动确定的语义与需要库协议提供的事实均进入同一原始契约。
+
+导出范围由用户声明。Adapter 不得从 Consumer 调用、inline 定义或库名猜测导出范围。
+范围内可表达的实体全部输出，不能表达的实体记录诊断；基类/布局闭包提供验证依赖。
+可选构建准备要求精确的 `export_types` / `export_functions`，或显式
+`export_all = true`。未知 ownership 必须由用户在 `dci-ownership` 中手写一次，
+或显式选用可复用的 `ownership_headers`，不得猜测为 borrow。
+
+项目契约是持久输入，通常保存在 `contracts/`。已有离线 Adapter 契约经验证后
+直接消费，不重新提取或覆写。删除 `.cache` 只使临时定义、物化源码和构建戳
+失效；准备过程 **MUST NOT** 把缺失缓存戳当成契约 ABI 事实无效的证据。
+无效或不兼容的输入契约必须给出诊断。
+
+可选的 `source.preparation_inputs` 扩展记录第 1 版生产端头文件哈希、目标、
+C++ 标准/参数、异常边界和用户声明的导出范围。构建生成的契约用它独立于缓存
+识别已知的生产端输入变化。编译器版本信息不是消费时必须相等的条件。普通离线
+契约可以不携带该扩展，库版本由提供者管理。显式 `cpp-import --force` 可以
+要求重新测量。所选 Qt 连接操作必须已有实测桥接事实，才能从输入契约重建
+物化源码；缺失操作必须诊断。
+
+`parameter.default` 是生产端声明事实，不是 ABI 参数或额外重载。`constant` 保存
+与参数类型/取值范围一致的标量/null 值；`producer_expression` 记录尚未支持或需要
+生产端求值的默认表达式。可支持的常量默认值成为原始签名上的 Vyx 调用处默认参数；
+未解析的默认值记录诊断并要求显式参数。两者都不生成默认参数包装。
+原生定义引用原始 API 头文件；可选生产端适配操作单独选择。
+
 ---
 
 ## 8. Consumer 规范
@@ -922,7 +957,7 @@ Windows x86_64；异常门还将 Linux x86_64 对象在 WSL 下链接运行。�
 
 | 能力 | C++ | Rust | Zig |
 |---|---|---|---|
-| 继承具名基类 / trait + `override` | 是（[dci_cpp_trait](../tests/projects/dci_cpp_trait/)：实测 C++ 虚派发）；Qt counter 为历史覆盖，当前仍有构造绑定失败 | 是（[dci_rust_trait](../tests/projects/dci_rust_trait/)：`SinkG<i32>`） | 未验证（无测试） |
+| 继承具名基类 / trait + `override` | 是（[dci_cpp_trait](../tests/projects/dci_cpp_trait/)：实测 C++ 虚派发）；[Qt counter](../probes/gates/dci-qt-counter/README.md) 验证 Windows AOT 构造、原生事件覆写与清理 | 是（[dci_rust_trait](../tests/projects/dci_rust_trait/)：`SinkG<i32>`） | 未验证（无测试） |
 | 继承**闭合**泛型 trait 实例 | 是（[dci_cpp_trait](../tests/projects/dci_cpp_trait/)：`VyxHostI32 : SinkG<i32>`，消费方发现需求，由生产端补充实例；不手写 `--export-instance`） | 是（[dci_rust_trait](../tests/projects/dci_rust_trait/)：同一消费方发现与生产端闭合路径；显式 `--export-instance 'SinkG<i32>'` 产出等价事实） | 未验证 |
 | 泛型 Vyx stub 类（`class VyxHostTG<T> : native.SinkG<T>`，实例自动分化） | 是（dci_cpp_trait，2026-09-24：`VyxHostTG<i64>` / `VyxHostTG<VyxBox>`，直接虚调用） | 是（dci_rust_trait，2026-09-23：i32 / i64 / char 三实例 + 直接虚调用与跨界派发） | 未验证 |
 | 消费方自有 `@[repr(C)]` record 作泛型实参 | 是（dci_cpp_trait，2026-09-24：`VyxBox` 12 字节 = indirect + sret） | 是（dci_rust_trait，2026-09-23：`VyxBox` 12 字节 = indirect + sret；需双侧同布局） | 未验证 |
@@ -943,7 +978,8 @@ Windows x86_64；异常门还将 Linux x86_64 对象在 WSL 下链接运行。�
 | [dci-rust-ecosystem](../probes/gates/dci-rust-ecosystem/README.md) | locked/offline registry crates、Cargo 环境复放与原生 oracle |
 | [dci-industrial](../probes/gates/dci-industrial/README.md) | 真实夹具重复运行、有界并发、子进程耗时与进程树 RSS 采样 |
 
-保留的 Qt 门目前存在严格布局验证和构造绑定失败，见
+Qt counter 门已验证 Windows AOT 的独立 Adapter 准备、可见 Vyx 定义、原生事件派发，
+以及 O0/O2 连接生命周期和 shared ABI 清理。其他保留的 Qt 门未在本轮执行；早期失败记录见
 [dci-storage](../probes/gates/dci-storage/README.md)。旧 `tests/projects/dci_spdlog`
 夹具及 `probes/gates/gate-c` 已于 2026-09-28 退役。DCI 必跑项目为
 `dci_cpp_trait`、`dci_rust_trait`、`dci_multilang`、`dci_zig_abi`，再按改动范围运行机制门。

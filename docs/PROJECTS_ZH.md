@@ -11,9 +11,11 @@
 vyxc new hello_app
 cd hello_app
 vyxc build --target hello_app
+vyxc --run=aot --src=project . --target hello_app
 ```
 
-Windows：
+第二条命令构建后直接运行所选目标，自动使用清单中配置的输出路径。
+也可以单独运行产物。Windows：
 
 ```powershell
 .\target\hello_app.exe
@@ -77,6 +79,24 @@ auto_sources = false
 `--target hello_app` 选择构建目标。
 `--triplet` 选择目标平台，是另一个参数；不指定时构建本机程序。
 省略 `--target` 会按清单构建目标集合，而不只是选一个入口。
+
+`--run=aot --src=project .` 构建并运行一个可执行目标：优先选择与包同名的可执行目标，
+否则选择唯一的可执行目标。有多个候选时必须指定 `--target`；库目标不能运行。
+依赖、DCI stub、缓存和构建钩子与 `build` 共用，构建失败不会启动旧产物。
+程序退出码作为命令退出码返回。交叉编译产物不在本机自动启动。
+
+程序参数放在 `--` 后面：
+
+```sh
+vyxc --run=aot --src=project . --target hello_app -- "two words" --config app.json
+```
+
+`vyxc build` 是 `vyxc --src=project .` 的简写。所有项目输入都通过清单构建流程，
+包括 `vyxc --emit=ir --src=project . --target hello_app`，输出到目标配置的目录，
+并加载同一组依赖和 DCI 契约。`--src=file` 只编译单个文件。
+清单脚本仍使用 `vyxc run <脚本名>`。
+IDE 调试可用 `vyxc build --target hello_app -g -O0 --artifact-file launch.txt`，
+构建成功后 `launch.txt` 以 UTF-8 写入可执行产物的绝对路径。
 
 ## 3. 添加源文件
 

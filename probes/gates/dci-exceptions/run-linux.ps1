@@ -26,7 +26,9 @@ try {
         $hooked = Join-Path $run "linux-$level.tracked.ll"
         & $Compiler --src=file (Join-Path $PSScriptRoot 'main.vyx') --triplet=x86_64-unknown-linux-gnu --emit=ir "-$level" -o $ir
         if ($LASTEXITCODE -ne 0) { throw "$level Linux IR emission failed" }
-        $text = [IO.File]::ReadAllText($ir).Replace('@malloc','@tracked_malloc').Replace('@calloc','@tracked_calloc').Replace('@free','@tracked_free')
+        $text = [regex]::Replace([IO.File]::ReadAllText($ir), '@(vyx_runtime_malloc|malloc)(?=[(\s])', '@tracked_malloc')
+        $text = [regex]::Replace($text, '@(vyx_runtime_calloc|calloc)(?=[(\s])', '@tracked_calloc')
+        $text = [regex]::Replace($text, '@(vyx_runtime_free|free)(?=[(\s])', '@tracked_free')
         [IO.File]::WriteAllText($hooked,$text)
         & $clang -c -target x86_64-unknown-linux-gnu $hooked -ffunction-sections -o $obj
         if ($LASTEXITCODE -ne 0) { throw "$level ELF object emission failed" }
@@ -37,7 +39,9 @@ try {
         & wsl -d Ubuntu -e $linuxExe
         if ($LASTEXITCODE -ne 0) { throw "$level Itanium shared unwind failed: $LASTEXITCODE" }
         $doubleLog = Join-Path $run "linux-$level.double.log"
-        & wsl -d Ubuntu -e bash -c 'ulimit -c 0; DCI_EH_DOUBLE_THROW=1 "$1"' _ $linuxExe > $doubleLog 2>&1
+        # Redirect inside Linux: WSL host warnings use UTF-16 stderr and can
+        # otherwise corrupt the UTF-8 native abort marker in a merged log.
+        & wsl -d Ubuntu -e bash -c 'ulimit -c 0; DCI_EH_DOUBLE_THROW=1 "$1" > "$2" 2>&1' _ $linuxExe (WslPath $doubleLog)
         $code = $LASTEXITCODE
         if ($code -ne 134 -or !(Select-String -Path $doubleLog -Pattern '^SECOND_EXCEPTION_THROWN$' -Quiet)) {
             throw "$level expected SIGABRT during double unwind, got $code"

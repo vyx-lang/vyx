@@ -2,7 +2,14 @@ param([string]$Compiler = '')
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))
 if (!$Compiler) { $Compiler = Join-Path $repo 'bootstrap_compiler/out/boot.exe' }
-$runtime = Join-Path $repo 'bootstrap_compiler/out'
+$Compiler = (Resolve-Path -LiteralPath $Compiler).Path
+$runtime = Split-Path -Parent $Compiler
+if (!(Test-Path -LiteralPath (Join-Path $runtime 'vyx_runtime.lib'))) {
+    $runtime = Join-Path (Split-Path -Parent $runtime) 'lib'
+}
+if (!(Test-Path -LiteralPath (Join-Path $runtime 'vyx_runtime.lib'))) {
+    throw "Matching SDK runtime missing for $Compiler"
+}
 $env:PATH = "$runtime;$env:PATH"
 $clang = Join-Path $repo 'clang/bin/clang++.exe'
 $run = Join-Path $PSScriptRoot 'out'
@@ -32,7 +39,9 @@ foreach ($level in @('O0', 'O2')) {
     & $Compiler --src=file (Join-Path $PSScriptRoot 'main.vyx') --emit=ir "-$level" -o $ir
     if ($LASTEXITCODE -ne 0) { throw "$level IR emission failed" }
     $text = [IO.File]::ReadAllText($ir)
-    $text = $text.Replace('@malloc', '@tracked_malloc').Replace('@calloc', '@tracked_calloc').Replace('@free', '@tracked_free')
+    $text = [regex]::Replace($text, '@(vyx_runtime_malloc|malloc)(?=[(\s])', '@tracked_malloc')
+    $text = [regex]::Replace($text, '@(vyx_runtime_calloc|calloc)(?=[(\s])', '@tracked_calloc')
+    $text = [regex]::Replace($text, '@(vyx_runtime_free|free)(?=[(\s])', '@tracked_free')
     [IO.File]::WriteAllText($hooked, $text)
     & $clang $hooked (Join-Path $run 'native.obj') "-L$runtime" -lvyx_runtime -ltbb12 -lsynchronization -lws2_32 -fms-runtime-lib=static -fuse-ld=lld -o $exe
     if ($LASTEXITCODE -ne 0) { throw "$level executable link failed" }

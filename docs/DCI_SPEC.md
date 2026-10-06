@@ -149,6 +149,63 @@ publication. These APIs and the current sidecar-based build integration are dist
 implementation layers; their presence does not imply that every compiler query uses
 a persistent session or every build artifact uses the bundle store.
 
+## Standalone Vyx Converter
+
+The SDK command `vyx-dci convert` (aliases `converter` / `convertor`) reads a
+validated contract and emits an editable Vyx module:
+
+```sh
+vyx-dci convert contracts/Api.dcib --module native.api --header Api.hpp -o src/native_api.vyx
+```
+
+`extern "dci"` retains visible type and method declarations, including const
+and virtual signatures for Vyx inheritance and `override`. Authored definitions
+are checked by the Consumer against the original contract. An existing file
+requires explicit `--force` to replace it. Build-time generation is optional.
+The current automatic declaration surface covers global C++ classes and
+representable signatures; unsupported host declarations produce diagnostics.
+
+Ownership and lifecycle extraction, validation and generation belong to the
+Adapter. Some facts follow from producer semantics and measured operations;
+pointer retention, transfer and release require authoritative library semantics
+or a protocol. The Converter must not invent those facts from pointer spelling.
+Both kinds of fact enter the same contract. Producer layout, base offsets,
+dispatch tables and native ABI symbols retain their measured identities.
+
+Export scope is author-controlled. The Adapter must not derive it from Consumer
+usage, inline definitions or library-name heuristics. Within the selected scope
+it emits representable entities and reports rejected ones; base/layout closure
+supplies validation dependencies. The optional build preparation requires exact
+`export_types` / `export_functions`, or explicit `export_all = true`.
+Unknown ownership must be declared once by the author in a `dci-ownership`
+annotation or explicitly selected reusable `ownership_headers`. The tool must
+not substitute a guessed borrow for a missing fact.
+
+Project contracts are persistent inputs, conventionally in `contracts/`.
+An existing offline Adapter contract is validated and consumed without
+re-extraction or rewriting it. Deleting `.cache` only invalidates disposable
+definitions, materialization and build stamps. Preparation MUST NOT treat a
+missing cache stamp as evidence that the contract's ABI facts are invalid.
+Invalid or incompatible supplied contracts produce diagnostics.
+
+The optional `source.preparation_inputs` extension records version 1 producer
+header hashes, target, C++ standard/flags, exception boundary and declared export
+scope. Build-generated contracts use it to recognize known producer input
+changes independently of the cache. Compiler version provenance is not a
+consume-time equality requirement. Plain offline contracts may omit this
+extension; library version freshness remains the provider's responsibility.
+Explicit `cpp-import --force` can request a new measurement. Selected Qt
+connection operations must already carry measured bridge facts to be
+re-materialized from a supplied contract; missing operations are diagnosed.
+
+`parameter.default` is a producer declaration fact, not an ABI parameter or an
+additional overload. A `constant` contains a typed, range-checked scalar/null
+value; a `producer_expression` records an unsupported/default-evaluation need.
+Supported constant defaults become Vyx call-site defaults on the original
+signature. Unresolved defaults require explicit arguments and diagnostics.
+Neither path generates a default-argument wrapper. Native definitions include
+original API headers; optional producer operations are selected separately.
+
 ## Direct and Stub
 
 **Direct** emits the native ABI operation described by the contract without an
@@ -273,7 +330,7 @@ Producer -> consumer reverse override (Stub; vtables measured by the producer):
 
 | Capability | C++ | Rust | Zig |
 |---|---|---|---|
-| Inherit named base / trait + `override` | yes ([dci_cpp_trait](../tests/projects/dci_cpp_trait/): measured C++ virtual dispatch); Qt counter is historical coverage with current constructor-binding failures | yes ([dci_rust_trait](../tests/projects/dci_rust_trait/): `SinkG<i32>`) | unverified |
+| Inherit named base / trait + `override` | yes ([dci_cpp_trait](../tests/projects/dci_cpp_trait/): measured C++ virtual dispatch); [Qt counter](../probes/gates/dci-qt-counter/README.md) verifies Windows AOT construction, native event overrides and cleanup | yes ([dci_rust_trait](../tests/projects/dci_rust_trait/): `SinkG<i32>`) | unverified |
 | Inherit a **closed** generic trait instance | yes ([dci_cpp_trait](../tests/projects/dci_cpp_trait/): `VyxHostI32 : SinkG<i32>`, consumer-discovered demand and producer instance supplement; no handwritten `--export-instance`) | yes ([dci_rust_trait](../tests/projects/dci_rust_trait/): the same instance-demand path; `--export-instance 'SinkG<i32>'` is the equivalent explicit request) | unverified |
 | Generic Vyx stub class (`class VyxHostTG<T> : native.SinkG<T>`) | yes (dci_cpp_trait, 2026-09-24: `VyxHostTG<i64>` / `VyxHostTG<VyxBox>` with direct virtual calls) | yes (dci_rust_trait, 2026-09-23: i32 / i64 / char) | unverified |
 | Consumer-owned `@[repr(C)]` record as a generic argument | yes (dci_cpp_trait, 2026-09-24: 12-byte `VyxBox`, indirect + sret) | yes (dci_rust_trait, 2026-09-23: 12-byte `VyxBox`, indirect + sret) | unverified |
@@ -295,8 +352,10 @@ machinery rather than any single producer language:
 | [dci-rust-ecosystem](../probes/gates/dci-rust-ecosystem/README.md) | Locked/offline registry crates, Cargo environment replay and native oracle |
 | [dci-industrial](../probes/gates/dci-industrial/README.md) | Repeated real fixtures, bounded parallel orchestration, child wall time and sampled process-tree RSS |
 
-The retained Qt gates have current strict-layout and constructor-binding failures
-documented in [dci-storage](../probes/gates/dci-storage/README.md).
+The Qt counter gate now verifies standalone Adapter preparation, visible Vyx
+definitions and native event dispatch on Windows AOT, plus O0/O2 connection
+lifetime and shared-ABI cleanup. Other retained Qt gates were not evaluated in
+this run; earlier failures are recorded in [dci-storage](../probes/gates/dci-storage/README.md).
 The old `tests/projects/dci_spdlog` fixture and `probes/gates/gate-c` were retired
 on 2026-09-28. Required project acceptance uses `dci_cpp_trait`, `dci_rust_trait`,
 `dci_multilang` and `dci_zig_abi`, alongside the relevant mechanism gates.

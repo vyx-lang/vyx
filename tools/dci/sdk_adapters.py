@@ -89,6 +89,10 @@ _CPP_PARAMETERS: tuple[OptionSpec, ...] = (
     ),
     OptionSpec(dest="std", flags=("--std",), default="c++17",
                help="C++ language standard"),
+    OptionSpec(dest="boundary", flags=("--boundary",), default="no_unwind",
+               choices=("no_unwind", "shared_abi"),
+               help="C++ exception boundary; shared_abi preserves native exceptions "
+                    "with a declared compatible propagation ABI"),
     OptionSpec(
         dest="jobs", flags=("-j", "--jobs"), metavar="N", convert=int,
         help="parallel Clang AST-dump workers (default: min(32, CPU count); "
@@ -102,6 +106,10 @@ _CPP_PARAMETERS: tuple[OptionSpec, ...] = (
                metavar="DIR", help="root whose public headers are exported"),
     OptionSpec(dest="scan_public_root", flags=("--scan-public-root",), kind="flag",
                help="export every header below --project-root"),
+    OptionSpec(dest="export_type", flags=("--export-type",), kind="append",
+               metavar="TYPE", help="export exact C++ record identities and their base closure"),
+    OptionSpec(dest="export_function", flags=("--export-function",), kind="append",
+               metavar="NAME", help="export exact free function identities in a selected API"),
     OptionSpec(dest="cmake_build_path", flags=("--cmake_build_path", "--cmake-build-path"),
                metavar="DIR", help="CMake build directory with compile_commands.json; "
                "real include dirs, defines, standard and layout flags are applied "
@@ -122,6 +130,7 @@ def _cpp_build_argv(request: AdapterRequest) -> list[str]:
     if request.extractor:
         argv.extend(["--clang", request.extractor])
     argv.extend(["--target", request.target, "--std", request.get("std")])
+    argv.extend(["--boundary", request.get("boundary")])
 
     jobs = request.get("jobs")
     if jobs is not None:
@@ -139,6 +148,10 @@ def _cpp_build_argv(request: AdapterRequest) -> list[str]:
         argv.extend(["--project-root", _resolved_directory(root, "project root")])
     if request.has("scan_public_root"):
         argv.append("--scan-public-root")
+    for name in request.many("export_type"):
+        argv.extend(["--export-type", name])
+    for name in request.many("export_function"):
+        argv.extend(["--export-function", name])
 
     clang_args = list(request.extractor_args)
     for include_dir in request.many("include_dir"):

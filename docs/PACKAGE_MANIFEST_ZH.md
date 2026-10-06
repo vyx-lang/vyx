@@ -8,8 +8,22 @@
 
 ## 目标选择
 
-`--target app` 选择清单中的目标并构建其依赖闭包；省略时构建清单中的目标集合。
+`--target app` 选择清单中的目标并构建其依赖闭包；仅构建时省略它会构建清单中的目标集合。
 `--triplet` 指定目标平台，不是清单目标名。默认编译宿主平台。
+
+`vyxc --src=project <目录>` 读取该目录的 `Vyx.toml`，使用与 `vyxc build` 相同的
+项目构建器。`build` 是当前目录项目的简写；目标、依赖、钩子、DCI 契约、优化和
+并行编译参数共用。`--src=file <文件>` 编译单个文件。
+
+`vyxc --run=aot --src=project <目录>` 构建并运行一个可执行目标的依赖闭包。未指定 `--target` 时，
+优先选择与包同名的可执行目标，否则选择唯一的可执行目标；有多个候选时报告错误。
+库和交叉平台产物不能这样启动。`--` 后的参数只传给程序，不影响构建选项。
+
+`--emit=ir` 将所选目标的 Vyx LLVM 模块合并到 `<输出目录>/<目标>.ll`；
+`--emit=obj` 输出一个对象文件，有多个对象时输出 `<目标>.objects` 目录。
+依赖照常构建，所选目标不链接为可执行文件。`-o <路径>` 覆盖产物位置；
+`-o` 路径相对调用目录，清单路径相对项目目录。多个目标且没有包同名目标时需指定
+`--target`。这两种输出不能与 `--run=aot` 或 `--artifact-file` 组合。
 
 ## 常用配置
 
@@ -125,3 +139,26 @@ vyxc build --target app --triplet aarch64-linux-android23
 
 调试配置见[编辑器与调试](TOOLING_ZH.md)。
 交叉编译需要目标平台的工具链、运行时及依赖，具体要求见[测试与构建指南](TESTING_GUIDE_ZH.md)。
+
+## 准备已声明的 C++ DCI 导出
+
+构建目标设置 `dci_imports = ["name"]` 后，编译器在收集源码前准备导入。
+`[dci.import.name]` 提供 `module`、`headers`，必须明确声明
+`export_types` / `export_functions` 或 `export_all = true`，以及可选的 `profile`
+（`cpp` 或 `qt`）、`project_roots`、`triplet`、`boundary`、`std`、`toolchain`、
+`contract`、`definitions`。
+原生 `cxx`、`cxxflags`、`include_paths` 使用目标与 build 默认配置。
+
+编译器在收集源码前调用 SDK DCI 工具。`contract` 默认输出到项目的
+`contracts/name.dcib`，放在缓存之外。可选的 `definitions` 指向已维护的 Vyx
+文件，准备过程不覆写它；省略时才添加 `.cache/dci/name/import.vyx`。
+两种模式都会添加准备好的原生 `producer.cpp`。已有离线契约经校验后直接使用，
+不重新提取 AST 或覆写。删除缓存后普通构建会从该契约重建中间产物。契约缺失，
+或 `source.preparation_inputs` 记录的生产端输入变化时才测量；无效或不兼容的
+输入契约会报错。`cpp-import --force` 显式要求重新生成；未携带准备元信息的
+离线契约由提供者管理版本。独立准备与可编辑的 Converter 定义仍可选用。
+应用调用不会决定导出范围；所选类的全部可表达成员保持可用。
+`ownership_headers` 显式选用用户编写的库事实声明，未知所有权拒绝适配。
+`qt_connections` 列出精确的可选信号连接操作，不会仅因出现信号或 inline 就增加导出。
+见 [DCI 工具说明](../tools/dci/README.zh-CN.md#可选的声明范围构建准备) 和
+[Qt 工程](../probes/gates/dci-qt-counter/README.md)。

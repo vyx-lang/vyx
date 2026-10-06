@@ -21,6 +21,86 @@ SPEC.loader.exec_module(adapter)
 
 class DciAdapterMsvcTests(unittest.TestCase):
 
+    def test_native_method_parameter_names_defaults_and_original_identity(self):
+        node = {"kind": "CXXMethodDecl", "name": "add", "mangledName": "native_add",
+                "type": {"qualType": "int (int, int)"}, "inner": [
+                    {"kind": "ParmVarDecl", "name": "amount"},
+                    {"kind": "ParmVarDecl", "name": "multiplier", "init": "c",
+                     "inner": [{"kind": "IntegerLiteral", "value": "2"}]}]}
+        symbol = adapter.symbol_from_method("Session", node, "public")
+        exported = adapter.symbol_json(symbol)
+        self.assertEqual(exported["link_name"], "native_add")
+        self.assertEqual(exported["params"][1]["name"], "multiplier")
+        self.assertEqual(exported["params"][1]["default"], {"kind": "constant", "value": 2, "source": "clang_ast"})
+        self.assertEqual(len(exported["abi"]["params"]), 2)
+
+    def test_default_expression_side_effects_are_not_evaluated_or_guessed(self):
+        node = {"init": "c", "inner": [{"kind": "CallExpr", "inner": [{"kind": "IntegerLiteral", "value": "0"}]}]}
+        fact = adapter.default_argument_fact(node, adapter.dci_type("int"))
+        self.assertEqual(fact["kind"], "producer_expression")
+        self.assertNotIn("value", fact)
+        cast = {"init": "c", "inner": [{"kind": "ImplicitCastExpr", "castKind": "IntegralCast",
+                                         "inner": [{"kind": "IntegerLiteral", "value": "256"}]}]}
+        self.assertEqual(adapter.default_argument_fact(cast, adapter.dci_type("unsigned char"))["kind"], "producer_expression")
+
+    def test_enum_defaults_use_producer_measured_values(self):
+        node = {"init": "c", "inner": [{"kind": "DeclRefExpr", "referencedDecl": {
+            "kind": "EnumConstantDecl", "name": "CoarseTimer", "type": {"qualType": "Qt::TimerType"}}}]}
+        param = {"type": adapter.dci_type("int"), "default": adapter.default_argument_fact(node, adapter.dci_type("int"))}
+        symbol = adapter.Symbol(name="timer", owner="", member_name="timer", mangled="native_timer",
+                                kind="function", calling_convention="cdecl", params=[param], ret=None)
+        with mock.patch.object(adapter, "_run_diagnostic_type_probe", return_value="implicit instantiation of undefined template '__vyx_dci_signed_default<0, 1>'"):
+            adapter.evaluate_enum_argument_defaults(None, "c++17", "windows_x64", [], [symbol], [])
+        self.assertEqual(param["default"], {"kind": "constant", "value": 1, "source": "producer_constant_evaluation"})
+
+    def test_anonymous_enum_default_retains_the_exact_native_scope(self):
+        node = {"kind": "DeclRefExpr", "referencedDecl": {"kind": "EnumConstantDecl",
+            "name": "ApplicationFlags", "type": {"qualType": "QCoreApplication::(unnamed enum at sdk/header.h:69:5)"}}}
+        expression = adapter.default_constant_expression(node)
+        self.assertEqual(expression, "QCoreApplication::ApplicationFlags")
+
+    def test_different_frontend_or_flags_cannot_supply_a_default_fact(self):
+        from types import SimpleNamespace
+        producer, extractor = SimpleNamespace(executable="native-cxx"), SimpleNamespace(executable="extractor-cxx")
+        for native, extract, native_args, extract_args in ((producer, extractor, [], []),
+                (producer, producer, ["-DDEFAULT=7"], [])):
+            symbol = adapter.Symbol(name="read", owner="", member_name="read", mangled="native_read",
+                kind="function", calling_convention="cdecl", params=[{"type": adapter.dci_type("int"),
+                    "default": {"kind": "constant", "value": 2, "source": "clang_ast"}}], ret=None)
+            self.assertFalse(adapter.default_arguments_have_producer_authority([symbol], native, extract, native_args, extract_args))
+            self.assertEqual(symbol.params[0]["default"]["kind"], "producer_expression")
+            self.assertNotIn("value", symbol.params[0]["default"])
+
+    def test_native_operation_uses_the_authored_ownership_rules(self):
+        symbol = adapter.Symbol(name="Widget::find", owner="Widget", member_name="find",
+            mangled="original", kind="method", calling_convention="win64",
+            params=[{"name": "other", "type": adapter.dci_type("Widget*")},
+                    {"name": "index", "type": adapter.dci_type("int")}],
+            ret={"type": adapter.dci_type("Widget*")})
+        adapter.apply_ownership_annotations([symbol], {adapter.symbol_selector(symbol):
+            {"parameters": {"0": "borrow"}, "return": "borrow"}})
+        exported = adapter.symbol_json(symbol)
+        self.assertEqual(exported["link_name"], "original")
+        self.assertEqual(exported["params"][0]["ownership"], "borrow")
+        self.assertEqual(exported["return"]["ownership"], "borrow")
+
+    def test_native_operation_cannot_invent_a_pointer_lifetime(self):
+        symbol = adapter.Symbol(name="Widget::take", owner="Widget", member_name="take",
+            mangled="original", kind="method", calling_convention="win64",
+            params=[{"name": "pointer", "type": adapter.dci_type("Widget*")}], ret=None)
+        with self.assertRaisesRegex(adapter.AdapterContractError, "explicit ownership annotation"):
+            adapter.symbol_json(symbol)
+
+    def test_qt_connection_ownership_requires_the_selected_library_protocol(self):
+        symbol = adapter.Symbol(name="Button::clicked", owner="Button", member_name="clicked",
+            mangled="original", kind="method", calling_convention="win64",
+            params=[{"name": "checked", "type": adapter.dci_type("bool")}],
+            ret={"type": adapter.dci_type("void")})
+        with self.assertRaisesRegex(adapter.AdapterContractError, "lifetime protocol"):
+            adapter.import_operation_ownership(symbol, "connect_clicked", "signal", 1, {}, "cpp")
+        _, facts = adapter.import_operation_ownership(symbol, "connect_clicked", "signal", 1, {}, "qt")
+        self.assertEqual(facts["parameters"], {"0": "borrow", "1": "borrow", "2": "copy", "3": "borrow"})
+
     def test_discovers_project_header_closure_without_exporting_sdk_headers(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -447,6 +527,25 @@ class DciAdapterMsvcTests(unittest.TestCase):
             self.assertEqual(info["name"], "Foo")
         finally:
             adapter.CPP_TYPE_ALIAS_TARGETS = previous
+
+    def test_bitfield_signedness_resolves_alias_discovered_after_layout(self):
+        previous = adapter.CPP_TYPE_ALIAS_TARGETS
+        try:
+            adapter.CPP_TYPE_ALIAS_TARGETS = {"uint": "unsigned int", "signed_word": "int"}
+            for name, expected in (("uint", False), ("signed_word", True)):
+                field = adapter.FieldLayout("bits", name, 0, bit_offset=0,
+                                            bit_width=3, storage_size=4, is_signed=None)
+                emitted = adapter.field_json(field, "QtLike")
+                self.assertIs(emitted["bitfield"]["signed"], expected)
+                self.assertIs(emitted["storage"]["signed"], expected)
+        finally:
+            adapter.CPP_TYPE_ALIAS_TARGETS = previous
+
+    def test_unknown_bitfield_signedness_is_rejected(self):
+        field = adapter.FieldLayout("bits", "UnresolvedWord", 0, bit_offset=0,
+                                    bit_width=3, storage_size=4, is_signed=None)
+        with self.assertRaisesRegex(adapter.AdapterContractError, "unknown signedness"):
+            adapter.field_json(field, "Unknown")
 
     @staticmethod
     def make_symbol(

@@ -4,7 +4,13 @@ $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))
 if (!$Compiler) { $Compiler = Join-Path $repo 'bootstrap_compiler/out/boot.exe' }
 $Compiler = (Resolve-Path -LiteralPath $Compiler).Path
-$runtime = Join-Path $repo 'bootstrap_compiler/out'
+$runtime = Split-Path -Parent $Compiler
+if (!(Test-Path -LiteralPath (Join-Path $runtime 'vyx_runtime.lib'))) {
+    $runtime = Join-Path (Split-Path -Parent $runtime) 'lib'
+}
+if (!(Test-Path -LiteralPath (Join-Path $runtime 'vyx_runtime.lib'))) {
+    throw "Matching SDK runtime missing for $Compiler"
+}
 $llvm = Join-Path $repo 'clang'
 $clang = Join-Path $llvm 'bin/clang++.exe'
 $env:LLVM_ROOT = $llvm
@@ -68,7 +74,9 @@ foreach ($level in @('O0', 'O2')) {
     if (!$text.Contains('dci_list_')) { throw "$level IR omitted the producer brace constructor" }
     # Intercept only DCI storage allocation calls in the Vyx IR. Native std
     # vectors keep their genuine constructors, methods, allocator and destructor.
-    $text = $text.Replace('@malloc', '@tracked_malloc').Replace('@calloc', '@tracked_calloc').Replace('@free', '@tracked_free')
+    $text = [regex]::Replace($text, '@(vyx_runtime_malloc|malloc)(?=[(\s])', '@tracked_malloc')
+    $text = [regex]::Replace($text, '@(vyx_runtime_calloc|calloc)(?=[(\s])', '@tracked_calloc')
+    $text = [regex]::Replace($text, '@(vyx_runtime_free|free)(?=[(\s])', '@tracked_free')
     [IO.File]::WriteAllText($hooked, $text)
     Invoke-Checked $clang @('-c', $stubs, "-$level", '-std=c++17', '-fexceptions',
         '-fcxx-exceptions', '-fms-runtime-lib=static', '-o', $stubObject) "$level-native-members"

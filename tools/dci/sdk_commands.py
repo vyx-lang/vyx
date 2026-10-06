@@ -326,3 +326,74 @@ register_command(CommandPlugin(
 ))
 
 assert COMMANDS  # built-ins registered on import
+
+def command_convert(args) -> int:
+    try:
+        try:
+            from . import converter
+        except ImportError:
+            import converter
+        contract = Path(args.contract).resolve()
+        output = Path(args.output).resolve()
+        report = Path(args.report).resolve() if args.report else None
+        if output == contract or report in {contract, output}:
+            raise ValueError("Converter output/report must not replace the input contract or each other")
+        document = load_contract(contract)
+        schema = json.loads(DEFAULT_SCHEMA.read_text(encoding="utf-8"))
+        errors = dci_validate.schema_errors(schema, document)
+        if isinstance(document, dict):
+            errors += dci_validate.semantic_errors(document, strict=True)
+        if errors:
+            raise ValueError("invalid measured contract:\n" + "\n".join(errors))
+        import os
+        relative_contract = Path(os.path.relpath(contract, output.parent)).as_posix()
+        source, rejected = converter.emit_import(document, args.module, relative_contract, args.header)
+        for item in rejected:
+            print(f'Converter: {item["selector"]}: {item["reason"]}', file=sys.stderr)
+        if args.deny_rejected and rejected:
+            return 1
+        converter.write_definition(output, source, force=args.force)
+        if report:
+            write_json(report, {"module": args.module, "contract": str(contract), "rejected": rejected})
+    except (OSError, ValueError, KeyError, TypeError, dci_validate.DciValidationError) as exc:
+        raise DciCliError(f"DCI conversion failed: {exc}") from exc
+    print(f"converted {contract} -> {output}")
+    return 0
+
+
+register_command(CommandPlugin(
+    name="convert", aliases=("converter", "convertor"),
+    help="convert a measured contract to editable Vyx extern dci definitions",
+    add_arguments=lambda sub: (
+        sub.add_argument("contract"), sub.add_argument("--module", required=True),
+        sub.add_argument("-o", "--output", required=True),
+        sub.add_argument("--header", action="append", default=[], help="cpp_include header for native Stub compilation; repeatable"),
+        sub.add_argument("--report", help="write unsupported host declarations as a diagnostic report"),
+        sub.add_argument("--deny-rejected", action="store_true"),
+        sub.add_argument("--force", action="store_true", help="explicitly overwrite an existing Vyx definition")),
+    handler=command_convert,
+))
+
+
+def command_cpp_import(args) -> int:
+    try:
+        try:
+            from . import cpp_auto_import
+        except ImportError:
+            import cpp_auto_import
+        cpp_auto_import.prepare(args.manifest, args.target, args.jobs, args.force, args.build_context, args.imports)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DciCliError(f"C++ export preparation failed: {exc}") from exc
+    return 0
+
+
+register_command(CommandPlugin(
+    name="cpp-import", help="prepare measured C++ imports through the Adapter/Converter pipeline",
+    add_arguments=lambda sub: (
+        sub.add_argument("manifest"), sub.add_argument("--target", required=True),
+        sub.add_argument("--import", dest="imports", action="append", help="prepare a named import independently of build-time dci_imports"),
+        sub.add_argument("-j", "--jobs", type=int, default=4),
+        sub.add_argument("--build-context", help="effective target inputs emitted by vyxc build"),
+        sub.add_argument("--force", action="store_true")),
+    handler=command_cpp_import,
+))

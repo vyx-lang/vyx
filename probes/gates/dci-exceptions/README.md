@@ -64,8 +64,10 @@ SDK compiler. Rebuild and rerun Gate A/B for subsequent compiler changes.
   rejection. Consumer lifecycle regressions now inspect emitted operations
   instead of requiring the removed `[dci-lifecycle]` diagnostic count logs;
   those former log assertions are not current known failures.
-- The existing Qt failures remain documented in `../dci-storage/README.md`:
-  Adapter strict layout validation and QApplication/QString constructor binding.
+- Qt adapter validation and constructor binding failures at that repair are
+  recorded in `../dci-storage/README.md`. The current
+  [Qt counter gate](../dci-qt-counter/README.md) validates original C++ exception
+  propagation, virtual callbacks and object cleanup with `shared_abi`.
 
 Before semantic changes, SPLIT2 extracted call/invoke emission into
 `llvm_unwind.vyx`. S2/S3 matched

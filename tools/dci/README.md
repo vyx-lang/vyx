@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md) · [Documentation](../../docs/README.md) · [DCI reference](../../docs/DCI_SPEC.md) · [Fact Semantic Ownership System](../../docs/MOSP.md)
 
-This directory contains producer Adapters, contract validation and encoding,
+This directory contains producer Adapters, a contract-to-Vyx Converter, validation and encoding,
 Active Adapter sessions, and Stub backends. The unified command is
 `python tools/dci/dci.py`; `vyxc dci` discovers the same tools beside the SDK
 or through `VYX_DCI_TOOLS`.
@@ -106,7 +106,7 @@ owning language:
 
 Each language also declares what only it understands: C++ adds `--toolchain`,
 `--std`, `-j`, `--include`, `-I`, `--project-root`, `--scan-public-root`,
-`--cmake-build-path`, `--compile-flags`; Rust adds `--edition`,
+`--cmake-build-path`, `--compile-flags`, `--boundary`; Rust adds `--edition`,
 `--deny-rejected`, `--export-active-requests`, `--export-instance`; Zig adds
 `--deny-rejected`. Using a parameter that belongs to another language is an
 error that names its owner instead of being silently ignored:
@@ -121,6 +121,158 @@ dci: error: adapter option(s) belong to another language adapter:
 what a plugin declares — see [EXTENDING.md](EXTENDING.md).
 
 ### C++ configuration
+
+#### Standalone Adapter and Converter
+
+DCI has an independent toolchain. Generate and validate a contract with the
+producer Adapter, then explicitly convert it to visible Vyx definitions:
+
+```sh
+vyx-dci adapter --language cpp include/Api.hpp --toolchain clang -o contracts/Api.dcib
+vyx-dci convert contracts/Api.dcib --module native.api --header Api.hpp -o src/native_api.vyx
+```
+
+`python tools/dci/dci.py` supplies the same commands without installation.
+`converter` and `convertor` are aliases of `convert`. The result is an ordinary
+module with `@[dci_import(...)]` and `extern "dci"`: class identities, public
+bases, constructors, destructors, methods, const and virtual signatures remain
+visible. Vyx subclasses use these signatures with `override`. The Consumer
+cross-checks authored declarations against the original measured contract.
+Conversion neither measures nor modifies ABI, ownership or lifecycle facts.
+Existing files are preserved unless an explicit conversion uses `--force`.
+`--report` records unsupported declarations; `--deny-rejected` makes them fail
+conversion. The current automatic declaration surface covers global C++ class
+names and representable method/free-function signatures, not every C++ syntax.
+
+Ownership extraction and normalization belong to the Adapter. Scalars, references
+and measured lifecycle operations provide some facts automatically. Raw-pointer
+retention, transfer and release need authoritative producer semantics or a library
+protocol. The Adapter rejects missing facts; the Converter consumes the contract
+and never invents ownership. The Qt protocol lives in the Adapter's SDK profile.
+Native layout, base adjustments, vtables and ABI symbols are measured from the
+producer compiler. Export scope belongs to the author: `--export-type` and
+`--export-function` select exact entities; an unfiltered Adapter invocation
+explicitly selects the supplied public-header scope. Consumer usage and inline
+definitions never select or expand it. Within that scope, representable entities
+are emitted with diagnostics for rejected entities. Layout/base dependencies
+are measured to validate the selected API.
+
+Scalar/null default arguments are declaration facts on the original signature.
+The Converter emits supported defaults in Vyx; the Consumer supplies them at
+the call site and still calls the original native symbol. Built-in constant
+expressions and enum constants are evaluated by the producer compiler. Unknown
+or dynamic defaults require an explicit argument, with a diagnostic; they never
+create a shortened-signature wrapper. `cpp_include` names original API headers.
+Defaults expanded by a different frontend or configuration are also rejected
+as call-site defaults; the native signature remains available with explicit arguments.
+
+The [Qt gate](../../probes/gates/dci-qt-counter/README.md) maintains visible
+definitions in `src/qt_widgets.vyx` and prepares its contract during project builds.
+`cpp-import Vyx.toml --target app --import widgets` prepares a named library
+independently of the target's automatic source import setting.
+
+#### Optional build preparation for declared exports
+
+A target's optional `dci_imports` list connects the original producer headers to a normal
+`vyxc build`. Configure a library once in `Vyx.toml`:
+
+```toml
+[target.app]
+type = "executable"
+entry = "src/main.vyx"
+dci_imports = ["widgets"]
+dci_stub_backend = "clang-cpp"
+# cxx, cxxflags and include_paths select the native toolchain as usual.
+
+[dci.import.widgets]
+module = "qt.widgets"
+contract = "contracts/qt_widgets.dcib"
+# Optional: use a maintained Converter file instead of cache-generated definitions.
+definitions = "src/qt_widgets.vyx"
+headers = ["native/widgets.hpp"]
+export_types = ["QWidget", "QPushButton"]
+ownership_headers = ["native/widgets_ownership.hpp"]
+# Optional Qt connection operation, selected explicitly:
+qt_connections = ["QAbstractButton::clicked(bool)"]
+profile = "qt"
+boundary = "shared_abi"
+```
+
+The compiler invokes `dci cpp-import Vyx.toml --target app` before collecting
+sources and adds the selected Vyx definition file and prepared native source to
+the build graph. `contract` defaults to `contracts/<import>.dcib`, outside the
+build cache. When `definitions` is supplied, it must name an existing Vyx file:
+the Adapter never rewrites it or generates a second module. Omit `definitions`
+to use the cache-generated Converter module, which references the project contract.
+The build system supplies the effective template and platform configuration;
+the adapter uses the same C++ flags and include paths as native compilation.
+The author must declare `export_types` / `export_functions`, or explicitly choose
+`export_all = true` for the supplied public-header scope. Application source is
+not scanned to select exports. A selected class exposes all its representable
+members, with measured base/layout dependencies; unused members are retained.
+Exact producer declarations supply signatures, bases, overloads and supported
+defaults. The Qt protocol checks the signals explicitly listed in
+`qt_connections` and materializes typed `on_<signal>` connection operations.
+Seeing a signal alone never enables a connection export. These are optional
+adapter operations, distinct from original native signal methods. The profile's
+callback state must outlive the connection; Qt sender/context destruction
+supplies disconnection, while unknown payload lifetimes are rejected.
+`ownership_headers` explicitly selects reusable library declarations, such as
+the SDK's `profiles/qt_widgets.hpp`; it is not enabled by the profile name. Facts
+can also be authored once in the public header's `dci-ownership` annotation.
+An unknown pointer lifetime is rejected with a diagnostic; it is never guessed.
+
+Project contracts live in `contracts/`; generated definitions, native
+materialization, dependency stamps and rejection reports live under
+`.cache/dci/<import>/`. Removing that cache does not remove the project contract
+or authored definitions; the next build prepares the missing artifacts from the
+existing contract, without AST extraction. A supplied offline Adapter contract
+is validated for schema, target ABI, exception boundary and selected exports;
+it is not rewritten. Missing measured Qt connection operations are diagnosed.
+Invalid or incompatible supplied contracts fail instead of being replaced.
+
+Preparation measures a contract when it is missing, when `cpp-import --force`
+is explicitly requested, or when a generated contract's recorded producer
+inputs changed. Generated contracts carry optional `source.preparation_inputs`
+with header content hashes and native configuration, independent of `.cache`.
+Compiler version annotations and DCI tool updates do not invalidate those facts.
+Plain offline contracts may omit this metadata; their provider manages library
+version freshness. C++ pointer ownership requires authoritative library
+facts; this pipeline does not invent lifetimes. Missing ABI facts and collapsed
+consumer overload identities are reported. Header dependencies, declared export
+scope, compilers and tool content determine cache validity. Changing application
+source cannot expand the scope or invalidate unchanged producer facts.
+
+`profile = "cpp"` is the default for ordinary C++ libraries. Python 3.11 includes
+the TOML reader; Python 3.10 uses the SDK's `tomli` dependency.
+This cache-generated definition mode is optional. A project maintaining explicit
+Converter definitions selects them with `definitions`, while keeping contract
+preparation in the normal build. Standalone Adapter/Converter commands remain
+available. See
+[the ordinary C++ project](../../tests/projects/dci_auto_import/README.md).
+The [export preparation gate](../../probes/gates/dci-auto-import/README.md) checks
+content invalidation, generated-output repair and author-controlled export scope.
+
+`--boundary shared_abi` declares a common C++ exception propagation ABI. It
+preserves exception identity and lets Vyx emit propagation and stack-object
+cleanup; this mode does not generate `translate_unwind.cpp`. It currently
+supports the implemented x86_64 MSVC / System V ABIs and requires compatible
+unwinding on both sides. The default `--boundary no_unwind` retains boundary
+catching and explicit error conversion.
+
+This option applies to C++ projects generally. Pass the library's original
+public header, for example:
+
+```powershell
+python tools/dci/dci.py adapter --language cpp include/Api.hpp --boundary shared_abi --triplet windows_x64 -o contracts/Api.dcib
+```
+
+The Vyx consumer emits exception propagation, object cleanup and required native
+bridges from the contract. Applications do not need handwritten `watch`,
+`throw` or `call_visible` test helpers, or a file named `exception_probe.hpp`.
+Those functions in the Qt regression fixture only inject exceptions and observe
+cleanup. Library ownership facts, destructor declarations and build/link
+configuration must still be supplied correctly.
 
 | Option | Purpose |
 |---|---|

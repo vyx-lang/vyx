@@ -55,6 +55,27 @@ SPEC.loader.exec_module(dci_cli)
 
 
 class DciCliTests(unittest.TestCase):
+    def test_converter_is_standalone_and_does_not_replace_authored_definitions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            contract = root / "api.dcib"
+            contract.write_bytes(dci_cli.dcib.encode(_portable_contract("test")))
+            original = contract.read_bytes()
+            output = root / "src/api.vyx"
+            args = ["convertor", str(contract), "--module", "api", "-o", str(output)]
+            with mock.patch.object(dci_cli.dci_adapter_cpp, "main", side_effect=AssertionError("Converter must not invoke Adapter")):
+                self.assertEqual(dci_cli.main(args), 0)
+            self.assertIn('extern "dci"', output.read_text())
+            self.assertIn('../api.dcib', output.read_text())
+            output.write_text("author edits\n")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(dci_cli.main(args), 2)
+            self.assertEqual(output.read_text(), "author edits\n")
+            self.assertEqual(dci_cli.main(args + ["--force"]), 0)
+            self.assertEqual(contract.read_bytes(), original)
+            self.assertNotIn("cpp-bindings", dci_cli.COMMANDS)
+            self.assertNotIn("cpp-bridge", dci_cli.COMMANDS)
+
     def test_target_aliases(self) -> None:
         self.assertEqual(
             dci_cli.canonical_target("x64_windows"),
@@ -257,6 +278,36 @@ class DciCliTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         argv = run.call_args.args[0]
         self.assertEqual(argv[argv.index("--jobs") + 1], "16")
+
+    def test_cpp_exception_boundary_reaches_adapter_before_compiler_arguments(self) -> None:
+        for boundary in ("no_unwind", "shared_abi"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as td:
+                header = Path(td) / "api.hpp"
+                header.write_text("void throwing_operation();\n", encoding="utf-8")
+                with mock.patch.object(dci_cli.dci_adapter_cpp, "main", return_value=0) as run:
+                    rc = dci_cli.main([
+                        "adapter", str(header), "--boundary", boundary,
+                        "-o", str(Path(td) / "api.dcib"), "--", "-DEXAMPLE=1",
+                    ])
+                self.assertEqual(rc, 0)
+                argv = run.call_args.args[0]
+                index = argv.index("--boundary")
+                self.assertEqual(argv[index + 1], boundary)
+                self.assertLess(index, argv.index("--"))
+
+    def test_cpp_exception_boundary_rejected_by_other_languages(self) -> None:
+        for language, suffix in (("rust", ".rs"), ("zig", ".zig")):
+            with self.subTest(language=language), tempfile.TemporaryDirectory() as td:
+                source = Path(td) / ("lib" + suffix)
+                source.write_text("", encoding="utf-8")
+                output = io.StringIO()
+                with contextlib.redirect_stderr(output):
+                    rc = dci_cli.main([
+                        "adapter", "--language", language, str(source),
+                        "--boundary", "shared_abi",
+                    ])
+                self.assertEqual(rc, 2)
+                self.assertIn("--boundary (--language cpp)", output.getvalue())
 
 
 if __name__ == "__main__":

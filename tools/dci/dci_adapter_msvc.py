@@ -322,6 +322,11 @@ def run(cmd: list[str]) -> str:
             f"C++ fact extraction command failed with exit code {proc.returncode}"
             + (f":\n{detail}" if detail else "")
         )
+    if "-ast-dump=json" in cmd:
+        # Successful diagnostics cannot be concatenated into structured JSON.
+        if proc.stderr:
+            print(proc.stderr, file=sys.stderr, end="")
+        return proc.stdout
     return proc.stdout + "\n" + proc.stderr
 
 
@@ -488,9 +493,11 @@ def _dci_type(raw: str, owner: str = "", _alias_stack: tuple[str, ...] = ()) -> 
             ),
             "cpp_type": raw,
             "calling_convention": declared_calling_convention(text) or "cdecl",
+            "noexcept": "noexcept" in function_pointer.group("suffix"),
             "signature": {
-                "params": [dci_type_contract(dci_type(param, owner)) for param in params],
+                "params": [dci_type_contract(dci_type(param, owner)) for param in params if param != "..."],
                 "return": dci_type_contract(dci_type(ret_text, owner)),
+                "variadic": "..." in params,
             },
         }
     array_type = RE_ARRAY_TYPE.match(text)
@@ -1036,6 +1043,36 @@ def apply_ownership_annotations(
             symbol.return_ownership = returned
 
 
+def import_operation_ownership(
+    symbol: Symbol, native_name: str, mode: str, count: int,
+    rule: dict[str, Any], profile: str,
+) -> tuple[str, dict[str, Any]]:
+    """Adapter facts for a generated producer operation, before ABI measurement.
+
+    Qt connection rules come from the explicitly selected library protocol;
+    pointer spelling never proves retention. Native defaults are call-site
+    facts and have no generated ownership or symbol entry.
+    The normal Adapter subsequently validates these rules against the measured
+    generated signature and writes normalized ownership into the contract.
+    """
+    if count < 0 or count > len(symbol.params):
+        raise AdapterContractError(f"{symbol.name}: invalid generated argument count")
+    params = symbol.params[:count]
+    spellings = [p["type"].get("cpp_type") or p["type"].get("canonical_cpp_type") for p in params]
+    if not all(spellings):
+        raise AdapterContractError(f"{symbol.name}: missing producer parameter spelling")
+    if mode == "signal":
+        if (profile != "qt" or symbol.is_static or symbol.kind != "method"
+                or (symbol.ret or {}).get("type", {}).get("name") != "void"
+                or any(p["type"].get("kind") != "primitive"
+                       or p["type"].get("reference", "value") != "value" for p in params)):
+            raise AdapterContractError(f"{symbol.name}: connection has no supported library lifetime protocol")
+        callback = ",".join(["void*"] + spellings)
+        selector = f"{native_name}({symbol.owner}*,QObject*,void (*)({callback}),void*)"
+        return selector, {"parameters": {"0": "borrow", "1": "borrow", "2": "copy", "3": "borrow"}}
+    raise AdapterContractError(f"{symbol.name}: unsupported generated operation {mode!r}")
+
+
 def split_top_level_template_args(text: str) -> list[str]:
     args: list[str] = []
     depth = 0
@@ -1113,7 +1150,9 @@ def discover_type_aliases(headers: list[str]) -> list[TypeAlias]:
                     class_scopes.append(class_depth)
             if re.match(r"^\s*template\s*<", raw_line):
                 pending_template_decl = True
-            if not class_scopes:
+            # Only namespace-scope aliases are public discovery candidates.
+            # Local aliases inside an inline bridge must not become API/layouts.
+            if not class_scopes and depth == (namespaces[-1][1] if namespaces else 0):
                 m = RE_USING_ALIAS.search(raw_line)
                 if m:
                     if pending_template_decl:
@@ -2263,6 +2302,125 @@ def msvc_complete_destructor_mangled(ast_mangled: str, is_virtual: bool) -> str:
     return "??1" + owner_encoding + "@@" + access_call + "@XZ"
 
 
+def default_constant_expression(node: dict[str, Any]) -> str | None:
+    """Reproduce only built-in constant syntax for producer evaluation.
+
+    Preserve compiler-reported operand casts. Never execute a CallExpr, or
+    reconstruct user-defined operators, constructors or retained addresses.
+    """
+    kind, children = node.get("kind"), node.get("inner", [])
+    if kind in {"ParenExpr", "ConstantExpr"} and len(children) == 1:
+        return default_constant_expression(children[0])
+    if kind == "IntegerLiteral" and re.fullmatch(r"\d+", str(node.get("value", ""))):
+        value = node["value"]
+        expression = f"{value}ULL"
+    elif kind == "CXXBoolLiteralExpr" and type(node.get("value")) is bool:
+        expression = "true" if node["value"] else "false"
+    elif kind == "DeclRefExpr" and node.get("referencedDecl", {}).get("kind") == "EnumConstantDecl":
+        declaration = node["referencedDecl"]
+        enum_spelling = (declaration.get("type") or {}).get("qualType", "")
+        enum_type = canonical_scoped_record_name(enum_spelling)
+        member = declaration.get("name", "")
+        anonymous = re.fullmatch(r"(.+)::\((?:unnamed|anonymous) enum(?: at .*)?\)", enum_spelling)
+        if anonymous and RE_PLAIN_SCOPED_IDENTIFIER.fullmatch(anonymous[1]):
+            # Clang identifies the exact enclosing scope of this anonymous
+            # enum. Refer to that scope's enumerator, never a leaf-name match.
+            enum_type = anonymous[1]
+        if not RE_PLAIN_SCOPED_IDENTIFIER.fullmatch(enum_type) or not re.fullmatch(r"[A-Za-z_]\w*", member):
+            return None
+        return enum_type + "::" + member
+    elif kind == "BinaryOperator" and len(children) == 2 and node.get("opcode") in {
+            "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "&&", "||", "==", "!=", "<", ">", "<=", ">="}:
+        operands = [default_constant_expression(child) for child in children]
+        if any(operand is None for operand in operands):
+            return None
+        return f'({operands[0]} {node["opcode"]} {operands[1]})'
+    elif kind == "UnaryOperator" and len(children) == 1 and node.get("opcode") in {"+", "-", "~", "!"}:
+        operand = default_constant_expression(children[0])
+        return f'({node["opcode"]}{operand})' if operand is not None else None
+    elif kind in {"ImplicitCastExpr", "CXXStaticCastExpr"} and len(children) == 1:
+        expression = default_constant_expression(children[0])
+        if expression is None:
+            return None
+    else:
+        return None
+    cpp_type = (node.get("type") or {}).get("qualType", "")
+    # Exact scalar/enum type spellings are compiler supplied. This restriction
+    # also keeps arbitrary declaration syntax out of the measurement probe.
+    if not cpp_type or not re.fullmatch(r"[A-Za-z_]\w*(?:(?:::| )[A-Za-z_]\w*)*", cpp_type):
+        return None
+    return f"static_cast<{cpp_type}>({expression})"
+
+
+def default_argument_fact(node: dict[str, Any], ty: dict[str, Any]) -> dict[str, Any] | None:
+    """Keep producer defaults as call-site facts, never a synthetic overload.
+
+    Only literal scalar/null expressions and compiler-evaluated ConstantExprs
+    can be moved to the Consumer. Calls, conversions and record construction
+    retain an explicit unsupported fact rather than guessed zero values.
+    """
+    if "init" not in node:
+        return None
+    expressions = node.get("inner", [])
+    if len(expressions) != 1:
+        return {"kind": "producer_expression", "reason": "default expression is unavailable in the producer AST"}
+    expression = expressions[0]
+    constant_expression = default_constant_expression(expression)
+    while expression.get("kind") in {"ParenExpr", "ExprWithCleanups", "ImplicitCastExpr"}:
+        children = expression.get("inner", [])
+        # An implicit cast can change a value; do not discard conversions.
+        if expression.get("kind") == "ImplicitCastExpr" and expression.get("castKind") not in {
+            "NoOp", "NullToPointer", "LValueToRValue"}:
+            break
+        if len(children) != 1:
+            break
+        expression = children[0]
+    kind = expression.get("kind")
+    value = None
+    supported = False
+    if kind in {"CXXNullPtrLiteralExpr", "GNUNullExpr"} and ty.get("reference") == "pointer":
+        supported = True
+    elif ty.get("kind") == "primitive" and ty.get("reference", "value") == "value":
+        if kind == "CXXBoolLiteralExpr" and ty.get("name") == "bool":
+            value, supported = expression.get("value"), True
+        elif kind in {"IntegerLiteral", "ConstantExpr"} and re.fullmatch(r"[iu](8|16|32|64)|[iu]size", ty.get("name", "")):
+            text = str(expression.get("value", ""))
+            if re.fullmatch(r"-?\d+", text):
+                value, supported = int(text), True
+        elif kind == "UnaryOperator" and expression.get("opcode") in {"-", "+"}:
+            inner = expression.get("inner", [])
+            if len(inner) == 1 and inner[0].get("kind") == "IntegerLiteral" and re.fullmatch(r"i(8|16|32|64)|isize", ty.get("name", "")):
+                value = int(inner[0]["value"]) * (-1 if expression["opcode"] == "-" else 1)
+                supported = True
+    if supported:
+        return {"kind": "constant", "value": value, "source": "clang_ast"}
+    if constant_expression is not None:
+        return {"kind": "producer_expression", "cpp_constant_expression": constant_expression,
+                "reason": "built-in default expression needs producer constant evaluation"}
+    if kind == "DeclRefExpr":
+        declaration = expression.get("referencedDecl", {})
+        enum_type = canonical_scoped_record_name((declaration.get("type") or {}).get("qualType", ""))
+        member = declaration.get("name", "")
+        if declaration.get("kind") == "EnumConstantDecl" and RE_PLAIN_SCOPED_IDENTIFIER.fullmatch(enum_type) and re.fullmatch(r"[A-Za-z_]\w*", member):
+            return {"kind": "producer_expression", "enum_type": enum_type, "enum_member": member,
+                    "reason": "enum default needs producer constant evaluation"}
+    return {"kind": "producer_expression", "reason": "default needs producer evaluation or a supported Consumer value type"}
+
+
+def parameters_from_ast(params_raw: list[str], node: dict[str, Any], owner: str = "") -> list[dict[str, Any]]:
+    declarations = [child for child in node.get("inner", []) if child.get("kind") == "ParmVarDecl"]
+    params = [{"name": f"p{i}", "type": dci_type(p, owner), "location": "abi"}
+              for i, p in enumerate(params_raw)]
+    if len(declarations) != len(params):
+        return params
+    for param, declaration in zip(params, declarations):
+        param["name"] = declaration.get("name") or param["name"]
+        default = default_argument_fact(declaration, param["type"])
+        if default is not None:
+            param["default"] = default
+    return params
+
+
 def symbol_from_method(owner: str, node: dict[str, Any], access: str) -> Symbol | None:
     if (
         node.get("isImplicit")
@@ -2299,10 +2457,7 @@ def symbol_from_method(owner: str, node: dict[str, Any], access: str) -> Symbol 
         ret = "void"
         is_static = False
         mangled = msvc_complete_destructor_mangled(mangled, is_virtual)
-    params = [
-        {"name": f"p{i}", "type": dci_type(p, owner), "location": "abi"}
-        for i, p in enumerate(params_raw)
-    ]
+    params = parameters_from_ast(params_raw, node, owner)
     if kind == "method" and not is_static:
         call_cc = "cxx_virtual_method" if is_virtual else "cxx_method"
     elif kind == "constructor":
@@ -2383,7 +2538,7 @@ def ast_symbols(nodes: list[dict[str, Any]], record_names: set[str], free_names:
                     continue
                 qual_type = (rec.get("type") or {}).get("qualType") or ""
                 ret, params_raw, _ = split_function_type(qual_type)
-                params = [{"name": f"p{i}", "type": dci_type(p), "location": "abi"} for i, p in enumerate(params_raw)]
+                params = parameters_from_ast(params_raw, rec)
                 sym = Symbol(
                     name=name,
                     owner="",
@@ -2545,6 +2700,61 @@ def _run_diagnostic_type_probe(
         env=environment,
     )
     return proc.stdout or ""
+
+
+def default_arguments_have_producer_authority(symbols, toolchain, extractor, native_args, extractor_args):
+    """Do not adopt another frontend/configuration's expanded defaults."""
+    same_executable = os.path.normcase(os.path.realpath(toolchain.executable)) == os.path.normcase(os.path.realpath(extractor.executable))
+    if same_executable and native_args == extractor_args:
+        return True
+    for symbol in symbols:
+        for param in symbol.params:
+            if "default" in param:
+                param["default"] = {"kind": "producer_expression",
+                                    "reason": "default declaration was extracted with a different producer frontend/configuration; supply an explicit argument"}
+    return False
+
+
+def evaluate_enum_argument_defaults(toolchain, std, target, headers, symbols, compiler_args):
+    """Ask the ABI authority for constant defaults; emit no runtime entries."""
+    candidates = []
+    for symbol in symbols:
+        for param in symbol.params:
+            fact, ty = param.get("default", {}), param["type"]
+            if fact.get("kind") != "producer_expression" or not ("enum_type" in fact or "cpp_constant_expression" in fact):
+                continue
+            if ty.get("kind") != "primitive" or not re.fullmatch(r"[iu](8|16|32|64)", ty.get("name", "")):
+                continue
+            candidates.append(param)
+    if not candidates:
+        return
+    with tempfile.TemporaryDirectory(prefix="vyx_dci_defaults_") as directory:
+        probe = Path(directory) / "constants.cpp"
+        lines = [f'#include "{header}"' for header in headers]
+        lines += ["template<int, long long> struct __vyx_dci_signed_default;",
+                  "template<int, unsigned long long> struct __vyx_dci_unsigned_default;"]
+        for i, param in enumerate(candidates):
+            fact = param["default"]
+            expression = fact.get("cpp_constant_expression")
+            if expression is None:
+                enum_type, member = fact["enum_type"], fact["enum_member"]
+                if not RE_PLAIN_SCOPED_IDENTIFIER.fullmatch(enum_type) or not re.fullmatch(r"[A-Za-z_]\w*", member):
+                    raise AdapterContractError("invalid producer enum default identity")
+                expression = enum_type + "::" + member
+            unsigned = param["type"]["name"].startswith("u")
+            kind, carrier = ("unsigned", "unsigned long long") if unsigned else ("signed", "long long")
+            lines.append(f"__vyx_dci_{kind}_default<{i}, static_cast<{carrier}>({expression})> __vyx_dci_default_{i};")
+        probe.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        output = _run_diagnostic_type_probe(toolchain, std, probe, compiler_args, target)
+    measured = {}
+    for match in re.finditer(r"__vyx_dci_(?:signed|unsigned)_default<\s*(\d+)\s*,\s*(-?\d+)(?:[uUlL]*)\s*>", output):
+        index, value = int(match[1]), int(match[2])
+        if index in measured and measured[index] != value:
+            raise AdapterContractError("conflicting producer default constant measurements")
+        measured[index] = value
+    for i, param in enumerate(candidates):
+        if i in measured:
+            param["default"] = {"kind": "constant", "value": measured[i], "source": "producer_constant_evaluation"}
 
 
 def discover_enum_underlying_with_selected_compiler(
@@ -4991,12 +5201,21 @@ def field_json(field_layout: FieldLayout, owner: str = "") -> dict[str, Any]:
         "is_readonly": cpp_top_level_const(field_layout.cpp_type),
     }
     if field_layout.bit_width is not None:
+        signed = field_layout.is_signed
+        if signed is None:
+            # Layout extraction can precede typedef discovery. Re-resolve the
+            # producer's canonical type after aliases are known (e.g. Qt uint).
+            signed = bitfield_is_signed(result["type"].get("canonical_cpp_type", field_layout.cpp_type))
+        if signed is None:
+            raise AdapterContractError(
+                f"bitfield {owner}::{field_layout.name} has unknown signedness for {field_layout.cpp_type!r}"
+            )
         bitfield = {
             "storage_offset": field_layout.offset,
             "storage_size": field_layout.storage_size,
             "bit_offset": field_layout.bit_offset,
             "bit_width": field_layout.bit_width,
-            "signed": field_layout.is_signed,
+            "signed": signed,
             "bit_order": "lsb0",
             "read": "direct",
             "write": "direct",
@@ -5009,7 +5228,7 @@ def field_json(field_layout: FieldLayout, owner: str = "") -> dict[str, Any]:
             "bit_width": field_layout.bit_width,
             "unit_size": field_layout.storage_size,
             "unit_bits": field_layout.storage_size * 8 if field_layout.storage_size else None,
-            "signed": field_layout.is_signed,
+            "signed": signed,
             "access": "masked",
         }
     return result
@@ -6249,6 +6468,10 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Treat every .h/.hpp under --project-root as a public API root",
     )
+    parser.add_argument("--export-type", action="append", default=[],
+                        help="export exact record identities and their measured base closure")
+    parser.add_argument("--export-function", action="append", default=[],
+                        help="export exact free function identities for a selected API")
     parser.add_argument(
         "--toolchain",
         default="clang",
@@ -6400,6 +6623,18 @@ def main(argv: list[str]) -> int:
             + [alias.target for alias in aliases]
         )
         free_names = discover_free_function_names(project_headers)
+        selected_api = bool(args.export_type or args.export_function)
+        if selected_api:
+            requested = unique_names([canonical_cpp_name(name) for name in args.export_type])
+            missing = set(requested) - set(record_names)
+            if missing:
+                raise AdapterContractError(f"requested C++ record identities were not declared: {sorted(missing)}")
+            record_names = requested
+            requested_functions = unique_names(args.export_function)
+            missing_functions = set(requested_functions) - set(free_names)
+            if missing_functions:
+                raise AdapterContractError(f"requested free functions were not declared: {sorted(missing_functions)}")
+            free_names = requested_functions
         include_text = "".join(f'#include "{h}"\n' for h in args.include)
         record_names = filter_sizeofable_record_names(
             extractor.executable,
@@ -6427,8 +6662,14 @@ def main(argv: list[str]) -> int:
         measured_record_names = unique_names(record_names + measured_instance_names)
         text = include_text
         for idx, name in enumerate(measured_record_names):
+            # The alias and its specialization must be visible in the SAME
+            # filtered Clang dump: AST node IDs belong to that invocation.
+            # Keep valid record identifiers in the synthetic alias so the
+            # record filter includes both. Non-record spellings (e.g. member
+            # pointer aliases) use an opaque label, never an invalid C++ name.
             leaf = last_cpp_component_without_template_args(name)
-            text += f'using vyx_dci_instance_{leaf}_{idx} = {name};\n'
+            label = leaf if re.fullmatch(r"[A-Za-z_]\w*", leaf) else "opaque"
+            text += f'using vyx_dci_instance_{label}_{idx} = {name};\n'
             text += f'static_assert(sizeof({name}) >= 0, "vyx_dci_{idx}");\n'
         probe.write_text(text, encoding="utf-8")
         native_compiler_args = frontend_validation_args(
@@ -6462,6 +6703,17 @@ def main(argv: list[str]) -> int:
         layouts, _closure_record_names = expand_layout_closure(
             layout_dump, measured_record_names
         )
+        if selected_api:
+            # Layout closure proves complete bases. Export their methods too,
+            # so a derived consumer can call and override inherited APIs.
+            base_names = {base.type_name for record in layouts for base in record.bases}
+            record_names = unique_names(record_names + sorted(base_names))
+            ownership_annotations = {
+                selector: facts for selector, facts in ownership_annotations.items()
+                if (selector.split("(", 1)[0].rsplit("::", 1)[0] in record_names
+                    if "::" in selector.split("(", 1)[0]
+                    else selector.split("(", 1)[0] in free_names)
+            }
         # B. Discover enum underlying integers with the selected compiler (the
         #    ABI authority) from every not-yet-resolved class-like field type,
         #    before the AST scan turns symbol parameters into DCI types.
@@ -6544,6 +6796,10 @@ def main(argv: list[str]) -> int:
         if symbol_enum_underlying:
             CPP_ENUM_UNDERLYING.update(symbol_enum_underlying)
         rewrite_enum_symbol_types(symbols)
+        if default_arguments_have_producer_authority(symbols, selected_toolchain, extractor,
+                                                      native_compiler_args, extra):
+            evaluate_enum_argument_defaults(selected_toolchain, args.std, target,
+                                            args.include, symbols, native_compiler_args)
         # A (cont). Give the nested closure records their AST trait/lifecycle
         #    facts.  Without them a by-value parameter such as
         #    ``fmt::basic_string_view<char>`` (``logger::log``) has no executable
@@ -6630,7 +6886,7 @@ def main(argv: list[str]) -> int:
             extractor.executable,
             args.std,
             target,
-            project_headers,
+            args.include,
             extra,
             destructor_probe_owners(symbols),
         )
@@ -6640,7 +6896,7 @@ def main(argv: list[str]) -> int:
                 extractor.executable,
                 args.std,
                 target,
-                project_headers,
+                args.include,
                 extra,
                 layouts,
             )
@@ -6674,7 +6930,7 @@ def main(argv: list[str]) -> int:
         write_abi(
             Path(args.out),
             target,
-            project_headers,
+            args.include,
             layouts,
             symbols,
             vtables,
