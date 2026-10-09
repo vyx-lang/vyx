@@ -28,7 +28,8 @@ Download an SDK from [Releases](https://github.com/vyx-lang/vyx/releases/latest)
 extract it, and add its `bin` directory to `PATH`. The Windows and Linux SDKs
 both bundle the LLVM backend and native linking tools. Keep the SDK directory
 intact; no separate LLVM installation is needed to use the SDK.
-See [Getting started](docs/TUTORIAL.md) for installation.
+See [Getting started](docs/TUTORIAL.md) for installation. For directory selection,
+updates, rollback, and uninstall, see [SDK setup](tools/sdk-setup/README.md).
 
 Save this as `hello.vyx`:
 

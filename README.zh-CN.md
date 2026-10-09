@@ -24,7 +24,8 @@ Migrate、Reflection、DCI、DCE、Effect 是它的五大核心特性。
 从 [Releases](https://github.com/vyx-lang/vyx/releases/latest) 下载 SDK，解压后
 将 `bin` 目录加入 `PATH`。Windows 与 Linux SDK 均已内置 LLVM 后端和原生链接工具，
 使用时保留完整的 SDK 目录，无需另装 LLVM。
-安装步骤见[入门教程](docs/入门指南_ZH.md)。
+安装步骤见[入门教程](docs/入门指南_ZH.md)。自选安装目录、更新、回退与卸载见
+[SDK 安装管理](tools/sdk-setup/README.zh-CN.md)。
 
 保存为 `hello.vyx`：
 
