@@ -30,7 +30,7 @@ allocation behavior. Keep the compiler, backend and runtime from the same build.
 ## LSP
 
 ```powershell
-python probes/gates/editor-industrial/measure_lsp.py --lsp bootstrap_compiler/out/vyxc-lsp.exe --workspace bootstrap_compiler --document bootstrap_compiler/src/core/parser.vyx --iterations 100 --semantic-tokens --burst 100 --result .runs/editor-industrial/lsp-compiler.json
+python probes/gates/editor-industrial/measure_lsp.py --lsp bootstrap_compiler/out/vyxc-lsp.exe --workspace bootstrap_compiler --document bootstrap_compiler/src/core/syntax/parser.vyx --iterations 100 --semantic-tokens --burst 100 --result .runs/editor-industrial/lsp-compiler.json
 python probes/gates/editor-industrial/measure_lsp.py --lsp bootstrap_compiler/out/vyxc-lsp.exe --workspace Zyn --document Zyn/src/ui/Ui.vyx --query Zyn --iterations 100 --semantic-tokens --result .runs/editor-industrial/lsp-zyn.json
 python probes/gates/editor-industrial/measure_lsp.py --lsp bootstrap_compiler/out/vyxc-lsp.exe --workspace probes/gates/dci-qt-counter --document probes/gates/dci-qt-counter/src/main.vyx --query Counter --iterations 100 --semantic-tokens --burst 100 --result .runs/editor-industrial/lsp-qt.json
 ```
@@ -64,7 +64,7 @@ and closing a document releases its editor text and restores its disk index.
 ```powershell
 python probes/gates/editor-industrial/check_lsp_semantic.py --lsp bootstrap_compiler/out/vyxc-lsp.exe --compiler bootstrap_compiler/out/boot.exe --result .runs/editor-industrial/semantic.json
 python probes/gates/editor-industrial/check_lsp_packages.py --lsp bootstrap_compiler/out/vyxc-lsp.exe --result .runs/editor-industrial/packages.json
-python probes/gates/editor-industrial/measure_lsp_bindings.py --lsp bootstrap_compiler/out/vyxc-lsp.exe --workspace bootstrap_compiler --document bootstrap_compiler/src/core/parser.vyx --result .runs/editor-industrial/bindings-compiler.json
+python probes/gates/editor-industrial/measure_lsp_bindings.py --lsp bootstrap_compiler/out/vyxc-lsp.exe --workspace bootstrap_compiler --document bootstrap_compiler/src/core/syntax/parser.vyx --result .runs/editor-industrial/bindings-compiler.json
 ```
 
 The first gate checks exact bindings in a six-file project, applies renames and

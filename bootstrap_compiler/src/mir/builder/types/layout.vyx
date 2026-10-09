@@ -1,0 +1,508 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn field_index_in_owner(self, field_item_id: i32, owner_item_id: i32) -> i32 {
+        var index: i32 = 0;
+        var item_id: i32 = 1;
+        while (item_id < field_item_id) {
+            if (self.h.item_kind(item_id) == hir_item_field()
+                && self.h.item_owner(item_id) == owner_item_id) {
+                index = index + 1;
+            }
+            item_id = item_id + 1;
+        }
+        return index;
+    }
+
+    public fn variant_index_in_owner(self, variant_item_id: i32, owner_item_id: i32) -> i32 {
+        var index: i32 = 0;
+        var item_id: i32 = 1;
+        while (item_id < variant_item_id) {
+            if (self.h.item_kind(item_id) == hir_item_variant()
+                && self.h.item_owner(item_id) == owner_item_id) {
+                index = index + 1;
+            }
+            item_id = item_id + 1;
+        }
+        return index;
+    }
+
+    public fn type_id_for_item(self, item_id: i32) -> i32 {
+        let direct = self.h.item_type(item_id);
+        if (direct != hir_id_invalid()) { return direct; }
+        let name = self.h.item_name(item_id);
+        if (name.len == 0) { return hir_id_invalid(); }
+        return self.type_id_by_text(name);
+    }
+
+    public fn reset_layout_indexes_for_current_hir(self) {
+        self.layout_type_index = mir_name_id_map_dispose(self.layout_type_index);
+        var layout_type_cap: i32 = self.h.types.count;
+        layout_type_cap = layout_type_cap + 1;
+        self.layout_type_id_map = mir_i32_map_clear_for_count(self.layout_type_id_map, layout_type_cap);
+        self.layout_materialized_type_id_map = mir_i32_map_clear_for_count(self.layout_materialized_type_id_map, layout_type_cap);
+        self.layout_owner_type_item_map = mir_i32_map_clear_for_count(self.layout_owner_type_item_map, layout_type_cap);
+        self.field_owner_first_map = mir_i32_map_clear_for_count(self.field_owner_first_map, self.h.item_count + 1);
+        self.field_owner_next_map = mir_i32_map_clear_for_count(self.field_owner_next_map, self.h.item_count + 1);
+        self.variant_owner_first_map = mir_i32_map_clear_for_count(self.variant_owner_first_map, self.h.item_count + 1);
+        self.variant_owner_next_map = mir_i32_map_clear_for_count(self.variant_owner_next_map, self.h.item_count + 1);
+        self.field_owner_done_map = mir_i32_map_clear_for_count(self.field_owner_done_map, self.h.item_count + 1);
+        self.variant_owner_done_map = mir_i32_map_clear_for_count(self.variant_owner_done_map, self.h.item_count + 1);
+        self.layout_item_count = self.h.item_count;
+        self.layout_owner_item_count = 0;
+    }
+
+    public fn owner_item_has_layout_member(self, owner_item: i32) -> bool {
+        if (owner_item == hir_id_invalid()) { return false; }
+        var member = self.h.item_first_member(owner_item);
+        var guard: i32 = 0;
+        while (member != hir_id_invalid() && guard <= self.h.item_count) {
+            let member_kind = self.h.item_kind(member);
+            if (member_kind == hir_item_field() || member_kind == hir_item_variant()) { return true; }
+            member = self.h.item_next_sibling(member);
+            guard = guard + 1;
+        }
+        var item_id: i32 = 1;
+        while (item_id <= self.h.item_count) {
+            if (self.h.item_owner(item_id) == owner_item) {
+                let item_kind = self.h.item_kind(item_id);
+                if (item_kind == hir_item_field() || item_kind == hir_item_variant()) { return true; }
+            }
+            item_id = item_id + 1;
+        }
+        return false;
+    }
+
+    public fn string_abi_member_call_is_builtin(self, callee_expr_id: i32) -> bool {
+        if (callee_expr_id == hir_id_invalid()
+            || self.h.expr_kind(callee_expr_id) != ex_MEMBER()) { return false; }
+        var name = self.h.expr_name(callee_expr_id);
+        if (name.len == 0) { name = self.h.expr_value_text(callee_expr_id); }
+        let builtin_name = name == "c_str" || name == "ptr" || name == "data"
+            || name == "len" || name == "length" || name == "size" || name == "count"
+            || name == "clone" || name == "repeat"
+            || name == "find" || name == "indexOf" || name == "index_of"
+            || name == "equals" || name == "contains"
+            || name == "startsWith" || name == "starts_with"
+            || name == "endsWith" || name == "ends_with"
+            || name == "isEmpty" || name == "is_empty"
+            || name == "substr" || name == "substring"
+            || name == "charAt" || name == "char_at"
+            || name == "charCodeAt" || name == "char_code_at" || name == "byteAt"
+            || name == "trim" || name == "replace"
+            || name == "toUpper" || name == "to_upper"
+            || name == "toLower" || name == "to_lower";
+        if (!builtin_name) { return false; }
+        let receiver = self.h.expr_lhs(callee_expr_id);
+        if (receiver == hir_id_invalid()) { return false; }
+        return self.type_text_is_string_abi(self.type_text(self.h.expr_type(receiver)));
+    }
+
+    public fn owner_item_layout_member_count(self, owner_item: i32) -> i32 {
+        if (owner_item == hir_id_invalid()) { return 0; }
+        var count: i32 = 0;
+        var item_id: i32 = 1;
+        while (item_id <= self.h.item_count) {
+            if (self.h.item_owner(item_id) == owner_item) {
+                let kind = self.h.item_kind(item_id);
+                if (kind == hir_item_field() || kind == hir_item_variant()) {
+                    count = count + 1;
+                }
+            }
+            item_id = item_id + 1;
+        }
+        return count;
+    }
+
+    public fn ensure_layout_owner_type_index(self) {
+        if (self.layout_owner_item_count == self.h.item_count) { return; }
+        var layout_type_cap: i32 = self.h.types.count;
+        layout_type_cap = layout_type_cap + 1;
+        self.layout_owner_type_item_map = mir_i32_map_clear_for_count(self.layout_owner_type_item_map, layout_type_cap);
+        self.field_owner_first_map = mir_i32_map_clear_for_count(self.field_owner_first_map, self.h.item_count + 1);
+        self.field_owner_next_map = mir_i32_map_clear_for_count(self.field_owner_next_map, self.h.item_count + 1);
+        self.variant_owner_first_map = mir_i32_map_clear_for_count(self.variant_owner_first_map, self.h.item_count + 1);
+        self.variant_owner_next_map = mir_i32_map_clear_for_count(self.variant_owner_next_map, self.h.item_count + 1);
+        var item_id: i32 = 1;
+        while (item_id <= self.h.item_count) {
+            let kind = self.h.item_kind(item_id);
+            if (kind == hir_item_class()
+                || kind == hir_item_enum()
+                || kind == hir_item_interface()) {
+                let type_id = self.type_id_for_item(item_id);
+                if (type_id != hir_id_invalid()) {
+                    let existing_owner = mir_i32_map_get(self.layout_owner_type_item_map, type_id);
+                    if (existing_owner == hir_id_invalid()
+                        || self.owner_item_layout_member_count(item_id)
+                            > self.owner_item_layout_member_count(existing_owner)) {
+                        mir_i32_map_put(self.layout_owner_type_item_map, type_id, item_id);
+                    }
+                }
+            } else if (kind == hir_item_field()) {
+                let owner_item = self.h.item_owner(item_id);
+                if (owner_item != hir_id_invalid()) {
+                    let prev = mir_i32_map_get(self.field_owner_first_map, owner_item);
+                    mir_i32_map_put(self.field_owner_next_map, item_id, prev);
+                    mir_i32_map_put(self.field_owner_first_map, owner_item, item_id);
+                }
+            } else if (kind == hir_item_variant()) {
+                let owner_variant_item = self.h.item_owner(item_id);
+                if (owner_variant_item != hir_id_invalid()) {
+                    let prev_variant = mir_i32_map_get(self.variant_owner_first_map, owner_variant_item);
+                    mir_i32_map_put(self.variant_owner_next_map, item_id, prev_variant);
+                    mir_i32_map_put(self.variant_owner_first_map, owner_variant_item, item_id);
+                }
+            }
+            item_id = item_id + 1;
+        }
+        self.layout_owner_item_count = self.h.item_count;
+    }
+
+    public fn owner_item_for_layout_type(self, type_id: i32) -> i32 {
+        if (type_id == hir_id_invalid()) { return hir_id_invalid(); }
+        self.ensure_layout_owner_type_index();
+        return mir_i32_map_get(self.layout_owner_type_item_map, type_id);
+    }
+
+    public fn first_field_item_for_owner(self, owner_item: i32) -> i32 {
+        if (owner_item == hir_id_invalid()) { return hir_id_invalid(); }
+        self.ensure_layout_owner_type_index();
+        return mir_i32_map_get(self.field_owner_first_map, owner_item);
+    }
+
+    public fn next_field_item(self, item_id: i32) -> i32 {
+        if (item_id == hir_id_invalid()) { return hir_id_invalid(); }
+        return mir_i32_map_get(self.field_owner_next_map, item_id);
+    }
+
+    public fn first_variant_item_for_owner(self, owner_item: i32) -> i32 {
+        if (owner_item == hir_id_invalid()) { return hir_id_invalid(); }
+        self.ensure_layout_owner_type_index();
+        return mir_i32_map_get(self.variant_owner_first_map, owner_item);
+    }
+
+    public fn next_variant_item(self, item_id: i32) -> i32 {
+        if (item_id == hir_id_invalid()) { return hir_id_invalid(); }
+        return mir_i32_map_get(self.variant_owner_next_map, item_id);
+    }
+
+    public fn build_field_layouts(self) {
+        var item_id: i32 = self.field_item_scan_next;
+        if (item_id < 1) { item_id = 1; }
+        while (item_id <= self.h.item_count) {
+            if (self.h.item_kind(item_id) == hir_item_field()) {
+                var field_exists = false;
+                if (item_id <= self.unit.field_cap) {
+                    let existing = self.unit.field_record(item_id);
+                    field_exists = existing != null
+                        && ast_read_i32(existing) == item_id
+                        && ast_read_i32(ptr_offset(existing, 8)) != mir_id_invalid()
+                        && ast_read_i32(ptr_offset(existing, 12)) != mir_id_invalid();
+                }
+                if (!field_exists) {
+                    let owner_item = self.h.item_owner(item_id);
+                    var field_index = self.h.item_field_index(item_id);
+                    if (field_index < 0) {
+                        field_index = self.field_index_in_owner(item_id, owner_item);
+                    }
+                    let owner_type = self.type_id_for_item(owner_item);
+                    // Keep a valid record for every referenced HIR FieldId.
+                    // Versioned class layouts can reuse a numeric field index
+                    // while retaining distinct historical FieldIds; the
+                    // type/index lookup may pick the latest record, but MIR
+                    // verification and semantic targets still need both.
+                    self.unit.add_field_layout(
+                                              item_id,
+                                              owner_item,
+                                              owner_type,
+                                              self.h.item_type(item_id),
+                                              field_index,
+                                              self.h.item_name(item_id));
+                }
+            }
+            item_id = item_id + 1;
+        }
+        self.field_item_scan_next = self.h.item_count + 1;
+    }
+
+    public fn build_variant_layouts(self) {
+        var item_id: i32 = self.variant_item_scan_next;
+        if (item_id < 1) { item_id = 1; }
+        while (item_id <= self.h.item_count) {
+            if (self.h.item_kind(item_id) == hir_item_variant()) {
+                var variant_exists = false;
+                if (item_id <= self.unit.variant_cap) {
+                    let existing = self.unit.variant_record(item_id);
+                    variant_exists = existing != null && ast_read_i32(existing) == item_id;
+                }
+                if (!variant_exists) {
+                    let owner_item = self.h.item_owner(item_id);
+                    var tag = self.h.item_variant_tag(item_id);
+                    if (tag < 0) {
+                        tag = self.variant_index_in_owner(item_id, owner_item);
+                    }
+                    self.unit.add_variant_layout(
+                                                item_id,
+                                                owner_item,
+                                                self.type_id_for_item(owner_item),
+                                                tag,
+                                                self.h.item_name(item_id),
+                                                self.h.item_variant_payload_types(item_id),
+                                                self.h.item_variant_payload_count(item_id));
+                }
+            }
+            item_id = item_id + 1;
+        }
+        self.variant_item_scan_next = self.h.item_count + 1;
+    }
+
+    public fn ensure_field_layout_for_item(self, item_id: i32) -> i32 {
+        if (item_id == hir_id_invalid()
+            || item_id < 1
+            || item_id > self.h.item_count
+            || self.h.item_kind(item_id) != hir_item_field()) {
+            return hir_id_invalid();
+        }
+        let owner_item = self.h.item_owner(item_id);
+        let owner_type = self.type_id_for_item(owner_item);
+        self.ensure_field_layout_for_owner_item(owner_item);
+        var field_index = self.h.item_field_index(item_id);
+        if (field_index < 0) {
+            field_index = self.field_index_in_owner(item_id, owner_item);
+        }
+        var item_record_valid = false;
+        if (item_id <= self.unit.field_cap) {
+            let item_record = self.unit.field_record(item_id);
+            item_record_valid = item_record != null
+                && ast_read_i32(item_record) == item_id
+                && self.unit.field_owner_type( item_id)
+                    != mir_id_invalid()
+                && self.unit.field_type( item_id)
+                    != mir_id_invalid();
+        }
+        if (!item_record_valid) {
+            self.unit.add_field_layout(
+                                      item_id,
+                                      owner_item,
+                                      owner_type,
+                                      self.h.item_type(item_id),
+                                      field_index,
+                                      self.h.item_name(item_id));
+        }
+        return item_id;
+    }
+
+    public fn ensure_field_layout_for_owner_item(self, owner_item: i32) {
+        if (owner_item == hir_id_invalid()) { return; }
+        if (mir_i32_map_get(self.field_owner_done_map, owner_item) == 2) { return; }
+        mir_i32_map_put(self.field_owner_done_map, owner_item, 2);
+        let owner_type = self.type_id_for_item(owner_item);
+        var scan = self.first_field_item_for_owner(owner_item);
+        while (scan != hir_id_invalid()) {
+            var field_index = self.h.item_field_index(scan);
+            if (field_index < 0) {
+                field_index = self.field_index_in_owner(scan, owner_item);
+            }
+            self.ensure_layouts_for_type(self.h.item_type(scan));
+            var scan_record_valid = false;
+            if (scan <= self.unit.field_cap) {
+                let scan_record = self.unit.field_record(scan);
+                scan_record_valid = scan_record != null
+                    && ast_read_i32(scan_record) == scan
+                    && self.unit.field_owner_type( scan)
+                        != mir_id_invalid()
+                    && self.unit.field_type( scan)
+                        != mir_id_invalid();
+            }
+            if (!scan_record_valid) {
+                self.unit.add_field_layout(
+                                          scan,
+                                          owner_item,
+                                          owner_type,
+                                          self.h.item_type(scan),
+                                          field_index,
+                                          self.h.item_name(scan));
+            }
+            scan = self.next_field_item(scan);
+        }
+    }
+
+    public fn ensure_variant_layout_for_item(self, item_id: i32) -> i32 {
+        if (item_id == hir_id_invalid()
+            || item_id < 1
+            || item_id > self.h.item_count
+            || self.h.item_kind(item_id) != hir_item_variant()) {
+            return hir_id_invalid();
+        }
+        let owner_item = self.h.item_owner(item_id);
+        self.ensure_variant_layout_for_owner_item(owner_item);
+        var tag = self.h.item_variant_tag(item_id);
+        if (tag < 0) {
+            tag = self.variant_index_in_owner(item_id, owner_item);
+        }
+        return self.unit.variant_id_for_type_tag( self.type_id_for_item(owner_item), tag);
+    }
+
+    public fn ensure_variant_layout_for_owner_item(self, owner_item: i32) {
+        if (owner_item == hir_id_invalid()) { return; }
+        if (mir_i32_map_get(self.variant_owner_done_map, owner_item) == 2) { return; }
+        mir_i32_map_put(self.variant_owner_done_map, owner_item, 2);
+        let owner_type = self.type_id_for_item(owner_item);
+        var scan = self.first_variant_item_for_owner(owner_item);
+        while (scan != hir_id_invalid()) {
+            var tag = self.h.item_variant_tag(scan);
+            if (tag < 0) {
+                tag = self.variant_index_in_owner(scan, owner_item);
+            }
+            if (self.unit.variant_id_for_type_tag( owner_type, tag) == mir_id_invalid()) {
+                self.unit.add_variant_layout(
+                                            scan,
+                                            owner_item,
+                                            owner_type,
+                                            tag,
+                                            self.h.item_name(scan),
+                                            self.h.item_variant_payload_types(scan),
+                                            self.h.item_variant_payload_count(scan));
+            }
+            scan = self.next_variant_item(scan);
+        }
+    }
+
+    public fn ensure_layouts_for_existing_type_text_args(self, type_text: string) {
+        if (type_text.len == 0 || policy_generic_call_has_args(type_text.clone()) == 0) { return; }
+        let args = policy_generic_call_args(type_text.clone());
+        var idx: i32 = 0;
+        while (idx < 64) {
+            let arg_text = policy_generic_arg_at(args.clone(), idx);
+            if (arg_text.len == 0) { return; }
+            let arg_type = self.type_id_by_text(arg_text);
+            if (arg_type != hir_id_invalid()) {
+                self.ensure_layouts_for_type(arg_type);
+            }
+            idx = idx + 1;
+        }
+    }
+
+    public fn ensure_codegen_layout_type_materialized(self, type_id: i32) {
+        if (!self.has_hir_codegen_builder || type_id == hir_id_invalid()) { return; }
+        if (mir_i32_map_get(self.layout_materialized_type_id_map, type_id) == 2) { return; }
+        let type_text = self.type_text(type_id);
+        if (type_text.len == 0
+            || hir_type_table_kind(self.h.types, type_id) != ty_CLASS()) {
+            mir_i32_map_put(self.layout_materialized_type_id_map, type_id, 2);
+            return;
+        }
+        if (self.type_id_has_open_template_atom(type_id)) {
+            mir_i32_map_put(self.layout_materialized_type_id_map, type_id, 2);
+            return;
+        }
+        let before_items = self.h.item_count;
+        let before_types = self.h.types.count;
+        let ok = hir_codegen_builder_handle_ensure_concrete_type_text_ready(self.hir_codegen_builder, type_text);
+        if (!ok) { return; }
+        mir_i32_map_put(self.layout_materialized_type_id_map, type_id, 2);
+        self.refresh_from_codegen_builder();
+        if (self.h.item_count != before_items || self.h.types.count != before_types) {
+            self.reset_layout_indexes_for_current_hir();
+        }
+    }
+
+    public fn type_needs_item_layout_scan(self, type_id: i32) -> bool {
+        if (type_id == hir_id_invalid()) { return false; }
+        let kind = hir_type_table_kind(self.h.types, type_id);
+        if (kind == ty_CLASS()) { return true; }
+        if (kind == ty_PTR() || kind == ty_REF() || kind == ty_MUTREF()) {
+            self.ensure_layouts_for_type(hir_type_table_elem(self.h.types, type_id));
+            return false;
+        }
+        if (kind == ty_ARRAY()) {
+            self.ensure_layouts_for_type(hir_type_table_elem(self.h.types, type_id));
+            return false;
+        }
+        return false;
+    }
+
+    public fn ensure_layouts_for_type(self, type_id: i32) {
+        if (type_id == hir_id_invalid()) { return; }
+        self.ensure_codegen_layout_type_materialized(type_id);
+        if (!self.type_needs_item_layout_scan(type_id)) { return; }
+        if (self.layout_item_count != self.h.item_count) {
+            self.reset_layout_indexes_for_current_hir();
+        }
+        let owner_item_direct = self.owner_item_for_layout_type(type_id);
+        if (mir_i32_map_get(self.layout_type_id_map, type_id) == 2) {
+            if (owner_item_direct == hir_id_invalid()) { return; }
+            let has_field_members = self.first_field_item_for_owner(owner_item_direct) != hir_id_invalid();
+            let has_variant_members = self.first_variant_item_for_owner(owner_item_direct) != hir_id_invalid();
+            let fields_missing = has_field_members && self.unit.field_count_for_type( type_id) <= 0;
+            let variants_missing = has_variant_members && self.unit.variant_count_for_type( type_id) <= 0;
+            if (!fields_missing && !variants_missing) { return; }
+        }
+        mir_i32_map_put(self.layout_type_id_map, type_id, 2);
+        self.ensure_layouts_for_existing_type_text_args(self.type_text(type_id));
+        if (owner_item_direct != hir_id_invalid()) {
+            self.ensure_field_layout_for_owner_item(owner_item_direct);
+            self.ensure_variant_layout_for_owner_item(owner_item_direct);
+            return;
+        }
+        let concrete_text = self.type_text(type_id);
+        if (concrete_text.len == 0 || policy_generic_call_has_args(concrete_text.clone()) == 0) {
+            return;
+        }
+        var item_id: i32 = 1;
+        while (item_id <= self.h.item_count) {
+            let kind = self.h.item_kind(item_id);
+            if (kind == hir_item_field() || kind == hir_item_variant()) {
+                let owner_item = self.h.item_owner(item_id);
+                let owner_type = self.type_id_for_item(owner_item);
+                if (owner_item != hir_id_invalid()
+                    && self.type_uses_closed_template_layout(type_id, owner_type, owner_item)) {
+                    if (kind == hir_item_field()) {
+                        self.ensure_field_layout_for_item(item_id);
+                    } else {
+                        self.ensure_variant_layout_for_item(item_id);
+                    }
+                }
+            }
+            item_id = item_id + 1;
+        }
+    }
+
+    public fn ensure_field_layout_for_ref(self, field_id: i32) {
+        if (field_id == hir_id_invalid()
+            || field_id < 1
+            || field_id > self.h.item_count
+            || self.h.item_kind(field_id) != hir_item_field()) {
+            return;
+        }
+        self.ensure_field_layout_for_item(field_id);
+    }
+
+    public fn finalize_field_layouts_for_refs(self) {
+        var place_id: i32 = 1;
+        while (place_id <= self.unit.place_count) {
+            self.ensure_field_layout_for_ref(self.unit.place_field(place_id));
+            place_id = place_id + 1;
+        }
+        var value_id: i32 = 1;
+        while (value_id <= self.unit.value_count) {
+            self.ensure_field_layout_for_ref(self.unit.value_aggregate_field(value_id));
+            value_id = value_id + 1;
+        }
+    }
+}

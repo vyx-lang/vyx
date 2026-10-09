@@ -1,0 +1,1016 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn dci_record_name_matches_type(self, dci_record: string, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid() || dci_record.len == 0) { return false; }
+        let text = llvm_mir_type_text(&self.m, type_id);
+        return self.dci_plain_type_names_match(dci_record, text)
+            || self.dci_type_alias_names_match(dci_record, text);
+    }
+
+    public fn dci_record_name_matches_text(self, dci_record: string, type_text: string) -> bool {
+        if (dci_record.len == 0 || type_text.len == 0) { return false; }
+        return self.dci_plain_type_names_match(dci_record, type_text)
+            || self.dci_type_alias_names_match(dci_record, type_text);
+    }
+
+    fn dci_indexed_layout(self, type_text: string) -> rawptr {
+        if (type_text.len == 0) { return null; }
+        if (self.dci_json() == null) { return null; }
+        self.dci_ensure_indexes();
+        var hit = llvm_mir_dci_obj_index_first(self.dci_layout_index, self.dci_layout_index_cap, type_text);
+        if (hit != null) { return hit; }
+        if (!llvm_mir_dci_type_name_is_plain(type_text)) {
+            hit = llvm_mir_dci_obj_index_first(self.dci_layout_index,
+                                               self.dci_layout_index_cap,
+                                               self.dci_canonical_type_name_text(type_text));
+        }
+        return hit;
+    }
+
+    public fn dci_layout_object_for_record_name(self, record_name: string) -> rawptr {
+        if (record_name.len == 0) { return null; }
+        let hit = self.dci_indexed_layout(record_name);
+        if (hit != null) { return hit; }
+        let layouts = self.dci_root_exports_array("layouts");
+        var obj = dci_cjson_child(layouts);
+        while (obj != null) {
+            let ty = self.dci_json_string(obj, "type_name");
+            if (self.dci_record_name_matches_text(ty, record_name)) { return obj; }
+            obj = dci_cjson_next(obj);
+        }
+        // A consumer-declared record instance has no descriptor entry, so the
+        // name-keyed walk above cannot see it.  Field offsets, base walks and
+        // the field-object lookup are all keyed by name, so the derived layouts
+        // have to answer here as well as in the type-keyed lookup.
+        return self.dci_local_layout_for_record_name(record_name);
+    }
+
+    /// Contract-only layout lookup: the descriptor's `layouts` array and nothing
+    /// else.  The public lookup layers the locally derived consumer-record
+    /// layouts on top of this; a synthesizer must ask *this* one so it can tell
+    /// "the producer measured it" from "we derived it" without recursing.
+    public fn dci_contract_layout_for_type(self, type_id: i32) -> rawptr {
+        if (type_id == mir_id_invalid()) { return null; }
+        let type_text = llvm_mir_type_text(&self.m, type_id);
+        let obj = self.dci_indexed_layout(type_text);
+        if (obj != null) { return obj; }
+        let layouts = self.dci_root_exports_array("layouts");
+        var obj2 = dci_cjson_child(layouts);
+        while (obj2 != null) {
+            let ty2 = self.dci_json_string(obj2, "type_name");
+            if (self.dci_record_name_matches_type(ty2, type_id)) { return obj2; }
+            obj2 = dci_cjson_next(obj2);
+        }
+        return null;
+    }
+
+    public fn dci_layout_object_for_type(self, type_id: i32) -> rawptr {
+        if (type_id == mir_id_invalid()) { return null; }
+        let cached = llvm_mir_map_get(self.dci_layout_by_type_cache, type_id);
+        if (cached != null) { return cached; }
+        var obj = self.dci_contract_layout_for_type(type_id);
+        if (obj == null) { obj = self.dci_local_layout_object_for_type(type_id); }
+        if (obj != null) {
+            llvm_mir_map_put(self.dci_layout_by_type_cache, type_id, obj);
+            return obj;
+        }
+        return null;
+    }
+
+    public fn dci_layout_object_for_type_text(self, type_text: string) -> rawptr {
+        if (type_text.len == 0) { return null; }
+        let hit = self.dci_indexed_layout(type_text);
+        if (hit != null) { return hit; }
+        let layouts = self.dci_root_exports_array("layouts");
+        var obj = dci_cjson_child(layouts);
+        while (obj != null) {
+            let ty = self.dci_json_string(obj, "type_name");
+            if (self.dci_record_name_matches_text(ty, type_text)) { return obj; }
+            obj = dci_cjson_next(obj);
+        }
+        return null;
+    }
+
+    // ── Locally derived layouts for consumer-declared records ─────────────
+    //
+    // An open-generic instance closed over a *consumer* record has no
+    // descriptor entry: the record is not part of the producer's artifact, so
+    // no adapter ever measured it, yet the consumer must know the layout
+    // before it can emit IR.  The layout is therefore derived here from what
+    // both sides can see -- primitive widths, descriptor-measured records, and
+    // the C rule for `@[repr(C)]` records -- and emitted next to the open
+    // requests (`record` / `layout` lines) so the producer can define the
+    // record and *measure* the very same thing.  A derived layout is a claim
+    // the producer verifies; it never replaces a measurement that exists,
+    // because `dci_contract_layout_for_type` is asked first.
+    //
+    // The derivation is deliberately narrow, and every restriction is a
+    // fail-closed choice rather than a guess: a record is derivable only when
+    // it is `@[repr(C)]` (so the C rule *is* its layout, floor included), and
+    // every component is either a scalar or a record that is itself measured
+    // by the descriptor or `@[repr(C)]`.  References, handles, arrays, tuples,
+    // enums, unmeasured foreign-DCI declarations, unmeasured nested instances
+    // and non-`repr(C)` classes are refused, so a case we cannot reason about
+    // keeps the old "no layout" diagnostic instead of silently getting a
+    // make-believe one.
+
+    public fn dci_local_scalar_size(self, type_id: i32) -> i64 {
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (kind == ty_BOOL() || kind == ty_I8() || kind == ty_U8()) { return 1; }
+        if (kind == ty_I16() || kind == ty_U16()) { return 2; }
+        if (kind == ty_CHAR() || kind == ty_I32() || kind == ty_U32() || kind == ty_F32()) { return 4; }
+        if (kind == ty_I64() || kind == ty_U64() || kind == ty_ISIZE()
+            || kind == ty_USIZE() || kind == ty_F64()) { return 8; }
+        return 0;
+    }
+
+    public fn dci_local_boundary_component_ok(self, type_id: i32, depth: i32) -> bool {
+        if (type_id == mir_id_invalid() || depth > 8) { return false; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let kind = llvm_mir_type_kind(&self.m, canonical);
+        if (kind != ty_CLASS()) { return self.dci_local_scalar_size(canonical) > 0; }
+        if (self.type_is_dyn_trait(canonical) || self.type_is_str_abi(canonical)
+            || self.type_is_option_abi(canonical) || self.type_is_result_abi(canonical)) {
+            return false;
+        }
+        if (mir_unit_variant_count_for_type(&self.m, canonical) > 0) { return false; }
+        if (mir_unit_field_count_for_type(&self.m, canonical) <= 0) { return false; }
+        // A record the descriptor already measured is safe by measurement: the
+        // producer said what it is, and the derived layout uses that number.
+        if (self.dci_contract_layout_for_type(canonical) != null) { return true; }
+        // Everything else must *be* a C-layout record.  A plain Vyx class
+        // keeps an 8-byte alignment floor that the producer's struct does not
+        // have, so its size is not derivable from its fields; an unmeasured
+        // foreign-DCI declaration is a type nobody has laid out at all.
+        if (!self.type_repr_is_c(canonical)) { return false; }
+        if (mir_unit_type_is_foreign_dci(&self.m, canonical)) { return false; }
+        if (self.dci_local_instance_is_open_instance(canonical)) { return false; }
+        let n = mir_unit_field_count_for_type(&self.m, canonical);
+        var i: i32 = 0;
+        while (i < n) {
+            let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, i);
+            if (field_id == mir_id_invalid()) { return false; }
+            if (!self.dci_local_boundary_component_ok(mir_unit_field_type(&self.m, field_id),
+                                                      depth + 1)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// A closed instance of a foreign-DCI generic, e.g. `Pair2<i32,TestS>`.
+    /// Nested instances stay outside the derived surface: the producer's own
+    /// generic could lay them out any way it likes.
+    public fn dci_local_instance_is_open_instance(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        if (!mir_unit_type_is_foreign_dci(&self.m, type_id)) { return false; }
+        let text = llvm_mir_type_text(&self.m, type_id);
+        if (text.len == 0) { return false; }
+        return policy_generic_call_has_args(text.clone()) != 0;
+    }
+
+    /// Size of one component of a locally derived layout.  The descriptor is
+    /// the authority for anything it has measured; the C rule (no class
+    /// alignment floor) answers for `@[repr(C)]` records.
+    public fn dci_local_component_size(self, type_id: i32) -> i64 {
+        if (type_id == mir_id_invalid()) { return 0; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let kind = llvm_mir_type_kind(&self.m, canonical);
+        if (kind != ty_CLASS()) { return self.dci_local_scalar_size(canonical); }
+        let contract = self.dci_contract_layout_for_type(canonical);
+        if (contract != null) {
+            let measured = self.dci_json_i64(contract, "size");
+            if (measured > 0) { return measured; }
+        }
+        return self.dci_local_record_size(canonical);
+    }
+
+    public fn dci_local_component_align(self, type_id: i32) -> i64 {
+        if (type_id == mir_id_invalid()) { return 0; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let kind = llvm_mir_type_kind(&self.m, canonical);
+        if (kind != ty_CLASS()) { return self.dci_local_scalar_size(canonical); }
+        let contract = self.dci_contract_layout_for_type(canonical);
+        if (contract != null) {
+            let measured = self.dci_json_i64(contract, "alignment");
+            if (measured > 0) { return measured; }
+        }
+        return self.dci_local_record_align(canonical);
+    }
+
+    /// Field-sequence size of a record under the C rule.
+    public fn dci_local_record_size(self, type_id: i32) -> i64 {
+        if (type_id == mir_id_invalid()) { return 0; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let packed = self.type_repr_is_packed(canonical);
+        let n = mir_unit_field_count_for_type(&self.m, canonical);
+        if (n <= 0) { return 0; }
+        var offset: i64 = 0;
+        var natural: i64 = 1;
+        var i: i32 = 0;
+        while (i < n) {
+            let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, i);
+            if (field_id == mir_id_invalid()) { return 0; }
+            let field_type = mir_unit_field_type(&self.m, field_id);
+            let field_size = self.dci_local_component_size(field_type);
+            var field_align = self.dci_local_component_align(field_type);
+            if (packed) { field_align = 1; }
+            if (field_size <= 0 || field_align <= 0) { return 0; }
+            if (field_align > natural) { natural = field_align; }
+            offset = self.align_up_i64(offset, field_align);
+            offset = offset + self.align_up_i64(field_size, field_align);
+            i = i + 1;
+        }
+        if (offset <= 0) { return 0; }
+        return self.align_up_i64(offset, natural);
+    }
+
+    public fn dci_local_record_align(self, type_id: i32) -> i64 {
+        if (type_id == mir_id_invalid()) { return 0; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let forced = self.type_repr_explicit_align(canonical);
+        if (self.type_repr_is_packed(canonical)) {
+            if (forced > 0) { return forced; }
+            return 1;
+        }
+        var out: i64 = 1;
+        let n = mir_unit_field_count_for_type(&self.m, canonical);
+        var i: i32 = 0;
+        while (i < n) {
+            let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, i);
+            if (field_id != mir_id_invalid()) {
+                let field_align = self.dci_local_component_align(mir_unit_field_type(&self.m, field_id));
+                if (field_align > out) { out = field_align; }
+            }
+            i = i + 1;
+        }
+        if (forced > out) { out = forced; }
+        if (out <= 0) { return 1; }
+        return out;
+    }
+
+    public fn dci_local_boundary_type_name(self, type_id: i32) -> string {
+        let text = llvm_mir_type_text(&self.m, type_id);
+        let canonical = self.dci_canonical_type_name_text(text.clone());
+        if (canonical.len > 0) { return canonical; }
+        return text;
+    }
+
+    public fn dci_local_boundary_type_json(self, type_id: i32) -> string {
+        return "{\"name\":\"" + self.dci_local_boundary_type_name(type_id)
+               + "\",\"kind\":\"" + self.dci_open_type_kind_word(type_id)
+               + "\",\"nullable\":false,\"reference\":\"value\"}";
+    }
+
+    /// `{"name":..,"offset":..,"type":{..}},..` under the same walk the sizes
+    /// above use, so offsets and size can never disagree.
+    public fn dci_local_record_fields_json(self, type_id: i32) -> string {
+        let canonical = self.canonical_record_type_id(type_id);
+        let packed = self.type_repr_is_packed(canonical);
+        let n = mir_unit_field_count_for_type(&self.m, canonical);
+        var offset: i64 = 0;
+        var out = "";
+        var i: i32 = 0;
+        while (i < n) {
+            let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, i);
+            if (field_id == mir_id_invalid()) { return ""; }
+            let field_type = mir_unit_field_type(&self.m, field_id);
+            let field_size = self.dci_local_component_size(field_type);
+            var field_align = self.dci_local_component_align(field_type);
+            if (packed) { field_align = 1; }
+            if (field_size <= 0 || field_align <= 0) { return ""; }
+            offset = self.align_up_i64(offset, field_align);
+            if (i > 0) { out = out + ","; }
+            out = out + "{\"name\":\"" + mir_unit_field_name(&self.m, field_id)
+                  + "\",\"offset\":" + offset.toString()
+                  + ",\"is_readonly\":false,\"visibility\":\"public\",\"type\":"
+                  + self.dci_local_boundary_type_json(field_type) + "}";
+            offset = offset + self.align_up_i64(field_size, field_align);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// `name:type:offset,...` -- the record's definition in the shape a
+    /// producer can turn into `struct`/`#[repr(C)]` source.
+    public fn dci_local_record_fields_csv(self, type_id: i32) -> string {
+        let canonical = self.canonical_record_type_id(type_id);
+        let packed = self.type_repr_is_packed(canonical);
+        let n = mir_unit_field_count_for_type(&self.m, canonical);
+        var offset: i64 = 0;
+        var out = "";
+        var i: i32 = 0;
+        while (i < n) {
+            let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, i);
+            if (field_id == mir_id_invalid()) { return ""; }
+            let field_type = mir_unit_field_type(&self.m, field_id);
+            let field_size = self.dci_local_component_size(field_type);
+            var field_align = self.dci_local_component_align(field_type);
+            if (packed) { field_align = 1; }
+            if (field_size <= 0 || field_align <= 0) { return ""; }
+            offset = self.align_up_i64(offset, field_align);
+            if (i > 0) { out = out + ","; }
+            out = out + mir_unit_field_name(&self.m, field_id) + ":"
+                  + self.dci_local_boundary_type_name(field_type) + ":"
+                  + offset.toString();
+            offset = offset + self.align_up_i64(field_size, field_align);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// A consumer-declared record is one the descriptor never measured, that
+    /// is not itself a foreign-DCI declaration, and whose layout *is* the C
+    /// layout because it says so (`@[repr(C)]`).  Without that flag the
+    /// record's own layout carries the class alignment floor, which no
+    /// producer's `struct` has, so there is nothing honest to tell the
+    /// producer about it.
+    public fn dci_local_record_is_consumer_declared(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        let canonical = self.canonical_record_type_id(type_id);
+        if (llvm_mir_type_kind(&self.m, canonical) != ty_CLASS()) { return false; }
+        if (mir_unit_type_is_foreign_dci(&self.m, canonical)) { return false; }
+        if (self.dci_contract_layout_for_type(canonical) != null) { return false; }
+        if (!self.type_repr_is_c(canonical)) { return false; }
+        if (mir_unit_variant_count_for_type(&self.m, canonical) > 0) { return false; }
+        return mir_unit_field_count_for_type(&self.m, canonical) > 0;
+    }
+
+    /// `record` lines for every consumer-declared record reachable from
+    /// `type_id`, nested ones included.  Deduplicated across the whole unit.
+    public fn dci_local_record_support_lines(self, type_id: i32) -> string {
+        if (!self.dci_local_record_is_consumer_declared(type_id)) { return ""; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let name = self.dci_local_boundary_type_name(canonical);
+        if (name.len == 0) { return ""; }
+        if (self.dci_local_reported_names.contains("\n" + name + "\n")) { return ""; }
+        let size = self.dci_local_record_size(canonical);
+        let align = self.dci_local_record_align(canonical);
+        let csv = self.dci_local_record_fields_csv(canonical);
+        if (size <= 0 || align <= 0 || csv.len == 0) { return ""; }
+        self.dci_local_reported_names = self.dci_local_reported_names
+                                        + "\n" + name + "\n";
+        var out = "record\t" + name + "\t" + size.toString() + "\t"
+                  + align.toString() + "\t" + csv + "\n";
+        // Nested consumer-declared records: their definitions have to be in
+        // scope before this one, so they are emitted first.
+        let n = mir_unit_field_count_for_type(&self.m, canonical);
+        var i: i32 = 0;
+        while (i < n) {
+            let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, i);
+            if (field_id != mir_id_invalid()) {
+                out = self.dci_local_record_support_lines(mir_unit_field_type(&self.m, field_id)) + out;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    public fn dci_local_instance_layout_derivable(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        let canonical = self.canonical_record_type_id(type_id);
+        if (llvm_mir_type_kind(&self.m, canonical) != ty_CLASS()) { return false; }
+        // Only a *closed* instance (`Pair2<i32,TestS>`) is a consumer-side
+        // declaration; an open declaration has no layout to derive.
+        if (!self.dci_local_instance_is_open_instance(canonical)) { return false; }
+        // A measured instance keeps its measurement -- asked first, refused here.
+        if (self.dci_contract_layout_for_type(canonical) != null) { return false; }
+        if (self.type_is_dyn_trait(canonical) || self.type_is_str_abi(canonical)
+            || self.type_is_option_abi(canonical) || self.type_is_result_abi(canonical)) {
+            return false;
+        }
+        if (mir_unit_variant_count_for_type(&self.m, canonical) > 0) { return false; }
+        let n = mir_unit_field_count_for_type(&self.m, canonical);
+        if (n <= 0) { return false; }
+        // Every component must be reason-about-able, *and* at least one of them
+        // must be a consumer-declared record.  An instance whose arguments are
+        // all things the producer can already see (scalars, measured records)
+        // is one the adapter was supposed to measure: its missing layout is a
+        // contract bug, and it keeps the loud diagnostic instead of quietly
+        // acquiring a derived one.
+        var consumer_component = false;
+        var i: i32 = 0;
+        while (i < n) {
+            let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, i);
+            if (field_id == mir_id_invalid()) { return false; }
+            let field_type = mir_unit_field_type(&self.m, field_id);
+            if (!self.dci_local_boundary_component_ok(field_type, 0)) { return false; }
+            if (self.dci_local_record_is_consumer_declared(field_type)) {
+                consumer_component = true;
+            }
+            i = i + 1;
+        }
+        return consumer_component;
+    }
+
+    /// Record every consumer-declared record reachable from `type_id` into the
+    /// requests sidecar.  Called for each open-generic instance's parameter and
+    /// return types, so the producer learns the *definition* of a type argument
+    /// it has never seen -- the consumer-declared record -- before it is asked
+    /// to monomorphize an instance over it.
+    public fn dci_local_emit_support_for_type(self, type_id: i32) {
+        if (type_id == mir_id_invalid()) { return; }
+        g_dci_local_record_lines = g_dci_local_record_lines
+                                   + self.dci_local_record_support_lines(type_id);
+    }
+
+    /// The same, for every type a closed instance mentions.  Emitted from the
+    /// one place that also emits the instance's `open` line, so a request can
+    /// never reach the producer without the definitions it needs.
+    public fn dci_local_emit_open_support(self, function_id: i32) {
+        let param_count = self.function_source_param_count(function_id);
+        var pi: i32 = 0;
+        while (pi < param_count) {
+            self.dci_local_emit_support_for_type(
+                self.function_source_param_type(function_id, pi));
+            pi = pi + 1;
+        }
+        self.dci_local_emit_support_for_type(self.m.function_return_type(function_id));
+    }
+
+    /// Synthesize the descriptor-shaped layout of a closed instance whose type
+    /// arguments include a consumer-declared record, and tell the producer what
+    /// was derived so it can measure the same thing.
+    ///
+    /// Derived objects are kept in a small slot array so the name-keyed lookups
+    /// (`dci_layout_object_for_record_name` and everything built on it) can find
+    /// them too; a second type id that canonicalises to the same instance gets
+    /// the same object back.  Only the sidecar lines are additionally
+    /// deduplicated by name, since a plain Vyx record reaches this path through
+    /// the support emitter instead.
+    public fn dci_local_layout_object_for_type(self, type_id: i32) -> rawptr {
+        if (type_id == mir_id_invalid()) { return null; }
+        let canonical = self.canonical_record_type_id(type_id);
+        if (!self.dci_local_instance_layout_derivable(canonical)) { return null; }
+        let name = self.dci_local_boundary_type_name(canonical);
+        if (name.len == 0) { return null; }
+        let existing = self.dci_local_layout_for_record_name(name.clone());
+        if (existing != null) { return existing; }
+        let size = self.dci_local_record_size(canonical);
+        let align = self.dci_local_record_align(canonical);
+        let fields = self.dci_local_record_fields_json(canonical);
+        if (size <= 0 || align <= 0 || fields.len == 0) { return null; }
+        let json = "{\"type_name\":\"" + name + "\",\"size\":" + size.toString()
+                   + ",\"alignment\":" + align.toString()
+                   + ",\"representation\":\"stable\",\"bases\":[]"
+                   + ",\"has_vtable\":false,\"is_pod\":true"
+                   + ",\"is_trivially_destructible\":true"
+                   + ",\"lifecycle\":{\"copy_semantics\":\"trivial\""
+                   + ",\"move_semantics\":\"trivial\",\"destruction\":\"trivial\""
+                   + ",\"moved_from_state\":\"valid\",\"operations\":{}"
+                   + ",\"ownership_model\":\"value\"}"
+                   + ",\"dci_local_derived\":true"
+                   + ",\"fields\":[" + fields + "]}";
+        let parsed = cJSON_Parse(json.c_str());
+        if (parsed == null) { return null; }
+        self.dci_register_local_layout(parsed);
+        if (!self.dci_local_reported_names.contains("\n" + name + "\n")) {
+            self.dci_local_reported_names = self.dci_local_reported_names
+                                            + "\n" + name + "\n";
+            let n = mir_unit_field_count_for_type(&self.m, canonical);
+            var i: i32 = 0;
+            while (i < n) {
+                let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, i);
+                if (field_id != mir_id_invalid()) {
+                    self.dci_local_emit_support_for_type(mir_unit_field_type(&self.m, field_id));
+                }
+                i = i + 1;
+            }
+            g_dci_local_record_lines = g_dci_local_record_lines
+                                       + "layout\t" + name + "\t" + size.toString()
+                                       + "\t" + align.toString() + "\n";
+        }
+        return parsed;
+    }
+
+    /// Register a derived layout so the name-keyed lookups can find it.  The
+    /// name is read back out of the object (`type_name`) rather than stored
+    /// beside it, so nothing here owns a string.
+    fn dci_register_local_layout(self, obj: rawptr) {
+        if (obj == null) { return; }
+        if (self.dci_local_layout_slots == null) {
+            self.dci_local_layout_slots = malloc((64 * 8) as u64);
+            if (self.dci_local_layout_slots == null) { return; }
+        }
+        if (self.dci_local_layout_count >= 64) { return; }
+        ast_write_rawptr(ptr_offset(self.dci_local_layout_slots,
+                                    (self.dci_local_layout_count * 8) as i64),
+                         obj);
+        self.dci_local_layout_count = self.dci_local_layout_count + 1;
+    }
+
+    public fn dci_local_layout_for_record_name(self, name: string) -> rawptr {
+        if (name.len == 0 || self.dci_local_layout_slots == null) { return null; }
+        var i: i32 = 0;
+        while (i < self.dci_local_layout_count) {
+            let obj = ast_read_rawptr(ptr_offset(self.dci_local_layout_slots,
+                                                 (i * 8) as i64));
+            if (obj != null) {
+                let stored = self.dci_json_string(obj, "type_name");
+                if (stored.len > 0 && (stored == name
+                    || self.dci_record_name_matches_text(stored.clone(), name.clone()))) {
+                    return obj;
+                }
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    public fn dci_record_size_bytes_for_exact_type(self, type_id: i32) -> i64 {
+        let obj = self.dci_layout_object_for_type(type_id);
+        if (obj == null) { return -1; }
+        return self.dci_json_i64(obj, "size");
+    }
+
+    public fn dci_field_offset_bits_for_record_name(self,
+                                                    record_name: string,
+                                                    field_name: string,
+                                                    depth: i32) -> i64 {
+        if (record_name.len == 0 || field_name.len == 0 || depth > 16) { return -1; }
+        let layout = self.dci_layout_object_for_record_name(record_name);
+        if (layout == null) { return -1; }
+        let fields = self.dci_json_item(layout, "fields");
+        var i: i32 = 0;
+        if (fields != null && cJSON_IsArray(fields) != 0) {
+            let n = cJSON_GetArraySize(fields);
+            while (i < n) {
+                let obj = cJSON_GetArrayItem(fields, i);
+                if (self.dci_json_string(obj, "name") == field_name) {
+                    return self.dci_json_i64(obj, "offset") * 8;
+                }
+                i = i + 1;
+            }
+        }
+        let bases = self.dci_json_item(layout, "bases");
+        if (bases != null && cJSON_IsArray(bases) != 0) {
+            let nb = cJSON_GetArraySize(bases);
+            i = 0;
+            while (i < nb) {
+                let obj2 = cJSON_GetArrayItem(bases, i);
+                let base_offset_bytes = self.dci_constant_base_adjustment_offset(obj2);
+                if (base_offset_bytes < 0) {
+                    i = i + 1;
+                    continue;
+                }
+                let base = self.dci_json_string(obj2, "type_name");
+                let field_offset = self.dci_field_offset_bits_for_record_name(base, field_name, depth + 1);
+                if (field_offset >= 0) { return base_offset_bytes * 8 + field_offset; }
+                i = i + 1;
+            }
+        }
+        return -1;
+    }
+
+    public fn dci_field_offset_bits_for_type(self, record_type_id: i32, field_name: string) -> i64 {
+        if (!mir_unit_has_dci_abi(&self.m) || record_type_id == mir_id_invalid() || field_name.len == 0) { return -1; }
+        let record_name = self.dci_record_name_for_type(record_type_id);
+        if (record_name.len > 0) {
+            return self.dci_field_offset_bits_for_record_name(record_name, field_name, 0);
+        }
+        return -1;
+    }
+
+    public fn dci_direct_field_object_for_record_name(self,
+                                                      record_name: string,
+                                                      field_name: string) -> rawptr {
+        if (record_name.len == 0 || field_name.len == 0) { return null; }
+        let layout = self.dci_layout_object_for_record_name(record_name);
+        if (layout == null) { return null; }
+        let fields = self.dci_json_item(layout, "fields");
+        if (fields != null && cJSON_IsArray(fields) != 0) {
+            let count = cJSON_GetArraySize(fields);
+            var i: i32 = 0;
+            while (i < count) {
+                let field = cJSON_GetArrayItem(fields, i);
+                if (self.dci_json_string(field, "name") == field_name) { return field; }
+                i = i + 1;
+            }
+        }
+        return null;
+    }
+
+    public fn dci_field_object_for_record_name(self,
+                                               record_name: string,
+                                               field_name: string,
+                                               depth: i32) -> rawptr {
+        if (record_name.len == 0 || field_name.len == 0 || depth > 16) { return null; }
+        let direct = self.dci_direct_field_object_for_record_name(record_name, field_name);
+        if (direct != null) { return direct; }
+        let layout = self.dci_layout_object_for_record_name(record_name);
+        if (layout == null) { return null; }
+        let bases = self.dci_json_item(layout, "bases");
+        if (bases != null && cJSON_IsArray(bases) != 0) {
+            let base_count = cJSON_GetArraySize(bases);
+            var base_index: i32 = 0;
+            while (base_index < base_count) {
+                let base = cJSON_GetArrayItem(bases, base_index);
+                let found = self.dci_field_object_for_record_name(self.dci_json_string(base, "type_name"),
+                                                                  field_name,
+                                                                  depth + 1);
+                if (found != null) { return found; }
+                base_index = base_index + 1;
+            }
+        }
+        return null;
+    }
+
+    public fn dci_bitfield_for_place(self, place_id: i32) -> rawptr {
+        if (place_id == mir_id_invalid() || self.m.place_kind(place_id) != mir_place_field()) {
+            return null;
+        }
+        let base_place = self.m.place_base(place_id);
+        let base_type = self.canonical_record_type_id(self.place_effective_type(base_place));
+        var field_id = self.remapped_field_for_base(base_type, self.m.place_field(place_id));
+        if (field_id == mir_id_invalid()) { field_id = self.m.place_field(place_id); }
+        if (field_id == mir_id_invalid()) { return null; }
+        let record_type = self.foreign_dci_field_record_type(base_type, field_id);
+        if (record_type == mir_id_invalid()) { return null; }
+        let field = self.dci_field_object_for_record_name(self.dci_record_name_for_type(record_type),
+                                                          mir_unit_field_name(&self.m, field_id),
+                                                          0);
+        if (field == null) { return null; }
+        var bitfield = self.dci_json_item(field, "bitfield");
+        if (bitfield == null) {
+            let storage = self.dci_json_item(field, "storage");
+            if (self.dci_json_string(storage, "kind") == "bitfield") { bitfield = storage; }
+        }
+        if (bitfield == null || cJSON_IsObject(bitfield) == 0) { return null; }
+        return bitfield;
+    }
+
+    public fn dci_bitfield_storage_size(self, bitfield: rawptr) -> i64 {
+        var out = self.dci_json_i64(bitfield, "storage_size");
+        if (out <= 0) { out = self.dci_json_i64(bitfield, "unit_size"); }
+        return out;
+    }
+
+    public fn dci_bitfield_operation_is_complete(self, operation: rawptr) -> bool {
+        if (operation == null || cJSON_IsObject(operation) == 0) { return false; }
+        if (self.dci_json_string(operation, "symbol").len > 0
+            || self.dci_json_string(operation, "intrinsic").len > 0) {
+            return true;
+        }
+        let table = self.dci_json_string(operation, "dispatch_table");
+        let slot = self.dci_json_item(operation, "slot");
+        return table.len > 0 && slot != null && cJSON_IsNumber(slot) != 0
+            && self.dci_json_i64(operation, "slot") >= 0;
+    }
+
+    public fn require_dci_direct_bitfield_contract(self,
+                                                   bitfield: rawptr,
+                                                   place_id: i32) -> bool {
+        let storage_offset = self.dci_json_item(bitfield, "storage_offset");
+        let storage_size = self.dci_json_item(bitfield, "storage_size");
+        let bit_offset = self.dci_json_item(bitfield, "bit_offset");
+        let bit_width = self.dci_json_item(bitfield, "bit_width");
+        let signed_value = self.dci_json_item(bitfield, "signed");
+        let bit_order = self.dci_json_string(bitfield, "bit_order");
+        let read_mode = self.dci_json_string(bitfield, "read");
+        let write_mode = self.dci_json_string(bitfield, "write");
+        if (bit_order == "target") {
+            self.report_error("DCI bitfield bit_order `target` has no Direct Profile interpretation for place #"
+                       + place_id.toString());
+            return false;
+        }
+        if (storage_offset == null || cJSON_IsNumber(storage_offset) == 0
+            || storage_size == null || cJSON_IsNumber(storage_size) == 0
+            || bit_offset == null || cJSON_IsNumber(bit_offset) == 0
+            || bit_width == null || cJSON_IsNumber(bit_width) == 0
+            || signed_value == null
+            || (cJSON_IsTrue(signed_value) == 0 && cJSON_IsFalse(signed_value) == 0)
+            || (bit_order != "lsb0" && bit_order != "msb0")
+            || (read_mode != "direct" && read_mode != "operation" && read_mode != "unavailable")
+            || (write_mode != "direct" && write_mode != "operation" && write_mode != "unavailable")
+            || (read_mode == "operation"
+                && !self.dci_bitfield_operation_is_complete(
+                    self.dci_json_item(bitfield, "read_operation")))
+            || (write_mode == "operation"
+                && !self.dci_bitfield_operation_is_complete(
+                    self.dci_json_item(bitfield, "write_operation")))) {
+            self.report_error("incomplete or unsupported DCI bitfield Direct contract for place #"
+                       + place_id.toString());
+            return false;
+        }
+        return true;
+    }
+
+    public fn dci_bitfield_effective_offset(self, bitfield: rawptr, storage_bits: i32) -> i32 {
+        let raw = self.dci_json_i64(bitfield, "bit_offset") as i32;
+        let width = self.dci_json_i64(bitfield, "bit_width") as i32;
+        if (self.dci_json_string(bitfield, "bit_order") == "msb0") {
+            return storage_bits - raw - width;
+        }
+        return raw;
+    }
+
+    public fn dci_bitfield_mask(self, width: i32) -> i64 {
+        if (width >= 64) { return -1; }
+        if (width <= 0) { return 0; }
+        return ((1 as i64) << width) - 1;
+    }
+
+    public fn lower_dci_bitfield_read(self,
+                                      place_id: i32,
+                                      storage_addr: rawptr,
+                                      value_type: i32) -> rawptr {
+        let bitfield = self.dci_bitfield_for_place(place_id);
+        if (bitfield == null) { return null; }
+        if (!self.require_dci_direct_bitfield_contract(bitfield, place_id)) { return null; }
+        let read_mode = self.dci_json_string(bitfield, "read");
+        if (read_mode != "direct") {
+            self.report_error("DCI bitfield read mode `" + read_mode
+                      + "` is unsupported by the Direct Consumer for place #"
+                      + place_id.toString());
+            return null;
+        }
+        let storage_size = self.dci_bitfield_storage_size(bitfield);
+        let storage_bits = (storage_size * 8) as i32;
+        let width = self.dci_json_i64(bitfield, "bit_width") as i32;
+        let offset = self.dci_bitfield_effective_offset(bitfield, storage_bits);
+        let value_bits = llvm_mir_int_bits_for_kind(llvm_mir_type_kind(&self.m, value_type));
+        if ((storage_bits != 8 && storage_bits != 16 && storage_bits != 32 && storage_bits != 64)
+            || width <= 0 || width > storage_bits || offset < 0 || offset + width > storage_bits
+            || value_bits <= 0) {
+            self.report_error("invalid DCI bitfield read contract for place #" + place_id.toString());
+            return null;
+        }
+        let storage_type = self.int_type_for_bits(storage_bits);
+        var value = vyx_rt_build_load(self.mod,
+                                      storage_type,
+                                      storage_addr,
+                                      "dci.bitfield.storage".c_str(),
+                                      20);
+        if (value == null) { return null; }
+        if (offset > 0) {
+            value = vyx_rt_build_lshr(self.mod,
+                                      value,
+                                      vyx_rt_const_int(self.mod, storage_type, offset as i64, 0),
+                                      "dci.bitfield.shift".c_str(),
+                                      18);
+        }
+        value = vyx_rt_build_and(self.mod,
+                                 value,
+                                 vyx_rt_const_int(self.mod,
+                                                  storage_type,
+                                                  self.dci_bitfield_mask(width),
+                                                  0),
+                                 "dci.bitfield.mask".c_str(),
+                                 17);
+        let destination_type = self.int_type_for_bits(value_bits);
+        if (self.dci_json_bool(bitfield, "signed") && width < storage_bits) {
+            let sign_bit = (1 as i64) << (width - 1);
+            value = vyx_rt_build_xor(self.mod,
+                                     value,
+                                     vyx_rt_const_int(self.mod, storage_type, sign_bit, 0),
+                                     "dci.bitfield.sign.flip".c_str(),
+                                     23);
+            value = vyx_rt_build_sub(self.mod,
+                                     value,
+                                     vyx_rt_const_int(self.mod, storage_type, sign_bit, 0),
+                                     "dci.bitfield.sign.fill".c_str(),
+                                     23);
+        }
+        if (value_bits > storage_bits) {
+            if (self.dci_json_bool(bitfield, "signed")) {
+                value = vyx_rt_build_sext(self.mod,
+                                          value,
+                                          destination_type,
+                                          "dci.bitfield.sign".c_str(),
+                                          17);
+            } else {
+                value = vyx_rt_build_zext(self.mod,
+                                          value,
+                                          destination_type,
+                                          "dci.bitfield.zero".c_str(),
+                                          17);
+            }
+        } else if (value_bits < storage_bits) {
+            value = vyx_rt_build_trunc(self.mod,
+                                       value,
+                                       destination_type,
+                                       "dci.bitfield.result".c_str(),
+                                       19);
+        }
+        return value;
+    }
+
+    public fn lower_dci_bitfield_store(self,
+                                       place_id: i32,
+                                       storage_addr: rawptr,
+                                       value_id: i32,
+                                       value_type: i32) -> bool {
+        let bitfield = self.dci_bitfield_for_place(place_id);
+        if (bitfield == null) { return false; }
+        if (!self.require_dci_direct_bitfield_contract(bitfield, place_id)) { return true; }
+        let write_mode = self.dci_json_string(bitfield, "write");
+        if (write_mode != "direct") {
+            self.report_error("DCI bitfield write mode `" + write_mode
+                      + "` is unsupported by the Direct Consumer for place #"
+                      + place_id.toString());
+            return true;
+        }
+        let storage_size = self.dci_bitfield_storage_size(bitfield);
+        let storage_bits = (storage_size * 8) as i32;
+        let width = self.dci_json_i64(bitfield, "bit_width") as i32;
+        let offset = self.dci_bitfield_effective_offset(bitfield, storage_bits);
+        let source_bits = llvm_mir_int_bits_for_kind(llvm_mir_type_kind(&self.m, value_type));
+        if ((storage_bits != 8 && storage_bits != 16 && storage_bits != 32 && storage_bits != 64)
+            || width <= 0 || width > storage_bits || offset < 0 || offset + width > storage_bits
+            || source_bits <= 0) {
+            self.report_error("invalid DCI bitfield write contract for place #" + place_id.toString());
+            return true;
+        }
+        let storage_type = self.int_type_for_bits(storage_bits);
+        var incoming = self.lower_value_as(value_id, value_type);
+        if (incoming == null) { return true; }
+        if (source_bits < storage_bits) {
+            incoming = vyx_rt_build_zext(self.mod,
+                                         incoming,
+                                         storage_type,
+                                         "dci.bitfield.extend".c_str(),
+                                         19);
+        } else if (source_bits > storage_bits) {
+            incoming = vyx_rt_build_trunc(self.mod,
+                                          incoming,
+                                          storage_type,
+                                          "dci.bitfield.trunc".c_str(),
+                                          18);
+        }
+        let low_mask = self.dci_bitfield_mask(width);
+        incoming = vyx_rt_build_and(self.mod,
+                                    incoming,
+                                    vyx_rt_const_int(self.mod, storage_type, low_mask, 0),
+                                    "dci.bitfield.input".c_str(),
+                                    18);
+        if (offset > 0) {
+            incoming = vyx_rt_build_shl(self.mod,
+                                        incoming,
+                                        vyx_rt_const_int(self.mod, storage_type, offset as i64, 0),
+                                        "dci.bitfield.position".c_str(),
+                                        21);
+        }
+        var shifted_mask = low_mask;
+        if (offset > 0) { shifted_mask = low_mask << offset; }
+        let old_value = vyx_rt_build_load(self.mod,
+                                          storage_type,
+                                          storage_addr,
+                                          "dci.bitfield.old".c_str(),
+                                          16);
+        let cleared = vyx_rt_build_and(self.mod,
+                                       old_value,
+                                       vyx_rt_const_int(self.mod, storage_type, ~shifted_mask, 0),
+                                       "dci.bitfield.clear".c_str(),
+                                       18);
+        let merged = vyx_rt_build_or(self.mod,
+                                     cleared,
+                                     incoming,
+                                     "dci.bitfield.merge".c_str(),
+                                     18);
+        vyx_rt_build_store(self.mod, merged, storage_addr);
+        return true;
+    }
+
+    public fn foreign_dci_field_record_type(self, base_type_id: i32, field_id: i32) -> i32 {
+        if (field_id == mir_id_invalid()) { return mir_id_invalid(); }
+        if (!self.unit_has_dci_layout_inputs() && !self.unit_has_foreign_dci_types()) {
+            return mir_id_invalid();
+        }
+        if (base_type_id != mir_id_invalid()) {
+            let cached = self.pair_bool_cache_get(self.foreign_dci_field_record_cache, base_type_id, field_id);
+            if (cached != 0) {
+                return cached - 1;
+            }
+        }
+        let field_name = mir_unit_field_name(&self.m, field_id);
+        var result = mir_id_invalid();
+        if (base_type_id != mir_id_invalid()
+            && self.type_is_foreign_dci(base_type_id)
+            && self.dci_direct_field_object_for_record_name(self.dci_record_name_for_type(base_type_id),
+                                                            field_name) != null) {
+            result = base_type_id;
+        }
+        let owner_type = mir_unit_field_owner_type(&self.m, field_id);
+        if (result == mir_id_invalid()
+            && owner_type != mir_id_invalid()
+            && self.type_is_foreign_dci(owner_type)) {
+            result = owner_type;
+        }
+        if (result == mir_id_invalid()
+            && base_type_id != mir_id_invalid()
+            && self.type_is_foreign_dci(base_type_id)) {
+            result = base_type_id;
+        }
+        if (result == mir_id_invalid()) {
+            let prefix_record = self.dci_foreign_prefix_record_type(base_type_id, field_name);
+            if (prefix_record != mir_id_invalid()) { result = prefix_record; }
+        }
+        if (base_type_id != mir_id_invalid()) {
+            self.pair_bool_cache_put(self.foreign_dci_field_record_cache, base_type_id, field_id, result + 1);
+        }
+        return result;
+    }
+
+    public fn dci_foreign_prefix_record_type(self, base_type_id: i32, field_name: string) -> i32 {
+        if (base_type_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let canonical = self.canonical_record_type_id(base_type_id);
+        var type_id: i32 = 1;
+        while (type_id <= self.m.types.count) {
+            if (type_id != canonical
+                && self.type_is_foreign_dci(type_id)
+                && self.record_layout_prefix_compatible(canonical, type_id)
+                && self.dci_record_size_bytes_for_exact_type(type_id) > 0) {
+                if (field_name.len == 0 || self.dci_field_offset_bits_for_type(type_id, field_name) >= 0) {
+                    return type_id;
+                }
+            }
+            type_id = type_id + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn dci_record_size_bytes_for_type(self, type_id: i32) -> i64 {
+        if (type_id == mir_id_invalid()) { return -1; }
+        if (!self.unit_has_dci_layout_inputs() && !self.unit_has_foreign_dci_types()) {
+            return -1;
+        }
+        let canonical = self.canonical_record_type_id(type_id);
+        if (self.type_is_foreign_dci(canonical)) {
+            return self.dci_record_size_bytes_for_exact_type(canonical);
+        }
+        let prefix_record = self.dci_foreign_prefix_record_type(canonical, "");
+        if (prefix_record != mir_id_invalid()) {
+            return self.dci_record_size_bytes_for_exact_type(prefix_record);
+        }
+        var best: i64 = -1;
+        var field_id: i32 = 1;
+        while (field_id <= self.m.field_count) {
+            let owner_type = mir_unit_field_owner_type(&self.m, field_id);
+            if (owner_type != mir_id_invalid()
+                && self.type_is_foreign_dci(owner_type)
+                && self.field_owner_accepts_base_type(owner_type, canonical)) {
+                let sz = self.dci_record_size_bytes_for_exact_type(owner_type);
+                if (sz > best) { best = sz; }
+            }
+            field_id = field_id + 1;
+        }
+        return best;
+    }
+
+    public fn dci_field_addr(self, base_addr: rawptr, base_type_id: i32, field_id: i32) -> rawptr {
+        let record_type = self.foreign_dci_field_record_type(base_type_id, field_id);
+        if (record_type == mir_id_invalid()) { return null; }
+        var record_base_addr = base_addr;
+        let canonical_base = self.canonical_record_type_id(base_type_id);
+        let canonical_record = self.canonical_record_type_id(record_type);
+        if (canonical_base != canonical_record
+            && self.dci_type_derives_from(canonical_base, canonical_record)) {
+            record_base_addr = self.adjust_dci_base_pointer(base_addr,
+                                                            canonical_base,
+                                                            canonical_record,
+                                                            "dci.field.base");
+            if (record_base_addr == null) { return null; }
+        }
+        let field_name = mir_unit_field_name(&self.m, field_id);
+        var offset_bits = self.dci_field_offset_bits_for_type(record_type, field_name);
+        let field_object = self.dci_field_object_for_record_name(self.dci_record_name_for_type(record_type),
+                                                                 field_name,
+                                                                 0);
+        if (field_object != null) {
+            var bitfield = self.dci_json_item(field_object, "bitfield");
+            if (bitfield == null) {
+                let legacy_storage = self.dci_json_item(field_object, "storage");
+                if (self.dci_json_string(legacy_storage, "kind") == "bitfield") {
+                    bitfield = legacy_storage;
+                }
+            }
+            if (bitfield != null) {
+                var storage_offset = self.dci_json_i64(bitfield, "storage_offset");
+                if (self.dci_json_item(bitfield, "storage_offset") == null) {
+                    storage_offset = self.dci_json_i64(bitfield, "byte_offset");
+                }
+                offset_bits = storage_offset * 8;
+            }
+        }
+        if (offset_bits < 0) {
+            self.report_error("missing DCI field layout for "
+                      + llvm_mir_type_text(&self.m, record_type)
+                      + "."
+                      + field_name);
+            return null;
+        }
+        if ((offset_bits % 8) != 0) {
+            self.report_error("DCI field storage is not byte-addressable for "
+                      + llvm_mir_type_text(&self.m, record_type)
+                      + "."
+                      + field_name);
+            return null;
+        }
+        return self.ptr_offset_bytes(record_base_addr,
+                                     vyx_rt_const_int(self.mod, self.ty_i64, offset_bits / 8, 0),
+                                     field_name);
+    }
+}

@@ -1,0 +1,1002 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn type_is_str_abi(self, type_id: i32) -> bool {
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (kind == ty_STRING()) { return true; }
+        if (kind == ty_CLASS()) {
+            let text = llvm_mir_type_text(&self.m, type_id);
+            if (llvm_mir_is_primitive_str_name(text)) { return true; }
+        }
+        return false;
+    }
+
+    public fn type_is_std_string_class(self, type_id: i32) -> bool {
+        if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
+        let canonical_type = self.canonical_record_type_id(type_id);
+        let text = llvm_mir_type_text(&self.m, canonical_type);
+        if (text.len == 0) { return false; }
+        let base = policy_generic_call_base(text.clone());
+        if (self.last_path_segment(base) != "String") { return false; }
+        if (self.field_id_for_type_name(canonical_type, "ptr") == mir_id_invalid()) { return false; }
+        if (self.field_id_for_type_name(canonical_type, "len") == mir_id_invalid()) { return false; }
+        if (self.field_id_for_type_name(canonical_type, "cap") == mir_id_invalid()) { return false; }
+        if (self.field_id_for_type_name(canonical_type, "owned") == mir_id_invalid()) { return false; }
+        return self.field_id_for_type_name(canonical_type, "inline0") != mir_id_invalid();
+    }
+
+    public fn type_is_string_view_type(self, type_id: i32) -> bool {
+        if (self.type_is_str_abi(type_id)) { return true; }
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (kind == ty_REF() || kind == ty_MUTREF()) {
+            return self.type_is_str_abi(hir_type_table_elem(self.m.types, type_id));
+        }
+        return self.type_is_std_string_class(type_id);
+    }
+
+    public fn default_value_for_type(self, type_id: i32) -> rawptr {
+        if (type_id == mir_id_invalid()) {
+            self.report_error("cannot lower default_value with empty return type");
+            return null;
+        }
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (kind == ty_VOID()) { return null; }
+        if (self.type_is_str_abi(type_id)) { return self.emit_str_value(""); }
+        if (self.type_is_option_abi(type_id)) {
+            return self.build_option_value_from_parts(type_id,
+                                                      vyx_rt_const_int(self.mod, self.ty_i32, 1, 0),
+                                                      null);
+        }
+        let bits = llvm_mir_int_bits_for_kind(kind);
+        if (bits > 0) {
+            return vyx_rt_const_int(self.mod, self.int_type_for_bits(bits), 0, 0);
+        }
+        if (llvm_mir_kind_pointer_handle(kind)) {
+            return self.pointer_handle_null();
+        }
+        if (llvm_mir_kind_pointer_like(kind)) {
+            return vyx_rt_const_ptr_null(self.mod, self.ty_ptr);
+        }
+        let ll_ty = self.lower_type(type_id);
+        if (ll_ty == null) {
+            self.report_error("cannot lower default_value for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        return vyx_rt_const_null(self.mod, ll_ty);
+    }
+
+    public fn bodyless_default_value_call(self, value_id: i32, target_fn: i32, call_name: string) -> bool {
+        if (call_name != "default_value") { return false; }
+        if (target_fn == mir_id_invalid()) { return false; }
+        if (self.call_arg_count(value_id) != 0) { return false; }
+        if (self.function_can_be_declared(target_fn)) { return false; }
+        return self.m.function_first_block(target_fn) == mir_id_invalid();
+    }
+
+    public fn lower_default_new_call(self, value_id: i32, builtin_name: string) -> rawptr {
+        let argc = self.call_arg_count(value_id);
+        let type_id = self.m.value_type(value_id);
+        if (argc == 1) {
+            let source_id = self.call_arg_at(value_id, 0);
+            let source = self.lower_value_as(source_id, type_id);
+            if (source == null) {
+                self.report_error("builtin " + builtin_name + " cannot construct `"
+                                  + llvm_mir_type_text(&self.m, type_id)
+                                  + "` from the provided value");
+            }
+            return source;
+        }
+        if (argc != 0) {
+            self.report_error("builtin " + builtin_name + " for `"
+                              + llvm_mir_type_text(&self.m, type_id)
+                              + "` accepts zero arguments for value initialization or one value for move construction; got "
+                              + policy_i64_to_string(argc as i64));
+            return null;
+        }
+        if (self.type_is_class_pointer_abi(type_id)) {
+            return self.build_zeroed_class_object(type_id);
+        }
+        return self.default_value_for_type(type_id);
+    }
+
+    public fn bodyless_i64_constant_known(self, call_name: string) -> bool {
+        if (call_name == "string_sso_capacity") { return true; }
+        if (call_name == "string_inline_flag") { return true; }
+        if (call_name == "string_heap_flag") { return true; }
+        if (call_name == "str_borrowed_flag") { return true; }
+        if (call_name == "str_malloc_flag") { return true; }
+        if (call_name == "str_header_flag") { return true; }
+        if (call_name == "str_runtime_flag") { return true; }
+        if (call_name == "str_pooled_flag") { return true; }
+        return false;
+    }
+
+    public fn bodyless_i64_constant_value(self, call_name: string) -> i64 {
+        if (call_name == "string_sso_capacity") { return 23; }
+        if (call_name == "string_heap_flag") { return 1; }
+        if (call_name == "str_malloc_flag") { return 1; }
+        if (call_name == "str_header_flag") { return 2; }
+        if (call_name == "str_runtime_flag") { return 3; }
+        if (call_name == "str_pooled_flag") { return 4; }
+        return 0;
+    }
+
+    public fn bodyless_i64_constant_call(self, value_id: i32, target_fn: i32, call_name: string) -> rawptr {
+        if (!self.bodyless_i64_constant_known(call_name)) { return null; }
+        if (target_fn == mir_id_invalid()) { return null; }
+        if (self.call_arg_count(value_id) != 0) { return null; }
+        if (self.m.function_first_block(target_fn) != mir_id_invalid()) { return null; }
+        return vyx_rt_const_int(self.mod,
+                                self.lower_type(self.m.value_type(value_id)),
+                                self.bodyless_i64_constant_value(call_name),
+                                0);
+    }
+
+    public fn kind_is_numeric_identity_scalar(self, kind: i32) -> bool {
+        if (kind == ty_I8() || kind == ty_I16() || kind == ty_I32() || kind == ty_I64()) { return true; }
+        if (kind == ty_U8() || kind == ty_U16() || kind == ty_U32() || kind == ty_U64()) { return true; }
+        if (kind == ty_ISIZE() || kind == ty_USIZE()) { return true; }
+        if (kind == ty_F32() || kind == ty_F64()) { return true; }
+        return false;
+    }
+
+    public fn bodyless_numeric_identity_call(self, value_id: i32, target_fn: i32, call_name: string) -> rawptr {
+        if (call_name != "zero" && call_name != "one") { return null; }
+        if (target_fn == mir_id_invalid()) { return null; }
+        if (self.call_arg_count(value_id) != 0) { return null; }
+        if (self.m.function_first_block(target_fn) != mir_id_invalid()) { return null; }
+        let type_id = self.m.value_type(value_id);
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (!self.kind_is_numeric_identity_scalar(kind)) { return null; }
+        var numeric_value: i64 = 0;
+        var real_value: f64 = 0.0;
+        if (call_name == "one") {
+            numeric_value = 1;
+            real_value = 1.0;
+        }
+        if (llvm_mir_kind_float(kind)) {
+            return vyx_rt_const_real(self.mod, self.lower_type(type_id), real_value);
+        }
+        let bits = llvm_mir_int_bits_for_kind(kind);
+        if (bits <= 0) { return null; }
+        return vyx_rt_const_int(self.mod, self.int_type_for_bits(bits), numeric_value, 0);
+    }
+
+    public fn last_path_segment(self, name: string) -> string {
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i < name.len) {
+            if (name.charAt(i) == 46) { start = i + 1; }
+            i = i + 1;
+        }
+        return name.substring(start, name.len as i32);
+    }
+
+    public fn compute_type_is_result_abi(self, type_id: i32) -> bool {
+        if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
+        let text = llvm_mir_type_text(&self.m, type_id);
+        if (policy_generic_call_has_args(text) == 0) { return false; }
+        return self.last_path_segment(policy_generic_call_base(text)) == "Result";
+    }
+
+    public fn type_is_result_abi(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        let cached = llvm_mir_i32_map_get(self.result_abi_cache, type_id);
+        if (cached != 0) { return cached == 2; }
+        let result = self.compute_type_is_result_abi(type_id);
+        var state: i32 = 1;
+        if (result) { state = 2; }
+        llvm_mir_i32_map_put(self.result_abi_cache, type_id, state);
+        return result;
+    }
+
+    public fn compute_type_is_option_abi(self, type_id: i32) -> bool {
+        if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
+        let text = llvm_mir_type_text(&self.m, type_id);
+        if (policy_generic_call_has_args(text) == 0) { return false; }
+        return self.last_path_segment(policy_generic_call_base(text)) == "Option";
+    }
+
+    public fn type_is_option_abi(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        let cached = llvm_mir_i32_map_get(self.option_abi_cache, type_id);
+        if (cached != 0) { return cached == 2; }
+        let result = self.compute_type_is_option_abi(type_id);
+        var state: i32 = 1;
+        if (result) { state = 2; }
+        llvm_mir_i32_map_put(self.option_abi_cache, type_id, state);
+        return result;
+    }
+
+    public fn type_id_by_text(self, text: string) -> i32 {
+        if (text.len == 0) { return mir_id_invalid(); }
+        var normalized = text;
+        if (llvm_mir_is_primitive_str_name(normalized)) { normalized = "str"; }
+        self.ensure_type_text_index();
+        if (normalized == "rawptr" && self.interned_rawptr_type_id != mir_id_invalid()) {
+            return self.interned_rawptr_type_id;
+        }
+        if (normalized == "str" && self.interned_str_type_id != mir_id_invalid()) {
+            return self.interned_str_type_id;
+        }
+        if (normalized == "f32" && self.interned_f32_type_id != mir_id_invalid()) {
+            return self.interned_f32_type_id;
+        }
+        if (normalized == "f64" && self.interned_f64_type_id != mir_id_invalid()) {
+            return self.interned_f64_type_id;
+        }
+        if (self.type_text_index != null) {
+            let preferred_kind = self.preferred_type_kind_for_text(normalized);
+            if (preferred_kind != 0) {
+                let preferred = llvm_mir_symbol_index_get(self.type_text_index,
+                                                          self.type_text_index_cap,
+                                                          self.type_text_kind_key(preferred_kind, normalized));
+                if (preferred != mir_id_invalid()) { return preferred; }
+            }
+            let exact = llvm_mir_symbol_index_get(self.type_text_index,
+                                                  self.type_text_index_cap,
+                                                  normalized);
+            if (exact != mir_id_invalid()) { return exact; }
+        } else {
+            let preferred_kind = self.preferred_type_kind_for_text(normalized);
+            if (preferred_kind != 0) {
+                var preferred_id: i32 = 1;
+                while (preferred_id <= self.m.types.count) {
+                    if (llvm_mir_type_text(&self.m, preferred_id) == normalized
+                        && llvm_mir_type_kind(&self.m, preferred_id) == preferred_kind) {
+                        return preferred_id;
+                    }
+                    preferred_id = preferred_id + 1;
+                }
+            }
+            var exact_id: i32 = 1;
+            while (exact_id <= self.m.types.count) {
+                if (llvm_mir_type_text(&self.m, exact_id) == normalized) { return exact_id; }
+                exact_id = exact_id + 1;
+            }
+        }
+        var id: i32 = 1;
+        while (id <= self.m.types.count) {
+            if (self.type_text_equivalent(llvm_mir_type_text(&self.m, id), normalized)) { return id; }
+            id = id + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn preferred_type_kind_for_text(self, text: string) -> i32 {
+        let normalized = self.trim_type_text(text);
+        // Generic argument placeholders may share text with the concrete
+        // pointer type. Size/storage queries must select its structured kind.
+        if (normalized.startsWith("*")) { return ty_PTR(); }
+        if (normalized.startsWith("&mut ")) { return ty_MUTREF(); }
+        if (normalized.startsWith("&")) { return ty_REF(); }
+        let pointer_base = policy_generic_call_base(normalized.clone());
+        if (pointer_base == "ptr") { return ty_PTR(); }
+        if (pointer_base == "ref") { return ty_REF(); }
+        if (pointer_base == "mutref") { return ty_MUTREF(); }
+        if (normalized.len >= 4 && normalized.substring(0, 4) == "cfn(") { return ty_CFN(); }
+        if (normalized.len >= 10 && normalized.substring(0, 10) == "unsafe fn(") { return ty_CFN(); }
+        if (normalized.len >= 3 && normalized.substring(0, 3) == "fn(") { return ty_FN(); }
+        return 0;
+    }
+
+    public fn type_is_heap_indirect_deref_type(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
+        var text = llvm_mir_type_text(&self.m, type_id);
+        let canonical_type = self.canonical_record_type_id(type_id);
+        if (policy_generic_call_has_args(text.clone()) == 0) {
+            text = llvm_mir_type_text(&self.m, canonical_type);
+        }
+        if (policy_generic_call_has_args(text.clone()) == 0) { return false; }
+        let base = policy_generic_call_base(text.clone());
+        let segment = self.last_path_segment(base);
+        if (segment != "Box" && segment != "Ref") { return false; }
+        let data_field = self.field_id_for_type_name(canonical_type, "data");
+        if (data_field == mir_id_invalid()) { return false; }
+        return llvm_mir_type_kind(&self.m, mir_unit_field_type(&self.m, data_field)) == ty_RAWPTR();
+    }
+
+    public fn heap_indirect_payload_type(self, type_id: i32) -> i32 {
+        if (!self.type_is_heap_indirect_deref_type(type_id)) { return mir_id_invalid(); }
+        var text = llvm_mir_type_text(&self.m, type_id);
+        if (policy_generic_call_has_args(text.clone()) == 0) {
+            text = llvm_mir_type_text(&self.m, self.canonical_record_type_id(type_id));
+        }
+        let args = policy_generic_call_args(text.clone());
+        let payload_text = policy_generic_arg_at(args, 0);
+        if (payload_text.len == 0) { return mir_id_invalid(); }
+        return self.type_id_by_text(payload_text);
+    }
+
+    public fn heap_indirect_payload_matches(self, src_type_id: i32, dst_type_id: i32) -> bool {
+        if (src_type_id == mir_id_invalid() || dst_type_id == mir_id_invalid()) { return false; }
+        let payload_type = self.heap_indirect_payload_type(src_type_id);
+        if (payload_type == mir_id_invalid()) { return false; }
+        return self.type_ids_compatible(payload_type, dst_type_id);
+    }
+
+    public fn type_is_ref_counted_handle(self, type_id: i32) -> bool {
+        return self.ref_counted_handle_offset(type_id) >= 0;
+    }
+
+    public fn ref_counted_handle_offset(self, type_id: i32) -> i64 {
+        if (type_id == mir_id_invalid()) { return -1; }
+        if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return -1; }
+        let canonical_type = self.canonical_record_type_id(type_id);
+        var text = llvm_mir_type_text(&self.m, type_id);
+        if (policy_generic_call_has_args(text.clone()) == 0) {
+            text = llvm_mir_type_text(&self.m, canonical_type);
+        }
+        if (policy_generic_call_has_args(text.clone()) == 0) { return -1; }
+        let base = policy_generic_call_base(text.clone());
+        let handle = self.last_path_segment(base);
+        if (handle != "Ref" && handle != "Weak") { return -1; }
+        let data_field = self.field_id_for_type_name(canonical_type, "data");
+        let rc_field = self.field_id_for_type_name(canonical_type, "rc");
+        if (data_field == mir_id_invalid() || rc_field == mir_id_invalid()) { return -1; }
+        if (llvm_mir_type_kind(&self.m, mir_unit_field_type(&self.m, data_field)) != ty_RAWPTR()) { return -1; }
+        if (llvm_mir_type_kind(&self.m, mir_unit_field_type(&self.m, rc_field)) != ty_RAWPTR()) { return -1; }
+        if (handle == "Ref") { return 0; }
+        return 8;
+    }
+
+    public fn place_is_owning_drop_local(self, place_id: i32) -> bool {
+        if (place_id == mir_id_invalid()) { return false; }
+        if (self.m.place_kind(place_id) != mir_place_local()) { return false; }
+        let local_id = self.m.place_local(place_id);
+        if (local_id == mir_id_invalid()) { return false; }
+        return (self.m.local_flags(local_id) & mir_local_flag_auto_drop()) != 0;
+    }
+
+    public fn value_reads_move_parameter(self, value_id: i32) -> bool {
+        if (value_id == mir_id_invalid()) { return false; }
+        if (self.m.value_kind(value_id) != mir_value_read_place()) { return false; }
+        let place_id = self.m.value_place(value_id);
+        if (place_id == mir_id_invalid()) { return false; }
+        if (self.m.place_kind(place_id) != mir_place_local()) { return false; }
+        let local_id = self.m.place_local(place_id);
+        if (local_id == mir_id_invalid()) { return false; }
+        return (self.m.local_flags(local_id) & mir_local_flag_move_arg()) != 0;
+    }
+
+    public fn value_reads_same_local_place(self, value_id: i32, place_id: i32) -> bool {
+        if (value_id == mir_id_invalid() || place_id == mir_id_invalid()) { return false; }
+        if (self.m.value_kind(value_id) != mir_value_read_place()) { return false; }
+        let src_place = self.m.value_place(value_id);
+        if (src_place == place_id) { return true; }
+        if (self.m.place_kind(src_place) != mir_place_local()) { return false; }
+        if (self.m.place_kind(place_id) != mir_place_local()) { return false; }
+        return self.m.place_local(src_place) == self.m.place_local(place_id);
+    }
+
+    // `str` is a value view and does not carry a buffer reference count.  A
+    // self-assignment may reclaim or mutate its old buffer only when no prior
+    // MIR operation could have retained an alias.  This is deliberately a
+    // local, intraprocedural proof: calls, address formation, captures, drops,
+    // derived places, and unrecognized prior reads all reject the fast path.
+    public fn string_append_value_mentions_local(self, value_id: i32, local_id: i32) -> bool {
+        self.local_lifetime_marker_value_visit_budget = llvm_mir_lifetime_marker_max_value_visits();
+        self.local_lifetime_marker_value_query_failed = false;
+        let mentions = self.local_lifetime_marker_value_uses_local(value_id, local_id);
+        return mentions || self.local_lifetime_marker_value_query_failed;
+    }
+
+    public fn string_append_prior_assign_is_self_update(self,
+                                                        instr_id: i32,
+                                                        place_id: i32,
+                                                        local_id: i32) -> bool {
+        if (self.m.instr_kind(instr_id) != mir_instr_assign()
+            || self.m.instr_place(instr_id) != place_id) {
+            return false;
+        }
+        let prior_value = self.m.instr_value(instr_id);
+        if (prior_value == mir_id_invalid()
+            || self.m.value_kind(prior_value) != mir_value_binary()
+            || self.m.value_op(prior_value) != llvm_mir_tk_PLUS()) {
+            return false;
+        }
+        let prior_lhs = self.m.value_lhs(prior_value);
+        let prior_rhs = self.m.value_rhs(prior_value);
+        return self.value_reads_same_local_place(prior_lhs, place_id)
+            && !self.string_append_value_mentions_local(prior_rhs, local_id);
+    }
+
+    public fn string_append_local_is_proven_unique(self,
+                                                   instr_id: i32,
+                                                   place_id: i32) -> bool {
+        if (instr_id == mir_id_invalid() || place_id == mir_id_invalid()
+            || self.m.place_kind(place_id) != mir_place_local()) {
+            return false;
+        }
+        let local_id = self.m.place_local(place_id);
+        if (local_id == mir_id_invalid() || self.m.local_function(local_id) != self.current_function_id) {
+            return false;
+        }
+        let rejected_flags = mir_local_flag_param()
+            | mir_local_flag_capture()
+            | mir_local_flag_move_arg()
+            | mir_local_flag_self_receiver()
+            | mir_local_flag_reference_capture();
+        if ((self.m.local_flags(local_id) & rejected_flags) != 0
+            || self.local_lifetime_marker_has_address_or_capture(local_id)) {
+            return false;
+        }
+
+        var initialized: bool = false;
+        var prior_id: i32 = 1;
+        while (prior_id < instr_id) {
+            if (!mir_unit_instr_owner_is_removed(&self.m, prior_id)
+                && self.m.instr_function(prior_id) == self.current_function_id) {
+                let prior_kind = self.m.instr_kind(prior_id);
+                let prior_place = self.m.instr_place(prior_id);
+                if (prior_place == place_id && prior_kind == mir_instr_storage_live()) {
+                    // Initial storage has no value to alias.
+                } else if (prior_place == place_id
+                           && !initialized
+                           && !self.string_append_value_mentions_local(self.m.instr_value(prior_id), local_id)) {
+                    // The first direct assignment establishes this local. It
+                    // may not read the local it initializes.
+                    initialized = true;
+                } else if (prior_place == place_id
+                           && initialized
+                           && self.string_append_prior_assign_is_self_update(prior_id,
+                                                                              place_id,
+                                                                              local_id)) {
+                    // Earlier `local = local + suffix` updates preserve the
+                    // same uniqueness proof when suffix is independent.
+                } else if (self.string_append_value_mentions_local(self.m.instr_value(prior_id), local_id)
+                           || self.string_append_value_mentions_local(self.m.instr_lhs(prior_id), local_id)
+                           || self.string_append_value_mentions_local(self.m.instr_rhs(prior_id), local_id)
+                           || prior_place == place_id) {
+                    return false;
+                }
+            }
+            prior_id = prior_id + 1;
+        }
+        return true;
+    }
+
+    public fn assignment_should_retain_ref_handle(self, place_id: i32, value_id: i32, dst_type_id: i32) -> bool {
+        if (!self.type_is_ref_counted_handle(dst_type_id)) { return false; }
+        if (!self.place_is_owning_drop_local(place_id)) { return false; }
+        if (self.m.value_kind(value_id) != mir_value_read_place()) { return false; }
+        if (self.value_reads_move_parameter(value_id)) { return false; }
+        if (self.value_reads_same_local_place(value_id, place_id)) { return false; }
+        return true;
+    }
+
+    public fn retain_ref_handle_value(self, value: rawptr, type_id: i32) -> rawptr {
+        if (value == null || !self.type_is_ref_counted_handle(type_id)) { return value; }
+        if (self.current_function_value == null) {
+            self.report_error("cannot retain Ref handle outside a function");
+            return null;
+        }
+        var rc_ptr: rawptr = null;
+        var data_ptr: rawptr = null;
+        var retained_value = value;
+        if (self.type_is_class_pointer_abi(type_id)) {
+            let rc_addr = self.record_field_addr_for_type(value, type_id, "rc");
+            let data_addr = self.record_field_addr_for_type(value, type_id, "data");
+            if (rc_addr != null && data_addr != null) {
+                rc_ptr = vyx_rt_build_load(self.mod,
+                                           self.ty_ptr,
+                                           rc_addr,
+                                           "mir.ref.rc".c_str(),
+                                           10);
+                data_ptr = vyx_rt_build_load(self.mod,
+                                              self.ty_ptr,
+                                              data_addr,
+                                              "mir.ref.data".c_str(),
+                                              12);
+            }
+        } else {
+            rc_ptr = vyx_rt_build_extract_value(self.mod,
+                                                value,
+                                                1,
+                                                "mir.ref.rc".c_str(),
+                                                10);
+        }
+        if (rc_ptr == null) {
+            self.report_error("cannot read Ref rc field for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        // Classes use pointer ABI, so a raw assignment otherwise aliases the
+        // handle wrapper itself. Ref/Weak require value-handle semantics:
+        // copy the two pointer fields into a distinct wrapper before updating
+        // the matching strong or weak count.
+        if (self.type_is_class_pointer_abi(type_id)) {
+            let wrapper = self.build_zeroed_class_object(type_id);
+            let wrapper_data = self.record_field_addr_for_type(wrapper, type_id, "data");
+            let wrapper_rc = self.record_field_addr_for_type(wrapper, type_id, "rc");
+            if (wrapper == null || wrapper_data == null || wrapper_rc == null || data_ptr == null) {
+                self.report_error("cannot materialize independent Ref handle for " + llvm_mir_type_text(&self.m, type_id));
+                return null;
+            }
+            vyx_rt_build_store(self.mod, data_ptr, wrapper_data);
+            vyx_rt_build_store(self.mod, rc_ptr, wrapper_rc);
+            retained_value = wrapper;
+        }
+        let live = vyx_rt_build_icmp(self.mod,
+                                     llvm_mir_icmp_ne(),
+                                     rc_ptr,
+                                     vyx_rt_const_null(self.mod, self.ty_ptr),
+                                     "mir.ref.live".c_str(),
+                                     12);
+        if (live == null) {
+            self.report_error("cannot test Ref rc field for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        let retain_bb = vyx_rt_append_block(self.mod,
+                                            self.current_function_value,
+                                            "mir.ref.retain".c_str(),
+                                            14);
+        let cont_bb = vyx_rt_append_block(self.mod,
+                                          self.current_function_value,
+                                          "mir.ref.retain.cont".c_str(),
+                                          19);
+        if (retain_bb == null || cont_bb == null) {
+            self.report_error("cannot create Ref retain control flow");
+            return null;
+        }
+        vyx_rt_build_cond_br(self.mod, live, retain_bb, cont_bb);
+        vyx_rt_position_at_end(self.mod, retain_bb);
+        let count_offset = self.ref_counted_handle_offset(type_id);
+        let count_ptr = self.ptr_offset_bytes(rc_ptr,
+                                              vyx_rt_const_int(self.mod, self.ty_i64, count_offset, 0),
+                                              "mir.ref.count.addr");
+        let prior_count = vyx_rt_build_atomicrmw_add(self.mod,
+                                                      count_ptr,
+                                                      vyx_rt_const_int(self.mod, self.ty_i64, 1, 0),
+                                                      "mir.ref.count.atomic_add".c_str(),
+                                                      24);
+        if (prior_count == null) {
+            self.report_error("cannot atomically retain Ref for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        vyx_rt_build_br(self.mod, cont_bb);
+        vyx_rt_position_at_end(self.mod, cont_bb);
+        return retained_value;
+    }
+
+    public fn release_replaced_string_storage(self,
+                                              base_ptr: rawptr,
+                                              base_owned: rawptr) -> bool {
+        if (base_ptr == null || base_owned == null || self.current_function_value == null) {
+            self.report_error("cannot release replaced string storage");
+            return false;
+        }
+        if (self.builtin_free_fn == null || self.builtin_free_fty == null
+            || self.builtin_forget_string_len_fn == null
+            || self.builtin_forget_string_len_fty == null
+            || self.builtin_pooled_string_free_fn == null
+            || self.builtin_pooled_string_free_fty == null
+            || self.builtin_runtime_string_free_fn == null
+            || self.builtin_runtime_string_free_fty == null) {
+            self.report_error("string storage deallocator declarations are unavailable");
+            return false;
+        }
+        let local_name = "mir.str.release.local";
+        let check_name = "mir.str.release.check";
+        let runtime_name = "mir.str.release.runtime";
+        let pooled_name = "mir.str.release.pooled";
+        let cont_name = "mir.str.release.cont";
+        let local_bb = vyx_rt_append_block(self.mod,
+                                           self.current_function_value,
+                                           local_name.c_str(),
+                                           local_name.len as u64);
+        let check_bb = vyx_rt_append_block(self.mod,
+                                           self.current_function_value,
+                                           check_name.c_str(),
+                                           check_name.len as u64);
+        let runtime_bb = vyx_rt_append_block(self.mod,
+                                             self.current_function_value,
+                                             runtime_name.c_str(),
+                                             runtime_name.len as u64);
+        let pooled_bb = vyx_rt_append_block(self.mod,
+                                            self.current_function_value,
+                                            pooled_name.c_str(),
+                                            pooled_name.len as u64);
+        let cont_bb = vyx_rt_append_block(self.mod,
+                                          self.current_function_value,
+                                          cont_name.c_str(),
+                                          cont_name.len as u64);
+        let is_local = vyx_rt_build_icmp(self.mod,
+                                         llvm_mir_icmp_eq(),
+                                         base_owned,
+                                         vyx_rt_const_int(self.mod, self.ty_i64, 1, 0),
+                                         llvm_mir_empty_name(),
+                                         0);
+        if (local_bb == null || check_bb == null || runtime_bb == null || pooled_bb == null
+            || cont_bb == null || is_local == null) {
+            self.report_error("cannot create string storage release control flow");
+            return false;
+        }
+        vyx_rt_build_cond_br(self.mod, is_local, local_bb, check_bb);
+
+        vyx_rt_position_at_end(self.mod, local_bb);
+        vyx_rt_build_call1(self.mod,
+                           self.builtin_forget_string_len_fty,
+                           self.builtin_forget_string_len_fn,
+                           base_ptr,
+                           llvm_mir_empty_name(),
+                           0);
+        vyx_rt_build_call1(self.mod,
+                           self.builtin_free_fty,
+                           self.builtin_free_fn,
+                           base_ptr,
+                           llvm_mir_empty_name(),
+                           0);
+        vyx_rt_build_br(self.mod, cont_bb);
+
+        vyx_rt_position_at_end(self.mod, check_bb);
+        let is_runtime = vyx_rt_build_icmp(self.mod,
+                                           llvm_mir_icmp_eq(),
+                                           base_owned,
+                                           vyx_rt_const_int(self.mod, self.ty_i64, 3, 0),
+                                           llvm_mir_empty_name(),
+                                           0);
+        if (is_runtime == null) {
+            self.report_error("cannot classify replaced string storage");
+            return false;
+        }
+        let pooled_check_name = "mir.str.release.pooled.check";
+        let pooled_check_bb = vyx_rt_append_block(self.mod,
+                                                  self.current_function_value,
+                                                  pooled_check_name.c_str(),
+                                                  pooled_check_name.len as u64);
+        if (pooled_check_bb == null) {
+            self.report_error("cannot create pooled string release branch");
+            return false;
+        }
+        vyx_rt_build_cond_br(self.mod, is_runtime, runtime_bb, pooled_check_bb);
+
+        vyx_rt_position_at_end(self.mod, runtime_bb);
+        vyx_rt_build_call1(self.mod,
+                           self.builtin_runtime_string_free_fty,
+                           self.builtin_runtime_string_free_fn,
+                           base_ptr,
+                           llvm_mir_empty_name(),
+                           0);
+        vyx_rt_build_br(self.mod, cont_bb);
+
+        vyx_rt_position_at_end(self.mod, pooled_check_bb);
+        let is_pooled = vyx_rt_build_icmp(self.mod,
+                                          llvm_mir_icmp_eq(),
+                                          base_owned,
+                                          vyx_rt_const_int(self.mod, self.ty_i64, 4, 0),
+                                          llvm_mir_empty_name(),
+                                          0);
+        if (is_pooled == null) {
+            self.report_error("cannot classify pooled string storage");
+            return false;
+        }
+        vyx_rt_build_cond_br(self.mod, is_pooled, pooled_bb, cont_bb);
+
+        vyx_rt_position_at_end(self.mod, pooled_bb);
+        vyx_rt_build_call1(self.mod,
+                           self.builtin_pooled_string_free_fty,
+                           self.builtin_pooled_string_free_fn,
+                           base_ptr,
+                           llvm_mir_empty_name(),
+                           0);
+        vyx_rt_build_br(self.mod, cont_bb);
+        vyx_rt_position_at_end(self.mod, cont_bb);
+        return true;
+    }
+
+    public fn lower_string_append_assign_into_place(self, instr_id: i32, place_id: i32, value_id: i32, dst_addr: rawptr, dst_type: i32) -> bool {
+        if (place_id == mir_id_invalid() || value_id == mir_id_invalid() || dst_addr == null) { return false; }
+        if (!self.type_is_str_abi(dst_type)) { return false; }
+        if (self.m.value_kind(value_id) != mir_value_binary()) { return false; }
+        if (self.m.value_op(value_id) != llvm_mir_tk_PLUS()) { return false; }
+        if (!self.type_is_string_view_type(self.m.value_type(value_id))) { return false; }
+
+        let lhs_id = self.m.value_lhs(value_id);
+        let rhs_id = self.m.value_rhs(value_id);
+        if (!self.value_reads_same_local_place(lhs_id, place_id)) { return false; }
+        if (rhs_id == mir_id_invalid()) { return false; }
+        if (!self.string_append_local_is_proven_unique(instr_id, place_id)) { return false; }
+        let base_value = self.lower_string_view_value(lhs_id);
+        let rhs_value = self.lower_string_view_value(rhs_id);
+        if (base_value == null || rhs_value == null) {
+            self.report_error("cannot lower string append-assign operands");
+            return true;
+        }
+        let base_ptr = self.string_ptr_value(base_value);
+        let base_len = self.string_len_value(base_value);
+        let base_cap = self.string_cap_value(base_value);
+        let base_owned = self.string_owned_value(base_value);
+        let rhs_ptr = self.string_ptr_value(rhs_value);
+        let rhs_len = self.string_len_value(rhs_value);
+        if (base_ptr == null || base_len == null || base_cap == null || base_owned == null
+            || rhs_ptr == null || rhs_len == null) {
+            self.report_error("cannot extract string append-assign fields");
+            return true;
+        }
+        if (self.current_function_value == null
+            || self.builtin_malloc_fn == null || self.builtin_malloc_fty == null
+            || self.builtin_memcpy_fn == null || self.builtin_memcpy_fty == null
+            || self.builtin_memmove_fn == null || self.builtin_memmove_fty == null) {
+            self.report_error("string append-assign lowering declarations are unavailable");
+            return true;
+        }
+
+        // Allocation and deallocation stay in the generated module. This is
+        // necessary for JIT code: a buffer from its CRT allocation domain must
+        // never cross into a runtime DLL and later be released by IR free().
+        let one = vyx_rt_const_int(self.mod, self.ty_i64, 1, 0);
+        let min_cap = vyx_rt_const_int(self.mod, self.ty_i64, 64, 0);
+        let total = vyx_rt_build_add(self.mod, base_len, rhs_len, "mir.str.append.len".c_str(), 18);
+        let needed = vyx_rt_build_add(self.mod, total, one, "mir.str.append.needed".c_str(), 21);
+        let doubled = vyx_rt_build_mul(self.mod, base_cap, vyx_rt_const_int(self.mod, self.ty_i64, 2, 0), "mir.str.append.double".c_str(), 21);
+        let at_least_min = vyx_rt_build_icmp(self.mod, llvm_mir_icmp_uge(), doubled, min_cap, llvm_mir_empty_name(), 0);
+        let geometric = vyx_rt_build_select(self.mod, at_least_min, doubled, min_cap, "mir.str.append.geometric".c_str(), 24);
+        let enough_growth = vyx_rt_build_icmp(self.mod, llvm_mir_icmp_uge(), geometric, needed, llvm_mir_empty_name(), 0);
+        let grown_cap = vyx_rt_build_select(self.mod, enough_growth, geometric, needed, "mir.str.append.cap".c_str(), 18);
+        let is_local = vyx_rt_build_icmp(self.mod,
+                                         llvm_mir_icmp_eq(),
+                                         base_owned,
+                                         one,
+                                         llvm_mir_empty_name(),
+                                         0);
+        let has_capacity = vyx_rt_build_icmp(self.mod,
+                                             llvm_mir_icmp_uge(),
+                                             base_cap,
+                                             needed,
+                                             llvm_mir_empty_name(),
+                                             0);
+        let reuse = vyx_rt_build_and(self.mod, is_local, has_capacity, "mir.str.append.reuse".c_str(), 20);
+        let reuse_name = "mir.str.append.reuse";
+        let alloc_name = "mir.str.append.alloc";
+        let join_name = "mir.str.append.join";
+        let reuse_bb = vyx_rt_append_block(self.mod,
+                                           self.current_function_value,
+                                           reuse_name.c_str(),
+                                           reuse_name.len as u64);
+        let alloc_bb = vyx_rt_append_block(self.mod,
+                                           self.current_function_value,
+                                           alloc_name.c_str(),
+                                           alloc_name.len as u64);
+        let join_bb = vyx_rt_append_block(self.mod,
+                                          self.current_function_value,
+                                          join_name.c_str(),
+                                          join_name.len as u64);
+        if (one == null || min_cap == null || total == null || needed == null
+            || doubled == null || at_least_min == null || geometric == null
+            || enough_growth == null || grown_cap == null || is_local == null
+            || has_capacity == null || reuse == null || reuse_bb == null
+            || alloc_bb == null || join_bb == null) {
+            self.report_error("cannot create string append-assign control flow");
+            return true;
+        }
+        vyx_rt_build_cond_br(self.mod, reuse, reuse_bb, alloc_bb);
+
+        // memmove preserves self/slice append semantics when rhs aliases the
+        // existing local buffer.
+        vyx_rt_position_at_end(self.mod, reuse_bb);
+        let reuse_tail = self.ptr_offset_bytes(base_ptr, base_len, "mir.str.append.reuse.tail");
+        let reuse_end = self.ptr_offset_bytes(base_ptr, total, "mir.str.append.reuse.end");
+        let reuse_copy = vyx_rt_build_call3(self.mod,
+                                            self.builtin_memmove_fty,
+                                            self.builtin_memmove_fn,
+                                            reuse_tail,
+                                            rhs_ptr,
+                                            rhs_len,
+                                            llvm_mir_empty_name(),
+                                            0);
+        if (reuse_tail == null || reuse_end == null || reuse_copy == null) {
+            self.report_error("cannot emit in-place string append");
+            return true;
+        }
+        vyx_rt_build_store(self.mod, vyx_rt_const_int(self.mod, self.ty_i8, 0, 0), reuse_end);
+        let reuse_end_bb = vyx_rt_get_insert_block(self.mod);
+        vyx_rt_build_br(self.mod, join_bb);
+
+        // A replacement allocation is made by the same malloc/free pair that
+        // owns ordinary IR strings. Copy before releasing base so aliasing rhs
+        // remains valid on the growth path too.
+        vyx_rt_position_at_end(self.mod, alloc_bb);
+        let allocated = vyx_rt_build_call1(self.mod,
+                                            self.builtin_malloc_fty,
+                                            self.builtin_malloc_fn,
+                                            grown_cap,
+                                            "mir.str.append.data".c_str(),
+                                            19);
+        let alloc_head_copy = vyx_rt_build_call3(self.mod,
+                                                 self.builtin_memcpy_fty,
+                                                 self.builtin_memcpy_fn,
+                                                 allocated,
+                                                 base_ptr,
+                                                 base_len,
+                                                 llvm_mir_empty_name(),
+                                                 0);
+        let alloc_tail = self.ptr_offset_bytes(allocated, base_len, "mir.str.append.alloc.tail");
+        let alloc_tail_copy = vyx_rt_build_call3(self.mod,
+                                                 self.builtin_memcpy_fty,
+                                                 self.builtin_memcpy_fn,
+                                                 alloc_tail,
+                                                 rhs_ptr,
+                                                 rhs_len,
+                                                 llvm_mir_empty_name(),
+                                                 0);
+        let alloc_end = self.ptr_offset_bytes(allocated, total, "mir.str.append.alloc.end");
+        if (allocated == null || alloc_head_copy == null || alloc_tail == null
+            || alloc_tail_copy == null || alloc_end == null) {
+            self.report_error("cannot emit replacement string append");
+            return true;
+        }
+        vyx_rt_build_store(self.mod, vyx_rt_const_int(self.mod, self.ty_i8, 0, 0), alloc_end);
+        if (!self.release_replaced_string_storage(base_ptr, base_owned)) { return true; }
+        let alloc_end_bb = vyx_rt_get_insert_block(self.mod);
+        vyx_rt_build_br(self.mod, join_bb);
+
+        vyx_rt_position_at_end(self.mod, join_bb);
+        let result_ptr = vyx_rt_build_phi(self.mod, self.ty_ptr, "mir.str.append.ptr".c_str(), 18);
+        let result_cap = vyx_rt_build_phi(self.mod, self.ty_i64, "mir.str.append.result.cap".c_str(), 25);
+        if (reuse_end_bb == null || alloc_end_bb == null || result_ptr == null || result_cap == null) {
+            self.report_error("cannot join string append-assign result");
+            return true;
+        }
+        vyx_rt_add_incoming(self.mod, result_ptr, base_ptr, reuse_end_bb);
+        vyx_rt_add_incoming(self.mod, result_ptr, allocated, alloc_end_bb);
+        vyx_rt_add_incoming(self.mod, result_cap, base_cap, reuse_end_bb);
+        vyx_rt_add_incoming(self.mod, result_cap, grown_cap, alloc_end_bb);
+        let out_value = self.emit_string_value_from_parts(result_ptr,
+                                                          total,
+                                                          result_cap,
+                                                          one);
+        if (out_value == null) {
+            self.report_error("cannot assemble string append-assign result");
+            return true;
+        }
+        vyx_rt_build_store(self.mod, out_value, dst_addr);
+        return true;
+    }
+
+    public fn lower_heap_indirect_payload_address(self, value_id: i32, dst_type_id: i32) -> rawptr {
+        let src_type_id = self.m.value_type(value_id);
+        let payload_type = self.heap_indirect_payload_type(src_type_id);
+        if (payload_type == mir_id_invalid() || !self.type_ids_compatible(payload_type, dst_type_id)) {
+            self.report_error("cannot resolve heap-indirected payload address from "
+                      + llvm_mir_type_text(&self.m, src_type_id)
+                      + " to "
+                      + llvm_mir_type_text(&self.m, dst_type_id));
+            return null;
+        }
+        let base_addr = self.lower_self_receiver_address(value_id, src_type_id);
+        let data_addr = self.record_field_addr_for_type(base_addr, src_type_id, "data");
+        if (base_addr == null || data_addr == null) {
+            self.report_error("cannot address heap-indirected storage for "
+                      + llvm_mir_type_text(&self.m, src_type_id));
+            return null;
+        }
+        let data_ptr = vyx_rt_build_load(self.mod,
+                                         self.ty_ptr,
+                                         data_addr,
+                                         "mir.deref.data".c_str(),
+                                         14);
+        if (data_ptr == null) {
+            self.report_error("cannot load heap-indirected payload address for "
+                      + llvm_mir_type_text(&self.m, src_type_id));
+            return null;
+        }
+        return data_ptr;
+    }
+
+    public fn lower_heap_indirect_payload_value(self, value_id: i32, dst_type_id: i32) -> rawptr {
+        let src_type_id = self.m.value_type(value_id);
+        let payload_type = self.heap_indirect_payload_type(src_type_id);
+        if (payload_type == mir_id_invalid()) {
+            self.report_error("cannot resolve heap-indirected payload type for "
+                      + llvm_mir_type_text(&self.m, src_type_id));
+            return null;
+        }
+        let data_ptr = self.lower_heap_indirect_payload_address(value_id, payload_type);
+        let payload_ll_ty = self.lower_type(payload_type);
+        if (data_ptr == null || payload_ll_ty == null) {
+            self.report_error("cannot address heap-indirected payload for "
+                      + llvm_mir_type_text(&self.m, src_type_id));
+            return null;
+        }
+        if (self.type_is_class_pointer_abi(payload_type)) {
+            return self.cast_value(data_ptr, payload_type, dst_type_id);
+        }
+        let payload = vyx_rt_build_load(self.mod,
+                                        payload_ll_ty,
+                                        data_ptr,
+                                        "mir.deref.value".c_str(),
+                                        15);
+        if (payload == null) {
+            self.report_error("cannot load heap-indirected payload "
+                      + llvm_mir_type_text(&self.m, payload_type)
+                      + " from "
+                      + llvm_mir_type_text(&self.m, src_type_id));
+            return null;
+        }
+        return self.cast_value(payload, payload_type, dst_type_id);
+    }
+
+    public fn lower_drop_instr(self, instr_id: i32) {
+        let place_id = self.m.instr_place(instr_id);
+        let target_fn = self.m.instr_target_id(instr_id);
+        if (place_id == mir_id_invalid()) {
+            self.report_error("drop instr #" + policy_i64_to_string(instr_id as i64) + " is missing place");
+            return;
+        }
+        if (self.lower_dci_stub_destroy_place(place_id)) { return; }
+        if (target_fn == mir_id_invalid()) {
+            self.report_error("drop instr #" + policy_i64_to_string(instr_id as i64) + " is missing place or target function");
+            return;
+        }
+        self.declare_function_signature(target_fn);
+        let fn_value = llvm_mir_map_get(self.function_values, target_fn);
+        let fn_type = llvm_mir_map_get(self.function_types, target_fn);
+        if (fn_value == null || fn_type == null) {
+            self.report_error("cannot resolve drop target for instr #" + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        let receiver_type = self.function_source_param_type(target_fn, 0);
+        if (receiver_type == mir_id_invalid()) {
+            self.report_error("drop target has no self parameter for instr #" + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        var receiver_arg: rawptr = null;
+        if (self.source_param_uses_self_pointer_abi(target_fn, 0)) {
+            let place_addr = self.lower_place_addr(place_id);
+            receiver_arg = self.class_object_addr_from_place_addr(place_id, place_addr, receiver_type);
+        } else if (llvm_mir_type_kind(&self.m, receiver_type) == ty_PTR()
+            && hir_type_table_elem(self.m.types, receiver_type) == self.m.place_type(place_id)) {
+            // A descriptor lifecycle destroy is a free function `fn(*T)`.
+            // Preserve the local storage identity instead of loading T and
+            // attempting an aggregate-to-pointer cast.
+            receiver_arg = self.lower_place_addr(place_id);
+        } else {
+            let value_id = self.m.instr_value(instr_id);
+            if (value_id != mir_id_invalid()) {
+                receiver_arg = self.lower_value_as(value_id, receiver_type);
+            } else {
+                let addr = self.lower_place_addr(place_id);
+                if (addr != null) {
+                    let loaded = vyx_rt_build_load(self.mod,
+                                                   self.lower_type(self.m.place_type(place_id)),
+                                                   addr,
+                                                   llvm_mir_empty_name(),
+                                                   0);
+                    receiver_arg = self.cast_value(loaded, self.m.place_type(place_id), receiver_type);
+                }
+            }
+        }
+        if (receiver_arg == null) {
+            self.report_error("cannot lower drop receiver for instr #" + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        let args = malloc(8);
+        if (args == null) {
+            self.report_error("cannot allocate drop call args for instr #" + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        ast_write_rawptr(args, receiver_arg);
+        let lifetime_error = llvm_lifetime_finish_drop(&self.m, place_id, target_fn,
+                                                       self.mod, fn_type, fn_value, args,
+                                                       self.type_is_class_pointer_abi(self.m.place_type(place_id)),
+                                                       self.builtin_free_fty, self.builtin_free_fn);
+        free(args);
+        if (lifetime_error.len > 0) { self.report_error(lifetime_error); }
+    }
+
+    public fn track_shared_unwind_owner(self, place_id: i32, addr: rawptr) {
+        if (!self.dci_caller_participates_in_shared_unwind()) { return; }
+        let drop = llvm_unwind_drop_for_place(&self.m, self.current_function_id, place_id);
+        if (drop == mir_id_invalid()) { return; }
+        self.declare_function_signature(drop);
+        let type_id = self.m.place_type(place_id);
+        let object = self.class_object_addr_from_place_addr(place_id, addr, type_id);
+        if (llvm_unwind_track_owner(&self.m, place_id, drop, self.mod, object,
+                                     self.type_is_class_pointer_abi(type_id),
+                                     self.function_values, self.builtin_free_fn) != 0) {
+            self.report_error("cannot register constructed object for shared unwind");
+        }
+    }
+}

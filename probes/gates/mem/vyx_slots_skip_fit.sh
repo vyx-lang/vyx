@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-SRC="$ROOT/bootstrap_compiler/src/core/build_system.vyx"
+SRC="$ROOT/bootstrap_compiler/src/core/project/build_system.vyx"
 fail=0
 
 if ! grep -q 'VYX_BUILD_VYX_SLOTS' "$SRC"; then

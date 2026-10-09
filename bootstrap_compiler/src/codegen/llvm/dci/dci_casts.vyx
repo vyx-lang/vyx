@@ -1,0 +1,673 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn dci_runtime_cast_operation_matches(self,
+                                                  operation: rawptr,
+                                                  source_record: string,
+                                                  target_record: string) -> bool {
+        if (operation == null || cJSON_IsObject(operation) == 0) { return false; }
+        if (self.dci_json_bool(operation, "requires_stub")) { return false; }
+        if (!self.dci_json_bool(operation, "no_unwind")) { return false; }
+        let availability = self.dci_json_string(operation, "availability");
+        if (availability == "unavailable") { return false; }
+        let source_type = self.dci_json_string(operation, "source_type");
+        let target_type = self.dci_json_string(operation, "target_type");
+        if (source_type.len == 0 || target_type.len == 0) { return false; }
+        if (!self.dci_record_name_matches_text(source_type, source_record)
+            || !self.dci_record_name_matches_text(target_type, target_record)) {
+            return false;
+        }
+        let failure = self.dci_json_string(operation, "failure");
+        let null_behavior = self.dci_json_string(operation, "null_behavior");
+        return failure == "null" && null_behavior == "return_null";
+    }
+
+    public fn dci_runtime_cast_operation_named(self,
+                                                source_record: string,
+                                                target_record: string,
+                                                operation_name: string) -> rawptr {
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let runtime_operations = self.dci_exports_array_from(
+                self.dci_contract_at(root_i), "runtime_type_operations");
+            if (runtime_operations != null) {
+                let n = cJSON_GetArraySize(runtime_operations);
+                var i: i32 = 0;
+                while (i < n) {
+                    let runtime_type = cJSON_GetArrayItem(runtime_operations, i);
+                    let declared_type = self.dci_json_string(runtime_type, "type_name");
+                    if (self.dci_record_name_matches_text(declared_type, target_record)) {
+                        let operations = self.dci_json_item(runtime_type, "operations");
+                        let operation = self.dci_json_item(operations, operation_name);
+                        if (self.dci_runtime_cast_operation_matches(operation,
+                                                                    source_record,
+                                                                    target_record)) {
+                            return operation;
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+            root_i = root_i + 1;
+        }
+        return null;
+    }
+
+    public fn dci_runtime_cast_operation(self,
+                                         source_record: string,
+                                         target_record: string) -> rawptr {
+        var matching_types: i32 = 0;
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let runtime_operations = self.dci_exports_array_from(
+                self.dci_contract_at(root_i), "runtime_type_operations");
+            if (runtime_operations != null) {
+                let runtime_count = cJSON_GetArraySize(runtime_operations);
+                var runtime_index: i32 = 0;
+                while (runtime_index < runtime_count) {
+                    let runtime_type = cJSON_GetArrayItem(runtime_operations, runtime_index);
+                    if (self.dci_record_name_matches_text(
+                            self.dci_json_string(runtime_type, "type_name"),
+                            target_record)) {
+                        matching_types = matching_types + 1;
+                    }
+                    runtime_index = runtime_index + 1;
+                }
+            }
+            root_i = root_i + 1;
+        }
+        if (matching_types > 1) {
+            self.report_error("ambiguous DCI runtime type operations for `"
+                      + target_record + "`");
+            return null;
+        }
+        var operation = self.dci_runtime_cast_operation_named(source_record,
+                                                               target_record,
+                                                               "checked_downcast");
+        if (operation == null) {
+            operation = self.dci_runtime_cast_operation_named(source_record,
+                                                               target_record,
+                                                               "downcast");
+        }
+        if (operation == null) {
+            operation = self.dci_runtime_cast_operation_named(source_record,
+                                                               target_record,
+                                                               "cast");
+        }
+        return operation;
+    }
+
+    public fn lower_dci_runtime_pointer_cast(self,
+                                              value: rawptr,
+                                              source_type_id: i32,
+                                              target_type_id: i32,
+                                              source_record_id: i32,
+                                              target_record_id: i32) -> rawptr {
+        let source_record = self.dci_record_name_for_type(source_record_id);
+        let target_record = self.dci_record_name_for_type(target_record_id);
+        let operation = self.dci_runtime_cast_operation(source_record, target_record);
+        if (operation == null) {
+            self.report_error("DCI runtime cast `" + source_record + "` -> `" + target_record
+                      + "` has no Direct checked-downcast operation");
+            return null;
+        }
+        let intrinsic = self.dci_json_string(operation, "intrinsic");
+        if (intrinsic.len > 0) {
+            self.report_error("unsupported DCI runtime cast intrinsic `" + intrinsic + "`");
+            return null;
+        }
+        let reference = self.dci_json_string(operation, "symbol");
+        let symbol = self.dci_symbol_object_for_reference(reference);
+        if (symbol == null || !self.dci_runtime_cast_symbol_contract_matches(symbol,
+                                                                              source_type_id,
+                                                                              target_type_id)) {
+            self.report_error("invalid DCI checked-downcast symbol contract `" + reference + "`");
+            return null;
+        }
+        let link_name = self.dci_symbol_link_name(symbol);
+        let cache_node = self.dci_runtime_operation_function(symbol, link_name);
+        if (cache_node == null) { return null; }
+        let fn_value = ast_read_rawptr(ptr_offset(cache_node, 8));
+        let fn_type = ast_read_rawptr(ptr_offset(cache_node, 16));
+        let args = malloc(8);
+        if (args == null) {
+            self.report_error("cannot allocate DCI runtime cast argument");
+            return null;
+        }
+        ast_write_rawptr(args, value);
+        let out = vyx_rt_build_call(self.mod,
+                                    fn_type,
+                                    fn_value,
+                                    args,
+                                    1,
+                                    "dci.runtime.cast".c_str(),
+                                    16);
+        free(args);
+        let cc = self.dci_symbol_calling_convention(symbol);
+        if (out != null && cc.len > 0
+            && vyx_rt_set_calling_convention(self.mod,
+                                             out,
+                                             cc.c_str(),
+                                             cc.len as u64) != 0) {
+            self.report_error("cannot apply DCI runtime cast call convention `" + cc
+                      + "`: " + self.runtime_last_error());
+            return null;
+        }
+        return out;
+    }
+
+    public fn dci_type_uses_stable_value_layout(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+
+        let canonical = self.canonical_record_type_id(type_id);
+        if (!mir_unit_type_is_foreign_dci(&self.m, canonical)) { return false; }
+        // extern "dci" C++ structs are represented as classes internally;
+        // the Descriptor representation, not that parser-specific flag,
+        // determines whether their value ABI is stable.
+        if (llvm_mir_type_kind(&self.m, canonical) != ty_CLASS()) {
+            return false;
+        }
+        let layout = self.dci_layout_object_for_type(canonical);
+        if (layout == null) { return false; }
+        let representation = self.dci_json_string(layout, "representation");
+        return representation == "stable" || representation == "transparent";
+    }
+
+    public fn dci_type_value_alignment(self, type_id: i32) -> i64 {
+        if (!self.dci_type_uses_stable_value_layout(type_id)) { return 0; }
+        return self.dci_json_i64(self.dci_layout_object_for_type(type_id), "alignment");
+    }
+
+    public fn dci_record_name_for_type(self, type_id: i32) -> string {
+        let cached = llvm_mir_map_get(self.dci_record_name_cache, type_id);
+        if (cached != null) { return from_cstr(cached); }
+        let obj = self.dci_layout_object_for_type(type_id);
+        if (obj == null) { return ""; }
+        let out = self.dci_json_string(obj, "type_name");
+        llvm_mir_map_put(self.dci_record_name_cache, type_id, ast_dup_c_string(out.clone()));
+        return out;
+    }
+
+    public fn dci_record_name_for_type_text(self, type_text: string) -> string {
+        let obj = self.dci_layout_object_for_type_text(type_text);
+        if (obj == null) { return ""; }
+        return self.dci_json_string(obj, "type_name");
+    }
+
+    public fn dci_record_name_derives_from_type(self,
+                                                derived_record: string,
+                                                base_type_id: i32,
+                                                depth: i32) -> bool {
+        if (derived_record.len == 0 || base_type_id == mir_id_invalid() || depth > 16) { return false; }
+        let layout = self.dci_layout_object_for_record_name(derived_record);
+        if (layout == null) { return false; }
+        let bases = self.dci_json_item(layout, "bases");
+        if (bases == null || cJSON_IsArray(bases) == 0) { return false; }
+        let n = cJSON_GetArraySize(bases);
+        var i: i32 = 0;
+        while (i < n) {
+            let obj = cJSON_GetArrayItem(bases, i);
+            let base = self.dci_json_string(obj, "type_name");
+            if (self.dci_record_name_matches_type(base, base_type_id)) { return true; }
+            if (self.dci_record_name_derives_from_type(base, base_type_id, depth + 1)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn dci_record_name_derives_from_record(self,
+                                                  derived_record: string,
+                                                  base_record: string,
+                                                  depth: i32) -> bool {
+        if (derived_record.len == 0 || base_record.len == 0 || depth > 16) { return false; }
+        let layout = self.dci_layout_object_for_record_name(derived_record);
+        if (layout == null) { return false; }
+        let bases = self.dci_json_item(layout, "bases");
+        if (bases == null || cJSON_IsArray(bases) == 0) { return false; }
+        let n = cJSON_GetArraySize(bases);
+        var i: i32 = 0;
+        while (i < n) {
+            let obj = cJSON_GetArrayItem(bases, i);
+            let base = self.dci_json_string(obj, "type_name");
+            if (base == base_record || self.dci_record_name_matches_text(base, base_record)) { return true; }
+            if (self.dci_record_name_derives_from_record(base, base_record, depth + 1)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn dci_type_derives_from(self, derived_type_id: i32, base_type_id: i32) -> bool {
+        if (derived_type_id == mir_id_invalid() || base_type_id == mir_id_invalid()) { return false; }
+        if (self.dci_record_name_matches_type(self.dci_record_name_for_type(base_type_id), derived_type_id)) {
+            return true;
+        }
+        let derived_record = self.dci_record_name_for_type(derived_type_id);
+        if (derived_record.len == 0) { return false; }
+        return self.dci_record_name_derives_from_type(derived_record, base_type_id, 0);
+    }
+
+    public fn dci_constant_base_adjustment_offset(self, base_object: rawptr) -> i64 {
+        if (base_object == null) { return -1; }
+        let adjustment = self.dci_json_item(base_object, "adjustment");
+        if (adjustment == null) {
+            if (self.dci_json_bool(base_object, "is_virtual")) { return -1; }
+            let legacy_offset = self.dci_json_item(base_object, "offset");
+            if (legacy_offset == null) { return 0; }
+            if (cJSON_IsNumber(legacy_offset) == 0) { return -1; }
+            return self.dci_json_i64(base_object, "offset");
+        }
+        if (self.dci_json_string(adjustment, "kind") != "constant") { return -1; }
+        let offset = self.dci_json_item(adjustment, "offset");
+        if (offset == null || cJSON_IsNumber(offset) == 0) { return -1; }
+        if (self.dci_json_bool(base_object, "is_virtual")) {
+            let null_preserving = self.dci_json_item(adjustment, "null_preserving");
+            if (null_preserving == null
+                || (cJSON_IsTrue(null_preserving) == 0 && cJSON_IsFalse(null_preserving) == 0)) {
+                return -1;
+            }
+        }
+        return self.dci_json_i64(adjustment, "offset");
+    }
+
+    public fn dci_base_offset_bytes_for_records(self,
+                                                derived_record: string,
+                                                base_record: string,
+                                                depth: i32) -> i64 {
+        if (derived_record.len == 0 || base_record.len == 0 || depth > 16) { return -1; }
+        if (derived_record == base_record || self.dci_record_name_matches_text(derived_record, base_record)) {
+            return 0;
+        }
+        let layout = self.dci_layout_object_for_record_name(derived_record);
+        if (layout == null) { return -1; }
+        let bases = self.dci_json_item(layout, "bases");
+        if (bases == null || cJSON_IsArray(bases) == 0) { return -1; }
+        let n = cJSON_GetArraySize(bases);
+        var i: i32 = 0;
+        while (i < n) {
+            let obj = cJSON_GetArrayItem(bases, i);
+            let base = self.dci_json_string(obj, "type_name");
+            if (base == base_record || self.dci_record_name_matches_text(base, base_record)) {
+                return self.dci_constant_base_adjustment_offset(obj);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < n) {
+            let obj2 = cJSON_GetArrayItem(bases, i);
+            let offset2 = self.dci_constant_base_adjustment_offset(obj2);
+            if (offset2 < 0) {
+                i = i + 1;
+                continue;
+            }
+            let base2 = self.dci_json_string(obj2, "type_name");
+            let sub2 = self.dci_base_offset_bytes_for_records(base2, base_record, depth + 1);
+            if (sub2 >= 0) { return offset2 + sub2; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn dci_base_offset_bytes_for_types(self, derived_type_id: i32, base_type_id: i32) -> i64 {
+        if (derived_type_id == mir_id_invalid() || base_type_id == mir_id_invalid()) { return -1; }
+        let derived_canonical = self.canonical_record_type_id(derived_type_id);
+        let base_canonical = self.canonical_record_type_id(base_type_id);
+        if (derived_canonical == base_canonical) { return 0; }
+        let derived_record = self.dci_record_name_for_type(derived_canonical);
+        let base_record = self.dci_record_name_for_type(base_canonical);
+        if (derived_record.len == 0 || base_record.len == 0) { return -1; }
+        return self.dci_base_offset_bytes_for_records(derived_record, base_record, 0);
+    }
+
+    public fn dci_apply_direct_base_adjustment(self,
+                                               ptr_value: rawptr,
+                                               base_object: rawptr,
+                                               label: string) -> rawptr {
+        if (ptr_value == null || base_object == null) { return null; }
+        let adjustment = self.dci_json_item(base_object, "adjustment");
+        var null_preserving = self.dci_json_bool(adjustment, "null_preserving");
+        var adjustment_kind = self.dci_json_string(adjustment, "kind");
+        if (adjustment_kind.len == 0) { adjustment_kind = "constant"; }
+        if (adjustment_kind == "constant"
+            && self.dci_json_item(adjustment, "null_preserving") == null) {
+            null_preserving = true;
+        }
+        if (!null_preserving) {
+            return self.dci_apply_direct_base_adjustment_nonnull(ptr_value, base_object, label);
+        }
+        if (self.current_function_value == null) {
+            self.report_error("cannot emit null-preserving DCI adjustment outside a function");
+            return null;
+        }
+        let is_null = vyx_rt_build_icmp(self.mod,
+                                        llvm_mir_icmp_eq(),
+                                        ptr_value,
+                                        vyx_rt_const_ptr_null(self.mod, self.ty_ptr),
+                                        (label.clone() + ".is.null").c_str(),
+                                        (label.clone() + ".is.null").len as u64);
+        let null_name = label.clone() + ".null";
+        let adjust_name = label.clone() + ".nonnull";
+        let cont_name = label.clone() + ".cont";
+        let null_bb = vyx_rt_append_block(self.mod,
+                                          self.current_function_value,
+                                          null_name.c_str(),
+                                          null_name.len as u64);
+        let adjust_bb = vyx_rt_append_block(self.mod,
+                                            self.current_function_value,
+                                            adjust_name.c_str(),
+                                            adjust_name.len as u64);
+        let cont_bb = vyx_rt_append_block(self.mod,
+                                          self.current_function_value,
+                                          cont_name.c_str(),
+                                          cont_name.len as u64);
+        if (is_null == null || null_bb == null || adjust_bb == null || cont_bb == null) {
+            self.report_error("cannot create null-preserving DCI adjustment flow");
+            return null;
+        }
+        vyx_rt_build_cond_br(self.mod, is_null, null_bb, adjust_bb);
+
+        vyx_rt_position_at_end(self.mod, null_bb);
+        let null_value = vyx_rt_const_ptr_null(self.mod, self.ty_ptr);
+        vyx_rt_build_br(self.mod, cont_bb);
+
+        vyx_rt_position_at_end(self.mod, adjust_bb);
+        let adjusted = self.dci_apply_direct_base_adjustment_nonnull(ptr_value,
+                                                                     base_object,
+                                                                     label.clone() + ".value");
+        if (adjusted == null) { return null; }
+        let adjusted_end_bb = vyx_rt_get_insert_block(self.mod);
+        vyx_rt_build_br(self.mod, cont_bb);
+
+        vyx_rt_position_at_end(self.mod, cont_bb);
+        let result = vyx_rt_build_phi(self.mod,
+                                      self.ty_ptr,
+                                      (label.clone() + ".result").c_str(),
+                                      (label.clone() + ".result").len as u64);
+        if (result == null) {
+            self.report_error("cannot create null-preserving DCI adjustment result");
+            return null;
+        }
+        vyx_rt_add_incoming(self.mod, result, null_value, null_bb);
+        vyx_rt_add_incoming(self.mod, result, adjusted, adjusted_end_bb);
+        return result;
+    }
+
+    public fn dci_apply_direct_base_adjustment_nonnull(self,
+                                                       ptr_value: rawptr,
+                                                       base_object: rawptr,
+                                                       label: string) -> rawptr {
+        if (ptr_value == null || base_object == null) { return null; }
+        let adjustment = self.dci_json_item(base_object, "adjustment");
+        var kind = self.dci_json_string(adjustment, "kind");
+        if (self.dci_json_bool(base_object, "is_virtual")
+            && (adjustment == null || kind.len == 0)) {
+            self.report_error("DCI virtual base requires an explicit adjustment");
+            return null;
+        }
+        if (kind.len == 0) {
+            if (adjustment != null) {
+                self.report_error("DCI base adjustment is missing its kind");
+                return null;
+            }
+            kind = "constant";
+        }
+        if (kind == "constant") {
+            if (self.dci_json_bool(base_object, "is_virtual")) {
+                self.report_error("DCI virtual base cannot use a constant adjustment");
+                return null;
+            }
+            var offset = self.dci_json_i64(base_object, "offset");
+            if (adjustment != null && self.dci_json_item(adjustment, "offset") == null) {
+                self.report_error("DCI constant base adjustment is missing its offset");
+                return null;
+            }
+            if (adjustment != null) {
+                offset = self.dci_json_i64(adjustment, "offset");
+            }
+            if (offset == 0) { return ptr_value; }
+            return self.ptr_offset_bytes(ptr_value,
+                                         vyx_rt_const_int(self.mod, self.ty_i64, offset, 1),
+                                         label);
+        }
+        if (kind == "table") {
+            if (adjustment == null
+                || self.dci_json_item(adjustment, "table_pointer_offset") == null
+                || (self.dci_json_item(adjustment, "table_entry_offset") == null
+                    && self.dci_json_item(adjustment, "table_offset") == null)
+                || self.dci_json_item(adjustment, "table_entry_size") == null) {
+                self.report_error("incomplete DCI table base adjustment requires Stub mode");
+                return null;
+            }
+            let table_pointer_offset = self.dci_json_i64(adjustment, "table_pointer_offset");
+            var table_entry_offset = self.dci_json_i64(adjustment, "table_entry_offset");
+            if (self.dci_json_item(adjustment, "table_entry_offset") == null) {
+                table_entry_offset = self.dci_json_i64(adjustment, "table_offset");
+            }
+            var entry_size = self.dci_json_i64(adjustment, "table_entry_size");
+            if (entry_size <= 0) { entry_size = 4; }
+            let displacement_base = self.dci_json_i64(adjustment, "displacement_base_offset");
+            if (entry_size != 1 && entry_size != 2 && entry_size != 4 && entry_size != 8) {
+                self.report_error("unsupported DCI adjustment table entry size " + entry_size.toString());
+                return null;
+            }
+            let table_pointer_addr = self.ptr_offset_bytes(ptr_value,
+                                                           vyx_rt_const_int(self.mod,
+                                                                            self.ty_i64,
+                                                                            table_pointer_offset,
+                                                                            1),
+                                                           label.clone() + ".table.ptr.addr");
+            let table_pointer = vyx_rt_build_load(self.mod,
+                                                  self.ty_ptr,
+                                                  table_pointer_addr,
+                                                  (label.clone() + ".table.ptr").c_str(),
+                                                  (label.clone() + ".table.ptr").len as u64);
+            let entry_addr = self.ptr_offset_bytes(table_pointer,
+                                                   vyx_rt_const_int(self.mod,
+                                                                    self.ty_i64,
+                                                                    table_entry_offset,
+                                                                    1),
+                                                   label.clone() + ".table.entry.addr");
+            let entry_type = self.int_type_for_bits((entry_size * 8) as i32);
+            var displacement = vyx_rt_build_load(self.mod,
+                                                 entry_type,
+                                                 entry_addr,
+                                                 (label.clone() + ".table.entry").c_str(),
+                                                 (label.clone() + ".table.entry").len as u64);
+            if (displacement == null) { return null; }
+            if (entry_size < 8) {
+                if (self.dci_json_bool(adjustment, "table_entry_signed")) {
+                    displacement = vyx_rt_build_sext(self.mod,
+                                                      displacement,
+                                                      self.ty_i64,
+                                                      (label.clone() + ".table.sext").c_str(),
+                                                      (label.clone() + ".table.sext").len as u64);
+                } else {
+                    displacement = vyx_rt_build_zext(self.mod,
+                                                      displacement,
+                                                      self.ty_i64,
+                                                      (label.clone() + ".table.zext").c_str(),
+                                                      (label.clone() + ".table.zext").len as u64);
+                }
+            }
+            if (displacement_base != 0) {
+                displacement = vyx_rt_build_add(self.mod,
+                                                 displacement,
+                                                 vyx_rt_const_int(self.mod,
+                                                                  self.ty_i64,
+                                                                  displacement_base,
+                                                                  1),
+                                                 (label.clone() + ".table.base").c_str(),
+                                                 (label.clone() + ".table.base").len as u64);
+            }
+            return self.ptr_offset_bytes(ptr_value, displacement, label.clone() + ".table.result");
+        }
+        if (kind == "operation") {
+            self.report_error("DCI base adjustment operation requires Stub mode");
+            return null;
+        }
+        self.report_error("unsupported DCI base adjustment kind `" + kind + "`");
+        return null;
+    }
+
+    public fn dci_base_adjustment_is_directly_executable(self, base_object: rawptr) -> bool {
+        if (base_object == null) { return false; }
+        let adjustment = self.dci_json_item(base_object, "adjustment");
+        if (adjustment == null) { return !self.dci_json_bool(base_object, "is_virtual"); }
+        let kind = self.dci_json_string(adjustment, "kind");
+        if (kind == "constant") {
+            let offset = self.dci_json_item(adjustment, "offset");
+            if (offset == null || cJSON_IsNumber(offset) == 0) { return false; }
+            return !self.dci_json_bool(base_object, "is_virtual");
+        }
+        if (kind != "table" || adjustment == null) { return false; }
+        let table_pointer_offset = self.dci_json_item(adjustment, "table_pointer_offset");
+        let table_entry_offset = self.dci_json_item(adjustment, "table_entry_offset");
+        let legacy_table_offset = self.dci_json_item(adjustment, "table_offset");
+        let table_entry_size = self.dci_json_item(adjustment, "table_entry_size");
+        let table_entry_signed = self.dci_json_item(adjustment, "table_entry_signed");
+        let displacement_base = self.dci_json_item(adjustment, "displacement_base_offset");
+        let null_preserving = self.dci_json_item(adjustment, "null_preserving");
+        if (table_pointer_offset == null || cJSON_IsNumber(table_pointer_offset) == 0) { return false; }
+        if ((table_entry_offset == null || cJSON_IsNumber(table_entry_offset) == 0)
+            && (legacy_table_offset == null || cJSON_IsNumber(legacy_table_offset) == 0)) {
+            return false;
+        }
+        if (table_entry_size == null || cJSON_IsNumber(table_entry_size) == 0
+            || displacement_base == null || cJSON_IsNumber(displacement_base) == 0) {
+            return false;
+        }
+        if (table_entry_signed == null
+            || (cJSON_IsTrue(table_entry_signed) == 0 && cJSON_IsFalse(table_entry_signed) == 0)
+            || null_preserving == null
+            || (cJSON_IsTrue(null_preserving) == 0 && cJSON_IsFalse(null_preserving) == 0)
+            || self.dci_json_string(adjustment, "result") != "object_plus_base_plus_displacement") {
+            return false;
+        }
+        let entry_size = self.dci_json_i64(adjustment, "table_entry_size");
+        return entry_size == 1 || entry_size == 2 || entry_size == 4 || entry_size == 8;
+    }
+
+    public fn dci_adjust_pointer_between_records(self,
+                                                 ptr_value: rawptr,
+                                                 derived_record: string,
+                                                 base_record: string,
+                                                 depth: i32,
+                                                 label: string) -> rawptr {
+        if (ptr_value == null || derived_record.len == 0 || base_record.len == 0 || depth > 16) {
+            return null;
+        }
+        if (derived_record == base_record
+            || self.dci_record_name_matches_text(derived_record, base_record)) {
+            return ptr_value;
+        }
+        let layout = self.dci_layout_object_for_record_name(derived_record);
+        if (layout == null) { return null; }
+        let bases = self.dci_json_item(layout, "bases");
+        if (bases == null || cJSON_IsArray(bases) == 0) { return null; }
+        let count = cJSON_GetArraySize(bases);
+        var i: i32 = 0;
+        while (i < count) {
+            let base = cJSON_GetArrayItem(bases, i);
+            let direct_name = self.dci_json_string(base, "type_name");
+            if (direct_name == base_record
+                || self.dci_record_name_matches_text(direct_name, base_record)) {
+                if (!self.dci_base_adjustment_is_directly_executable(base)) {
+                    i = i + 1;
+                    continue;
+                }
+                return self.dci_apply_direct_base_adjustment(ptr_value, base, label);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < count) {
+            let next_base = cJSON_GetArrayItem(bases, i);
+            let next_name = self.dci_json_string(next_base, "type_name");
+            if (self.dci_base_adjustment_is_directly_executable(next_base)
+                && self.dci_record_name_derives_from_record(next_name, base_record, depth + 1)) {
+                let next_ptr = self.dci_apply_direct_base_adjustment(ptr_value,
+                                                                     next_base,
+                                                                     label.clone() + ".step");
+                if (next_ptr == null) { return null; }
+                return self.dci_adjust_pointer_between_records(next_ptr,
+                                                               next_name,
+                                                               base_record,
+                                                               depth + 1,
+                                                               label);
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    public fn adjust_dci_base_pointer(self,
+                                      ptr_value: rawptr,
+                                      source_type_id: i32,
+                                      target_type_id: i32,
+                                      label: string) -> rawptr {
+        if (ptr_value == null) { return null; }
+        if (source_type_id == mir_id_invalid() || target_type_id == mir_id_invalid()) { return ptr_value; }
+        if (!self.type_is_class_pointer_abi(source_type_id) || !self.type_is_class_pointer_abi(target_type_id)) {
+            // Native value classes still flatten MI by GEP; only skip when
+            // neither side is a CLASS record.
+            let source_kind = llvm_mir_type_kind(&self.m, self.canonical_record_type_id(source_type_id));
+            let target_kind = llvm_mir_type_kind(&self.m, self.canonical_record_type_id(target_type_id));
+            if (source_kind != ty_CLASS() || target_kind != ty_CLASS()) {
+                return ptr_value;
+            }
+        }
+        let source_canonical = self.canonical_record_type_id(source_type_id);
+        let target_canonical = self.canonical_record_type_id(target_type_id);
+        if (source_canonical == target_canonical) { return ptr_value; }
+        if (self.type_is_class_pointer_abi(source_type_id) && self.type_is_class_pointer_abi(target_type_id)) {
+            let source_record = self.dci_record_name_for_type(source_canonical);
+            let target_record = self.dci_record_name_for_type(target_canonical);
+            let adjusted = self.dci_adjust_pointer_between_records(ptr_value,
+                                                                   source_record,
+                                                                   target_record,
+                                                                   0,
+                                                                   label);
+            if (adjusted != null) { return adjusted; }
+        }
+        let vyx_idx = self.record_layout_subobject_field_index(source_canonical, target_canonical);
+        if (vyx_idx > 0) {
+            var base_ty = self.class_record_storage_ty(source_canonical);
+            if (base_ty == null) { base_ty = self.lower_storage_type(source_canonical); }
+            if (base_ty == null) {
+                self.report_error("cannot lower flattened class layout for "
+                          + llvm_mir_type_text(&self.m, source_canonical)
+                          + " -> "
+                          + llvm_mir_type_text(&self.m, target_canonical));
+                return null;
+            }
+            let gep = vyx_rt_build_gep2(self.mod,
+                                        base_ty,
+                                        ptr_value,
+                                        vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                        vyx_rt_const_int(self.mod, self.ty_i32, vyx_idx as i64, 0),
+                                        label.c_str(),
+                                        label.len as u64);
+            if (gep == null) {
+                self.report_error("cannot GEP flattened parent subobject "
+                          + llvm_mir_type_text(&self.m, source_canonical)
+                          + " -> "
+                          + llvm_mir_type_text(&self.m, target_canonical));
+                return null;
+            }
+            return gep;
+        }
+        if (vyx_idx == 0) { return ptr_value; }
+        if (self.type_is_class_pointer_abi(source_type_id)
+            && self.type_is_class_pointer_abi(target_type_id)
+            && self.type_ids_compatible(target_canonical, source_canonical)) {
+            self.report_error("missing DCI base adjustment "
+                      + llvm_mir_type_text(&self.m, source_canonical)
+                      + " -> "
+                      + llvm_mir_type_text(&self.m, target_canonical));
+            return null;
+        }
+        return ptr_value;
+    }
+}

@@ -45,8 +45,8 @@ Press F5 from this folder to launch an Extension Development Host.
 
 ## Source of truth
 
-- Language server: `bootstrap_compiler/src/core/lsp_main.vyx`
-- Debug adapter: `bootstrap_compiler/src/core/dap_main.vyx`
-- Compiler CLI: `bootstrap_compiler/src/core/main.vyx`
+- Language server: `bootstrap_compiler/src/core/tooling/lsp_main.vyx`
+- Debug adapter: `bootstrap_compiler/src/core/tooling/dap_main.vyx`
+- Compiler CLI: `bootstrap_compiler/src/core/driver/main.vyx`
 
 Host-era `src/LSP` is archived and is not used.

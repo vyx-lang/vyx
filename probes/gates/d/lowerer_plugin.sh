@@ -9,14 +9,14 @@ need() {
     fail=1
   fi
 }
-need "$ROOT/bootstrap_compiler/src/codegen/llvm_lower.vyx" \
+need "$ROOT/bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx" \
   'fn llvm_mir_lowerer_is_acceptance_backend() -> bool { return true; }' \
   'llvm acceptance plugin'
-need "$ROOT/bootstrap_compiler/src/codegen/mir_cpp_lower.vyx" \
+need "$ROOT/bootstrap_compiler/src/codegen/cpp/mir_cpp_lower.vyx" \
   'fn mir_cpp_plugin_is_acceptance_backend() -> bool' \
   'cpp optional plugin'
 if grep -A2 'fn mir_cpp_plugin_is_acceptance_backend' \
-     "$ROOT/bootstrap_compiler/src/codegen/mir_cpp_lower.vyx" | grep -q 'return true;'; then
+     "$ROOT/bootstrap_compiler/src/codegen/cpp/mir_cpp_lower.vyx" | grep -q 'return true;'; then
   echo "FAIL: C++ plugin must not be an acceptance backend"
   fail=1
 fi

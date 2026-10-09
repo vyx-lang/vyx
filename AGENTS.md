@@ -7,7 +7,7 @@
 ## 接手顺序
 
 1. 阅读本文件，然后查看 `git status --short`、当前分支和最近提交。保留已有未提交改动。
-2. 从下表找到任务的源码与验证入口，先读对应 README 和涉及的代码。
+2. 从下表找到任务的源码与验证入口，先读对应 README 和涉及的代码。编译器目录导航见 [源码树](bootstrap_compiler/src/README.md)。
 3. 确认实际工具链、已有产物的来源和相关探针基线，再修改源码。
 4. 用本次构建的产物验证，交接时写明执行命令、结果、跳过项和剩余问题。
 
@@ -185,7 +185,7 @@ foreach ($sample in @('zyn_platform_smoke', 'zyn_render_smoke')) {
 - VS Code / Cursor：在 `vscode/vyx/` 执行 `npm ci`、`npm run compile`。
 - IntelliJ / CLion：在 `IDEA/vyx/` 用 `gradlew.bat buildPlugin -PvyxIdePath=<本机IDE目录>`；
   平台与 JDK 要求查该目录的 README 和 `build.gradle.kts`，不提交本机 IDE 路径或 SDK 缓存。
-- LSP / DAP 行为在 `bootstrap_compiler/src/core/lsp_main.vyx`、`dap_main.vyx`。
+- LSP / DAP 行为在 `bootstrap_compiler/src/core/tooling/lsp_main.vyx`、`dap_main.vyx`。
   验证插件时配套使用同一次构建的语言服务器和调试适配器。
 
 ## 网站与文档

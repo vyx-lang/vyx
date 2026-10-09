@@ -1,0 +1,138 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    /// Lower the canonical `String.append(integer.toString())` composition
+    /// without materialising the intermediate owned `str`.  This is a MIR
+    /// rewrite, so LLVM and MIR2CPP both consume the same direct call to the
+    /// stdlib implementation.  Keep the match deliberately structural: an
+    /// unrelated user `append` or `toString` must retain ordinary call
+    /// semantics.
+    public fn try_lower_std_string_append_integer_to_string(self,
+                                                             expr_id: i32,
+                                                             fallback_result_type_id: i32,
+                                                             callee_expr_id: i32,
+                                                             original_target_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid()
+            || callee_expr_id == hir_id_invalid()
+            || original_target_id == mir_id_invalid()
+            || self.h.expr_kind(expr_id) != ex_CALL()
+            || self.h.expr_kind(callee_expr_id) != ex_MEMBER()) {
+            return mir_id_invalid();
+        }
+        // The function owner is the canonical, fully-qualified identity.  Do
+        // not use a tail-name test here: a user class named String is not the
+        // std string lang-item.
+        let append_owner = self.unit.function_owner_type(original_target_id);
+        if ((append_owner != "std.string.String"
+             && append_owner != "std.string.StringBuilder")
+            || self.unit.function_name(original_target_id) != "append") {
+            return mir_id_invalid();
+        }
+        let outer_arg = self.h.expr_first_arg(expr_id);
+        if (outer_arg == hir_id_invalid()
+            || self.h.expr_next_arg(outer_arg) != hir_id_invalid()
+            || self.h.expr_kind(outer_arg) != ex_CALL()) {
+            return mir_id_invalid();
+        }
+        let inner_callee = self.h.expr_lhs(outer_arg);
+        if (inner_callee == hir_id_invalid()
+            || self.h.expr_kind(inner_callee) != ex_MEMBER()) {
+            return mir_id_invalid();
+        }
+        let inner_name = self.h.expr_name(inner_callee);
+        if ((inner_name != "toString" && inner_name != "to_string")
+            || self.h.expr_first_arg(outer_arg) != hir_id_invalid()) {
+            return mir_id_invalid();
+        }
+        // Primitive textual conversion is a compiler builtin.  Requiring the
+        // HIR builtin target prevents a same-named user method from being
+        // folded into this fast path.
+        if (self.h.expr_target_kind(inner_callee) != hir_target_builtin()
+            && self.h.expr_sem_kind(inner_callee) != expr_sem_BUILTIN()) {
+            return mir_id_invalid();
+        }
+        let integer_expr = self.h.expr_lhs(inner_callee);
+        if (integer_expr == hir_id_invalid()) { return mir_id_invalid(); }
+        let integer_type_id = self.h.expr_type(integer_expr);
+        if (integer_type_id == hir_id_invalid()) { return mir_id_invalid(); }
+        var integer_text = self.resolve_type_text_in_function(self.current_function_id,
+                                                               self.type_text(integer_type_id));
+        integer_text = policy_generic_call_base(integer_text);
+        var append_method = "";
+        var append_arg_type = mir_id_invalid();
+        if (integer_text == "i8" || integer_text == "i16" || integer_text == "i32"
+            || integer_text == "i64" || integer_text == "isize") {
+            append_method = "appendI64";
+            append_arg_type = self.i64_type_id();
+        } elif (integer_text == "u8" || integer_text == "u16" || integer_text == "u32"
+                 || integer_text == "u64" || integer_text == "usize") {
+            append_method = "appendU64";
+            append_arg_type = self.intern_type_id_by_text("u64");
+        } else {
+            return mir_id_invalid();
+        }
+        if (append_arg_type == mir_id_invalid()) { return mir_id_invalid(); }
+        let append_target = self.function_target_by_owner_type_and_method(append_owner,
+                                                                            append_method);
+        if (append_target == mir_id_invalid()) { return mir_id_invalid(); }
+        let string_receiver_expr = self.h.expr_lhs(callee_expr_id);
+        if (string_receiver_expr == hir_id_invalid()) { return mir_id_invalid(); }
+        // Match the source language's left-to-right member-call evaluation:
+        // evaluate String receiver first, then the integer receiver.
+        let string_receiver_value = self.lower_expr(string_receiver_expr);
+        if (string_receiver_value == mir_id_invalid()) { return mir_id_invalid(); }
+        let integer_value = self.lower_expr_as(integer_expr, append_arg_type);
+        if (integer_value == mir_id_invalid()) { return mir_id_invalid(); }
+        var result_type = fallback_result_type_id;
+        let target_return_type = self.unit.function_return_type(append_target);
+        if (target_return_type != mir_id_invalid()) { result_type = target_return_type; }
+        let target_ref = self.unit.add_value(
+                                            self.current_function_id,
+                                            mir_value_target_ref(),
+                                            result_type,
+                                            mir_id_invalid(),
+                                            mir_target_function(),
+                                            append_target,
+                                            callee_expr_id,
+                                            hir_unit_expr_flags(self.h, callee_expr_id),
+                                            self.h.expr_op(callee_expr_id),
+                                            hir_unit_expr_int_value(self.h, callee_expr_id),
+                                            append_method,
+                                            self.h.expr_value_text(callee_expr_id));
+        self.unit.set_value_lhs( target_ref, string_receiver_value);
+        let out_call = self.unit.add_value(
+                                          self.current_function_id,
+                                          mir_value_call(),
+                                          result_type,
+                                          mir_id_invalid(),
+                                          mir_target_function(),
+                                          append_target,
+                                          expr_id,
+                                          hir_unit_expr_flags(self.h, expr_id),
+                                          self.h.expr_op(expr_id),
+                                          hir_unit_expr_int_value(self.h, expr_id),
+                                          append_method,
+                                          self.h.expr_value_text(expr_id));
+        self.unit.set_value_lhs( out_call, target_ref);
+        self.append_value_arg(out_call, mir_id_invalid(), mir_id_invalid(), integer_value);
+        // The original String.append receiver ownership contract remains in
+        // force; the elided builtin integer conversion owns no str temporary.
+        self.deactivate_call_moved_receiver(expr_id);
+        return out_call;
+    }
+}

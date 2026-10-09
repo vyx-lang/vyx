@@ -1,0 +1,200 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn refresh_mir_capture_source(self, hir_local_id: i32, mir_local_id: i32) {
+        if (hir_local_id == hir_id_invalid() || mir_local_id == mir_id_invalid()) { return; }
+        let source_hir_local = self.h.local_capture_source(hir_local_id);
+        if (source_hir_local == hir_id_invalid()) { return; }
+        let source_mir_local = mir_i32_map_get(self.local_map, source_hir_local);
+        if (source_mir_local != mir_id_invalid()) {
+            self.unit.set_local_capture_source( mir_local_id, source_mir_local);
+        }
+    }
+
+    public fn local_map_entry_matches_function(self, mir_local_id: i32, mir_function_id: i32) -> bool {
+        if (mir_local_id == mir_id_invalid() || mir_function_id == mir_id_invalid()) { return false; }
+        return self.unit.local_function(mir_local_id) == mir_function_id;
+    }
+
+    public fn find_function_local_for_hir(self, mir_function_id: i32, hir_local_id: i32) -> i32 {
+        if (mir_function_id == mir_id_invalid() || hir_local_id == hir_id_invalid()) { return mir_id_invalid(); }
+        var local = self.unit.function_first_local(mir_function_id);
+        while (local != mir_id_invalid()) {
+            if (self.unit.local_hir_id(local) == hir_local_id
+                && self.unit.local_function(local) == mir_function_id) {
+                return local;
+            }
+            local = self.unit.local_next(local);
+        }
+        return mir_id_invalid();
+    }
+
+    public fn existing_function_local_for_hir(self, hir_local_id: i32, mir_function_id: i32) -> i32 {
+        let mapped = mir_i32_map_get(self.local_map, hir_local_id);
+        if (self.local_map_entry_matches_function(mapped, mir_function_id)) { return mapped; }
+        return self.find_function_local_for_hir(mir_function_id, hir_local_id);
+    }
+
+    public fn local_has_live_place(self, mir_local_id: i32) -> bool {
+        if (mir_local_id == mir_id_invalid()) { return false; }
+        let place_id = self.unit.local_place(mir_local_id);
+        if (place_id == mir_id_invalid() || place_id > self.unit.place_count) { return false; }
+        return self.unit.place_kind(place_id) == mir_place_local();
+    }
+
+    public fn ensure_local_places_for_function(self, hir_function_id: i32, mir_function_id: i32) {
+        var local_id = self.h.function_first_local(hir_function_id);
+        while (local_id != hir_id_invalid()) {
+            let existing = self.existing_function_local_for_hir(local_id, mir_function_id);
+            if (existing != mir_id_invalid()) {
+                self.ensure_layouts_for_type(self.h.local_type(local_id));
+                // The HIR type is authoritative: a body first built before
+                // semantic resolution pinned a monomorphised callee's return
+                // type snapshots a placeholder (observed as `i64`) into the
+                // reused local.  Without this re-assertion the rebuild keeps
+                // the stale type and every field access on the local fails
+                // with `field X belongs to T but base is i64` under multi-CGU.
+                if (self.unit.local_type(existing) != self.h.local_type(local_id)) {
+                    self.unit.set_local_type(existing, self.h.local_type(local_id));
+                }
+                mir_i32_map_put(self.local_map, local_id, existing);
+                if (!self.local_has_live_place(existing)) {
+                    let place_id = self.unit.add_place(
+                                                      mir_function_id,
+                                                      mir_place_local(),
+                                                      self.h.local_type(local_id),
+                                                      existing,
+                                                      mir_id_invalid(),
+                                                      mir_id_invalid(),
+                                                      mir_id_invalid(),
+                                                      hir_id_invalid(),
+                                                      self.h.local_name(local_id));
+                    self.unit.set_local_place( existing, place_id);
+                    mir_i32_map_put(self.place_map, local_id, place_id);
+                } else {
+                    mir_i32_map_put(self.place_map, local_id, self.unit.local_place(existing));
+                }
+                self.refresh_mir_capture_source(local_id, existing);
+                local_id = self.h.local_next(local_id);
+                continue;
+            }
+            let mir_local = self.unit.add_local(
+                                               mir_function_id,
+                                               local_id,
+                                               self.h.local_name(local_id),
+                                               self.h.local_type(local_id),
+                                               (self.h.local_flags(local_id) & ~hir_local_flag_volatile())
+                                                   | ((self.h.local_flags(local_id) & hir_local_flag_volatile()) != 0
+                                                      ? mir_local_flag_volatile() : 0));
+            self.ensure_layouts_for_type(self.h.local_type(local_id));
+            let place_id = self.unit.add_place(
+                                              mir_function_id,
+                                              mir_place_local(),
+                                              self.h.local_type(local_id),
+                                              mir_local,
+                                              mir_id_invalid(),
+                                              mir_id_invalid(),
+                                              mir_id_invalid(),
+                                              hir_id_invalid(),
+                                              self.h.local_name(local_id));
+            self.unit.set_local_place( mir_local, place_id);
+            mir_i32_map_put(self.local_map, local_id, mir_local);
+            mir_i32_map_put(self.place_map, local_id, place_id);
+            self.refresh_mir_capture_source(local_id, mir_local);
+            local_id = self.h.local_next(local_id);
+        }
+    }
+
+    public fn lower_local_places_for_function(self, hir_function_id: i32) {
+        self.ensure_local_places_for_function(hir_function_id, self.current_function_id);
+    }
+
+    public fn lower_capture_init_values_for_function(self, hir_function_id: i32, mir_function_id: i32) {
+        if (hir_function_id == hir_id_invalid() || mir_function_id == mir_id_invalid()) { return; }
+        self.ensure_local_places_for_function(hir_function_id, mir_function_id);
+        var local_id = self.h.function_first_local(hir_function_id);
+        while (local_id != hir_id_invalid()) {
+            if ((self.h.local_flags(local_id) & hir_local_flag_capture()) != 0) {
+                let init_expr = self.h.local_capture_init_expr(local_id);
+                if (init_expr != hir_id_invalid()) {
+                    let mir_local = mir_i32_map_get(self.local_map, local_id);
+                    if (mir_local != mir_id_invalid()
+                        && self.unit.local_capture_init_value(mir_local) == mir_id_invalid()) {
+                        let init_value = self.lower_expr_as(init_expr, self.h.local_type(local_id));
+                        if (init_value != mir_id_invalid()) {
+                            self.unit.set_local_capture_init_value( mir_local, init_value);
+                            // A named by-value capture keeps its materialized
+                            // expression for the immediate lowering path, and
+                            // also records the direct source local when there
+                            // is one. Streaming LLVM can release the parent
+                            // ValueId before it materializes the closure fat
+                            // value; the source is then the conservative
+                            // replay path rather than an unresolved capture.
+                            if (self.unit.value_kind(init_value) == mir_value_read_place()) {
+                                let init_place = self.unit.value_place(init_value);
+                                if (init_place != mir_id_invalid()
+                                    && self.unit.place_kind(init_place) == mir_place_local()) {
+                                    let init_source = self.unit.place_local(init_place);
+                                    if (init_source != mir_id_invalid()) {
+                                        self.unit.set_local_capture_source( mir_local, init_source);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            local_id = self.h.local_next(local_id);
+        }
+    }
+
+    public fn push_parameter_drops_for_function(self, hir_function_id: i32) {
+        var local_id = self.h.function_first_local(hir_function_id);
+        while (local_id != hir_id_invalid()) {
+            if ((self.h.local_flags(local_id) & hir_local_flag_param()) != 0) {
+                self.drop_stack_push(local_id);
+            }
+            local_id = self.h.local_next(local_id);
+        }
+    }
+
+    public fn copy_signature_locals_for_bodyless_function(self, hir_function_id: i32, mir_function_id: i32) {
+        if (hir_function_id == hir_id_invalid() || mir_function_id == mir_id_invalid()) { return; }
+        var local_id = self.h.function_first_local(hir_function_id);
+        while (local_id != hir_id_invalid()) {
+            if ((self.h.local_flags(local_id) & hir_local_flag_param()) != 0) {
+                let existing = self.existing_function_local_for_hir(local_id, mir_function_id);
+                if (existing != mir_id_invalid()) {
+                    mir_i32_map_put(self.local_map, local_id, existing);
+                } else {
+                    let mir_local = self.unit.add_local(
+                                                       mir_function_id,
+                                                       local_id,
+                                                       self.h.local_name(local_id),
+                                                       self.h.local_type(local_id),
+                                                       (self.h.local_flags(local_id) & ~hir_local_flag_volatile())
+                                                           | ((self.h.local_flags(local_id) & hir_local_flag_volatile()) != 0
+                                                              ? mir_local_flag_volatile() : 0));
+                    mir_i32_map_put(self.local_map, local_id, mir_local);
+                    mir_i32_map_put(self.place_map, local_id, mir_id_invalid());
+                }
+            }
+            local_id = self.h.local_next(local_id);
+        }
+    }
+}

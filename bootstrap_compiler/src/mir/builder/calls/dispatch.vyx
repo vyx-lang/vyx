@@ -1,0 +1,415 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn lower_call_expr_value(self,
+                                    expr_id: i32,
+                                    type_id: i32,
+                                    prefix_value_id: i32,
+                                    prefix_source_expr_id: i32) -> i32 {
+        var call_target_kind = self.target_kind_from_hir(self.h.expr_target_kind(expr_id));
+        var call_target_id = self.target_id_from_hir_expr(expr_id);
+        let callee_expr_id = self.h.expr_lhs(expr_id);
+        if (call_target_kind == mir_target_none()
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_target_kind(callee_expr_id) == hir_target_variant()) {
+            call_target_kind = mir_target_hir_variant();
+            call_target_id = self.target_id_from_hir_expr(callee_expr_id);
+        }
+        if (call_target_kind == mir_target_none()
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_target_kind(callee_expr_id) == hir_target_builtin()) {
+            call_target_kind = mir_target_builtin();
+            call_target_id = self.target_id_from_hir_expr(callee_expr_id);
+        }
+        // HIR keeps the exact Sema-selected callable on a member callee while
+        // some materialized call nodes intentionally retain no target of their
+        // own. Preserve that canonical target before applying any name-based
+        // fallback; this is required for imported static methods, whose MIR
+        // shell is an external declaration in the consuming partition.
+        if (call_target_kind == mir_target_none()
+            && callee_expr_id != hir_id_invalid()
+            && (self.h.expr_kind(callee_expr_id) == ex_IDENT()
+                || self.h.expr_kind(callee_expr_id) == ex_MEMBER())
+            && self.h.expr_target_kind(callee_expr_id) == hir_target_function()) {
+            call_target_kind = mir_target_function();
+            call_target_id = self.target_id_from_hir_expr(callee_expr_id);
+        }
+        // `str`/`string` views expose c_str/ptr/data as compiler builtins.
+        // A stale peer HIR can accidentally attach the owned std.string.String
+        // method shell instead; force the ABI-level builtin before direct-call
+        // lowering so no undefined String.c_str symbol is emitted.
+        if (callee_expr_id != hir_id_invalid()
+            && self.string_abi_member_call_is_builtin(callee_expr_id)) {
+            let string_receiver = self.h.expr_lhs(callee_expr_id);
+            var string_member_name = self.h.expr_name(callee_expr_id);
+            if (string_member_name.len == 0) {
+                string_member_name = self.h.expr_value_text(callee_expr_id);
+            }
+            call_target_kind = mir_target_builtin();
+            call_target_id = self.h.add_or_get_builtin(string_member_name,
+                                                         expr_sem_BUILTIN(),
+                                                         self.h.expr_type(string_receiver),
+                                                         0);
+        }
+        if (call_target_kind == mir_target_none()
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            let owner_expr_id = self.h.expr_lhs(callee_expr_id);
+            if (owner_expr_id != hir_id_invalid()
+                && self.h.expr_sem_kind(owner_expr_id) == expr_sem_CLASS()) {
+                let owner_type = self.type_text(self.h.expr_type(owner_expr_id));
+                var member_method_name = self.h.expr_name(callee_expr_id);
+                if (member_method_name.len == 0) {
+                    member_method_name = self.h.expr_value_text(callee_expr_id);
+                }
+                let recovered_static_target = self.static_method_target_by_owner_type_and_call(
+                    owner_type,
+                    member_method_name,
+                    expr_id);
+                if (recovered_static_target != mir_id_invalid()) {
+                    call_target_kind = mir_target_function();
+                    call_target_id = recovered_static_target;
+                }
+            }
+        }
+        if ((call_target_kind == mir_target_none() || call_target_kind == mir_target_builtin())
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_kind(callee_expr_id) == ex_MEMBER()
+            && !self.string_abi_member_call_is_builtin(callee_expr_id)) {
+            let owner_expr_id = self.h.expr_lhs(callee_expr_id);
+            if (owner_expr_id != hir_id_invalid()) {
+                var member_method_name = self.h.expr_name(callee_expr_id);
+                if (member_method_name.len == 0) {
+                    member_method_name = self.h.expr_value_text(callee_expr_id);
+                }
+                let want_static = self.h.expr_sem_kind(owner_expr_id) == expr_sem_CLASS();
+                var owner_type = self.member_receiver_type_text(owner_expr_id);
+                if (want_static) {
+                    let named_owner = self.resolve_type_text_in_function(
+                        self.current_function_id,
+                        self.h.expr_name(owner_expr_id));
+                    if (named_owner.len > 0) { owner_type = named_owner; }
+                }
+                let recovered_method = self.imported_method_target_by_owner_type_and_call(
+                    owner_type,
+                    member_method_name,
+                    expr_id,
+                    want_static);
+                if (recovered_method != mir_id_invalid()) {
+                    call_target_kind = mir_target_function();
+                    call_target_id = recovered_method;
+                } elif (!want_static
+                         && (owner_type == "void" || owner_type == "rawptr"
+                             || policy_primitive_type_kind(policy_generic_call_base(owner_type)) != 0)) {
+                    let recovered_method_any = self.imported_method_target_by_name_and_call(
+                        member_method_name,
+                        expr_id);
+                    if (recovered_method_any != mir_id_invalid()) {
+                        call_target_kind = mir_target_function();
+                        call_target_id = recovered_method_any;
+                    }
+                }
+            }
+        }
+        if (call_target_kind == mir_target_none()
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            let member_builtin_name = self.h.expr_name(callee_expr_id);
+            let member_receiver_expr_id = self.h.expr_lhs(callee_expr_id);
+            if (self.builtin_member_fallback_allowed(member_receiver_expr_id, member_builtin_name)
+                && (member_builtin_name == "toString" || member_builtin_name == "to_string"
+                || member_builtin_name == "len" || member_builtin_name == "length"
+                || member_builtin_name == "size" || member_builtin_name == "count"
+                || member_builtin_name == "ptr" || member_builtin_name == "c_str"
+                || member_builtin_name == "data" || member_builtin_name == "clone"
+                || member_builtin_name == "repeat" || member_builtin_name == "find"
+                || member_builtin_name == "indexOf" || member_builtin_name == "index_of"
+                || member_builtin_name == "equals" || member_builtin_name == "substr"
+                || member_builtin_name == "substring" || member_builtin_name == "charAt"
+                || member_builtin_name == "char_at" || member_builtin_name == "charCodeAt"
+                || member_builtin_name == "char_code_at" || member_builtin_name == "byteAt"
+                || member_builtin_name == "contains" || member_builtin_name == "startsWith"
+                || member_builtin_name == "starts_with" || member_builtin_name == "endsWith"
+                || member_builtin_name == "ends_with" || member_builtin_name == "isEmpty"
+                || member_builtin_name == "is_empty" || member_builtin_name == "trim"
+                || member_builtin_name == "replace" || member_builtin_name == "toUpper"
+                || member_builtin_name == "to_upper" || member_builtin_name == "toLower"
+                || member_builtin_name == "to_lower")) {
+                call_target_kind = mir_target_builtin();
+                call_target_id = self.target_id_from_hir_expr(callee_expr_id);
+            }
+        }
+        if (call_target_kind == mir_target_builtin()
+            && call_target_id == mir_id_invalid()
+            && callee_expr_id != hir_id_invalid()) {
+            var builtin_name = self.h.expr_name(callee_expr_id);
+            var builtin_owner_type = hir_id_invalid();
+            if (self.h.expr_kind(callee_expr_id) == ex_MEMBER()) {
+                let receiver_expr_id = self.h.expr_lhs(callee_expr_id);
+                if (receiver_expr_id != hir_id_invalid()) {
+                    builtin_owner_type = self.h.expr_type(receiver_expr_id);
+                }
+            }
+            if (builtin_name.len > 0) {
+                call_target_id = self.h.add_or_get_builtin(builtin_name,
+                                                             expr_sem_BUILTIN(),
+                                                             builtin_owner_type,
+                                                             0);
+            }
+        }
+        let primitive_member_value = self.lower_primitive_member_call_expr(expr_id,
+                                                                           type_id,
+                                                                           callee_expr_id,
+                                                                           call_target_kind);
+        if (primitive_member_value != mir_id_invalid()) {
+            return primitive_member_value;
+        }
+        // A generic `T: Ord` call is closed by HIR to the selected primitive
+        // impl method. Primitive/string compare is nevertheless a MIR builtin:
+        // retaining the bodyless closed method shell here would emit an
+        // undefined native symbol instead of the shared LLVM/MIR2CPP lowering.
+        if (call_target_kind == mir_target_function()
+            && self.primitive_compare_member_call_is_builtin(callee_expr_id)) {
+            let receiver_expr_id = self.h.expr_lhs(callee_expr_id);
+            call_target_kind = mir_target_builtin();
+            call_target_id = self.h.add_or_get_builtin("compare",
+                                                         expr_sem_BUILTIN(),
+                                                         self.h.expr_type(receiver_expr_id),
+                                                         0);
+        }
+        if (call_target_kind == mir_target_function()) {
+            call_target_id = self.executable_method_target_for_call(expr_id, call_target_id);
+            let direct_string_append = self.try_lower_std_string_append_integer_to_string(
+                expr_id,
+                type_id,
+                callee_expr_id,
+                call_target_id);
+            if (direct_string_append != mir_id_invalid()) {
+                return direct_string_append;
+            }
+            // `executable_method_target_for_call` can retarget a generic or
+            // interface shell to a closed executable instance.  A direct MIR
+            // call is a reachability edge regardless of how its final target
+            // was selected; otherwise the shell is declared but never lowered
+            // and the linker sees an undefined symbol.
+            if (call_target_id != mir_id_invalid()
+                && self.function_can_reach_executable_body(call_target_id)) {
+                self.mark_function_reachable(call_target_id);
+            }
+            if (call_target_id != mir_id_invalid()
+                && (self.unit.function_flags( call_target_id) & hir_function_flag_async_task()) != 0) {
+                self.mark_async_call_support_reachable(call_target_id);
+            }
+        }
+        if (call_target_kind == mir_target_hir_variant()) {
+            call_target_id = self.variant_item_for_owner_type(type_id, call_target_id);
+        }
+        var call_result_type_id = type_id;
+        // Built-in pointer methods: the HIR call node may carry a stale/void
+        // type, but the result ABI is fully determined by the receiver's own
+        // pointer type (stepping) or i64 (offset_from family).
+        if (call_target_kind == mir_target_builtin()
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            let pm_name = self.h.expr_name(callee_expr_id);
+            let pm_kind = policy_pointer_method_kind(generic_call_base(pm_name));
+            if (pm_kind > 0) {
+                let recv_expr = self.h.expr_lhs(callee_expr_id);
+                if (recv_expr != hir_id_invalid()) {
+                    let recv_ty = self.h.expr_type(recv_expr);
+                    if (recv_ty != hir_id_invalid()) {
+                        if (pm_kind == 7 || pm_kind == 8) {
+                            call_result_type_id = self.i64_type_id();
+                        } else {
+                            call_result_type_id = recv_ty;
+                        }
+                    }
+                }
+            }
+        }
+        if (call_target_kind == mir_target_function()
+            && call_target_id != mir_id_invalid()) {
+            let target_return_type = self.unit.function_return_type(call_target_id);
+            if (target_return_type != mir_id_invalid()) {
+                call_result_type_id = target_return_type;
+            }
+        }
+        var callee_value = mir_id_invalid();
+        if (call_target_kind == mir_target_function()
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            callee_value = self.unit.add_value(
+                                              self.current_function_id,
+                                              mir_value_target_ref(),
+                                              call_result_type_id,
+                                              mir_id_invalid(),
+                                              mir_target_function(),
+                                              call_target_id,
+                                              callee_expr_id,
+                                              hir_unit_expr_flags(self.h, callee_expr_id),
+                                              self.h.expr_op(callee_expr_id),
+                                              hir_unit_expr_int_value(self.h, callee_expr_id),
+                                              self.h.expr_name(callee_expr_id),
+                                              self.h.expr_value_text(callee_expr_id));
+            self.unit.set_value_lhs( callee_value, self.lower_expr(self.h.expr_lhs(callee_expr_id)));
+        } else {
+            callee_value = self.lower_expr(callee_expr_id);
+            if (call_target_kind == mir_target_function()
+                && callee_value != mir_id_invalid()
+                && self.unit.value_kind(callee_value) == mir_value_target_ref()
+                && self.unit.value_target_kind(callee_value) == mir_target_function()
+                && self.unit.value_target_id(callee_value) != call_target_id) {
+                self.unit.set_value_target( callee_value, mir_target_function(), call_target_id);
+            }
+            if (call_target_kind == mir_target_builtin()
+                && callee_value != mir_id_invalid()
+                && self.unit.value_kind(callee_value) == mir_value_target_ref()
+                && self.unit.value_target_kind(callee_value) != mir_target_builtin()) {
+                self.unit.set_value_target(
+                                          callee_value,
+                                          mir_target_builtin(),
+                                          call_target_id);
+            }
+            if (call_target_kind == mir_target_hir_variant()
+                && callee_value != mir_id_invalid()
+                && self.unit.value_kind(callee_value) == mir_value_target_ref()
+                && self.unit.value_target_kind(callee_value) == mir_target_hir_variant()
+                && self.unit.value_target_id(callee_value) != call_target_id) {
+                self.unit.set_value_target( callee_value, mir_target_hir_variant(), call_target_id);
+            }
+        }
+        var call_name = self.h.expr_name(expr_id);
+        var call_text = self.h.expr_value_text(expr_id);
+        if (call_name.len == 0
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            call_name = self.h.expr_name(callee_expr_id);
+        }
+        if (call_target_kind == mir_target_builtin()
+            && call_target_id != mir_id_invalid()) {
+            let resolved_builtin_name = self.h.builtin_name(call_target_id);
+            if (resolved_builtin_name.len > 0) {
+                call_name = resolved_builtin_name;
+            }
+        }
+        if (call_name.len == 0
+            && call_target_kind == mir_target_builtin()
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            call_name = self.h.expr_name(callee_expr_id);
+        }
+        if (call_target_kind == mir_target_none()
+            && callee_expr_id != hir_id_invalid()
+            && self.h.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            // Unresolved member call (HIR left sem/target empty, e.g.
+            // `m.keys.get(i)` on a generic projection receiver): keep the
+            // method name and receiver type text on the call value so
+            // mir_verify can report a diagnosable error instead of an
+            // opaque value id at LLVM lowering time. Resolved calls keep
+            // their original name/text untouched.
+            if (call_name.len == 0) {
+                call_name = self.h.expr_name(callee_expr_id);
+            }
+            if (call_text.len == 0) {
+                let receiver_expr_id = self.h.expr_lhs(callee_expr_id);
+                if (receiver_expr_id != hir_id_invalid()) {
+                    call_text = "recv=" + self.type_text(self.h.expr_type(receiver_expr_id));
+                }
+            }
+        }
+        var layout_call_name = call_name;
+        if (layout_call_name.len == 0 && callee_expr_id != hir_id_invalid()) {
+            layout_call_name = self.h.expr_name(callee_expr_id);
+            if (layout_call_name.len == 0) {
+                layout_call_name = self.h.expr_value_text(callee_expr_id);
+            }
+        }
+        if (policy_generic_call_has_args(layout_call_name.clone()) == 0
+            && callee_expr_id != hir_id_invalid()) {
+            var generic_layout_call_name = self.h.expr_name(callee_expr_id);
+            if (policy_generic_call_has_args(generic_layout_call_name.clone()) == 0) {
+                generic_layout_call_name = self.h.expr_value_text(callee_expr_id);
+            }
+            if (policy_generic_call_has_args(generic_layout_call_name.clone()) != 0) {
+                layout_call_name = generic_layout_call_name;
+            }
+        }
+        self.ensure_layouts_for_builtin_type_args(call_target_kind, layout_call_name);
+        let out_call = self.unit.add_value(
+                                          self.current_function_id,
+                                          mir_value_call(),
+                                          call_result_type_id,
+                                         mir_id_invalid(),
+                                         call_target_kind,
+                                         call_target_id,
+                                         expr_id,
+                                         hir_unit_expr_flags(self.h, expr_id),
+                                         self.h.expr_op(expr_id),
+                                         hir_unit_expr_int_value(self.h, expr_id),
+                                         call_name,
+                                         call_text);
+        self.unit.set_value_lhs( out_call, callee_value);
+        if (call_target_kind == mir_target_builtin()) {
+            let builtin_base = policy_generic_call_base(call_name.clone());
+            if (builtin_base == "construct" || builtin_base == "new") {
+                // Builtins have no function signature locals, so the generic
+                // argument lowering path cannot discover a concrete-to-dyn
+                // conversion from a parameter type.  Preserve the source HIR
+                // type here and make every concrete vtable method reachable
+                // before the source body is discarded by streaming codegen.
+                let construct_arg = self.h.expr_first_arg(expr_id);
+                if (construct_arg != hir_id_invalid()
+                    && self.h.expr_next_arg(construct_arg) == hir_id_invalid()) {
+                    self.ensure_dyn_trait_methods_reachable(self.h.expr_type(construct_arg), type_id);
+                }
+            }
+        }
+        var first_arg = mir_id_invalid();
+        var last_arg = mir_id_invalid();
+        var skipped_params: i32 = 0;
+        if (prefix_value_id != mir_id_invalid()) {
+            last_arg = self.append_value_arg(out_call,
+                                             mir_id_invalid(),
+                                             mir_id_invalid(),
+                                             prefix_value_id);
+            first_arg = self.unit.value_first_arg(out_call);
+            skipped_params = 1;
+        }
+        if (!self.lower_named_call_arg_values_from(out_call,
+                                                   self.h.expr_first_arg(expr_id),
+                                                   call_target_id,
+                                                   first_arg,
+                                                   last_arg,
+                                                   skipped_params)) {
+            self.lower_arg_values_from(out_call,
+                                       self.h.expr_first_arg(expr_id),
+                                       first_arg,
+                                       last_arg,
+                                       call_target_id,
+                                       skipped_params);
+        }
+        if (prefix_source_expr_id != hir_id_invalid()) {
+            self.deactivate_call_moved_prefix(expr_id, prefix_source_expr_id);
+            self.deactivate_call_moved_args_from(expr_id, self.h.expr_first_arg(expr_id), 1);
+        } else {
+            self.deactivate_call_moved_receiver(expr_id);
+            self.deactivate_call_moved_args(expr_id);
+        }
+        return out_call;
+    }
+}

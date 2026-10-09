@@ -1,0 +1,538 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn string_cstr_from_value(self, value_id: i32) -> rawptr {
+        if (value_id == mir_id_invalid()) { return null; }
+        let ty = self.m.value_type(value_id);
+        if (!self.type_is_string_view_type(ty)) {
+            self.report_error("value is not string-view compatible: " + llvm_mir_type_text(&self.m, ty));
+            return null;
+        }
+        if (self.m.value_kind(value_id) == mir_value_const_str()
+            && self.m.value_first_arg(value_id) == mir_id_invalid()) {
+            return self.emit_str_ptr(self.m.value_text(value_id));
+        }
+        return self.string_ptr_value(self.lower_string_view_value(value_id));
+    }
+
+    public fn string_len_from_value(self, value_id: i32) -> rawptr {
+        if (value_id == mir_id_invalid()) { return null; }
+        if (self.m.value_kind(value_id) == mir_value_const_str()
+            && self.m.value_first_arg(value_id) == mir_id_invalid()) {
+            return vyx_rt_const_int(self.mod, self.ty_i64, self.m.value_text(value_id).len, 0);
+        }
+        return self.string_len_value(self.lower_string_view_value(value_id));
+    }
+
+    public fn reference_value_to_string(self, value_id: i32, reference_type: i32) -> rawptr {
+        let elem = hir_type_table_elem(self.m.types, reference_type);
+        let handle = self.lower_value(value_id);
+        let addr = self.pointer_handle_address(handle, "mir.string.ref");
+        let storage = self.lower_storage_type(elem);
+        if (elem == mir_id_invalid() || addr == null || storage == null) {
+            self.report_error_at_value(value_id, "cannot load reference for string conversion");
+            return null;
+        }
+        let loaded = vyx_rt_build_load(self.mod, storage, addr, llvm_mir_empty_name(), 0);
+        if (loaded == null) { return null; }
+        let kind = llvm_mir_type_kind(&self.m, elem);
+        if (self.type_is_str_abi(elem)) {
+            // The container or caller owns this buffer. Interpolation can copy
+            // its bytes but must not release it as a formatting temporary.
+            let len = self.string_len_value(loaded);
+            return self.emit_string_value_from_parts(self.string_ptr_value(loaded), len, len,
+                                                      vyx_rt_const_int(self.mod, self.ty_i64, 0, 0));
+        }
+        if (kind == ty_BOOL()) {
+            return self.string_value_from_bool_to_string(self.int_value_to_bits(loaded, elem, 32));
+        }
+        if (llvm_mir_int_bits_for_kind(kind) > 0) {
+            return self.string_value_from_integer_to_string(self.int_value_to_bits(loaded, elem, 64),
+                                                             llvm_mir_kind_decimal_unsigned(kind));
+        }
+        if (llvm_mir_kind_float(kind)) {
+            var as_double = loaded;
+            if (kind == ty_F32()) {
+                as_double = vyx_rt_build_fp_ext(self.mod, loaded, vyx_rt_float_type(self.mod, 64),
+                                                llvm_mir_empty_name(), 0);
+            }
+            return self.float_format_arg_to_string(as_double);
+        }
+        self.report_error_at_value(value_id, "cannot convert reference to `"
+                                   + llvm_mir_type_text(&self.m, elem) + "` to string");
+        return null;
+    }
+
+    public fn string_value_for_interpolation_segment(self, value_id: i32) -> rawptr {
+        if (value_id == mir_id_invalid()) { return null; }
+        let value_type = self.m.value_type(value_id);
+        if (self.type_is_string_view_type(value_type)) {
+            return self.lower_string_view_value(value_id);
+        }
+        let kind = llvm_mir_type_kind(&self.m, value_type);
+        if (kind == ty_REF() || kind == ty_MUTREF()) {
+            return self.reference_value_to_string(value_id, value_type);
+        }
+        let bits = llvm_mir_int_bits_for_kind(kind);
+        if (bits > 0 && kind != ty_BOOL()) {
+            let as_i64 = self.int_value_to_bits(self.lower_value(value_id), value_type, 64);
+            if (as_i64 == null) {
+                self.report_error("cannot lower integer interpolation segment");
+                return null;
+            }
+            return self.string_value_from_integer_to_string(
+                as_i64,
+                llvm_mir_kind_decimal_unsigned(kind));
+        }
+        if (kind == ty_BOOL()) {
+            if (self.builtin_bool_to_string_fn == null || self.builtin_bool_to_string_fty == null) {
+                self.report_error("bool_to_string declaration is unavailable");
+                return null;
+            }
+            let as_i32 = self.int_value_to_bits(self.lower_value(value_id), value_type, 32);
+            let cstr = vyx_rt_build_call1(self.mod,
+                                          self.builtin_bool_to_string_fty,
+                                          self.builtin_bool_to_string_fn,
+                                          as_i32,
+                                          llvm_mir_empty_name(),
+                                          0);
+            let nonzero = vyx_rt_build_icmp(self.mod,
+                                            llvm_mir_icmp_ne(),
+                                            as_i32,
+                                            vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                            llvm_mir_empty_name(),
+                                            0);
+            let len_v = vyx_rt_build_select(self.mod,
+                                            nonzero,
+                                            vyx_rt_const_int(self.mod, self.ty_i64, 4, 0),
+                                            vyx_rt_const_int(self.mod, self.ty_i64, 5, 0),
+                                            llvm_mir_empty_name(),
+                                            0);
+            if (cstr == null || len_v == null) {
+                self.report_error("cannot lower bool interpolation segment");
+                return null;
+            }
+            let cap_v2 = self.string_capacity_for_cstr(len_v, 3);
+            return self.emit_string_value_from_parts(cstr,
+                                                     len_v,
+                                                     cap_v2,
+                                                     vyx_rt_const_int(self.mod, self.ty_i64, 3, 0));
+        }
+        if (llvm_mir_kind_float(kind)) {
+            return self.float_value_to_string(value_id);
+        }
+        let cstr2 = self.value_to_cstr(value_id);
+        if (cstr2 == null || self.builtin_strlen_fn == null || self.builtin_strlen_fty == null) {
+            self.report_error("cannot lower interpolation segment");
+            return null;
+        }
+        let len2 = vyx_rt_build_call1(self.mod,
+                                      self.builtin_strlen_fty,
+                                      self.builtin_strlen_fn,
+                                      cstr2,
+                                      llvm_mir_empty_name(),
+                                      0);
+        if (len2 == null) {
+            self.report_error("cannot measure interpolation segment");
+            return null;
+        }
+        return self.emit_string_value_from_parts(cstr2,
+                                                 len2,
+                                                 len2,
+                                                 vyx_rt_const_int(self.mod, self.ty_i64, 0, 0));
+    }
+
+    public fn lower_interpolated_string_value(self, value_id: i32) -> rawptr {
+        let seg_count = self.call_arg_count(value_id);
+        if (seg_count <= 0) { return self.emit_str_value(""); }
+        let part_values = malloc((seg_count * 8) as u64);
+        let part_lens = malloc((seg_count * 8) as u64);
+        let part_kinds = malloc((seg_count * 4) as u64);
+        if (part_values == null || part_lens == null || part_kinds == null) {
+            if (part_values != null) { free(part_values); }
+            if (part_lens != null) { free(part_lens); }
+            if (part_kinds != null) { free(part_kinds); }
+            self.report_error("cannot allocate interpolation segment buffers");
+            return null;
+        }
+        var total = vyx_rt_const_int(self.mod, self.ty_i64, 0, 0);
+        var idx: i32 = 0;
+        var seg = self.m.value_first_arg(value_id);
+        while (seg != mir_id_invalid()) {
+            let payload = self.call_arg_payload(seg);
+            let payload_type = self.m.value_type(payload);
+            let payload_kind = llvm_mir_type_kind(&self.m, payload_type);
+            let payload_bits = llvm_mir_int_bits_for_kind(payload_kind);
+            var stored_value: rawptr = null;
+            var part_len: rawptr = null;
+            var part_kind: i32 = 0;
+            let format_unsigned = llvm_mir_kind_decimal_unsigned(payload_kind);
+
+            if (payload_bits > 0 && payload_kind != ty_BOOL()
+                && ((format_unsigned
+                     && self.builtin_uint_decimal_len_fn != null
+                     && self.builtin_uint_decimal_len_fty != null
+                     && self.builtin_uint_to_string_into_fn != null
+                     && self.builtin_uint_to_string_into_fty != null)
+                    || (!format_unsigned
+                        && self.builtin_int_decimal_len_fn != null
+                        && self.builtin_int_decimal_len_fty != null
+                        && self.builtin_int_to_string_into_fn != null
+                        && self.builtin_int_to_string_into_fty != null))) {
+                stored_value = self.int_value_to_bits(self.lower_value(payload), payload_type, 64);
+                if (stored_value == null) {
+                    free(part_values);
+                    free(part_lens);
+                    free(part_kinds);
+                    self.report_error("cannot lower integer interpolation segment");
+                    return null;
+                }
+                var decimal_len_fn: rawptr = self.builtin_int_decimal_len_fn;
+                var decimal_len_fty: rawptr = self.builtin_int_decimal_len_fty;
+                if (format_unsigned) {
+                    decimal_len_fn = self.builtin_uint_decimal_len_fn;
+                    decimal_len_fty = self.builtin_uint_decimal_len_fty;
+                    part_kind = 5;
+                } else {
+                    part_kind = 1;
+                }
+                part_len = vyx_rt_build_call1(self.mod,
+                                              decimal_len_fty,
+                                              decimal_len_fn,
+                                              stored_value,
+                                              "mir.interp.int.len".c_str(),
+                                              18);
+            } else if (payload_kind == ty_BOOL()) {
+                stored_value = self.int_value_to_bits(self.lower_value(payload), payload_type, 32);
+                if (stored_value == null) {
+                    free(part_values);
+                    free(part_lens);
+                    free(part_kinds);
+                    self.report_error("cannot lower bool interpolation segment");
+                    return null;
+                }
+                let nonzero = vyx_rt_build_icmp(self.mod,
+                                                llvm_mir_icmp_ne(),
+                                                stored_value,
+                                                vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                                llvm_mir_empty_name(),
+                                                0);
+                part_len = vyx_rt_build_select(self.mod,
+                                               nonzero,
+                                               vyx_rt_const_int(self.mod, self.ty_i64, 4, 0),
+                                               vyx_rt_const_int(self.mod, self.ty_i64, 5, 0),
+                                               "mir.interp.bool.len".c_str(),
+                                               20);
+                part_kind = 2;
+            } else {
+                let part_value = self.string_value_for_interpolation_segment(payload);
+                if (part_value == null) {
+                    free(part_values);
+                    free(part_lens);
+                    free(part_kinds);
+                    return null;
+                }
+                part_len = self.string_len_value(part_value);
+                part_kind = 0;
+                if (llvm_mir_kind_float(payload_kind)) {
+                    stored_value = self.string_ptr_value(part_value);
+                    part_kind = 3;
+                } else if (self.string_value_is_consumed_temporary(payload, 0)) {
+                    // Preserve all four ABI fields until the segment has been
+                    // copied so allocator-domain ownership can be released.
+                    stored_value = part_value;
+                    part_kind = 4;
+                } else {
+                    stored_value = self.string_ptr_value(part_value);
+                }
+            }
+
+            if (stored_value == null || part_len == null) {
+                free(part_values);
+                free(part_lens);
+                free(part_kinds);
+                self.report_error("cannot extract interpolation segment");
+                return null;
+            }
+            ast_write_rawptr(ptr_offset(part_values, idx * 8), stored_value);
+            ast_write_rawptr(ptr_offset(part_lens, idx * 8), part_len);
+            ast_write_i32(ptr_offset(part_kinds, idx * 4), part_kind);
+            total = vyx_rt_build_add(self.mod, total, part_len, llvm_mir_empty_name(), 0);
+            if (total == null) {
+                free(part_values);
+                free(part_lens);
+                free(part_kinds);
+                self.report_error("cannot compute interpolation length");
+                return null;
+            }
+            idx = idx + 1;
+            seg = self.m.value_next_arg(seg);
+        }
+        let data = self.alloc_string_data_for_len(total);
+        if (data == null) {
+            free(part_values);
+            free(part_lens);
+            free(part_kinds);
+            return null;
+        }
+        var off = vyx_rt_const_int(self.mod, self.ty_i64, 0, 0);
+        idx = 0;
+        while (idx < seg_count) {
+            let kind_tag = ast_read_i32(ptr_offset(part_kinds, idx * 4));
+            let stored = ast_read_rawptr(ptr_offset(part_values, idx * 8));
+            let len_v = ast_read_rawptr(ptr_offset(part_lens, idx * 8));
+            let dst = self.ptr_offset_bytes(data, off, "mir.interp.dst");
+            if (stored == null || len_v == null || dst == null) {
+                free(part_values);
+                free(part_lens);
+                free(part_kinds);
+                self.report_error("cannot copy interpolation segment");
+                return null;
+            }
+            if (kind_tag == 1 || kind_tag == 5) {
+                var into_fn: rawptr = self.builtin_int_to_string_into_fn;
+                var into_fty: rawptr = self.builtin_int_to_string_into_fty;
+                if (kind_tag == 5) {
+                    into_fn = self.builtin_uint_to_string_into_fn;
+                    into_fty = self.builtin_uint_to_string_into_fty;
+                }
+                let wrote = vyx_rt_build_call2(self.mod,
+                                               into_fty,
+                                               into_fn,
+                                               stored,
+                                               dst,
+                                               llvm_mir_empty_name(),
+                                               0);
+                if (wrote == null) {
+                    free(part_values);
+                    free(part_lens);
+                    free(part_kinds);
+                    self.report_error("cannot emit integer interpolation write");
+                    return null;
+                }
+            } else {
+                var src = stored;
+                if (kind_tag == 2) {
+                    let nonzero2 = vyx_rt_build_icmp(self.mod,
+                                                     llvm_mir_icmp_ne(),
+                                                     stored,
+                                                     vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                                     llvm_mir_empty_name(),
+                                                     0);
+                    src = vyx_rt_build_select(self.mod,
+                                              nonzero2,
+                                              self.emit_str_ptr("true"),
+                                              self.emit_str_ptr("false"),
+                                               "mir.interp.bool.ptr".c_str(),
+                                               20);
+                } else if (kind_tag == 4) {
+                    src = self.string_ptr_value(stored);
+                }
+                if (src == null || self.builtin_memcpy_fn == null || self.builtin_memcpy_fty == null) {
+                    free(part_values);
+                    free(part_lens);
+                    free(part_kinds);
+                    self.report_error("cannot copy interpolation segment");
+                    return null;
+                }
+                let copied = vyx_rt_build_call3(self.mod,
+                                                self.builtin_memcpy_fty,
+                                                self.builtin_memcpy_fn,
+                                                dst,
+                                                src,
+                                                len_v,
+                                                llvm_mir_empty_name(),
+                                                0);
+                if (copied == null) {
+                    free(part_values);
+                    free(part_lens);
+                    free(part_kinds);
+                    self.report_error("cannot emit interpolation copy");
+                    return null;
+                }
+                if (kind_tag == 3) {
+                    vyx_rt_build_call1(self.mod,
+                                       self.builtin_forget_string_len_fty,
+                                       self.builtin_forget_string_len_fn,
+                                       stored,
+                                       llvm_mir_empty_name(),
+                                       0);
+                    vyx_rt_build_call1(self.mod,
+                                       self.builtin_free_fty,
+                                       self.builtin_free_fn,
+                                       stored,
+                                       llvm_mir_empty_name(),
+                                       0);
+                } else if (kind_tag == 4) {
+                    let owned = self.string_owned_value(stored);
+                    if (owned == null || !self.release_replaced_string_storage(src, owned)) {
+                        free(part_values);
+                        free(part_lens);
+                        free(part_kinds);
+                        return null;
+                    }
+                }
+            }
+            off = vyx_rt_build_add(self.mod, off, len_v, llvm_mir_empty_name(), 0);
+            if (off == null) {
+                free(part_values);
+                free(part_lens);
+                free(part_kinds);
+                self.report_error("cannot advance interpolation offset");
+                return null;
+            }
+            idx = idx + 1;
+        }
+        free(part_values);
+        free(part_lens);
+        free(part_kinds);
+        let cap_v = vyx_rt_build_add(self.mod,
+                                     total,
+                                     vyx_rt_const_int(self.mod, self.ty_i64, 1, 0),
+                                     llvm_mir_empty_name(),
+                                     0);
+        return self.emit_string_value_from_parts(data,
+                                                 total,
+                                                 cap_v,
+                                                 vyx_rt_const_int(self.mod, self.ty_i64, 4, 0));
+    }
+
+    public fn lower_string_concat_values(self, lhs_value: rawptr, rhs_value: rawptr) -> rawptr {
+        if (self.builtin_memcpy_fn == null || self.builtin_memcpy_fty == null) {
+            self.report_error("memcpy declaration is unavailable for str concat");
+            return null;
+        }
+        if (lhs_value == null || rhs_value == null) {
+            self.report_error("cannot lower string concat operands");
+            return null;
+        }
+        let lhs_ptr = self.string_ptr_value(lhs_value);
+        let rhs_ptr = self.string_ptr_value(rhs_value);
+        let lhs_len = self.string_len_value(lhs_value);
+        let rhs_len = self.string_len_value(rhs_value);
+        if (lhs_ptr == null || rhs_ptr == null || lhs_len == null || rhs_len == null) {
+            self.report_error("cannot extract str concat operands");
+            return null;
+        }
+        let total = vyx_rt_build_add(self.mod,
+                                     lhs_len,
+                                     rhs_len,
+                                     llvm_mir_empty_name(),
+                                     0);
+        if (total == null) {
+            self.report_error("cannot compute str concat length");
+            return null;
+        }
+        let data_ptr = self.alloc_string_data_for_len(total);
+        if (data_ptr == null) { return null; }
+        let lhs_copy = vyx_rt_build_call3(self.mod,
+                                          self.builtin_memcpy_fty,
+                                          self.builtin_memcpy_fn,
+                                          data_ptr,
+                                          lhs_ptr,
+                                          lhs_len,
+                                          llvm_mir_empty_name(),
+                                          0);
+        let tail = self.ptr_offset_bytes(data_ptr, lhs_len, "mir.str.concat.tail");
+        if (lhs_copy == null || tail == null) {
+            self.report_error("cannot copy left str concat operand");
+            return null;
+        }
+        let rhs_copy = vyx_rt_build_call3(self.mod,
+                                          self.builtin_memcpy_fty,
+                                          self.builtin_memcpy_fn,
+                                          tail,
+                                          rhs_ptr,
+                                          rhs_len,
+                                          llvm_mir_empty_name(),
+                                          0);
+        if (rhs_copy == null) {
+            self.report_error("cannot copy right str concat operand");
+            return null;
+        }
+        let cap_v = vyx_rt_build_add(self.mod,
+                                     total,
+                                     vyx_rt_const_int(self.mod, self.ty_i64, 1, 1),
+                                     llvm_mir_empty_name(),
+                                     0);
+        if (cap_v == null) {
+            self.report_error("cannot compute str concat capacity");
+            return null;
+        }
+        return self.emit_string_value_from_parts(data_ptr,
+                                                 total,
+                                                 cap_v,
+                                                 vyx_rt_const_int(self.mod, self.ty_i64, 4, 0));
+    }
+
+    public fn lower_string_concat_parts(self, lhs_id: i32, rhs_id: i32) -> rawptr {
+        let lhs_value = self.lower_string_view_value(lhs_id);
+        let rhs_value = self.lower_string_view_value(rhs_id);
+        return self.lower_string_concat_values(lhs_value, rhs_value);
+    }
+
+    public fn value_is_string_concat_node(self, value_id: i32) -> bool {
+        if (value_id == mir_id_invalid()) { return false; }
+        if (self.m.value_kind(value_id) != mir_value_binary()) { return false; }
+        if (self.m.value_op(value_id) != llvm_mir_tk_PLUS()) { return false; }
+        return self.type_is_string_view_type(self.m.value_type(value_id));
+    }
+
+    public fn lower_string_concat_value(self, value_id: i32) -> rawptr {
+        let cap: i32 = 4096;
+        let stack = malloc((cap * 4) as u64);
+        let leaves = malloc((cap * 4) as u64);
+        if (stack == null || leaves == null) {
+            if (stack != null) { free(stack); }
+            if (leaves != null) { free(leaves); }
+            self.report_error("cannot allocate str concat flatten stack");
+            return null;
+        }
+        var sp: i32 = 0;
+        var leaf_count: i32 = 0;
+        ast_write_i32(stack, value_id);
+        sp = 1;
+        while (sp > 0) {
+            sp = sp - 1;
+            let cur = ast_read_i32(ptr_offset(stack, sp * 4));
+            if (self.value_is_string_concat_node(cur)) {
+                if (sp + 2 >= cap) {
+                    free(stack);
+                    free(leaves);
+                    self.report_error("str concat expression is too deep");
+                    return null;
+                }
+                ast_write_i32(ptr_offset(stack, sp * 4), self.m.value_rhs(cur));
+                sp = sp + 1;
+                ast_write_i32(ptr_offset(stack, sp * 4), self.m.value_lhs(cur));
+                sp = sp + 1;
+            } else {
+                if (leaf_count >= cap) {
+                    free(stack);
+                    free(leaves);
+                    self.report_error("str concat expression has too many operands");
+                    return null;
+                }
+                ast_write_i32(ptr_offset(leaves, leaf_count * 4), cur);
+                leaf_count = leaf_count + 1;
+            }
+        }
+        if (leaf_count <= 0) {
+            free(stack);
+            free(leaves);
+            self.report_error("str concat expression has no operands");
+            return null;
+        }
+        var out = self.lower_string_view_value(ast_read_i32(leaves));
+        var i: i32 = 1;
+        while (i < leaf_count && out != null) {
+            let rhs_value = self.lower_string_view_value(ast_read_i32(ptr_offset(leaves, i * 4)));
+            out = self.lower_string_concat_values(out, rhs_value);
+            i = i + 1;
+        }
+        free(stack);
+        free(leaves);
+        return out;
+    }
+}

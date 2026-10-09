@@ -1,0 +1,1046 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Method lookup for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn function_name_matches_method_direct(self, function_name: string, method_name: string) -> bool {
+        if (function_name.len == 0 || method_name.len == 0) { return false; }
+        if (function_name == method_name) { return true; }
+        if (hir_builder_string_contains(function_name, "::" + method_name)) { return true; }
+        if (hir_builder_string_contains(function_name, "_3A_3A" + method_name + "_3A_3A")) { return true; }
+        let encoded_method = hir_builder_symbol_segment_for_name(method_name);
+        if (encoded_method != method_name) {
+            return hir_builder_string_contains(function_name, "_3A_3A" + encoded_method + "_3A_3A");
+        }
+        return false;
+    }
+
+    fn function_name_matches_method(self, function_name: string, method_name: string) -> bool {
+        if (self.function_name_matches_method_direct(function_name, method_name)) { return true; }
+        let legacy = policy_operator_legacy_method_name(method_name);
+        if (legacy.len > 0 && self.function_name_matches_method_direct(function_name, legacy)) { return true; }
+        let symbol = policy_operator_symbol_method_name(method_name);
+        if (symbol.len > 0 && self.function_name_matches_method_direct(function_name, symbol)) { return true; }
+        return false;
+    }
+
+    fn function_candidate_matches_method_name(self, fn_id: i32, method_name: string) -> bool {
+        if (fn_id == hir_id_invalid() || method_name.len == 0) { return false; }
+        if (method_name != "drop"
+            && (hir_unit_function_flags(self.unit, fn_id) & hir_function_flag_foreign_dci_dtor()) != 0) {
+            return false;
+        }
+        let item_id = self.unit.function_item(fn_id);
+        if (item_id != hir_id_invalid()) {
+            let item_name = self.unit.item_name(item_id);
+            if (item_name == method_name || self.function_name_matches_method(item_name, method_name)) {
+                return true;
+            }
+        }
+        return self.function_name_matches_method(self.unit.function_name(fn_id), method_name);
+    }
+
+    fn method_function_target_by_owner_type_and_method(self,
+                                                              owner_type_name: string,
+                                                              method_name: string) -> i32 {
+        self.profile_method_target_calls = self.profile_method_target_calls + 1;
+        if (owner_type_name.len == 0 || method_name.len == 0) { return hir_id_invalid(); }
+        let early_iface_member = self.raw_interface_method_decl_on_trait(self.raw_interface_decl_for_trait_name(owner_type_name),
+                                                                         method_name,
+                                                                         0);
+        if (early_iface_member != null) {
+            let early_iface_fn = hir_pointer_map_function(self.decl_map,early_iface_member);
+            if (early_iface_fn != hir_id_invalid()
+                && self.function_candidate_matches_method_name(early_iface_fn, method_name)
+                && !self.function_has_open_template_types(early_iface_fn)) {
+                return early_iface_fn;
+            }
+        }
+        if (self.owner_method_name_is_overloaded(owner_type_name, method_name)) {
+            return hir_id_invalid();
+        }
+        let closed_cached = self.closed_method_instance_for_owner_method(owner_type_name, method_name);
+        if (closed_cached != hir_id_invalid()) { return closed_cached; }
+        let owner_base = hir_builder_type_base_name(owner_type_name);
+        if (owner_base.len > 0) {
+            let indexed = hir_pair_id_map_get(self.method_function_index,owner_base, method_name);
+            if (indexed != hir_id_invalid()
+                && self.function_candidate_matches_method_name(indexed, method_name)
+                && self.function_candidate_covers_owner_type(indexed, owner_type_name)
+                && !self.function_has_open_template_types(indexed)) {
+                return indexed;
+            }
+            let owner_last = hir_builder_last_path_segment(owner_base);
+            if (owner_last.len > 0) {
+                let indexed_last = hir_pair_id_map_get(self.method_function_index,owner_last, method_name);
+                if (indexed_last != hir_id_invalid()
+                    && self.function_candidate_matches_method_name(indexed_last, method_name)
+                    && self.function_candidate_covers_owner_type(indexed_last, owner_type_name)
+                    && !self.function_has_open_template_types(indexed_last)) {
+                    return indexed_last;
+                }
+            }
+        }
+        let indexed_exact = hir_pair_id_map_get(self.method_function_index,owner_type_name, method_name);
+        if (indexed_exact != hir_id_invalid()
+            && self.function_candidate_matches_method_name(indexed_exact, method_name)
+            && self.function_candidate_covers_owner_type(indexed_exact, owner_type_name)
+            && !self.function_has_open_template_types(indexed_exact)) {
+            return indexed_exact;
+        }
+        if (policy_generic_call_args(owner_type_name.clone()).len > 0) {
+            return hir_id_invalid();
+        }
+        var first_match = hir_id_invalid();
+        var item_id: i32 = 1;
+        while (item_id <= self.unit.item_count) {
+            if (self.unit.item_kind(item_id) == hir_item_method()
+                && self.unit.item_name(item_id) == method_name
+                && self.owner_item_matches_type(self.unit.item_owner(item_id), owner_type_name)) {
+                let fn_id = self.unit.item_function(item_id);
+                if (fn_id != hir_id_invalid()) {
+                    if (self.function_candidate_covers_owner_type(fn_id, owner_type_name)) {
+                        if (first_match == hir_id_invalid()) { first_match = fn_id; }
+                        if (!self.function_has_open_template_types(fn_id)) { return fn_id; }
+                    }
+                }
+            }
+            item_id = item_id + 1;
+        }
+        if (first_match == hir_id_invalid() && method_name == "clone") {
+            return self.method_function_target_by_owner_type_and_method(owner_type_name, "dup");
+        }
+        return first_match;
+    }
+
+    // A concrete, non-generic method already has a stable ABI symbol in its
+    // owner partition. Generic body materialization may reach it through an
+    // interface requirement and create a synthetic `Self` shell instead;
+    // recover the direct symbol before that shell escapes into MIR.
+    fn direct_method_function_for_closed_receiver(self,
+                                                   owner_type_name: string,
+                                                   method_name: string,
+                                                   call_expr_id: i32,
+                                                   callee_expr_id: i32) -> i32 {
+        if (owner_type_name.len == 0 || method_name.len == 0) {
+            return hir_id_invalid();
+        }
+        var project_local = hir_id_invalid();
+        var fallback = hir_id_invalid();
+        var fn_id: i32 = 1;
+        while (fn_id <= self.unit.function_count) {
+            let name = self.unit.function_name(fn_id);
+            let raw_decl = hir_pointer_map_raw_for_function(self.decl_map, fn_id);
+            if (!name.startsWith("mir2$")
+                && raw_decl != null
+                && decl_get_kind(raw_decl) == de_METHOD()
+                && hir_builder_decl_template_params(raw_decl).len == 0
+                && self.function_candidate_matches_method_name(fn_id, method_name)) {
+                let raw_owner = hir_raw_owner_map_get(self.decl_owner_map, raw_decl);
+                if (raw_owner != null
+                    && hir_builder_decl_template_params(raw_owner).len == 0
+                    && self.raw_owner_decl_matches_type_exact(raw_owner, owner_type_name)) {
+                    let call_matches = call_expr_id == hir_id_invalid()
+                        || self.hir_function_arg_score_for_call(call_expr_id,
+                                                                callee_expr_id,
+                                                                fn_id) >= 0;
+                    if (call_matches) {
+                        if (self.decl_effectively_project_local(raw_decl)) {
+                            if (project_local != hir_id_invalid()
+                                && project_local != fn_id) {
+                                return hir_id_invalid();
+                            }
+                            project_local = fn_id;
+                        } else if (fallback == hir_id_invalid()) {
+                            fallback = fn_id;
+                        }
+                    }
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        if (project_local != hir_id_invalid()) { return project_local; }
+        return fallback;
+    }
+    fn note_closed_method_instance(self, owner_type_name: string, method_name: string, fn_id: i32) {
+        if (owner_type_name.len == 0 || method_name.len == 0 || fn_id == hir_id_invalid()) { return; }
+        if (!self.function_candidate_matches_method_name(fn_id, method_name)) { return; }
+        if (self.function_has_open_template_types(fn_id)) { return; }
+        if (self.owner_method_name_is_overloaded(owner_type_name, method_name)) { return; }
+        var canonical_fn = fn_id;
+        if (self.unit.function_name(fn_id).startsWith("mir2$")) {
+            let direct_fn = self.direct_method_function_for_closed_receiver(
+                owner_type_name,
+                method_name,
+                hir_id_invalid(),
+                hir_id_invalid());
+            if (direct_fn != hir_id_invalid()) { canonical_fn = direct_fn; }
+        }
+        self.closed_method_instance_index = hir_pair_id_map_put(self.closed_method_instance_index,owner_type_name, method_name, canonical_fn);
+    }
+
+    fn closed_method_instance_for_owner_method(self, owner_type_name: string, method_name: string) -> i32 {
+        if (owner_type_name.len == 0 || method_name.len == 0) { return hir_id_invalid(); }
+        if (self.owner_method_name_is_overloaded(owner_type_name, method_name)) { return hir_id_invalid(); }
+        let cached = hir_pair_id_map_get(self.closed_method_instance_index,owner_type_name, method_name);
+        if (cached != hir_id_invalid()
+            && self.function_candidate_matches_method_name(cached, method_name)
+            && self.function_candidate_covers_owner_type(cached, owner_type_name)
+            && !self.function_has_open_template_types(cached)) {
+            return cached;
+        }
+        return hir_id_invalid();
+    }
+
+    fn prefer_closed_function_instance_for_owner_method(self,
+                                                              owner_type_name: string,
+                                                              method_name: string,
+                                                              current_fn: i32) -> i32 {
+        if (current_fn == hir_id_invalid()
+            || owner_type_name.len == 0
+            || method_name.len == 0) {
+            return current_fn;
+        }
+        if (!self.function_has_open_template_types(current_fn)) {
+            let current_owner_type = hir_unit_function_owner_type(self.unit, current_fn);
+            if (self.function_candidate_matches_method_name(current_fn, method_name)
+                && (current_owner_type.len == 0 || current_owner_type == owner_type_name)) {
+                return current_fn;
+            }
+            if (self.function_candidate_matches_method_name(current_fn, method_name)
+                && self.unit.function_body(current_fn) != hir_id_invalid()) {
+                return current_fn;
+            }
+        }
+        let cached = self.closed_method_instance_for_owner_method(owner_type_name, method_name);
+        if (cached != hir_id_invalid() && cached != current_fn) { return cached; }
+        return current_fn;
+    }
+
+    fn raw_drop_decl_for_type_text(self, type_text: string) -> rawptr {
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) { return null; }
+        var member = decl_get_members(cd);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && decl_get_name(member) == "drop"
+                && !decl_get_is_static(member)) {
+                return member;
+            }
+            member = decl_get_next(member);
+        }
+        return null;
+    }
+
+    fn raw_method_decl_for_type_text(self, type_text: string, method_name: string) -> rawptr {
+        if (method_name.len == 0) { return null; }
+        let concrete_method = self.raw_concrete_method_decl_for_type_text(type_text, method_name, false);
+        if (concrete_method != null) { return concrete_method; }
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) { return null; }
+        var member = decl_get_members(cd);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(decl_get_name(member), method_name)
+                && !decl_get_is_static(member)) {
+                return member;
+            }
+            member = decl_get_next(member);
+        }
+        let inherited = self.raw_method_decl_from_layout_parents(cd,
+                                                                   method_name,
+                                                                   false,
+                                                                   0);
+        if (inherited != null) { return inherited; }
+        return self.raw_interface_default_method_decl_for_type_text(type_text, method_name);
+    }
+
+    fn raw_direct_method_decl_for_type_text(self,
+                                                  type_text: string,
+                                                  method_name: string,
+                                                  want_static: bool) -> rawptr {
+        if (type_text.len == 0 || method_name.len == 0) { return null; }
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) { return null; }
+        var member = decl_get_members(cd);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(decl_get_name(member), method_name)
+                && hir_builder_method_decl_matches_static_use(member, want_static)) {
+                return member;
+            }
+            member = decl_get_next(member);
+        }
+        return null;
+    }
+
+    fn raw_method_decl_on_class_tree(self,
+                                           class_decl: rawptr,
+                                           method_name: string,
+                                           want_static: bool,
+                                           depth: i32) -> rawptr {
+        if (class_decl == null || method_name.len == 0 || depth > 32) { return null; }
+        var member = decl_get_members(class_decl);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(decl_get_name(member), method_name)
+                && hir_builder_method_decl_matches_static_use(member, want_static)) {
+                return member;
+            }
+            member = decl_get_next(member);
+        }
+        return self.raw_method_decl_from_layout_parents(class_decl,
+                                                         method_name,
+                                                         want_static,
+                                                         depth + 1);
+    }
+
+    fn raw_method_decl_from_layout_parents(self,
+                                                   class_decl: rawptr,
+                                                   method_name: string,
+                                                   want_static: bool,
+                                                   depth: i32) -> rawptr {
+        if (class_decl == null || method_name.len == 0 || depth > 32) { return null; }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { return null; }
+            let found = self.raw_method_decl_on_class_tree(parent_decl,
+                                                            method_name,
+                                                            want_static,
+                                                            depth);
+            if (found != null) { return found; }
+            parent_i = parent_i + 1;
+        }
+        return null;
+    }
+
+    fn raw_method_name_count_on_class_tree(self,
+                                                 class_decl: rawptr,
+                                                 method_name: string,
+                                                 depth: i32) -> i32 {
+        if (class_decl == null || method_name.len == 0 || depth > 32) { return 0; }
+        var count: i32 = 0;
+        var member = decl_get_members(class_decl);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(decl_get_name(member), method_name)) {
+                count = count + 1;
+            }
+            member = decl_get_next(member);
+        }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { break; }
+            count = count + self.raw_method_name_count_on_class_tree(parent_decl,
+                                                                      method_name,
+                                                                      depth + 1);
+            parent_i = parent_i + 1;
+        }
+        return count;
+    }
+
+    fn owner_method_name_is_overloaded(self, owner_type_name: string, method_name: string) -> bool {
+        if (owner_type_name.len == 0 || method_name.len == 0) { return false; }
+        let cached = hir_pair_id_map_get(self.owner_method_overload_cache,owner_type_name, method_name);
+        if (cached == 2) { return true; }
+        if (cached == 1) { return false; }
+        var count: i32 = 0;
+        let class_decl = self.raw_class_decl_for_type_text(owner_type_name);
+        if (class_decl != null) {
+            count = count + self.raw_method_name_count_on_class_tree(class_decl, method_name, 0);
+            if (count > 1) {
+                self.owner_method_overload_cache = hir_pair_id_map_put(self.owner_method_overload_cache,owner_type_name, method_name, 2);
+                return true;
+            }
+        }
+        let template_decl = self.raw_template_class_decl_for_type_text(owner_type_name);
+        if (template_decl != null && template_decl != class_decl) {
+            count = count + self.raw_method_name_count_on_class_tree(template_decl, method_name, 0);
+            if (count > 1) {
+                self.owner_method_overload_cache = hir_pair_id_map_put(self.owner_method_overload_cache,owner_type_name, method_name, 2);
+                return true;
+            }
+        }
+        self.owner_method_overload_cache = hir_pair_id_map_put(self.owner_method_overload_cache,owner_type_name, method_name, 1);
+        return false;
+    }
+
+    fn raw_static_method_decl_for_type_text(self, type_text: string, method_name: string) -> rawptr {
+        if (method_name.len == 0) { return null; }
+        let concrete_method = self.raw_concrete_method_decl_for_type_text(type_text, method_name, true);
+        if (concrete_method != null) { return concrete_method; }
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) { return null; }
+        var member = decl_get_members(cd);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(decl_get_name(member), method_name)
+                && hir_builder_method_decl_matches_static_use(member, true)) {
+                return member;
+            }
+            member = decl_get_next(member);
+        }
+        return self.raw_method_decl_from_layout_parents(cd,
+                                                         method_name,
+                                                         true,
+                                                         0);
+    }
+
+    fn canonical_method_decl_for_owner_type(self,
+                                                  method_decl: rawptr,
+                                                  owner_type_name: string) -> rawptr {
+        if (method_decl == null
+            || owner_type_name.len == 0
+            || decl_get_kind(method_decl) != de_METHOD()) {
+            return method_decl;
+        }
+        let owner_args = policy_generic_call_args(owner_type_name.clone());
+        let direct_owner = hir_raw_owner_map_get(self.decl_owner_map,method_decl);
+        if (owner_args.len == 0
+            && direct_owner != null
+            && hir_builder_decl_template_params(direct_owner).len == 0
+            && !self.decl_body_has_template_type(method_decl)) {
+            return method_decl;
+        }
+        if (self.type_text_has_open_template_atom(owner_type_name)) {
+            return method_decl;
+        }
+        var concrete: rawptr = null;
+        var templ: rawptr = null;
+        if (decl_get_is_static(method_decl)) {
+            concrete = self.raw_concrete_method_decl_for_type_text(owner_type_name,
+                                                                   decl_get_name(method_decl),
+                                                                   true);
+            templ = self.raw_template_method_decl_for_type_text(owner_type_name,
+                                                                decl_get_name(method_decl),
+                                                                true);
+        } else {
+            concrete = self.raw_concrete_method_decl_for_type_text(owner_type_name,
+                                                                   decl_get_name(method_decl),
+                                                                   false);
+            templ = self.raw_template_method_decl_for_type_text(owner_type_name,
+                                                                decl_get_name(method_decl),
+                                                                false);
+        }
+        if (concrete == method_decl) {
+            return method_decl;
+        }
+        if (concrete != null
+            && hir_builder_decl_specialization_shape_matches(method_decl, concrete)) {
+            if (self.raw_function_body_decl_for(concrete) != null) { return concrete; }
+        }
+        if (templ == method_decl) {
+            return method_decl;
+        }
+        if (concrete != null
+            && !self.decl_body_has_template_type(method_decl)
+            && !self.decl_body_has_template_type(concrete)
+            && !hir_builder_decl_signature_matches(method_decl, concrete)) {
+            concrete = null;
+        }
+        if (templ != null
+            && !self.decl_body_has_template_type(method_decl)
+            && !self.decl_body_has_template_type(templ)
+            && !hir_builder_decl_signature_matches(method_decl, templ)) {
+            templ = null;
+        }
+        if (concrete != null && self.raw_function_body_decl_for(concrete) != null) { return concrete; }
+        if (templ != null && self.raw_function_body_decl_for(templ) != null) { return templ; }
+        if (concrete != null) { return concrete; }
+        if (templ != null) { return templ; }
+        return method_decl;
+    }
+
+    fn owner_decl_matches_concrete_type(self, owner_decl: rawptr, type_text: string) -> bool {
+        if (owner_decl == null || type_text.len == 0) { return false; }
+        let k = decl_get_kind(owner_decl);
+        if (k != de_CLASS() && k != de_ENUM()) { return false; }
+        let concrete_decl = self.raw_class_decl_for_type_text(type_text);
+        if (concrete_decl != null
+            && self.class_decl_is_or_inherits(concrete_decl, owner_decl, 0)) {
+            return true;
+        }
+        return self.raw_owner_decl_matches_type_base(owner_decl, type_text);
+    }
+
+    fn class_decl_is_or_inherits(self, class_decl: rawptr, ancestor_decl: rawptr, depth: i32) -> bool {
+        if (class_decl == null || ancestor_decl == null || depth > 32) { return false; }
+        if (depth == 0) {
+            let cached = hir_raw_pair_int_map_get(self.class_inherits_cache,class_decl, ancestor_decl);
+            if (cached == 2) { return true; }
+            if (cached == 1) { return false; }
+        }
+        if (class_decl == ancestor_decl) { return true; }
+        var out = false;
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { break; }
+            if (self.class_decl_is_or_inherits(parent_decl, ancestor_decl, depth + 1)) {
+                out = true;
+                break;
+            }
+            parent_i = parent_i + 1;
+        }
+        if (depth == 0) {
+            if (out) {
+                self.class_inherits_cache = hir_raw_pair_int_map_put(self.class_inherits_cache,class_decl, ancestor_decl, 2);
+            } else {
+                self.class_inherits_cache = hir_raw_pair_int_map_put(self.class_inherits_cache,class_decl, ancestor_decl, 1);
+            }
+        }
+        return out;
+    }
+
+    fn owner_decl_accepts_owner_type(self, owner_decl: rawptr, owner_type_name: string) -> bool {
+        if (owner_decl == null) { return true; }
+        if (owner_type_name.len == 0) { return true; }
+        if (self.owner_decl_matches_concrete_type(owner_decl, owner_type_name)) { return true; }
+        if ((decl_get_generic_flags(owner_decl) & 2) != 0) {
+            let class_decl = self.raw_class_decl_for_type_text(owner_type_name);
+            if (class_decl == null) { return true; }
+            return self.class_decl_implements_trait_name(class_decl, decl_get_name(owner_decl), 0);
+        }
+        return false;
+    }
+
+    fn method_owner_decl_for_type_text(self,
+                                             method_decl: rawptr,
+                                             type_text: string,
+                                             default_owner: rawptr) -> rawptr {
+        if (method_decl == null) { return default_owner; }
+        let can_cache = default_owner != null
+            && type_text.len > 0
+            && policy_generic_call_args(type_text.clone()).len == 0
+            && !self.type_text_has_open_template_atom(type_text);
+        if (can_cache) {
+            let cached_owner = hir_raw_pair_raw_map_get(self.method_owner_decl_cache,method_decl, default_owner);
+            if (cached_owner != null) { return cached_owner; }
+        }
+        let method_owner = hir_raw_owner_map_get(self.decl_owner_map,method_decl);
+        if (can_cache
+            && method_owner != null
+            && hir_builder_decl_template_params(method_owner).len == 0
+            && (default_owner == method_owner
+                || self.class_decl_is_or_inherits(default_owner, method_owner, 0))) {
+            let out_fast = self.generic_owner_decl_for_method_body(method_decl, method_owner);
+            if (out_fast != null) {
+                self.method_owner_decl_cache = hir_raw_pair_raw_map_put(self.method_owner_decl_cache,method_decl, default_owner, out_fast);
+                return out_fast;
+            }
+        }
+        var owner_decl = self.raw_template_class_decl_for_type_text(type_text);
+        if (self.owner_decl_matches_concrete_type(method_owner, type_text)) {
+            owner_decl = method_owner;
+        }
+        if (owner_decl == null) { owner_decl = default_owner; }
+        if (owner_decl == null) { owner_decl = method_owner; }
+        if (owner_decl == null) { owner_decl = self.raw_class_decl_for_type_text(type_text); }
+        let out = self.generic_owner_decl_for_method_body(method_decl, owner_decl);
+        if (can_cache && out != null) {
+            self.method_owner_decl_cache = hir_raw_pair_raw_map_put(self.method_owner_decl_cache,method_decl, default_owner, out);
+        }
+        return out;
+    }
+
+    fn raw_method_decl_matches_closed_receiver(self,
+                                                     method_decl: rawptr,
+                                                     owner_type_name: string,
+                                                     method_name: string,
+                                                     want_static: bool) -> bool {
+        if (method_decl == null
+            || owner_type_name.len == 0
+            || method_name.len == 0
+            || decl_get_kind(method_decl) != de_METHOD()
+            || !hir_builder_method_name_matches_lookup(decl_get_name(method_decl), method_name)
+            || !hir_builder_method_decl_matches_static_use(method_decl, want_static)) {
+            return false;
+        }
+        let owner_decl = hir_raw_owner_map_get(self.decl_owner_map,method_decl);
+        if (owner_decl == null) { return true; }
+        if (self.owner_decl_accepts_owner_type(owner_decl, owner_type_name)) { return true; }
+        let template_owner = self.raw_template_class_decl_for_type_text(owner_type_name);
+        if (template_owner != null && template_owner == owner_decl) { return true; }
+        return false;
+    }
+
+    fn semantic_method_decl_for_member_ast(self,
+                                                 member_expr: rawptr,
+                                                 owner_type_name: string,
+                                                 method_name: string,
+                                                 want_static: bool) -> rawptr {
+        if (member_expr == null || expr_get_kind(member_expr) != ex_MEMBER()) { return null; }
+        let raw_target = expr_get_semantic_target(member_expr);
+        if (self.raw_method_decl_matches_closed_receiver(raw_target,
+                                                         owner_type_name,
+                                                         method_name,
+                                                         want_static)) {
+            return raw_target;
+        }
+        if (self.raw_method_overload_count_for_type_text(owner_type_name,
+                                                         method_name,
+                                                         want_static) > 1) {
+            return null;
+        }
+        if (!self.raw_method_decl_matches_closed_receiver(raw_target,
+                                                          owner_type_name,
+                                                          method_name,
+                                                          want_static)) {
+            return null;
+        }
+        let raw_owner = hir_raw_owner_map_get(self.decl_owner_map,raw_target);
+        if (raw_owner != null
+            && !self.raw_owner_decl_matches_type_exact(raw_owner, owner_type_name)) {
+            let direct_method = self.raw_direct_method_decl_for_type_text(owner_type_name,
+                                                                          method_name,
+                                                                          want_static);
+            if (direct_method != null && direct_method != raw_target) {
+                return null;
+            }
+        }
+        return raw_target;
+    }
+
+    fn raw_versioned_method_decl_for_call(self,
+                                          owner_type_name: string,
+                                          method_name: string,
+                                          selected_name: string,
+                                          want_static: bool,
+                                          call_expr: rawptr,
+                                          call_expr_id: i32) -> rawptr {
+        if (owner_type_name.len == 0
+            || method_name.len == 0
+            || policy_module_selector_index(selected_name) < 0) {
+            return null;
+        }
+        let wanted_version = policy_module_version(selected_name);
+        let wanted_variant = policy_module_variant(selected_name);
+        if (wanted_version.len == 0) { return null; }
+        var best: rawptr = null;
+        var best_score: i32 = -1;
+        // The pointer-map linked list is a registration index, not an
+        // authoritative function order.  Migration merges append cloned
+        // members late and can make them shadow the original declaration in
+        // that chain.  FunctionId -> raw declaration preserves every
+        // registered implementation, including the historical original.
+        var candidate_fn: i32 = 1;
+        while (candidate_fn <= self.unit.function_count) {
+            let candidate = hir_pointer_map_raw_for_function(self.decl_map,
+                                                              candidate_fn);
+            if (candidate != null
+                && decl_get_kind(candidate) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(
+                    decl_get_name(candidate),
+                    method_name.clone())
+                && hir_builder_method_decl_matches_static_use(candidate,
+                                                               want_static)) {
+                let source_module = hir_builder_decl_source_module(candidate);
+                let source_variant = policy_module_variant(source_module);
+                let variant_matches = wanted_variant.len == 0
+                    || source_variant == wanted_variant;
+                let owner_decl = hir_raw_owner_map_get(self.decl_owner_map,
+                                                       candidate);
+                let owner_module = hir_builder_decl_source_module(owner_decl);
+                let owner_version = policy_module_version(owner_module);
+                let owner_variant = policy_module_variant(owner_module);
+                // A migration merge keeps historical method clones under the
+                // newest class owner.  The clone's member metadata still says
+                // `from:old-version`, so source-only matching would bind an
+                // explicit `method@old-version` call to the newest body.
+                // For a version selector the declaration owner must also be
+                // from that version (or have no module provenance at all).
+                let owner_module_matches = owner_module.len == 0
+                    || (owner_version == wanted_version
+                        && (wanted_variant.len == 0
+                            || owner_variant == wanted_variant));
+                let source_version_matches = policy_module_version(source_module)
+                    == wanted_version;
+                let owner_type_matches = self.owner_decl_accepts_owner_type(owner_decl,
+                                                                             owner_type_name);
+                if (source_version_matches
+                    && variant_matches
+                    && owner_module_matches
+                    && owner_type_matches) {
+                    let score = self.method_decl_score_for_call(call_expr,
+                                                                call_expr_id,
+                                                                candidate,
+                                                                owner_type_name);
+                    if (score > best_score) {
+                        best = candidate;
+                        best_score = score;
+                    }
+                }
+            }
+            candidate_fn = candidate_fn + 1;
+        }
+        return best;
+    }
+
+    fn raw_method_overload_count_on_class_tree(self,
+                                                     class_decl: rawptr,
+                                                     method_name: string,
+                                                     want_static: bool,
+                                                     depth: i32) -> i32 {
+        if (class_decl == null || method_name.len == 0 || depth > 32) { return 0; }
+        var count: i32 = 0;
+        var member = decl_get_members(class_decl);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(decl_get_name(member), method_name)
+                && hir_builder_method_decl_matches_static_use(member, want_static)) {
+                count = count + 1;
+            }
+            member = decl_get_next(member);
+        }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { break; }
+            count = count + self.raw_method_overload_count_on_class_tree(parent_decl,
+                                                                       method_name,
+                                                                       want_static,
+                                                                       depth + 1);
+            parent_i = parent_i + 1;
+        }
+        return count;
+    }
+
+    fn raw_method_overload_count_for_type_text(self,
+                                                     type_text: string,
+                                                     method_name: string,
+                                                     want_static: bool) -> i32 {
+        if (type_text.len == 0 || method_name.len == 0) { return 0; }
+        // Appending the staticness suffix replaces and drops cache_key.
+        // Own its bytes so that this cannot invalidate the caller's name.
+        var cache_key = method_name.clone();
+        if (want_static) {
+            cache_key = cache_key + "|static=1";
+        } else {
+            cache_key = cache_key + "|static=0";
+        }
+        let cached = hir_pair_id_map_get(self.raw_method_overload_count_cache,type_text, cache_key);
+        if (cached != hir_id_invalid()) { return cached; }
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) {
+            self.raw_method_overload_count_cache = hir_pair_id_map_put(self.raw_method_overload_count_cache,type_text, cache_key, 0);
+            return 0;
+        }
+        let out = self.raw_method_overload_count_on_class_tree(cd, method_name, want_static, 0);
+        self.raw_method_overload_count_cache = hir_pair_id_map_put(self.raw_method_overload_count_cache,type_text, cache_key, out);
+        return out;
+    }
+
+    fn closed_method_target_for_type_text(self,
+                                                 owner_type_name: string,
+                                                 method_name: string,
+                                                 call_expr: rawptr,
+                                                 call_expr_id: i32,
+                                                 method_decl: rawptr,
+                                                 want_static: bool) -> i32 {
+        if (owner_type_name.len == 0
+            || method_name.len == 0
+            || self.type_text_has_open_template_atom(owner_type_name)) {
+            return hir_id_invalid();
+        }
+        if (method_decl == null
+            && call_expr_id == hir_id_invalid()
+            && call_expr == null
+            && self.owner_method_name_is_overloaded(owner_type_name, method_name)) {
+            return hir_id_invalid();
+        }
+        var selected_decl = method_decl;
+        if (!self.raw_method_decl_matches_closed_receiver(selected_decl,
+                                                          owner_type_name,
+                                                          method_name,
+                                                          want_static)) {
+            selected_decl = null;
+        }
+        // A shallow interface may describe both a trait requirement and an
+        // exact, non-generic implementation in another object. Bind the
+        // latter by its imported ABI identity after checking the complete
+        // signature with Self substituted. It has no body to instantiate.
+        if (!want_static && selected_decl != null
+            && self.raw_function_body_decl_for(selected_decl) == null) {
+            let imported_impl = self.imported_impl_method_for_requirement(selected_decl,
+                                                                          owner_type_name);
+            if (imported_impl != null) {
+                let imported_fn = hir_pointer_map_function(self.decl_map,imported_impl);
+                if (imported_fn != hir_id_invalid()
+                    && !self.function_has_open_template_types(imported_fn)) {
+                    return imported_fn;
+                }
+            }
+        }
+        // Sema deliberately keeps a trait requirement as the provenance of a
+        // generic call. Once the receiver is closed that declaration is only
+        // a signature, not a body source. Resolve the receiver's concrete impl
+        // before publishing an instance shell for the bodyless requirement.
+        if (selected_decl != null
+            && !want_static
+            && !hir_builder_decl_is_foreign_dci_native(selected_decl)
+            && self.raw_function_body_decl_for(selected_decl) == null) {
+            var concrete_impl = self.concrete_impl_method_decl_for_call(method_name,
+                                                                        owner_type_name,
+                                                                        call_expr,
+                                                                        call_expr_id);
+            if (concrete_impl == null && call_expr_id == hir_id_invalid()) {
+                concrete_impl = self.concrete_impl_method_decl(method_name,
+                                                                owner_type_name);
+            }
+            if (concrete_impl != null
+                && concrete_impl != selected_decl
+                && self.raw_method_decl_matches_closed_receiver(concrete_impl,
+                                                                 owner_type_name,
+                                                                 method_name,
+                                                                 false)) {
+                selected_decl = concrete_impl;
+            }
+        }
+        // Generic-bound member expressions initially carry the interface
+        // prototype selected by Sema. That prototype does not belong to the
+        // now-concrete receiver, so recover the implementation from the
+        // receiver class before instance creation. Otherwise a synthetic
+        // `Self` declaration is emitted for a bodyless requirement.
+        if (selected_decl == null && !want_static) {
+            let receiver_decl = self.raw_class_decl_for_type_text(owner_type_name);
+            let receiver_method = self.raw_method_decl_for_call_on_class_tree(
+                receiver_decl,
+                method_name,
+                false,
+                call_expr,
+                call_expr_id,
+                owner_type_name,
+                0);
+            if (receiver_method != null
+                && self.raw_method_decl_matches_closed_receiver(receiver_method,
+                                                                 owner_type_name,
+                                                                 method_name,
+                                                                 false)) {
+                selected_decl = receiver_method;
+            }
+        }
+        // A foreign DCI method keeps the ABI owner that declared it.  In
+        // particular, an inherited non-primary C++ base method must remain an
+        // `A` target when invoked through `RightDerived`: LLVM then adjusts
+        // the receiver to the A base subobject before issuing the native
+        // call.  Instantiating it as a synthetic RightDerived::method loses
+        // that owner and passes the complete-object address to the C++ ABI.
+        // Resolve a concrete foreign declaration before receiver-closure or
+        // instance creation; the latter is only valid for language bodies.
+        var direct_foreign_decl = selected_decl;
+        if (direct_foreign_decl == null && call_expr_id != hir_id_invalid()) {
+            let call_callee_expr_id = self.unit.expr_lhs(call_expr_id);
+            direct_foreign_decl = self.raw_method_decl_for_call_expr(call_expr,
+                                                                      call_expr_id,
+                                                                      call_callee_expr_id);
+        }
+        if (direct_foreign_decl == null
+            && !self.owner_method_name_is_overloaded(owner_type_name, method_name)) {
+            direct_foreign_decl = self.raw_method_decl_for_type_text(owner_type_name,
+                                                                      method_name);
+        }
+        if (direct_foreign_decl != null
+            && hir_builder_decl_is_foreign_dci_native(direct_foreign_decl)) {
+            let direct_foreign_fn = hir_pointer_map_function(self.decl_map,direct_foreign_decl);
+            if (direct_foreign_fn != hir_id_invalid()
+                && self.function_candidate_matches_method_name(direct_foreign_fn, method_name)
+                && !self.function_has_open_template_types(direct_foreign_fn)) {
+                return direct_foreign_fn;
+            }
+        }
+        var out_fn = hir_id_invalid();
+        if (call_expr_id != hir_id_invalid() || selected_decl != null) {
+            out_fn = self.ensure_method_instance_for_call(owner_type_name,
+                                                          method_name,
+                                                          call_expr,
+                                                          call_expr_id,
+                                                          selected_decl,
+                                                          want_static);
+        }
+        if (out_fn == hir_id_invalid() && call_expr_id != hir_id_invalid()) {
+            var template_decl = self.raw_template_method_decl_for_call_type_text(owner_type_name,
+                                                                                 method_name,
+                                                                                 want_static,
+                                                                                 call_expr,
+                                                                                 call_expr_id);
+            if (template_decl == null) {
+                template_decl = self.raw_template_method_decl_for_type_text(owner_type_name,
+                                                                            method_name,
+                                                                            want_static);
+            }
+            if (template_decl != null && template_decl != selected_decl) {
+                out_fn = self.ensure_method_instance_for_call(owner_type_name,
+                                                              method_name,
+                                                              call_expr,
+                                                              call_expr_id,
+                                                              template_decl,
+                                                              want_static);
+            }
+        }
+        if (out_fn == hir_id_invalid()) {
+            if (want_static) {
+                out_fn = self.ensure_static_method_instance_for_type_text(owner_type_name, method_name);
+            } else {
+                out_fn = self.ensure_method_instance_for_type_text(owner_type_name, method_name);
+            }
+        }
+        if (out_fn == hir_id_invalid()) {
+            out_fn = self.method_function_target_by_owner_type_and_method(owner_type_name, method_name);
+        }
+        if (out_fn != hir_id_invalid() && !want_static) {
+            let callee_expr_id = if (call_expr_id != hir_id_invalid()) {
+                self.unit.expr_lhs(call_expr_id)
+            } else {
+                hir_id_invalid()
+            };
+            // A version family can register several ABI-identical direct
+            // methods under the same canonical owner name.  The owner/name
+            // scan below is intentionally unordered and therefore must not
+            // replace Sema's authoritative version/overload declaration with
+            // the first historical function it encounters.  Preserve an
+            // already closed, call-compatible semantic declaration; only use
+            // the direct receiver scan to replace synthetic/open instances.
+            let selected_direct_fn = hir_pointer_map_function(self.decl_map,
+                                                               selected_decl);
+            let selected_direct_matches = selected_direct_fn != hir_id_invalid()
+                && !self.function_has_open_template_types(selected_direct_fn)
+                && self.function_candidate_matches_method_name(selected_direct_fn,
+                                                                 method_name)
+                && (call_expr_id == hir_id_invalid()
+                    || self.hir_function_arg_score_for_call(call_expr_id,
+                                                             callee_expr_id,
+                                                             selected_direct_fn) >= 0);
+            // An inherited language body that invokes another member through
+            // `self` must be closed for the concrete receiver.  Replacing
+            // that closed A2::greet instance with A1::greet here freezes all
+            // nested `self.kind()` dispatches at the base implementation.
+            // Foreign methods returned above retain their ABI owner; this
+            // rule is solely for Vyx method bodies.
+            var selected_direct_reusable = true;
+            if (selected_decl != null
+                && !hir_builder_decl_is_foreign_dci_native(selected_decl)) {
+                let selected_owner = hir_raw_owner_map_get(self.decl_owner_map,
+                                                            selected_decl);
+                let receiver_owner = self.raw_class_decl_for_type_text(owner_type_name);
+                if (selected_owner != null
+                    && receiver_owner != null
+                    && receiver_owner != selected_owner
+                    && self.class_decl_is_or_inherits(receiver_owner,
+                                                       selected_owner,
+                                                       0)) {
+                    let selected_body = self.method_body_decl_for_instance(selected_decl);
+                    if (self.decl_body_has_self_member_call_cached(selected_body)) {
+                        selected_direct_reusable = false;
+                    }
+                }
+            }
+            if (selected_direct_matches && selected_direct_reusable) {
+                out_fn = selected_direct_fn;
+            } else if (!selected_direct_matches) {
+                let direct_fn = self.direct_method_function_for_closed_receiver(
+                    owner_type_name,
+                    method_name,
+                    call_expr_id,
+                    callee_expr_id);
+                if (direct_fn != hir_id_invalid()) { out_fn = direct_fn; }
+            }
+        }        if (out_fn == hir_id_invalid() || self.function_has_open_template_types(out_fn)) {
+            return hir_id_invalid();
+        }
+        if (!self.function_candidate_matches_method_name(out_fn, method_name)) {
+            return hir_id_invalid();
+        }
+        // Owner/name instance indexes intentionally erase overload shape.  A
+        // selected declaration is therefore not allowed to degrade to a
+        // cached sibling merely because both methods share the same owner and
+        // name.  Validate the emitted target against the actual call before
+        // returning it, then retain the compatible semantic declaration when
+        // the cache supplied an incompatible overload.
+        if (call_expr_id != hir_id_invalid()) {
+            let callee_expr_id = self.unit.expr_lhs(call_expr_id);
+            let out_score = self.hir_function_arg_score_for_call(call_expr_id,
+                                                                  callee_expr_id,
+                                                                  out_fn);
+            if (out_score < 0) {
+                let selected_fn = hir_pointer_map_function(self.decl_map,
+                                                            selected_decl);
+                if (selected_fn != hir_id_invalid()
+                    && !self.function_has_open_template_types(selected_fn)
+                    && self.function_candidate_matches_method_name(selected_fn,
+                                                                     method_name)
+                    && self.hir_function_arg_score_for_call(call_expr_id,
+                                                             callee_expr_id,
+                                                             selected_fn) >= 0) {
+                    self.ensure_reachable_function_body_by_id(selected_fn);
+                    return selected_fn;
+                }
+                return hir_id_invalid();
+            }
+        }
+        self.ensure_reachable_function_body_by_id(out_fn);
+        return out_fn;
+    }
+
+    fn raw_member_decl_on_class_tree(self,
+                                            class_decl: rawptr,
+                                            member_name: string,
+                                            depth: i32) -> rawptr {
+        if (class_decl == null || member_name.len == 0 || depth > 32) { return null; }
+        var member = decl_get_members(class_decl);
+        while (member != null) {
+            if (decl_get_name(member) == member_name) { return member; }
+            member = decl_get_next(member);
+        }
+        // Exact current names win.  Only after that, resolve an old spelling
+        // to the current migrated field declaration so HIR receives the
+        // canonical field type/index rather than the historical declaration.
+        member = decl_get_members(class_decl);
+        while (member != null) {
+            if (decl_get_kind(member) == de_FIELD()
+                && hir_builder_field_migrate_from_field(member) == member_name) {
+                return member;
+            }
+            member = decl_get_next(member);
+        }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { return null; }
+            let found = self.raw_member_decl_on_class_tree(parent_decl, member_name, depth + 1);
+            if (found != null) { return found; }
+            parent_i = parent_i + 1;
+        }
+        return null;
+    }
+
+    fn raw_member_decl_for_type_text(self, type_text: string, member_name: string) -> rawptr {
+        if (type_text.len == 0 || member_name.len == 0) { return null; }
+        let cached = hir_pair_raw_map_get(self.member_decl_cache,type_text, member_name);
+        if (cached != null) { return cached; }
+        if (hir_pair_id_map_get(self.member_decl_miss_cache,type_text, member_name) != hir_id_invalid()) { return null; }
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) {
+            return null;
+        }
+        let out = self.raw_member_decl_on_class_tree(cd, member_name, 0);
+        if (out != null) {
+            self.member_decl_cache = hir_pair_raw_map_put(self.member_decl_cache,type_text, member_name, out);
+        } else {
+            self.member_decl_miss_cache = hir_pair_id_map_put(self.member_decl_miss_cache,type_text, member_name, 1);
+        }
+        return out;
+    }
+}

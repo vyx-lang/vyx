@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 PIPE="$ROOT/bootstrap_compiler/src/codegen/lower_pipeline.vyx"
-MAIN="$ROOT/bootstrap_compiler/src/core/main.vyx"
+MAIN="$ROOT/bootstrap_compiler/src/core/driver/main.vyx"
 BOOT="$ROOT/bootstrap_compiler/out/boot"
 fail=0
 

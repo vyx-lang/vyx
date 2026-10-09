@@ -1,0 +1,449 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn lower_match_stmt(self, stmt_id: i32) {
+        let subject_expr = self.h.stmt_expr(stmt_id);
+        let raw_subject_value = self.lower_expr(subject_expr);
+        var subject_value = raw_subject_value;
+        let subject_drop_outer_mark = self.drop_stack_head;
+        var owned_subject_hir_local = hir_id_invalid();
+        if (raw_subject_value != mir_id_invalid()) {
+            // Every case dispatch must observe the value captured when the
+            // match was entered.  Re-lowering a call (or reloading a local
+            // mutated by a guard) changes match semantics.
+            let subject_type = self.unit.value_type(raw_subject_value);
+            let subject_category = hir_unit_expr_value_category(self.h, subject_expr);
+            let subject_move_flags = hir_unit_expr_move_drop_flags(self.h, subject_expr);
+            let subject_drop_fn = hir_unit_expr_drop_function(self.h, subject_expr);
+            let subject_is_owned = subject_category == hir_value_cat_value()
+                && (subject_move_flags & hir_move_drop_flag_borrow_arg()) == 0
+                && (subject_drop_fn != hir_id_invalid()
+                    || self.hir_type_text_is_dci_stub_class(self.type_text(subject_type)));
+            var subject_place = mir_id_invalid();
+            if (subject_is_owned) {
+                subject_place = self.add_owned_temp_place(subject_type,
+                                                          subject_expr,
+                                                          "match_subject",
+                                                          subject_drop_fn);
+                owned_subject_hir_local = self.hir_local_for_place(subject_place);
+            } else {
+                subject_place = self.add_temp_place(subject_type,
+                                                    subject_expr,
+                                                    "match_subject");
+            }
+            self.emit_assign(subject_place, raw_subject_value, stmt_id, subject_expr);
+            subject_value = self.add_read_value(subject_place, subject_expr);
+        }
+        var dispatch_block = self.current_block_id;
+        let exit_block = self.add_block(hir_id_invalid());
+        let match_drop_mark = self.drop_stack_head;
+        let match_defer_mark = self.defer_stack_head;
+        let match_storage_mark = self.storage_stack_head;
+        let match_drop_state = self.drop_stack_snapshot();
+        var lowering_default_arms = false;
+        // Reaching arms, collected as {body_block, end_state, next} nodes:
+        // their goto to the exit block is deferred until every arm's move
+        // facts are known, so the compensation pass can still append drops.
+        var reached_arms: rawptr = null;
+        var arm = self.h.stmt_child(stmt_id);
+        while (arm != hir_id_invalid() || !lowering_default_arms) {
+            if (arm == hir_id_invalid()) {
+                lowering_default_arms = true;
+                arm = self.h.stmt_child(stmt_id);
+            }
+            if (arm == hir_id_invalid()) { break; }
+            let next_arm = self.h.stmt_next(arm);
+            let pattern_expr = self.h.stmt_expr(arm);
+            let pattern_is_default = pattern_expr != hir_id_invalid()
+                && self.h.expr_kind(pattern_expr) == ex_NULL_LIT()
+                && self.h.expr_name(pattern_expr) == "__match_default";
+            if (pattern_is_default != lowering_default_arms) {
+                arm = next_arm;
+                continue;
+            }
+            let next_dispatch = self.add_block(next_arm);
+            let arm_block = self.add_block(arm);
+            let body_block = self.add_block(self.h.stmt_child(arm));
+
+            self.set_current_block(dispatch_block);
+            self.drop_stack_head = match_drop_mark;
+            self.defer_stack_head = match_defer_mark;
+            self.storage_stack_head = match_storage_mark;
+            let pat_value = self.lower_expr(pattern_expr);
+            // Pattern lowering can expand short-circuit expressions into CFG.
+            // The case belongs to, and must terminate, the resulting join block.
+            let case_owner_block = self.current_block_id;
+            let case_id = self.unit.add_case(
+                                            case_owner_block,
+                                            pat_value,
+                                            mir_id_invalid(),
+                                            arm_block,
+                                            arm,
+                                            self.h.stmt_name(arm));
+            self.terminate_current(mir_term_match(),
+                                   subject_value,
+                                   mir_id_invalid(),
+                                   next_dispatch,
+                                   case_id,
+                                   stmt_id);
+
+            self.set_current_block(arm_block);
+            self.drop_stack_head = match_drop_mark;
+            self.defer_stack_head = match_defer_mark;
+            self.storage_stack_head = match_storage_mark;
+            self.unit.add_instr(
+                               self.current_function_id,
+                               self.current_block_id,
+                               mir_instr_match_arm(),
+                               self.h.stmt_type(arm),
+                               mir_id_invalid(),
+                               pat_value,
+                               mir_id_invalid(),
+                               subject_value,
+                               mir_target_none(),
+                               mir_id_invalid(),
+                               arm,
+                               self.h.stmt_expr(arm),
+                               0,
+                               0,
+                               self.h.stmt_name(arm));
+
+            let guard_expr = self.h.stmt_cond(arm);
+            var guard_value = mir_id_invalid();
+            if (guard_expr != hir_id_invalid()) {
+                guard_value = self.lower_expr(guard_expr);
+            }
+            if (!self.current_block_terminated()) {
+                if (guard_value != mir_id_invalid()) {
+                    self.terminate_current(mir_term_branch(),
+                                           guard_value,
+                                           body_block,
+                                           next_dispatch,
+                                           mir_id_invalid(),
+                                           arm);
+                } else {
+                    self.terminate_current_goto(body_block);
+                }
+            }
+
+            self.set_current_block(body_block);
+            self.drop_stack_head = match_drop_mark;
+            self.defer_stack_head = match_defer_mark;
+            self.storage_stack_head = match_storage_mark;
+            self.lower_stmt(self.h.stmt_child(arm));
+            if (!self.current_block_terminated()) {
+                self.emit_scope_exit_until(match_defer_mark,
+                                           match_drop_mark,
+                                           match_storage_mark,
+                                           arm);
+                let arm_node = mir_profile_malloc(24);
+                if (arm_node != null) {
+                    memset(arm_node, 0, 24);
+                    // Nested control flow may have moved the continuation off
+                    // the body's entry block; record where the arm ends.
+                    ast_write_i32(arm_node, self.current_block_id);
+                    ast_write_rawptr(ptr_offset(arm_node, 8), self.drop_stack_snapshot());
+                    ast_write_rawptr(ptr_offset(arm_node, 16), reached_arms);
+                    reached_arms = arm_node;
+                }
+            }
+            self.drop_stack_restore_activity(match_drop_state);
+            dispatch_block = next_dispatch;
+            arm = next_arm;
+        }
+
+        // Compensation pass: every reaching arm is still an open block here,
+        // so each one can drop the locals a sibling arm moved away before any
+        // of them hands control to the exit block.
+        var arm_iter = reached_arms;
+        while (arm_iter != null) {
+            let arm_body_block = ast_read_i32(arm_iter);
+            self.set_current_block(arm_body_block);
+            self.drop_stack_restore_activity(ast_read_rawptr(ptr_offset(arm_iter, 8)));
+            var sib = reached_arms;
+            while (sib != null) {
+                if (ast_read_i32(sib) != arm_body_block) {
+                    self.emit_branch_compensation_drops(ast_read_rawptr(ptr_offset(sib, 8)), stmt_id);
+                }
+                sib = ast_read_rawptr(ptr_offset(sib, 16));
+            }
+            ast_write_rawptr(ptr_offset(arm_iter, 8), self.drop_stack_snapshot());
+            self.terminate_current_goto(exit_block);
+            arm_iter = ast_read_rawptr(ptr_offset(arm_iter, 16));
+        }
+
+        // Falling through every case is the explicit non-exhaustive path.
+        // Backends lower an empty match with no fallback to unreachable/panic.
+        self.set_current_block(dispatch_block);
+        self.drop_stack_head = match_drop_mark;
+        self.defer_stack_head = match_defer_mark;
+        self.storage_stack_head = match_storage_mark;
+        self.terminate_current(mir_term_match(),
+                               subject_value,
+                               mir_id_invalid(),
+                               mir_id_invalid(),
+                               mir_id_invalid(),
+                               stmt_id);
+        self.set_current_block(exit_block);
+        self.drop_stack_head = match_drop_mark;
+        self.defer_stack_head = match_defer_mark;
+        self.storage_stack_head = match_storage_mark;
+        // Exit activity = AND over the reaching arms' post-compensation
+        // states: a local moved in any arm was already dropped by every arm
+        // that still owned it, so it must stay inactive here.
+        var exit_cur = self.drop_stack_head;
+        while (exit_cur != null) {
+            let exit_local_id = ast_read_i32(exit_cur);
+            var exit_merged = true;
+            var exit_iter = reached_arms;
+            while (exit_iter != null) {
+                exit_merged = exit_merged
+                    && self.drop_stack_snapshot_active(ast_read_rawptr(ptr_offset(exit_iter, 8)),
+                                                       exit_local_id);
+                exit_iter = ast_read_rawptr(ptr_offset(exit_iter, 16));
+            }
+            self.drop_stack_set_active(exit_local_id, exit_merged);
+            exit_cur = ast_read_rawptr(ptr_offset(exit_cur, 8));
+        }
+        if (owned_subject_hir_local != hir_id_invalid()) {
+            self.emit_drop_for_hir_local(owned_subject_hir_local,
+                                         stmt_id,
+                                         subject_expr,
+                                         true);
+            self.drop_stack_head = subject_drop_outer_mark;
+        }
+    }
+
+    public fn lower_match_expr(self, expr_id: i32) -> i32 {
+        let result_place = self.add_temp_place_with_flags(self.h.expr_type(expr_id),
+                                                           expr_id,
+                                                           "match_expr",
+                                                           mir_local_flag_if_expr_result());
+        let subject_expr = self.h.expr_lhs(expr_id);
+        let raw_subject_value = self.lower_expr(subject_expr);
+        var subject_value = raw_subject_value;
+        let subject_drop_outer_mark = self.drop_stack_head;
+        var owned_subject_hir_local = hir_id_invalid();
+        if (raw_subject_value != mir_id_invalid()) {
+            // Every case dispatch must observe the value captured when the
+            // match was entered.  Re-lowering a call (or reloading a local
+            // mutated by a guard) changes match semantics.
+            let subject_type = self.unit.value_type(raw_subject_value);
+            let subject_category = hir_unit_expr_value_category(self.h, subject_expr);
+            let subject_move_flags = hir_unit_expr_move_drop_flags(self.h, subject_expr);
+            let subject_drop_fn = hir_unit_expr_drop_function(self.h, subject_expr);
+            let subject_is_owned = subject_category == hir_value_cat_value()
+                && (subject_move_flags & hir_move_drop_flag_borrow_arg()) == 0
+                && (subject_drop_fn != hir_id_invalid()
+                    || self.hir_type_text_is_dci_stub_class(self.type_text(subject_type)));
+            var subject_place = mir_id_invalid();
+            if (subject_is_owned) {
+                subject_place = self.add_owned_temp_place(subject_type,
+                                                          subject_expr,
+                                                          "match_subject",
+                                                          subject_drop_fn);
+                owned_subject_hir_local = self.hir_local_for_place(subject_place);
+            } else {
+                subject_place = self.add_temp_place(subject_type,
+                                                    subject_expr,
+                                                    "match_subject");
+            }
+            self.emit_assign(subject_place, raw_subject_value, expr_id, subject_expr);
+            subject_value = self.add_read_value(subject_place, subject_expr);
+        }
+        var dispatch_block = self.current_block_id;
+        let exit_block = self.add_block(hir_id_invalid());
+        let match_drop_mark = self.drop_stack_head;
+        let match_defer_mark = self.defer_stack_head;
+        let match_storage_mark = self.storage_stack_head;
+        let match_drop_state = self.drop_stack_snapshot();
+        var lowering_default_arms = false;
+        // Reaching arms, collected as {body_block, end_state, next} nodes:
+        // their goto to the exit block is deferred until every arm's move
+        // facts are known, so the compensation pass can still append drops.
+        var reached_arms: rawptr = null;
+        var arm = self.h.expr_stmt_rhs(expr_id);
+        while (arm != hir_id_invalid() || !lowering_default_arms) {
+            if (arm == hir_id_invalid()) {
+                lowering_default_arms = true;
+                arm = self.h.expr_stmt_rhs(expr_id);
+            }
+            if (arm == hir_id_invalid()) { break; }
+            let next_arm = self.h.stmt_next(arm);
+            let pattern_expr = self.h.stmt_expr(arm);
+            let pattern_is_default = pattern_expr != hir_id_invalid()
+                && self.h.expr_kind(pattern_expr) == ex_NULL_LIT()
+                && self.h.expr_name(pattern_expr) == "__match_default";
+            if (pattern_is_default != lowering_default_arms) {
+                arm = next_arm;
+                continue;
+            }
+            let next_dispatch = self.add_block(next_arm);
+            let arm_block = self.add_block(arm);
+            let body_block = self.add_block(self.h.stmt_child(arm));
+
+            self.set_current_block(dispatch_block);
+            self.drop_stack_head = match_drop_mark;
+            self.defer_stack_head = match_defer_mark;
+            self.storage_stack_head = match_storage_mark;
+            let pat_value = self.lower_expr(pattern_expr);
+            // Pattern lowering can expand short-circuit expressions into CFG.
+            // The case belongs to, and must terminate, the resulting join block.
+            let case_owner_block = self.current_block_id;
+            let case_id = self.unit.add_case(
+                                            case_owner_block,
+                                            pat_value,
+                                            mir_id_invalid(),
+                                            arm_block,
+                                            arm,
+                                            self.h.stmt_name(arm));
+            self.terminate_current(mir_term_match(),
+                                   subject_value,
+                                   mir_id_invalid(),
+                                   next_dispatch,
+                                   case_id,
+                                   expr_id);
+
+            self.set_current_block(arm_block);
+            self.drop_stack_head = match_drop_mark;
+            self.defer_stack_head = match_defer_mark;
+            self.storage_stack_head = match_storage_mark;
+            self.unit.add_instr(
+                               self.current_function_id,
+                               self.current_block_id,
+                               mir_instr_match_arm(),
+                               self.h.stmt_type(arm),
+                               mir_id_invalid(),
+                               pat_value,
+                               mir_id_invalid(),
+                               subject_value,
+                               mir_target_none(),
+                               mir_id_invalid(),
+                               arm,
+                               self.h.stmt_expr(arm),
+                               0,
+                               0,
+                               self.h.stmt_name(arm));
+
+            let guard_expr = self.h.stmt_cond(arm);
+            var guard_value = mir_id_invalid();
+            if (guard_expr != hir_id_invalid()) {
+                guard_value = self.lower_expr(guard_expr);
+            }
+            if (!self.current_block_terminated()) {
+                if (guard_value != mir_id_invalid()) {
+                    self.terminate_current(mir_term_branch(),
+                                           guard_value,
+                                           body_block,
+                                           next_dispatch,
+                                           mir_id_invalid(),
+                                           arm);
+                } else {
+                    self.terminate_current_goto(body_block);
+                }
+            }
+
+            self.set_current_block(body_block);
+            self.drop_stack_head = match_drop_mark;
+            self.defer_stack_head = match_defer_mark;
+            self.storage_stack_head = match_storage_mark;
+            self.lower_stmt_into_place(self.h.stmt_child(arm), result_place, expr_id);
+            if (!self.current_block_terminated()) {
+                self.emit_scope_exit_until(match_defer_mark,
+                                           match_drop_mark,
+                                           match_storage_mark,
+                                           arm);
+                let arm_node = mir_profile_malloc(24);
+                if (arm_node != null) {
+                    memset(arm_node, 0, 24);
+                    // Nested control flow may have moved the continuation off
+                    // the body's entry block; record where the arm ends.
+                    ast_write_i32(arm_node, self.current_block_id);
+                    ast_write_rawptr(ptr_offset(arm_node, 8), self.drop_stack_snapshot());
+                    ast_write_rawptr(ptr_offset(arm_node, 16), reached_arms);
+                    reached_arms = arm_node;
+                }
+            }
+            self.drop_stack_restore_activity(match_drop_state);
+            dispatch_block = next_dispatch;
+            arm = next_arm;
+        }
+
+        // Compensation pass: every reaching arm is still an open block here,
+        // so each one can drop the locals a sibling arm moved away before any
+        // of them hands control to the exit block.
+        var arm_iter = reached_arms;
+        while (arm_iter != null) {
+            let arm_body_block = ast_read_i32(arm_iter);
+            self.set_current_block(arm_body_block);
+            self.drop_stack_restore_activity(ast_read_rawptr(ptr_offset(arm_iter, 8)));
+            var sib = reached_arms;
+            while (sib != null) {
+                if (ast_read_i32(sib) != arm_body_block) {
+                    self.emit_branch_compensation_drops(ast_read_rawptr(ptr_offset(sib, 8)), expr_id);
+                }
+                sib = ast_read_rawptr(ptr_offset(sib, 16));
+            }
+            ast_write_rawptr(ptr_offset(arm_iter, 8), self.drop_stack_snapshot());
+            self.terminate_current_goto(exit_block);
+            arm_iter = ast_read_rawptr(ptr_offset(arm_iter, 16));
+        }
+
+        // Falling through every case is the explicit non-exhaustive path.
+        // Backends lower an empty match with no fallback to unreachable/panic.
+        self.set_current_block(dispatch_block);
+        self.drop_stack_head = match_drop_mark;
+        self.defer_stack_head = match_defer_mark;
+        self.storage_stack_head = match_storage_mark;
+        self.terminate_current(mir_term_match(),
+                               subject_value,
+                               mir_id_invalid(),
+                               mir_id_invalid(),
+                               mir_id_invalid(),
+                               expr_id);
+        self.set_current_block(exit_block);
+        self.drop_stack_head = match_drop_mark;
+        self.defer_stack_head = match_defer_mark;
+        self.storage_stack_head = match_storage_mark;
+        // Exit activity = AND over the reaching arms' post-compensation
+        // states: a local moved in any arm was already dropped by every arm
+        // that still owned it, so it must stay inactive here.
+        var exit_cur = self.drop_stack_head;
+        while (exit_cur != null) {
+            let exit_local_id = ast_read_i32(exit_cur);
+            var exit_merged = true;
+            var exit_iter = reached_arms;
+            while (exit_iter != null) {
+                exit_merged = exit_merged
+                    && self.drop_stack_snapshot_active(ast_read_rawptr(ptr_offset(exit_iter, 8)),
+                                                       exit_local_id);
+                exit_iter = ast_read_rawptr(ptr_offset(exit_iter, 16));
+            }
+            self.drop_stack_set_active(exit_local_id, exit_merged);
+            exit_cur = ast_read_rawptr(ptr_offset(exit_cur, 8));
+        }
+        if (owned_subject_hir_local != hir_id_invalid()) {
+            self.emit_drop_for_hir_local(owned_subject_hir_local,
+                                         expr_id,
+                                         subject_expr,
+                                         true);
+            self.drop_stack_head = subject_drop_outer_mark;
+        }
+        return self.add_read_value(result_place, expr_id);
+    }
+}

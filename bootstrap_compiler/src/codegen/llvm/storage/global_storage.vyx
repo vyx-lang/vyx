@@ -1,0 +1,232 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn global_name_for_hir_item(self, item_id: i32, source_name: string, type_id: i32) -> string {
+        // HIR item ids are compilation-local.  Imported units can assign a
+        // different id to the same global when the consumer has declarations
+        // before the import, so the id must never enter the linker identity.
+        // The declaring module and source name are stable across producer and
+        // consumer artifacts; keep the old module fallback for synthetic MIR
+        // units that have no module declaration.
+        var module_name = self.m.static_module_name(item_id);
+        if (module_name.len == 0) { module_name = self.module_symbol_name; }
+        let storage_name = self.m.static_name(item_id);
+        var name = "mir.global." + policy_mangle_part(module_name);
+        if (storage_name.len > 0) { name = name + "." + policy_mangle_part(storage_name); }
+        // A global is unique within its declaring module, so a local type id
+        // must not enter the linker identity.  Type aliases and qualification
+        // spellings can differ between a producer and consumer while the
+        // declaration still denotes the same storage.
+        return name;
+    }
+
+    public fn const_int_for_static_type(self, item_id: i32, type_id: i32, value: i64, sign_extend: i32) -> rawptr {
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        let bits = llvm_mir_int_bits_for_kind(kind);
+        if (bits <= 0) {
+            self.report_error("static item #" + policy_i64_to_string(item_id as i64)
+                      + " has integer initializer for non-integer type "
+                      + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        return vyx_rt_const_int(self.mod, self.int_type_for_bits(bits), value, sign_extend);
+    }
+
+    public fn const_str_static_value(self, item_id: i32, text: string) -> rawptr {
+        let st = self.get_string_ty();
+        let ptr = self.emit_str_ptr(text);
+        if (st == null || ptr == null) {
+            self.report_error("cannot build string static initializer for item #"
+                      + policy_i64_to_string(item_id as i64));
+            return null;
+        }
+        let vals = malloc(32);
+        if (vals == null) {
+            self.report_error("cannot allocate string static initializer fields for item #"
+                      + policy_i64_to_string(item_id as i64));
+            return null;
+        }
+        ast_write_rawptr(vals, ptr);
+        ast_write_rawptr(ptr_offset(vals, 8),
+                         vyx_rt_const_int(self.mod, self.ty_i64, text.len, 0));
+        ast_write_rawptr(ptr_offset(vals, 16),
+                         vyx_rt_const_int(self.mod, self.ty_i64, 0, 0));
+        ast_write_rawptr(ptr_offset(vals, 24),
+                         vyx_rt_const_int(self.mod, self.ty_i64, 0, 0));
+        let out = vyx_rt_const_named_struct(self.mod, st, vals, 4);
+        free(vals);
+        if (out == null) {
+            self.report_error("cannot build string static initializer for item #"
+                      + policy_i64_to_string(item_id as i64));
+        }
+        return out;
+    }
+
+    public fn const_null_for_static_type(self, item_id: i32, type_id: i32) -> rawptr {
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (llvm_mir_kind_pointer_handle(kind)) {
+            return self.pointer_handle_null();
+        }
+        if (llvm_mir_kind_pointer_like(kind)) {
+            return vyx_rt_const_ptr_null(self.mod, self.ty_ptr);
+        }
+        if (self.type_is_class_pointer_abi(type_id)) {
+            return vyx_rt_const_ptr_null(self.mod, self.ty_ptr);
+        }
+        let ll_ty = self.lower_type(type_id);
+        if (ll_ty == null) {
+            self.report_error("cannot build null static initializer for item #"
+                      + policy_i64_to_string(item_id as i64)
+                      + " type " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        return vyx_rt_const_null(self.mod, ll_ty);
+    }
+
+    public fn const_for_static_item(self, item_id: i32, type_id: i32, depth: i32) -> rawptr {
+        if (item_id == mir_id_invalid()) {
+            self.report_error("static initializer references empty item id");
+            return null;
+        }
+        if (depth > self.m.static_count + 1) {
+            self.report_error("cyclic static initializer around item #"
+                      + policy_i64_to_string(item_id as i64));
+            return null;
+        }
+        if (!self.m.static_exists(item_id)) {
+            self.report_error("missing MIR static record for item #"
+                      + policy_i64_to_string(item_id as i64));
+            return null;
+        }
+        let init_kind = self.m.static_init_kind(item_id);
+        if (init_kind == mir_static_init_none()
+            && (self.m.static_flags(item_id) & mir_static_flag_external()) != 0) {
+            self.report_error("interface static " + self.m.static_module_name(item_id)
+                      + "." + self.m.static_name(item_id)
+                      + " has no initializer available for constant evaluation");
+            return null;
+        }
+        if (init_kind == mir_static_init_int()) {
+            let sign_extend = 1;
+            return self.const_int_for_static_type(item_id,
+                                                  type_id,
+                                                  self.m.static_init_int(item_id),
+                                                  sign_extend);
+        }
+        if (init_kind == mir_static_init_bool()) {
+            var v: i64 = 0;
+            if (self.m.static_init_int(item_id) != 0) { v = 1; }
+            return self.const_int_for_static_type(item_id, type_id, v, 0);
+        }
+        if (init_kind == mir_static_init_char()) {
+            return self.const_int_for_static_type(item_id,
+                                                  type_id,
+                                                  self.m.static_init_int(item_id),
+                                                  0);
+        }
+        if (init_kind == mir_static_init_str()) {
+            if (!self.type_is_str_abi(type_id)) {
+                self.report_error("static item #" + policy_i64_to_string(item_id as i64)
+                          + " has string initializer for non-str type "
+                          + llvm_mir_type_text(&self.m, type_id));
+                return null;
+            }
+            return self.const_str_static_value(item_id, self.m.static_init_text(item_id));
+        }
+        if (init_kind == mir_static_init_null()) {
+            return self.const_null_for_static_type(item_id, type_id);
+        }
+        if (init_kind == mir_static_init_item_ref()) {
+            let ref_id = self.m.static_init_target_id(item_id);
+            if (self.m.static_init_target_kind(item_id) != mir_target_hir_item()
+                || ref_id == mir_id_invalid()) {
+                self.report_error("static item #" + policy_i64_to_string(item_id as i64)
+                          + " has invalid item-ref initializer");
+                return null;
+            }
+            return self.const_for_static_item(ref_id, type_id, depth + 1);
+        }
+        self.report_error("static item #" + policy_i64_to_string(item_id as i64)
+                  + " has unsupported initializer kind "
+                  + policy_i64_to_string(init_kind as i64));
+        return null;
+    }
+
+    public fn get_or_create_hir_item_global(self, item_id: i32, type_id: i32, source_name: string) -> rawptr {
+        if (item_id == mir_id_invalid()) { return null; }
+        let cached = llvm_mir_map_get(self.hir_item_globals, item_id);
+        if (cached != null) { return cached; }
+        if (!self.m.static_exists(item_id)) {
+            self.report_error("missing MIR storage ownership for global " + source_name);
+            return null;
+        }
+        let ll_ty = self.lower_type(type_id);
+        if (ll_ty == null) {
+            self.report_error("cannot resolve global item type for " + source_name);
+            return null;
+        }
+        let global_name = self.global_name_for_hir_item(item_id, source_name, type_id);
+        let gv = vyx_rt_add_global(self.mod, ll_ty, global_name.c_str(), global_name.len as u64);
+        if (gv == null) {
+            self.report_error("cannot declare global item " + global_name);
+            return null;
+        }
+        // Interface declarations refer to the producing object's storage.
+        // Later CGUs likewise refer to the definition emitted by an earlier
+        // unit. Neither path may acquire an initializer or internal linkage.
+        if ((self.m.static_flags(item_id) & mir_static_flag_external()) != 0
+            || (self.cgu_emit_index > 1
+                && llvm_mir_i32_map_get(self.cgu_static_defined_map, item_id) == 2)) {
+            llvm_mir_map_put(self.hir_item_globals, item_id, gv);
+            return gv;
+        }
+        let init = self.const_for_static_item(item_id, type_id, 0);
+        if (init == null) {
+            self.report_error("cannot initialize global item " + global_name);
+            return null;
+        }
+        vyx_rt_set_initializer(self.mod, gv, init);
+        if (self.partition_codegen_roots
+            || (self.m.static_flags(item_id) & mir_static_flag_odr()) != 0) {
+            // Separate root partitions compile the same producer declarations.
+            // Coalesce their definitions into one storage location; internal
+            // linkage would give each partition its own mutable copy. Weak ODR
+            // also retains exported storage with no local references. Verified
+            // template constants and closed associated storage use the same
+            // coalescing rule across independent consumers.
+            vyx_rt_set_linkage(self.mod, gv, 4);
+        }
+        if (self.cgu_emit_index > 0) {
+            llvm_mir_i32_map_put(self.cgu_static_defined_map, item_id, 2);
+        }
+        if (self.m.static_exists(item_id)
+            && self.m.static_item_kind(item_id) == hir_item_const()) {
+            vyx_rt_set_global_constant(self.mod, gv, 1);
+        }
+        llvm_mir_map_put(self.hir_item_globals, item_id, gv);
+        return gv;
+    }
+
+    public fn emit_static_storage_roots(self) {
+        var item_id: i32 = 1;
+        while (item_id <= self.m.static_count) {
+            if (self.m.static_exists(item_id)) {
+                let flags = self.m.static_flags(item_id);
+                if ((flags & mir_static_flag_exported()) != 0
+                    && (flags & mir_static_flag_external()) == 0) {
+                    self.get_or_create_hir_item_global(item_id,
+                                                      self.m.static_type(item_id),
+                                                      self.m.static_name(item_id));
+                }
+            }
+            item_id = item_id + 1;
+        }
+    }
+
+    /// True when the place ultimately names an MIR local declared `volatile`.
+    /// Volatility propagates through field/index projections (C semantics:
+    /// accessing any part of a volatile-qualified aggregate is a volatile
+    /// access).  Deref projections keep their non-volatile access semantics —
+    /// `volatile` on a pointer local qualifies the pointer, not the pointee.
+}

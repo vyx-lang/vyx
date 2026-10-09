@@ -1,0 +1,215 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Record layout for the HIR builder. See README.md.
+
+fn hir_builder_parse_positive_i64(s: string) -> i64 {
+    var n: i64 = 0;
+    var i: i32 = 0;
+    var any: bool = false;
+    while (i < s.len) {
+        let c = s.charAt(i);
+        if (c >= 48 && c <= 57) {
+            n = n * 10 + ((c - 48) as i64);
+            any = true;
+        } elif (any) {
+            break;
+        }
+        i = i + 1;
+    }
+    if (!any) { return 0; }
+    return n;
+}
+
+fn hir_builder_sanitize_align(n: i64) -> i64 {
+    if (n == 1 || n == 2 || n == 4 || n == 8 || n == 16 || n == 32 || n == 64) {
+        return n;
+    }
+    return 0;
+}
+
+fn hir_builder_decl_is_packed(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    if (hir_builder_decl_has_exact_attr(d, "packed")) { return true; }
+    let repr = hir_builder_decl_attr_value(d, "repr");
+    return hir_builder_string_contains(repr, "packed");
+}
+
+fn hir_builder_decl_repr_align(d: rawptr) -> i64 {
+    if (d == null) { return 0; }
+    let align_attr = hir_builder_decl_attr_value(d, "align");
+    if (align_attr.len > 0) {
+        let n = hir_builder_sanitize_align(hir_builder_parse_positive_i64(align_attr));
+        if (n > 0) { return n; }
+    }
+    let repr = hir_builder_decl_attr_value(d, "repr");
+    let pos = hir_builder_index_of(repr, "align(");
+    if (pos >= 0) {
+        return hir_builder_sanitize_align(hir_builder_parse_positive_i64(repr.substring(pos + 6, repr.len)));
+    }
+    return 0;
+}
+
+fn hir_builder_decl_has_repr_c(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    if (hir_builder_decl_has_exact_attr(d, "repr")) { return true; }
+    if (hir_builder_decl_has_exact_attr(d, "packed")) { return true; }
+    if (hir_builder_decl_has_exact_attr(d, "align")) { return true; }
+    return false;
+}
+
+fn hir_builder_strip_c_symbol_name(raw: string) -> string {
+    let quoted = hir_builder_first_string_arg(raw);
+    if (quoted.len > 0) { return quoted; }
+    return hir_builder_strip_quotes(hir_builder_trim(raw));
+}
+
+impl HirUnitBuilder {
+    fn class_uses_c_repr(self, class_decl: rawptr) -> bool {
+        if (class_decl == null) { return false; }
+        if (hir_builder_decl_is_packed(class_decl)) { return true; }
+        if (hir_builder_decl_repr_align(class_decl) > 0) { return true; }
+        return hir_builder_decl_has_repr_c(class_decl);
+    }
+
+    fn class_abi_align(self, class_decl: rawptr) -> i64 {
+        if (class_decl == null) { return 8; }
+        if (!self.class_uses_c_repr(class_decl)) { return 8; }
+        let packed = hir_builder_decl_is_packed(class_decl);
+        let forced = hir_builder_decl_repr_align(class_decl);
+        if (packed && forced <= 0) { return 1; }
+        var max_align: i64 = 1;
+        if (!packed) {
+            let total = self.count_class_fields(class_decl);
+            var idx: i32 = 0;
+            while (idx < total) {
+                let f = self.class_layout_field_at(class_decl, idx);
+                if (f != null) {
+                    let align = self.type_ref_abi_align(self.concrete_type_ref(decl_get_ty(f)));
+                    if (align > max_align) { max_align = align; }
+                }
+                idx = idx + 1;
+            }
+        }
+        if (forced > max_align) { max_align = forced; }
+        if (max_align <= 0) { return 1; }
+        return max_align;
+    }
+
+    fn type_ref_abi_align(self, ty_ref: rawptr) -> i64 {
+        if (ty_ref == null) { return 8; }
+        let sty = self.concrete_type_ref(ty_ref);
+        if (sty == null) { return 8; }
+        let k = tref_get_kind(sty);
+        if (k == ty_BOOL() || k == ty_I8() || k == ty_U8()) { return 1; }
+        if (k == ty_I16() || k == ty_U16()) { return 2; }
+        if (k == ty_CHAR() || k == ty_I32() || k == ty_U32() || k == ty_F32()) { return 4; }
+        if (k == ty_ARRAY()) { return self.type_ref_abi_align(tref_array_elem(sty)); }
+        if (k == ty_CLASS()) {
+            let n = tref_get_name(sty);
+            if (hir_builder_is_primitive_str_name(n)) { return 8; }
+            let cd = self.find_class_decl(n);
+            if (cd != null) { return self.class_abi_align(cd); }
+        }
+        return 8;
+    }
+
+    fn align_i64(self, value: i64, align: i64) -> i64 {
+        if (align <= 1) { return value; }
+        let rem = value % align;
+        if (rem == 0) { return value; }
+        return value + (align - rem);
+    }
+
+    fn class_storage_size(self, class_decl: rawptr) -> i64 {
+        if (class_decl == null) { return 8; }
+        let packed = hir_builder_decl_is_packed(class_decl);
+        let total = self.count_class_fields(class_decl);
+        var off: i64 = 0;
+        var idx: i32 = 0;
+        while (idx < total) {
+            let f = self.class_layout_field_at(class_decl, idx);
+            if (f != null) {
+                let ft = self.concrete_type_ref(decl_get_ty(f));
+                var align = self.type_ref_abi_align(ft);
+                if (packed) { align = 1; }
+                off = self.align_i64(off, align);
+                off = off + self.type_ref_storage_size(ft);
+            }
+            idx = idx + 1;
+        }
+        if (self.class_uses_c_repr(class_decl)) {
+            off = self.align_i64(off, self.class_abi_align(class_decl));
+        } else {
+            var max_align: i64 = 1;
+            var j: i32 = 0;
+            while (j < total) {
+                let f2 = self.class_layout_field_at(class_decl, j);
+                if (f2 != null) {
+                    let a2 = self.type_ref_abi_align(self.concrete_type_ref(decl_get_ty(f2)));
+                    if (a2 > max_align) { max_align = a2; }
+                }
+                j = j + 1;
+            }
+            off = self.align_i64(off, max_align);
+        }
+        if (off <= 0) { return 1; }
+        return off;
+    }
+
+    fn type_ref_storage_size(self, ty_ref: rawptr) -> i64 {
+        if (ty_ref == null) { return 8; }
+        let sty = self.concrete_type_ref(ty_ref);
+        if (sty == null) { return 8; }
+        let k = tref_get_kind(sty);
+        if (k == ty_BOOL() || k == ty_I8() || k == ty_U8()) { return 1; }
+        if (k == ty_I16() || k == ty_U16()) { return 2; }
+        if (k == ty_CHAR() || k == ty_I32() || k == ty_U32() || k == ty_F32()) { return 4; }
+        if (k == ty_I64() || k == ty_U64() || k == ty_ISIZE() || k == ty_USIZE() || k == ty_F64()) { return 8; }
+        if (k == ty_RAWPTR() || k == ty_PTR() || k == ty_REF() || k == ty_MUTREF() || k == ty_FN() || k == ty_CFN()) { return 8; }
+        if (k == ty_STRING()) { return 32; }
+        if (k == ty_VOID()) { return 0; }
+        if (k == ty_RANGE()) { return 16; }
+        if (k == ty_ARRAY()) {
+            let elem = tref_array_elem(sty);
+            let count = tref_array_size(sty);
+            if (count <= 0) { return 0; }
+            return self.type_ref_storage_size(elem) * count;
+        }
+        if (k == ty_TUPLE()) {
+            var off: i64 = 0;
+            var max_align: i64 = 1;
+            var i: i64 = 0;
+            while (i < tref_tuple_count(sty)) {
+                let et = tref_tuple_elem_at(sty, i);
+                let ea = self.type_ref_abi_align(et);
+                if (ea > max_align) { max_align = ea; }
+                off = self.align_i64(off, ea);
+                off = off + self.type_ref_storage_size(et);
+                i = i + 1;
+            }
+            return self.align_i64(off, max_align);
+        }
+        if (k == ty_CLASS()) {
+            let n = tref_get_name(sty);
+            if (hir_builder_is_primitive_str_name(n)) { return 32; }
+            if (n == "f32") { return 4; }
+            if (n == "f64") { return 8; }
+            if (policy_generic_call_base(n) == "Option" || policy_generic_call_base(n) == "Result") { return 16; }
+            let cd = self.find_class_decl(n);
+            if (cd != null) { return self.class_storage_size(cd); }
+            return 8;
+        }
+        return 8;
+    }
+}

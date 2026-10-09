@@ -1,0 +1,191 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Constructors for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn resolve_default_new_member_expr(self,
+                                              expr_id: i32,
+                                              owner_type_name: string,
+                                              member_name: string) -> bool {
+        if (expr_id == hir_id_invalid() || member_name != "new" || owner_type_name.len == 0) {
+            return false;
+        }
+        if (self.raw_method_decl_exists_for_type_text(owner_type_name, member_name, true)) {
+            return false;
+        }
+        let owner_type_id = self.type_id_from_text(owner_type_name);
+        if (!self.type_id_is_valid(owner_type_id)) { return false; }
+        let builtin_id = self.unit.add_or_get_builtin("new",
+                                                     expr_sem_BUILTIN(),
+                                                     owner_type_id,
+                                                     0);
+        self.unit.set_expr_type(expr_id, self.function_type_id_for_zero_arg_return(owner_type_id));
+        self.unit.set_expr_semantic(expr_id, expr_sem_BUILTIN(), hir_target_builtin(), builtin_id);
+        return true;
+    }
+
+    // `T.new(args...)` is the uniform value-construction spelling used by
+    // generic factories. A declared static `new` remains authoritative. When
+    // no such factory exists, bind the call to the best matching language
+    // constructor before falling back to the builtin 0/1-argument value
+    // constructor. This keeps constructor selection in HIR so LLVM and C++
+    // consume the exact same MIR target.
+    fn resolve_default_new_constructor_call(self,
+                                                     e: rawptr,
+                                                     call_expr_id: i32,
+                                                     callee_expr_id: i32) -> bool {
+        if (call_expr_id == hir_id_invalid()
+            || callee_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(callee_expr_id) != ex_MEMBER()
+            || policy_generic_call_base(self.unit.expr_name(callee_expr_id).clone()) != "new"
+            || self.unit.expr_target_kind(callee_expr_id) != hir_target_builtin()) {
+            return false;
+        }
+        let owner_type_name = self.member_call_owner_type_name(e, callee_expr_id);
+        if (owner_type_name.len == 0 || self.type_text_has_open_template_atom(owner_type_name)) {
+            return false;
+        }
+        let owner_decl = self.raw_class_decl_for_type_text(owner_type_name);
+        if (owner_decl == null) { return false; }
+        // Prefer an already closed HIR constructor. This path has complete
+        // argument types (including the widened literal types captured by a
+        // generic pack) and therefore preserves overload selection without
+        // depending on the original template AST's stale `new` callee.
+        var constructor_fn = self.best_hir_method_function_for_call(owner_type_name,
+                                                                     "constructor",
+                                                                     call_expr_id,
+                                                                     callee_expr_id);
+        if (constructor_fn == hir_id_invalid()) {
+            let constructor_decl = self.raw_method_decl_for_call_on_class_tree(owner_decl,
+                                                                                "constructor",
+                                                                                false,
+                                                                                e,
+                                                                                call_expr_id,
+                                                                                owner_type_name,
+                                                                                0);
+            if (constructor_decl == null) { return false; }
+            constructor_fn = self.closed_method_target_for_type_text(owner_type_name,
+                                                                      "constructor",
+                                                                      e,
+                                                                      call_expr_id,
+                                                                      constructor_decl,
+                                                                      false);
+        }
+        if (constructor_fn == hir_id_invalid()
+            || self.function_has_open_template_types(constructor_fn)) {
+            return false;
+        }
+        // A language constructor is a value-producing type call, not an
+        // instance method call. Erase the synthetic `.new` receiver so MIR
+        // matches the canonical `Type(args...)` shape and does not pass the
+        // type designator as the constructor's hidden `self` storage.
+        self.unit.set_expr_lhs(callee_expr_id, hir_id_invalid());
+        self.unit.set_expr_name(callee_expr_id, owner_type_name);
+        self.unit.set_expr_semantic(callee_expr_id,
+                                   expr_sem_METHOD(),
+                                   hir_target_function(),
+                                   constructor_fn);
+        let constructor_type = self.function_type_id(constructor_fn);
+        if (constructor_type != hir_id_invalid()) {
+            self.unit.set_expr_type(callee_expr_id, constructor_type);
+        }
+        self.unit.set_expr_semantic(call_expr_id,
+                                   expr_sem_METHOD(),
+                                   hir_target_function(),
+                                   constructor_fn);
+        let return_type = self.unit.function_return_type(constructor_fn);
+        if (self.type_id_is_valid(return_type)) {
+            self.unit.set_expr_type(call_expr_id, return_type);
+        } else {
+            self.unit.set_expr_type(call_expr_id,
+                                   self.type_id_from_text(owner_type_name));
+        }
+        return true;
+    }
+
+    // `construct::<T>(args...)` performs value construction without consulting
+    // a static `T.new` factory. Bind a matching source-language constructor in
+    // HIR; otherwise retain the builtin target for zero-argument value
+    // initialization or one-argument move/value construction. Both codegen
+    // backends therefore consume one identical MIR decision.
+    fn resolve_construct_constructor_call(self,
+                                                  e: rawptr,
+                                                  call_expr_id: i32,
+                                                  callee_expr_id: i32) -> bool {
+        if (call_expr_id == hir_id_invalid()
+            || callee_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(callee_expr_id) == ex_MEMBER()
+            || self.unit.expr_target_kind(callee_expr_id) != hir_target_builtin()) {
+            return false;
+        }
+        let raw_name = self.unit.expr_name(callee_expr_id);
+        if (policy_generic_call_base(raw_name.clone()) != "construct") { return false; }
+        let type_args = policy_generic_call_args(raw_name.clone());
+        let raw_owner_type_name = policy_generic_arg_at(type_args, 0);
+        if (raw_owner_type_name.len == 0) { return false; }
+        let owner_type_name = self.canonical_type_text_in_current_env(raw_owner_type_name);
+        if (owner_type_name.len == 0 || self.type_text_has_open_template_atom(owner_type_name)) {
+            return false;
+        }
+        self.ensure_concrete_type_text_ready(owner_type_name);
+        let owner_type_id = self.type_id_from_text(owner_type_name);
+        if (!self.type_id_is_valid(owner_type_id)) { return false; }
+        self.unit.set_expr_type(call_expr_id, owner_type_id);
+
+        let owner_decl = self.raw_class_decl_for_type_text(owner_type_name);
+        if (owner_decl == null) { return false; }
+        var constructor_fn = self.best_hir_method_function_for_call(owner_type_name,
+                                                                     "constructor",
+                                                                     call_expr_id,
+                                                                     callee_expr_id);
+        if (constructor_fn == hir_id_invalid()) {
+            let constructor_decl = self.raw_method_decl_for_call_on_class_tree(owner_decl,
+                                                                                "constructor",
+                                                                                false,
+                                                                                e,
+                                                                                call_expr_id,
+                                                                                owner_type_name,
+                                                                                0);
+            if (constructor_decl == null) { return false; }
+            constructor_fn = self.closed_method_target_for_type_text(owner_type_name,
+                                                                      "constructor",
+                                                                      e,
+                                                                      call_expr_id,
+                                                                      constructor_decl,
+                                                                      false);
+        }
+        if (constructor_fn == hir_id_invalid()
+            || self.function_has_open_template_types(constructor_fn)) {
+            return false;
+        }
+        self.unit.set_expr_name(callee_expr_id, owner_type_name);
+        self.unit.set_expr_semantic(callee_expr_id,
+                                   expr_sem_METHOD(),
+                                   hir_target_function(),
+                                   constructor_fn);
+        let constructor_type = self.function_type_id(constructor_fn);
+        if (constructor_type != hir_id_invalid()) {
+            self.unit.set_expr_type(callee_expr_id, constructor_type);
+        }
+        self.unit.set_expr_semantic(call_expr_id,
+                                   expr_sem_METHOD(),
+                                   hir_target_function(),
+                                   constructor_fn);
+        let return_type = self.unit.function_return_type(constructor_fn);
+        if (self.type_id_is_valid(return_type)) {
+            self.unit.set_expr_type(call_expr_id, return_type);
+        }
+        return true;
+    }
+}

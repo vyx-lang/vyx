@@ -1,0 +1,187 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Parameters for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn function_is_constructor_abi(self, fn_id: i32) -> bool {
+        if (fn_id == hir_id_invalid()) { return false; }
+        if ((self.unit.function_flags(fn_id) & hir_function_flag_constructor()) != 0) { return true; }
+        return self.unit.function_name(fn_id) == "constructor";
+    }
+
+    fn local_is_constructor_abi_self(self, fn_id: i32, local_id: i32) -> bool {
+        if (fn_id == hir_id_invalid() || local_id == hir_id_invalid()) { return false; }
+        if (!self.function_is_constructor_abi(fn_id)) { return false; }
+        if ((self.unit.local_flags(local_id) & hir_local_flag_self_receiver()) == 0) { return false; }
+        return self.unit.local_name(local_id) == "self";
+    }
+
+    fn function_has_self_receiver_param(self, fn_id: i32) -> bool {
+        var local_id = self.unit.function_first_local(fn_id);
+        while (local_id != hir_id_invalid()) {
+            if ((self.unit.local_flags(local_id) & hir_local_flag_self_receiver()) != 0) { return true; }
+            local_id = self.unit.local_next(local_id);
+        }
+        return false;
+    }
+
+    fn ensure_constructor_abi_self_param(self, fn_id: i32, owner_type_name: string) {
+        if (fn_id == hir_id_invalid() || owner_type_name.len == 0) { return; }
+        if (!self.function_is_constructor_abi(fn_id)) { return; }
+        if (self.function_has_self_receiver_param(fn_id)) { return; }
+        var self_type_id = self.unit.function_return_type(fn_id);
+        if (!self.type_id_is_valid(self_type_id)) {
+            self_type_id = self.type_id_from_text(owner_type_name);
+        }
+        if (!self.type_id_is_valid(self_type_id)) { return; }
+        self.unit.add_local(fn_id,
+                           "self",
+                           self_type_id,
+                           hir_local_flag_param()
+                               | hir_local_flag_self_receiver()
+                               | hir_local_flag_self_compat());
+    }
+
+    fn add_function_param_locals_with_owner(self, fn_id: i32, d: rawptr, owner_type_name: string) {
+        if (fn_id == hir_id_invalid() || d == null) { return; }
+        if (!hir_builder_decl_is_foreign_dci_native(d)) {
+            self.ensure_constructor_abi_self_param(fn_id, owner_type_name);
+        }
+        var param = decl_get_params(d);
+        while (param != null) {
+            if (hir_builder_c_varargs_param(param)) {
+                param = decl_get_next(param);
+            } elif (hir_builder_variadic_param(param)) {
+                let pack_name = hir_builder_param_pack_type_name(param);
+                let pack_count = self.current_pack_count(pack_name);
+                if (pack_count > 0) {
+                    var i: i32 = 0;
+                    while (i < pack_count) {
+                        let arg_text = self.current_pack_arg_text(pack_name, i);
+                        let arg_type = self.type_id_from_text(arg_text);
+                        var arg_flags: i32 = 1;
+                        if (self.param_type_id_should_move_arg(d, param, arg_type)) {
+                            arg_flags = arg_flags | 16;
+                        }
+                        let arg_local = self.unit.add_local(fn_id,
+                                                           decl_get_name(param) + "$" + policy_i64_to_string(i as i64),
+                                                           arg_type,
+                                                           arg_flags);
+                        i = i + 1;
+                    }
+                }
+            } else {
+                var param_type = self.type_id_from_ref(decl_get_ty(param));
+                if (owner_type_name.len > 0 && decl_get_name(param) == "self") {
+                    param_type = self.type_id_from_text(owner_type_name);
+                }
+                if (decl_get_name(param) == "self") {
+                    let self_binding = self.current_generic_binding("Self");
+                    if (self_binding.len > 0) {
+                        param_type = self.type_id_from_text(self_binding);
+                    }
+                }
+                var param_flags: i32 = 1;
+                if (decl_get_name(param) == "self") {
+                    param_flags = param_flags
+                        | hir_local_flag_self_receiver()
+                        | hir_builder_self_receiver_mode_flags(param);
+                }
+                // Mark move-receiving params at registration time, not only at
+                // body-build time (refresh_function_param_drop_metadata): the
+                // lazy codegen pipeline MIR-builds callers before the callee's
+                // body is materialized, and the caller's drop deactivation
+                // (deactivate_call_moved_args_from) reads this flag. Without it
+                // a moved argument would still be dropped by the caller
+                // (use-after-free / double-release on container push).
+                if (self.param_type_id_should_move_arg(d, param, param_type)) {
+                    param_flags = param_flags | hir_local_flag_move_arg();
+                } else if ((param_flags & hir_local_flag_move_arg()) != 0) {
+                    param_flags = param_flags - hir_local_flag_move_arg();
+                    param_flags = param_flags | hir_local_flag_self_compat();
+                }
+                let param_local = self.unit.add_local(fn_id, decl_get_name(param), param_type, param_flags);
+            }
+            param = decl_get_next(param);
+        }
+    }
+
+    fn add_function_param_locals(self, fn_id: i32, d: rawptr) {
+        self.add_function_param_locals_with_owner(fn_id, d, "");
+    }
+
+    fn bind_function_param_scope(self, fn_id: i32, d: rawptr) {
+        if (fn_id == hir_id_invalid() || d == null) { return; }
+        var local_id = self.unit.function_first_local(fn_id);
+        // A zero-length variadic parameter has no HIR local, but still needs
+        // an empty pack binding so `args.len` materializes as the constant 0.
+        // Only a function with neither a local nor an AST parameter list has
+        // no scope work at all.
+        if (local_id == hir_id_invalid() && decl_get_params(d) == null) { return; }
+        var param = decl_get_params(d);
+        if (local_id != hir_id_invalid()
+            && self.local_is_constructor_abi_self(fn_id, local_id)
+            && (param == null || decl_get_name(param) != "self")) {
+            self.locals = hir_local_scope_push(self.locals,
+                                 "self",
+                                 local_id,
+                                 self.unit.local_type(local_id),
+                                 fn_id,
+                                 null);
+            local_id = self.unit.local_next(local_id);
+        }
+        while (param != null) {
+            if (hir_builder_c_varargs_param(param)) {
+                param = decl_get_next(param);
+            } elif (hir_builder_variadic_param(param)) {
+                let pack_name = hir_builder_param_pack_type_name(param);
+                let pack_count = self.current_pack_count(pack_name);
+                var locals_buf: rawptr = null;
+                if (pack_count > 0) {
+                    locals_buf = hir_profile_malloc((pack_count * 4) as u64);
+                    if (locals_buf != null) { memset(locals_buf, 0, (pack_count * 4) as u64); }
+                }
+                var i: i32 = 0;
+                while (i < pack_count && local_id != hir_id_invalid()) {
+                    if ((self.unit.local_flags(local_id) & hir_local_flag_param()) != 0) {
+                        if (locals_buf != null) { ast_write_i32(ptr_offset(locals_buf, i * 4), local_id); }
+                        self.locals = hir_local_scope_push(self.locals,
+                                             self.unit.local_name(local_id),
+                                             local_id,
+                                             self.unit.local_type(local_id),
+                                             fn_id,
+                                             decl_get_semantic_target(param));
+                        i = i + 1;
+                    }
+                    local_id = self.unit.local_next(local_id);
+                }
+                self.pack_bindings = hir_pack_bindings_bind(self.pack_bindings, decl_get_name(param), locals_buf, pack_count);
+                param = decl_get_next(param);
+            } else if (local_id != hir_id_invalid() && (self.unit.local_flags(local_id) & hir_local_flag_param()) != 0) {
+                self.locals = hir_local_scope_push(self.locals,
+                                     decl_get_name(param),
+                                     local_id,
+                                     self.unit.local_type(local_id),
+                                     fn_id,
+                                     decl_get_semantic_target(param));
+                param = decl_get_next(param);
+                local_id = self.unit.local_next(local_id);
+            } else if (local_id != hir_id_invalid()) {
+                local_id = self.unit.local_next(local_id);
+            } else {
+                return;
+            }
+        }
+    }
+}

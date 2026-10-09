@@ -7,9 +7,9 @@ $Compiler = (Resolve-Path $Compiler).Path
 $runDir = Join-Path $PSScriptRoot ('.runs/' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 New-Item -ItemType Directory -Path (Join-Path $runDir 'fixtures') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $runDir '.cache') -Force | Out-Null
-$source = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/build_system.vyx'))
-$actionSource = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/build_action.vyx'))
-$resourceSource = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/build_resources.vyx'))
+$source = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_system.vyx'))
+$actionSource = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_action.vyx'))
+$resourceSource = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_resources.vyx'))
 $actionModel = [regex]::Match($actionSource, '(?ms)^public class BuildAction\s*\{.*?^\}').Value
 if (-not $actionModel) { throw 'Missing production BuildAction model' }
 $currentSource = $source + "`n" + $actionSource + "`n" + $resourceSource
@@ -111,7 +111,10 @@ $roots = @('build_cache_digest_index', 'build_cache_has_indexed', 'build_cache_r
 $unit = Join-Path $runDir 'scheduler.vyx'
 Write-Unit $currentSource $roots ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'probe.vyx'))) $unit $actionModel
 if (-not $SkipBaseline) {
-    $baselineLines = & git -C $repo show ($BaselineRevision + ':bootstrap_compiler/src/core/build_system.vyx')
+    $baselinePath = 'bootstrap_compiler/src/core/project/build_system.vyx'
+    & git -C $repo cat-file -e "${BaselineRevision}:$baselinePath" 2>$null
+    if ($LASTEXITCODE -ne 0) { $baselinePath = 'bootstrap_compiler/src/core/build_system.vyx' }
+    $baselineLines = & git -C $repo show "${BaselineRevision}:$baselinePath"
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read baseline production source' }
     $baseline = $baselineLines -join "`n"
     Write-Unit $baseline @('build_cache_digest_index', 'build_cache_has_indexed') `

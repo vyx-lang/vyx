@@ -1,0 +1,508 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn function_uses_dci_virtual_dispatch(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (!self.function_is_foreign_dci_instance_method(function_id)) { return false; }
+        if (self.function_is_foreign_dci_dtor(function_id)) { return false; }
+        if (self.function_is_foreign_dci_final_method(function_id)) { return false; }
+        return self.function_is_foreign_dci_virtual_method(function_id)
+            || self.function_is_foreign_dci_override_method(function_id);
+    }
+
+    public fn dci_call_receiver_is_exact_value_object(self, value_id: i32, function_id: i32) -> bool {
+        if (value_id == mir_id_invalid() || function_id == mir_id_invalid()) { return false; }
+        let receiver_id = self.direct_call_receiver(value_id);
+        if (receiver_id == mir_id_invalid()) { return false; }
+        let receiver_type = self.m.value_type(receiver_id);
+        let receiver_kind = llvm_mir_type_kind(&self.m, receiver_type);
+        if (receiver_kind == ty_PTR() || receiver_kind == ty_REF() || receiver_kind == ty_MUTREF()) {
+            return false;
+        }
+        let target_self_type = self.function_source_param_type(function_id, 0);
+        if (target_self_type == mir_id_invalid()) { return false; }
+        if (self.canonical_record_type_id(receiver_type) == self.canonical_record_type_id(target_self_type)) {
+            return true;
+        }
+        return false;
+    }
+
+    public fn dci_direct_method_this_base_offset_bytes(self, function_id: i32) -> i64 {
+        if (function_id == mir_id_invalid()) { return 0; }
+        if (!self.function_is_foreign_dci_instance_method(function_id)) { return 0; }
+        if (self.function_is_foreign_dci_ctor(function_id) || self.function_is_foreign_dci_dtor(function_id)) {
+            return 0;
+        }
+        if (!self.function_is_foreign_dci_override_method(function_id)) { return 0; }
+        let owner_type = self.foreign_dci_owner_type_id(function_id);
+        var owner_record = "";
+        if (owner_type != mir_id_invalid()) {
+            owner_record = self.dci_record_name_for_type(owner_type);
+        }
+        if (owner_record.len == 0) {
+            owner_record = self.dci_record_name_for_type_text(self.foreign_dci_owner_type_text(function_id));
+        }
+        if (owner_record.len == 0) { return 0; }
+        let selected = self.dci_symbol_object_for_function(function_id);
+        if (selected == null) { return -1; }
+        var base_offset: i64 = 0;
+        var base_found = false;
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let symbols = self.dci_exports_array_from(self.dci_contract_at(root_i), "symbols");
+            if (symbols != null) {
+            let n = cJSON_GetArraySize(symbols);
+            var i: i32 = 0;
+            while (i < n) {
+                let candidate = cJSON_GetArrayItem(symbols, i);
+                if (candidate != null && cJSON_IsObject(candidate) != 0
+                    && self.dci_json_string(candidate, "kind") == "method"
+                    && self.dci_json_bool(candidate, "is_virtual")
+                    && self.dci_symbol_member_name_matches_function(candidate, function_id)
+                    && self.dci_symbol_params_match_function(self.dci_json_item(candidate, "params"), function_id)
+                    && self.dci_symbol_return_matches_function(candidate, function_id)
+                    && self.dci_symbol_flags_match_function(candidate, function_id)) {
+                    var candidate_owner = self.dci_json_string(candidate, "owner");
+                    let normalized_owner = self.dci_record_name_for_type_text(candidate_owner);
+                    if (normalized_owner.len > 0) { candidate_owner = normalized_owner; }
+                    if (candidate_owner.len > 0
+                        && !self.dci_record_name_matches_text(candidate_owner, owner_record)) {
+                        let candidate_offset = self.dci_base_offset_bytes_for_records(owner_record,
+                                                                                       candidate_owner,
+                                                                                       0);
+                        if (candidate_offset < 0) {
+                            self.report_error("DCI direct override `" + self.m.function_name(function_id)
+                                      + "` requires a non-constant receiver adjustment; use virtual dispatch or Stub mode");
+                            return -1;
+                        }
+                        if (base_found && base_offset != candidate_offset) {
+                            self.report_error("DCI direct override `" + self.m.function_name(function_id)
+                                      + "` has ambiguous receiver adjustments; use virtual dispatch or Stub mode");
+                            return -1;
+                        }
+                        base_offset = candidate_offset;
+                        base_found = true;
+                    }
+                }
+                i = i + 1;
+            }
+            }
+            root_i = root_i + 1;
+        }
+        let this_adjust_item = self.dci_json_item(selected, "this_adjust");
+        if (this_adjust_item == null) { return base_offset; }
+        if (cJSON_IsNumber(this_adjust_item) == 0) {
+            self.report_error("DCI direct override `" + self.m.function_name(function_id)
+                      + "` has a non-numeric receiver adjustment");
+            return -1;
+        }
+        let errs = self.error_count;
+        let this_adjust = self.dci_json_number_item_i64(this_adjust_item, "this_adjust");
+        if (self.error_count > errs) { return -1; }
+        if (this_adjust < -2147483648 || this_adjust > 2147483647) {
+            self.report_error("DCI direct override `" + self.m.function_name(function_id)
+                      + "` receiver adjustment is outside the supported range");
+            return -1;
+        }
+        return base_offset + this_adjust;
+    }
+
+    public fn adjust_dci_direct_method_receiver(self,
+                                                receiver_val: rawptr,
+                                                function_id: i32,
+                                                label: string) -> rawptr {
+        if (receiver_val == null) { return null; }
+        let offset = self.dci_direct_method_this_base_offset_bytes(function_id);
+        if (offset < 0) { return null; }
+        if (offset == 0) { return receiver_val; }
+        return self.ptr_offset_bytes(receiver_val,
+                                     vyx_rt_const_int(self.mod, self.ty_i64, offset, 1),
+                                     label);
+    }
+
+    public fn dci_vtable_entry_slot_offset_for_function(self, function_id: i32) -> i64 {
+        if (function_id == mir_id_invalid()) { return -1; }
+        let symbol = self.dci_link_name_for_function(function_id);
+        if (symbol.len == 0) { return -1; }
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let vtables = self.dci_dispatch_tables_from(self.dci_contract_at(root_i));
+            if (vtables != null) {
+        let vt_count = cJSON_GetArraySize(vtables);
+        var vt_i: i32 = 0;
+        while (vt_i < vt_count) {
+            let vt = cJSON_GetArrayItem(vtables, vt_i);
+            if (vt != null && cJSON_IsObject(vt) != 0) {
+                let ap_obj = self.dci_json_item(vt, "address_point_offset");
+                if (ap_obj == null || cJSON_IsNumber(ap_obj) == 0) {
+                    self.report_error("DCI vtable for `" + self.dci_json_string(vt, "class_name")
+                               + "` has no address_point_offset");
+                    return -1;
+                }
+                let errs = self.error_count;
+                let address_point = self.dci_json_number_item_i64(ap_obj, "address_point_offset");
+                if (self.error_count > errs) { return -1; }
+                let entries = self.dci_json_item(vt, "entries");
+                if (entries != null && cJSON_IsArray(entries) != 0) {
+                    let entry_count = cJSON_GetArraySize(entries);
+                    var entry_i: i32 = 0;
+                    while (entry_i < entry_count) {
+                        let entry = cJSON_GetArrayItem(entries, entry_i);
+                        if (entry != null
+                            && cJSON_IsObject(entry) != 0
+                            && self.dci_symbol_link_name(entry) == symbol) {
+                            if (self.dci_json_i64(entry, "this_adjust") != 0
+                                || self.dci_json_i64(entry, "return_adjust") != 0) {
+                                self.report_error("DCI dispatch entry for `"
+                                          + self.m.function_name(function_id)
+                                          + "` requires an unsupported call adjustment");
+                                return -1;
+                            }
+                            let relative = self.dci_json_item(entry, "address_point_relative_offset");
+                            if (relative != null && cJSON_IsNumber(relative) != 0) {
+                                let rel_errs = self.error_count;
+                                let rel = self.dci_json_number_item_i64(relative, "address_point_relative_offset");
+                                if (self.error_count > rel_errs) { return -1; }
+                                return rel;
+                            }
+                            return self.dci_json_i64(entry, "offset") - address_point;
+                        }
+                        entry_i = entry_i + 1;
+                    }
+                }
+            }
+            vt_i = vt_i + 1;
+        }
+            }
+            root_i = root_i + 1;
+        }
+        return -1;
+    }
+
+    public fn dci_vtable_base_offset_bytes_for_function(self,
+                                                        function_id: i32,
+                                                        receiver_type_id: i32) -> i64 {
+        if (function_id == mir_id_invalid()) { return -1; }
+        let symbol = self.dci_link_name_for_function(function_id);
+        if (symbol.len == 0) { return -1; }
+        let receiver_record_type = self.canonical_record_type_id(receiver_type_id);
+        let receiver_record = self.dci_record_name_for_type(receiver_record_type);
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let vtables = self.dci_dispatch_tables_from(self.dci_contract_at(root_i));
+            if (vtables != null) {
+        let vt_count = cJSON_GetArraySize(vtables);
+        var vt_i: i32 = 0;
+        while (vt_i < vt_count) {
+            let vt = cJSON_GetArrayItem(vtables, vt_i);
+            if (vt != null && cJSON_IsObject(vt) != 0) {
+                let entries = self.dci_json_item(vt, "entries");
+                if (entries != null && cJSON_IsArray(entries) != 0) {
+                    let entry_count = cJSON_GetArraySize(entries);
+                    var entry_i: i32 = 0;
+                    while (entry_i < entry_count) {
+                        let entry = cJSON_GetArrayItem(entries, entry_i);
+                        if (entry != null
+                            && cJSON_IsObject(entry) != 0
+                            && self.dci_symbol_link_name(entry) == symbol) {
+                            let base_class = self.dci_json_string(vt, "base_class");
+                            let vt_class = self.dci_json_string(vt, "class_name");
+                            // An omitted base has no describable adjustment.  It is only
+                            // safe when the receiver is exactly the dispatch-table class.
+                            if (base_class.len == 0) {
+                                if (receiver_record.len > 0
+                                    && self.dci_record_name_matches_text(receiver_record, vt_class)) {
+                                    return 0;
+                                }
+                                self.report_error("DCI dispatch-table receiver adjustment is not statically described");
+                                return -1;
+                            }
+                            if (receiver_record.len > 0) {
+                                if (self.dci_record_name_matches_text(receiver_record, base_class)) {
+                                    return 0;
+                                }
+                                let receiver_offset = self.dci_base_offset_bytes_for_records(receiver_record,
+                                                                                            base_class,
+                                                                                            0);
+                                if (receiver_offset >= 0) { return receiver_offset; }
+                            }
+                            let vt_offset = self.dci_base_offset_bytes_for_records(vt_class, base_class, 0);
+                            if (vt_offset >= 0) { return vt_offset; }
+                            return -1;
+                        }
+                        entry_i = entry_i + 1;
+                    }
+                }
+            }
+            vt_i = vt_i + 1;
+        }
+            }
+            root_i = root_i + 1;
+        }
+        return -1;
+    }
+
+    public fn lower_dci_virtual_call(self, value_id: i32, target_fn: i32) -> rawptr {
+        if (!self.function_uses_dci_virtual_dispatch(target_fn)) { return null; }
+        let receiver_id = self.direct_call_receiver(value_id);
+        if (receiver_id == mir_id_invalid()) {
+            self.report_error_at_value(value_id,
+                                       "external DCI virtual call has no receiver for `"
+                                       + self.m.function_name(target_fn)
+                                       + "`");
+            return null;
+        }
+        let expected_argc = self.function_source_param_count(target_fn) - 1;
+        let source_argc = self.call_arg_count(value_id);
+        if (expected_argc != source_argc) {
+            self.report_error_at_value(value_id,
+                                       "external DCI virtual call argument count mismatch for `"
+                                       + self.m.function_name(target_fn)
+                                       + "`");
+            return null;
+        }
+        let receiver_type = self.function_source_param_type(target_fn, 0);
+        if (receiver_type == mir_id_invalid()) {
+            self.report_error("cannot resolve virtual receiver type for " + self.m.function_name(target_fn));
+            return null;
+        }
+        var receiver_val: rawptr = null;
+        if (self.m.value_kind(receiver_id) == mir_value_target_ref()
+            && self.m.value_target_kind(receiver_id) == mir_target_hir_item()
+            && self.m.static_exists(self.m.value_target_id(receiver_id))) {
+            receiver_val = self.lower_static_self_receiver_address(receiver_id, receiver_type);
+        } else {
+            receiver_val = self.lower_self_receiver_address(receiver_id, receiver_type);
+        }
+        if (receiver_val == null) {
+            self.report_error("cannot lower external DCI virtual receiver for "
+                      + self.m.function_name(target_fn));
+            return null;
+        }
+        let vtable_base_offset = self.dci_vtable_base_offset_bytes_for_function(target_fn, receiver_type);
+        if (vtable_base_offset < 0) {
+            // Ask for this instance before failing: whoever regenerates the
+            // contract learns the closed instances from the sidecar instead of
+            // from a hand-written `--export-instance` list.
+            llvm_dci_open_note_instance(self.foreign_dci_owner_type_text(target_fn));
+            self.report_error("DCI Descriptor has no dispatch-table base offset for external virtual `"
+                      + self.m.function_name(target_fn)
+                      + "` (owner=" + self.foreign_dci_owner_type_text(target_fn)
+                      + ")");
+            return null;
+        }
+        if (vtable_base_offset > 0) {
+            receiver_val = self.ptr_offset_bytes(receiver_val,
+                                                 vyx_rt_const_int(self.mod,
+                                                                  self.ty_i64,
+                                                                  vtable_base_offset,
+                                                                  1),
+                                                 "dci.vbase");
+            if (receiver_val == null) {
+                self.report_error("cannot adjust DCI virtual receiver for "
+                          + self.m.function_name(target_fn));
+                return null;
+            }
+        }
+        let slot_offset = self.dci_vtable_entry_slot_offset_for_function(target_fn);
+        if (slot_offset < 0) {
+            self.report_error("DCI Descriptor has no dispatch-table slot for external virtual `"
+                      + self.m.function_name(target_fn)
+                      + "` (owner=" + self.foreign_dci_owner_type_text(target_fn)
+                      + ")");
+            return null;
+        }
+        let vtable_ptr_slot = self.ptr_offset_bytes(receiver_val,
+                                                    vyx_rt_const_int(self.mod, self.ty_i64, 0, 0),
+                                                    "dci.vptr.slot");
+        let vtable_ptr = vyx_rt_build_load(self.mod,
+                                           self.ty_ptr,
+                                           vtable_ptr_slot,
+                                           "dci.vptr".c_str(),
+                                           8);
+        if (vtable_ptr == null) {
+            self.report_error("cannot load DCI vtable pointer for " + self.m.function_name(target_fn));
+            return null;
+        }
+        let fn_slot = self.ptr_offset_bytes(vtable_ptr,
+                                            vyx_rt_const_int(self.mod, self.ty_i64, slot_offset, 1),
+                                            "dci.vfn.slot");
+        let fn_value = vyx_rt_build_load(self.mod,
+                                         self.ty_ptr,
+                                         fn_slot,
+                                         "dci.vfn".c_str(),
+                                         7);
+        let fn_type = self.build_function_type(target_fn);
+        if (fn_value == null || fn_type == null) {
+            self.report_error("cannot materialize DCI virtual call target for " + self.m.function_name(target_fn));
+            return null;
+        }
+        var argc: i32 = 0;
+        if (self.function_uses_hidden_sret(target_fn)) { argc = argc + 1; }
+        argc = argc + self.dci_source_param_llvm_slots(target_fn, 0);
+        var argc_i: i32 = 0;
+        while (argc_i < source_argc) {
+            argc = argc + self.dci_source_param_llvm_slots(target_fn, argc_i + 1);
+            argc_i = argc_i + 1;
+        }
+        if (self.dci_function_inalloca_count(target_fn) > 1) { argc = argc + 1; }
+        let args = malloc((argc * 8) as u64);
+        if (args == null) {
+            self.report_error("cannot allocate DCI virtual call argument list for "
+                      + self.m.function_name(target_fn));
+            return null;
+        }
+        if (!self.dci_prepare_inalloca_call_frame(target_fn, args, argc)) {
+            free(args);
+            return null;
+        }
+        var out_index: i32 = 0;
+        var dci_sret_slot: rawptr = null;
+        var virtual_member_sret_after = target_fn != mir_id_invalid()
+            && self.dci_member_sret_after_receiver(target_fn);
+        if (self.function_uses_hidden_sret(target_fn)) {
+            let result_type = self.m.function_return_type(target_fn);
+            var result_storage = self.lower_storage_type(result_type);
+            if (self.dci_call_converts_translated_to_result(target_fn)) {
+                result_storage = self.dci_translated_sret_ty(target_fn);
+            }
+            if (result_storage == null) {
+                free(args);
+                self.report_error("cannot lower DCI virtual sret storage for "
+                          + self.m.function_name(target_fn));
+                return null;
+            }
+            if (self.type_is_class_pointer_abi(result_type)) {
+                dci_sret_slot = self.lower_class_pointer_aggregate_value_with_type(mir_id_invalid(),
+                                                                                   result_type);
+            } else {
+                dci_sret_slot = vyx_rt_build_alloca(self.mod,
+                                                    result_storage,
+                                                    "dci.virtual.sret".c_str(),
+                                                    16);
+                let sret_alignment = self.dci_json_i64(self.dci_return_abi(target_fn), "alignment");
+                if (dci_sret_slot != null && sret_alignment > 0) {
+                    vyx_rt_set_alignment(self.mod, dci_sret_slot, sret_alignment as i32);
+                }
+            }
+            if (dci_sret_slot == null) {
+                free(args);
+                self.report_error("cannot allocate DCI virtual sret storage for "
+                          + self.m.function_name(target_fn));
+                return null;
+            }
+            if (virtual_member_sret_after) {
+                ast_write_rawptr(ptr_offset(args, 1 * 8), dci_sret_slot);
+            } else {
+                ast_write_rawptr(ptr_offset(args, out_index * 8), dci_sret_slot);
+                out_index = out_index + 1;
+            }
+        }
+        if (self.dci_source_param_llvm_slots(target_fn, 0) > 0) {
+            ast_write_rawptr(ptr_offset(args, out_index * 8), receiver_val);
+            out_index = out_index + 1;
+            if (virtual_member_sret_after) { out_index = out_index + 1; }
+        } else if (self.dci_abi_passing(self.dci_source_parameter_abi(target_fn, 0)) == "inalloca"
+            && self.dci_function_inalloca_count(target_fn) > 1) {
+            if (!self.dci_store_packed_inalloca_pointer(target_fn,
+                                                        0,
+                                                        args,
+                                                        argc,
+                                                        receiver_val,
+                                                        self.function_source_param_type(target_fn, 0))) {
+                free(args);
+                return null;
+            }
+        } else {
+            free(args);
+            self.report_error("cannot lower packed DCI virtual receiver for "
+                      + self.m.function_name(target_fn));
+            return null;
+        }
+        var i: i32 = 0;
+        while (i < source_argc) {
+            let arg_id = self.call_arg_at(value_id, i);
+            let param_type = self.function_source_param_type(target_fn, i + 1);
+            if (param_type == mir_id_invalid()) {
+                free(args);
+                self.report_error("cannot resolve DCI virtual argument parameter #"
+                          + policy_i64_to_string(i as i64)
+                          + " for " + self.m.function_name(target_fn));
+                return null;
+            }
+            let next_idx = self.dci_append_call_argument(target_fn,
+                                                         i + 1,
+                                                         arg_id,
+                                                         param_type,
+                                                         args,
+                                                         out_index,
+                                                         argc);
+            if (next_idx < 0) {
+                free(args);
+                self.report_error("cannot lower DCI virtual argument #"
+                          + policy_i64_to_string(i as i64)
+                          + " for " + self.m.function_name(target_fn));
+                return null;
+            }
+            out_index = next_idx;
+            i = i + 1;
+        }
+        var out_call_name = "dci.virtual.call";
+        let ret_kind = llvm_mir_type_kind(&self.m, self.value_effective_type(value_id));
+        if (ret_kind == ty_VOID() || dci_sret_slot != null) { out_call_name = ""; }
+        var out = self.build_abi_call(fn_type,
+                                      fn_value,
+                                      args,
+                                      argc as u64,
+                                      out_call_name,
+                                      target_fn);
+        if (out != null && !self.apply_dci_callsite_abi_attrs(target_fn, out)) { out = null; }
+        if (out != null && !self.apply_native_c_aggregate_abi_attrs(target_fn, out)) { out = null; }
+        let call_cc = self.dci_symbol_calling_convention(self.dci_symbol_object_for_function(target_fn));
+        if (out != null && call_cc.len > 0
+            && vyx_rt_set_calling_convention(self.mod,
+                                             out,
+                                             call_cc.c_str(),
+                                             call_cc.len as u64) != 0) {
+            self.report_error("cannot apply DCI virtual calling convention `" + call_cc
+                      + "` for `" + self.m.function_name(target_fn)
+                      + "`: " + self.runtime_last_error());
+            out = null;
+        }
+        free(args);
+        if (out != null && dci_sret_slot != null) {
+            let result_type2 = self.m.function_return_type(target_fn);
+            if (self.dci_call_converts_translated_to_result(target_fn)) {
+                out = self.dci_result_from_translated_sret(target_fn, dci_sret_slot);
+            } else if (self.type_is_class_pointer_abi(result_type2)) {
+                out = dci_sret_slot;
+            } else {
+                out = vyx_rt_build_load(self.mod,
+                                        self.lower_type(result_type2),
+                                        dci_sret_slot,
+                                        "dci.virtual.sret.value".c_str(),
+                                        22);
+            }
+        } else if (out != null
+            && self.dci_abi_passing(self.dci_return_abi(target_fn)) == "coerce") {
+            out = self.dci_uncoerce_return_value(out,
+                                                 target_fn,
+                                                 self.m.function_return_type(target_fn));
+        }
+        if (out != null) {
+            out = self.wrap_foreign_direct_pointer_return(out,
+                                                          target_fn,
+                                                          "dci.virtual.return.ptr");
+        }
+        if (out == null) {
+            self.report_error("cannot build DCI virtual call for "
+                      + self.m.function_name(target_fn)
+                      + " runtime=" + self.runtime_last_error());
+        }
+        return out;
+    }
+}

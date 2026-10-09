@@ -39,8 +39,11 @@ function Get-ProductionFunction([string]$Text, [string]$Name) {
     throw "Unterminated production function $Name"
 }
 
-$current = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/build_sets.vyx'))
-$oldLines = & git -C $repo show ($BaselineRevision + ':bootstrap_compiler/src/core/build_system.vyx')
+$current = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_sets.vyx'))
+$baselinePath = 'bootstrap_compiler/src/core/project/build_system.vyx'
+& git -C $repo cat-file -e "${BaselineRevision}:$baselinePath" 2>$null
+if ($LASTEXITCODE -ne 0) { $baselinePath = 'bootstrap_compiler/src/core/build_system.vyx' }
+$oldLines = & git -C $repo show "${BaselineRevision}:$baselinePath"
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read baseline production source' }
 $old = $oldLines -join "`n"
 $baselineFunctions = @('build_contains', 'build_pipe_set_has', 'build_pipe_set_add', 'build_pipe_set_merge') |

@@ -13,6 +13,13 @@ Use a compatible SDK from this repository's
 as Stage 0. Install LLVM 22 for the host, including the tools and libraries needed
 to build the compiler backend. On Windows, provide the MSVC / Windows SDK build environment.
 
+The HIR, MIR and LLVM source layout requires a Stage 0 that publishes public inherent `impl`
+methods in `.vyi` and collects export roots from every file in a logical module.
+Early SDKs with the same `1.0.0-alpha.1` version label may lack these fixes; record
+the compiler hash and check the [module contract](../probes/gates/compiler-modules/README.md)
+when selecting a bootstrap compiler. An old compiler's successful build of the
+unsplit source does not validate the split source tree.
+
 With the Release SDK's `bin` on `PATH`, run from the repository root in PowerShell:
 
 ```powershell
@@ -82,6 +89,8 @@ Focused AOT gates live under `../probes/gates/`:
   and async frames and aggregate calls in native streaming codegen.
 - [Compiler pressure](../probes/gates/compiler-industrial/README.md): deterministic
   project generation and cold/warm/incremental `-j1`/`-jN` runs.
+- [Compiler module contracts](../probes/gates/compiler-modules/README.md): public
+  inherent implementation interfaces, multi-file module roots and helper visibility.
 
 The final Windows AOT artifact follow-up passed self-host S2/S3 byte identity at
 `build --target $compilerTarget -j4 -O0`, SHA-256
@@ -94,13 +103,16 @@ lowering, or the roadmap's large-project performance targets.
 
 The [compiler architecture](../docs/COMPILER.md) / [中文架构说明](../docs/COMPILER_ZH.md)
 connects the HIR, MIR, LLVM, and CGU stages below.
+The [source tree map](src/README.md) lists subsystem boundaries and entry points.
 
 | Path | Contents |
 |---|---|
 | `src/core/` | Driver, parsing, semantic analysis, metadata, project builds |
 | `src/hir/` | Typed high-level representation and resolution |
-| `src/mir/` | MIR construction, reachability, verification, optimization |
+| [`src/hir/builder/`](src/hir/builder/README.md) | HIR construction organized by declarations, instances, expression resolution and body lifetime |
+| [`src/mir/`](src/mir/README.md) | Separate model, build, analysis, passes, verification, backend and debug subtrees |
 | `src/codegen/` | LLVM lowering and native ABI handling |
+| [`src/codegen/llvm/`](src/codegen/llvm/README.md) | LLVM implementations organized by operation, ABI and streaming responsibility |
 | `std_packages/` | Canonical self-hosted standard-library packages |
 | `std/` | Compatibility modules used by older compiler stages |
 | `scripts/` | Build, packaging, fixed-point and probe tools |
@@ -130,6 +142,8 @@ over an old alias held open by an IDE. See the
 
 从本仓库 [最新 Release](https://github.com/vyx-lang/vyx/releases/latest) 下载兼容 SDK
 作为 Stage 0，准备 LLVM 22 与宿主构建环境，再按上方示例从清单读取编译器目标并构建。
+Stage 0 必须支持公开 inherent `impl` 方法的接口导出，以及多文件逻辑模块的完整导出根。
+相同版本号的早期 SDK 可能尚无这些修复，需记录实际哈希并运行上方模块契约门。
 使用本次构建的 SDK 编译器入口 `out/vyxc` 验证源码。完整流程见 [构建与验证指南](../docs/TESTING_GUIDE_ZH.md)，
 核心特性见 [Fact Semantic Ownership System](../docs/MOSP_ZH.md)。
 当前以 AOT 为验收基准；泛型接口、跨模块定义、match 表达式与编译压力门见上方

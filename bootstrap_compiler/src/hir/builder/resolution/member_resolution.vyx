@@ -1,0 +1,481 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Member resolution for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn member_expr_has_resolved_structural_target(self, e: rawptr, lhs_expr_id: i32) -> bool {
+        if (e == null || lhs_expr_id == hir_id_invalid()) { return false; }
+        if (expr_get_kind(e) != ex_MEMBER()) { return false; }
+        let member_name = policy_versioned_generic_call_base(expr_get_name(e).clone());
+        if (member_name.len == 0) { return false; }
+        var owner_type_name = "";
+        if (self.unit.expr_sem_kind(lhs_expr_id) == expr_sem_CLASS()) {
+            owner_type_name = self.resolve_type_text_in_current_env(self.unit.expr_name(lhs_expr_id));
+            if (owner_type_name.len == 0
+                && self.unit.expr_target_kind(lhs_expr_id) == hir_target_item()) {
+                let owner_item = self.unit.expr_target_id(lhs_expr_id);
+                if (owner_item != hir_id_invalid()) {
+                    owner_type_name = self.unit.item_name(owner_item);
+                }
+            }
+        }
+        if (owner_type_name.len == 0) {
+            let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(lhs_expr_id));
+            if (!self.type_id_is_valid(owner_type_id)) { return false; }
+            owner_type_name = self.member_lookup_type_name(owner_type_id);
+            if (owner_type_name == "rawptr") { return false; }
+            let field_item = self.field_id_for_type_and_name(owner_type_id, member_name);
+            if (field_item != hir_id_invalid()) { return true; }
+        }
+        if (owner_type_name.len == 0) { return false; }
+        if (self.raw_member_decl_for_type_text(owner_type_name, member_name) != null) { return true; }
+        let want_static_member = self.unit.expr_sem_kind(lhs_expr_id) == expr_sem_CLASS();
+        if (self.raw_method_decl_exists_for_type_text(owner_type_name,
+                                                      member_name,
+                                                      want_static_member)) {
+            return true;
+        }
+        if (self.method_function_target_by_owner_type_and_method(owner_type_name, member_name) != hir_id_invalid()) {
+            return true;
+        }
+        let payload_owner_type = self.heap_indirect_member_owner_type_text(owner_type_name, member_name);
+        if (payload_owner_type.len > 0) {
+            if (self.raw_member_decl_for_type_text(payload_owner_type, member_name) != null) { return true; }
+            if (self.raw_method_decl_exists_for_type_text(payload_owner_type,
+                                                          member_name,
+                                                          false)) {
+                return true;
+            }
+            if (self.method_function_target_by_owner_type_and_method(payload_owner_type, member_name) != hir_id_invalid()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn raw_method_decl_exists_for_type_text(self,
+                                                  owner_type_name: string,
+                                                  member_name: string,
+                                                  want_static: bool) -> bool {
+        if (owner_type_name.len == 0 || member_name.len == 0) { return false; }
+        // This key is reassigned below; it must not alias the borrowed name.
+        var cache_key = member_name.clone();
+        if (want_static) {
+            cache_key = cache_key + "|static=1";
+        } else {
+            cache_key = cache_key + "|static=0";
+        }
+        if (hir_pair_raw_map_get(self.raw_method_lookup_cache,owner_type_name, cache_key) != null) {
+            return true;
+        }
+        if (hir_pair_id_map_get(self.raw_method_lookup_miss_cache,owner_type_name, cache_key) != hir_id_invalid()) {
+            return false;
+        }
+        var out: rawptr = null;
+        if (want_static) {
+            out = self.raw_static_method_decl_for_type_text(owner_type_name, member_name);
+            if (out == null) {
+                out = self.raw_template_method_decl_for_type_text(owner_type_name, member_name, true);
+            }
+        } else {
+            out = self.raw_method_decl_for_type_text(owner_type_name, member_name);
+            if (out == null) {
+                out = self.raw_template_method_decl_for_type_text(owner_type_name, member_name, false);
+            }
+        }
+        if (out != null) {
+            self.raw_method_lookup_cache = hir_pair_raw_map_put(self.raw_method_lookup_cache,owner_type_name, cache_key, out);
+            return true;
+        }
+        self.raw_method_lookup_miss_cache = hir_pair_id_map_put(self.raw_method_lookup_miss_cache,owner_type_name, cache_key, 1);
+        return false;
+    }
+
+    fn declared_member_or_method_exists_for_expr(self,
+                                                       owner_type_name: string,
+                                                       member_name: string,
+                                                       lhs_expr_id: i32) -> bool {
+        if (owner_type_name.len == 0 || member_name.len == 0 || lhs_expr_id == hir_id_invalid()) {
+            return false;
+        }
+        if (self.raw_member_decl_for_type_text(owner_type_name, member_name) != null) { return true; }
+        let want_static_member = self.unit.expr_sem_kind(lhs_expr_id) == expr_sem_CLASS();
+        return self.raw_method_decl_exists_for_type_text(owner_type_name,
+                                                         member_name,
+                                                         want_static_member);
+    }
+
+    fn restore_builtin_member_semantic(self, e: rawptr, expr_id: i32) -> bool {
+        if (e == null || expr_id == hir_id_invalid()) { return false; }
+        if (expr_get_kind(e) != ex_MEMBER()) { return false; }
+        if (expr_get_semantic_kind(e) != expr_sem_BUILTIN()) { return false; }
+        let builtin_name = self.canonical_builtin_name_for_expr(e);
+        if (builtin_name.len == 0) { return false; }
+        let builtin_id = self.unit.add_or_get_builtin(builtin_name,
+                                                     expr_sem_BUILTIN(),
+                                                     self.builtin_owner_type_for_expr(e),
+                                                     expr_get_semantic_flags(e));
+        if (builtin_id == hir_id_invalid()) { return false; }
+        let builtin_type = self.type_id_from_expr_semantic(e, expr_sem_BUILTIN());
+        if (self.type_id_is_valid(builtin_type)) {
+            self.unit.set_expr_type(expr_id, builtin_type);
+        }
+        self.unit.set_expr_semantic(expr_id,
+                                   expr_sem_BUILTIN(),
+                                   hir_target_builtin(),
+                                   builtin_id);
+        return true;
+    }
+
+    fn restore_variant_member_semantic(self, e: rawptr, expr_id: i32) -> bool {
+        if (e == null || expr_id == hir_id_invalid()) { return false; }
+        if (expr_get_kind(e) != ex_MEMBER()) { return false; }
+        if (expr_get_semantic_kind(e) != expr_sem_VARIANT()) { return false; }
+        let raw_target = expr_get_semantic_target(e);
+        if (raw_target == null || decl_get_kind(raw_target) != de_VARIANT()) { return false; }
+        var owner_decl = expr_get_semantic_owner(e);
+        if (owner_decl == null) {
+            owner_decl = hir_raw_owner_map_get(self.decl_owner_map,raw_target);
+        }
+        var variant_item = hir_id_invalid();
+        var variant_type = hir_id_invalid();
+        if (owner_decl != null) {
+            let owner_type_name = self.concrete_owner_type_name(e, owner_decl);
+            if (owner_type_name.len > 0) {
+                variant_item = self.concrete_variant_target_for_type_text(raw_target,
+                                                                          owner_decl,
+                                                                          owner_type_name);
+                variant_type = self.variant_constructor_type_id_for_type_text(raw_target,
+                                                                              owner_decl,
+                                                                              owner_type_name);
+            }
+        }
+        if (variant_item == hir_id_invalid()) {
+            variant_item = self.concrete_variant_target(e, raw_target);
+        }
+        if (variant_item == hir_id_invalid()) { return false; }
+        if (self.type_id_is_valid(variant_type)) {
+            self.unit.set_expr_type(expr_id, variant_type);
+        } else {
+            self.unit.set_expr_type(expr_id, self.unit.item_type(variant_item));
+        }
+        self.unit.set_expr_semantic(expr_id,
+                                   expr_sem_VARIANT(),
+                                   hir_target_variant(),
+                                   variant_item);
+        return true;
+    }
+
+    /// Guard for the FIELD fast path: a raw field target whose item type
+    /// still carries an open template atom must not be bound directly when
+    /// the receiver type is a closed generic — a concrete instance field
+    /// exists (or can be instantiated) and the regular resolution flow
+    /// below will find it.
+    fn direct_field_shadows_concrete_instance(self, direct_field: i32, lhs_expr_id: i32) -> bool {
+        if (!self.type_id_has_template_atom(self.unit.item_type(direct_field))) { return false; }
+        let receiver_type_id = self.member_lookup_type_id(self.unit.expr_type(lhs_expr_id));
+        if (!self.type_id_is_valid(receiver_type_id)) { return false; }
+        let receiver_text = hir_type_table_text(self.unit.types, receiver_type_id);
+        if (policy_generic_call_args(receiver_text.clone()).len == 0) { return false; }
+        return !self.type_text_has_open_template_atom(receiver_text);
+    }
+
+    fn direct_method_shadows_concrete_instance(self, raw_method: rawptr, lhs_expr_id: i32) -> bool {
+        if (raw_method == null || decl_get_kind(raw_method) != de_METHOD()) { return false; }
+        let method_owner = hir_raw_owner_map_get(self.decl_owner_map,raw_method);
+        if (method_owner == null || !hir_builder_decl_template_head(method_owner)) { return false; }
+        let receiver_type_id = self.member_lookup_type_id(self.unit.expr_type(lhs_expr_id));
+        if (!self.type_id_is_valid(receiver_type_id)) { return false; }
+        let receiver_text = hir_type_table_text(self.unit.types, receiver_type_id);
+        if (policy_generic_call_args(receiver_text.clone()).len == 0) { return false; }
+        if (self.type_text_has_open_template_atom(receiver_text)) { return false; }
+        let owner_text = decl_get_name(method_owner);
+        if (owner_text.len == 0) { return false; }
+        let owner_base = hir_builder_type_base_name(owner_text);
+        return hir_builder_type_owner_names_match(receiver_text, owner_base);
+    }
+
+    fn resolve_member_expr_after_children(self, e: rawptr, expr_id: i32, lhs_expr_id: i32) {
+        if (expr_id == hir_id_invalid() || lhs_expr_id == hir_id_invalid()) { return; }
+        let defer_method_resolution_for_direct_call = e != null
+            && e == self.current_call_callee_ast
+            && expr_get_kind(e) == ex_MEMBER();
+        if (self.restore_variant_member_semantic(e, expr_id)) { return; }
+        if (defer_method_resolution_for_direct_call) {
+            let raw_sem_kind = expr_get_semantic_kind(e);
+            let raw_target = expr_get_semantic_target(e);
+            if (!hir_builder_decl_is_foreign_dci_ctor(raw_target)) {
+                if ((raw_sem_kind == expr_sem_METHOD()
+                    && !self.direct_method_shadows_concrete_instance(raw_target, lhs_expr_id))
+                    || (raw_target != null && decl_get_kind(raw_target) == de_METHOD())) {
+                    return;
+                }
+            }
+        }
+        if (!self.member_expr_has_resolved_structural_target(e, lhs_expr_id)) {
+            let preempt_owner_type = self.member_owner_type_name(e, lhs_expr_id);
+            let preempt_member_name = policy_versioned_generic_call_base(expr_get_name(e).clone());
+            var declared_member_exists = false;
+            if (preempt_owner_type.len > 0 && preempt_member_name.len > 0) {
+                declared_member_exists = self.declared_member_or_method_exists_for_expr(preempt_owner_type,
+                                                                                        preempt_member_name,
+                                                                                        lhs_expr_id);
+            }
+            if (!declared_member_exists && self.restore_builtin_member_semantic(e, expr_id)) { return; }
+        }
+        if (self.resolve_reflection_member_expr(e, expr_id, lhs_expr_id)) { return; }
+        let raw_sem_kind = expr_get_semantic_kind(e);
+        let raw_target = expr_get_semantic_target(e);
+        if (raw_sem_kind == expr_sem_METHOD() && raw_target != null) {
+            let direct_method_fn = self.direct_closed_raw_function_target(raw_target);
+            if (direct_method_fn != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id, self.function_type_id(direct_method_fn));
+                self.unit.set_expr_semantic(expr_id,
+                                           expr_sem_METHOD(),
+                                           hir_target_function(),
+                                           direct_method_fn);
+                return;
+            }
+        }
+        // Sema also represents associated constants with FIELD provenance,
+        // but their HIR target is storage, never an instance layout field.
+        if (raw_sem_kind == expr_sem_FIELD() && raw_target != null
+            && !hir_builder_decl_is_assoc_const_member(raw_target)) {
+            var semantic_field_target = raw_target;
+            let semantic_owner_type = self.member_owner_type_name(e, lhs_expr_id);
+            let semantic_member_name = policy_versioned_generic_call_base(
+                expr_get_name(e).clone());
+            let semantic_receiver_type = self.member_lookup_type_id(
+                self.unit.expr_type(lhs_expr_id));
+            let indexed_semantic_field = self.field_id_for_type_and_name(
+                semantic_receiver_type,
+                semantic_member_name);
+            if (indexed_semantic_field != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id,
+                                       self.unit.item_type(indexed_semantic_field));
+                self.unit.set_expr_semantic(expr_id,
+                                           expr_sem_FIELD(),
+                                           hir_target_field(),
+                                           indexed_semantic_field);
+                return;
+            }
+            if (semantic_owner_type.len > 0 && semantic_member_name.len > 0) {
+                let canonical_field = self.raw_member_decl_for_type_text(
+                    semantic_owner_type,
+                    semantic_member_name);
+                if (canonical_field != null
+                    && decl_get_kind(canonical_field) == de_FIELD()) {
+                    semantic_field_target = canonical_field;
+                }
+            }
+            let raw_field_owner = hir_raw_owner_map_get(self.decl_owner_map,
+                                                        semantic_field_target);
+            if (raw_field_owner == null
+                || !hir_builder_decl_template_head(raw_field_owner)) {
+                let direct_field = hir_pointer_map_item(self.decl_map,
+                                                        semantic_field_target);
+                if (direct_field != hir_id_invalid()
+                    && self.unit.item_kind(direct_field) == hir_item_field()
+                    && !self.direct_field_shadows_concrete_instance(direct_field, lhs_expr_id)) {
+                    self.unit.set_expr_type(expr_id, self.unit.item_type(direct_field));
+                    self.unit.set_expr_semantic(expr_id,
+                                               expr_sem_FIELD(),
+                                               hir_target_field(),
+                                               direct_field);
+                    return;
+                }
+            }
+        }
+        var existing_target_kind = self.unit.expr_target_kind(expr_id);
+        if (existing_target_kind == hir_target_item() && raw_target != null
+            && self.storage_decl_has_template_owner(raw_target)) {
+            let item_id = self.unit.expr_target_id(expr_id);
+            let item_kind = self.unit.item_kind(item_id);
+            if (item_kind == hir_item_const() || item_kind == hir_item_global()) {
+                // Sema names the template declaration before the receiver's
+                // closed HIR type is available. Resolve its storage below
+                // with that receiver, rather than retaining the open item.
+                self.unit.set_expr_semantic(expr_id, expr_sem_NONE(), hir_target_none(), hir_id_invalid());
+                existing_target_kind = hir_target_none();
+            }
+        }
+        if (existing_target_kind != hir_target_none()
+            && existing_target_kind != hir_target_field()
+            && existing_target_kind != hir_target_variant()
+            && existing_target_kind != hir_target_builtin()
+            && existing_target_kind != hir_target_function()) { return; }
+        var owner_type_name = self.member_owner_type_name(e, lhs_expr_id);
+        if (owner_type_name.len == 0) {
+            if (self.restore_builtin_member_semantic(e, expr_id)) { return; }
+            return;
+        }
+        let member_name = policy_versioned_generic_call_base(expr_get_name(e).clone());
+        if (self.unit.expr_sem_kind(expr_id) == expr_sem_FIELD()
+            || existing_target_kind == hir_target_field()) {
+            let receiver_type_id = self.member_lookup_type_id(self.unit.expr_type(lhs_expr_id));
+            let field_item_by_receiver = self.field_id_for_type_and_name(receiver_type_id, member_name);
+            if (field_item_by_receiver != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id, self.unit.item_type(field_item_by_receiver));
+                self.unit.set_expr_semantic(expr_id,
+                                           expr_sem_FIELD(),
+                                           hir_target_field(),
+                                           field_item_by_receiver);
+                return;
+            }
+        }
+        let dyn_iface_name = self.dyn_interface_name_from_type_text(owner_type_name);
+        if (dyn_iface_name.len > 0) {
+            let dyn_method_fn = self.method_function_target_by_owner_type_and_method(dyn_iface_name, member_name);
+            if (dyn_method_fn != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id, self.function_type_id(dyn_method_fn));
+                self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), dyn_method_fn);
+                return;
+            }
+        }
+        let owner_type_id_for_tuple = self.unit.expr_type(lhs_expr_id);
+        if (self.resolve_tuple_builtin_member_expr(expr_id, owner_type_id_for_tuple, member_name)) { return; }
+        let want_static_member = self.unit.expr_sem_kind(lhs_expr_id) == expr_sem_CLASS();
+        var semantic_method_decl: rawptr = null;
+        if (!defer_method_resolution_for_direct_call) {
+            semantic_method_decl = self.semantic_method_decl_for_member_ast(e,
+                                                                            owner_type_name,
+                                                                            member_name,
+                                                                            want_static_member);
+        }
+        if (semantic_method_decl != null) {
+            let semantic_method_fn = self.closed_method_target_for_type_text(owner_type_name,
+                                                                             member_name,
+                                                                             null,
+                                                                             hir_id_invalid(),
+                                                                             semantic_method_decl,
+                                                                             want_static_member);
+            if (semantic_method_fn != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id, self.function_type_id(semantic_method_fn));
+                self.unit.set_expr_semantic(expr_id,
+                                           expr_sem_METHOD(),
+                                           hir_target_function(),
+                                           semantic_method_fn);
+                return;
+            }
+        }
+        var member_decl = self.raw_member_decl_for_type_text(owner_type_name, member_name);
+        if (member_decl == null) {
+            let payload_owner_type = self.heap_indirect_member_owner_type_text(owner_type_name, member_name);
+            if (payload_owner_type.len > 0) {
+                let payload_member_decl = self.raw_member_decl_for_type_text(payload_owner_type, member_name);
+                if (payload_member_decl != null) {
+                    owner_type_name = payload_owner_type;
+                    member_decl = payload_member_decl;
+                }
+            }
+        }
+        if (member_decl == null) {
+            let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(lhs_expr_id));
+            let field_item = self.field_id_for_type_and_name(owner_type_id, member_name);
+            if (field_item != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id, self.unit.item_type(field_item));
+                self.unit.set_expr_semantic(expr_id, expr_sem_FIELD(), hir_target_field(), field_item);
+                return;
+            }
+            var method_owner_type = owner_type_name;
+            var method_fn = hir_id_invalid();
+            if (!defer_method_resolution_for_direct_call) {
+                method_fn = self.closed_method_target_for_type_text(method_owner_type,
+                                                                    member_name,
+                                                                    null,
+                                                                    hir_id_invalid(),
+                                                                    null,
+                                                                    want_static_member);
+            }
+            if (method_fn == hir_id_invalid()) {
+                let payload_owner_type = self.heap_indirect_member_owner_type_text(owner_type_name, member_name);
+                if (payload_owner_type.len > 0 && !defer_method_resolution_for_direct_call) {
+                    var payload_method_fn = self.closed_method_target_for_type_text(payload_owner_type,
+                                                                                    member_name,
+                                                                                    null,
+                                                                                    hir_id_invalid(),
+                                                                                    null,
+                                                                                    false);
+                    if (payload_method_fn != hir_id_invalid()) {
+                        method_owner_type = payload_owner_type;
+                        method_fn = payload_method_fn;
+                    }
+                }
+            }
+            if (method_fn != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id, self.function_type_id(method_fn));
+                self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), method_fn);
+                return;
+            }
+            if (self.resolve_default_new_member_expr(expr_id, owner_type_name, member_name)) { return; }
+            if (self.resolve_string_builtin_member_expr(expr_id, owner_type_name, member_name)) { return; }
+            if (self.resolve_primitive_builtin_member_expr(expr_id, owner_type_name, member_name)) { return; }
+            if (self.restore_builtin_member_semantic(e, expr_id)) { return; }
+            return;
+        }
+        let owner_decl = self.raw_class_decl_for_type_text(owner_type_name);
+        if (hir_builder_decl_is_assoc_const_member(member_decl)) {
+            let value_item = self.concrete_member_value_target_for_type_text(member_decl, owner_decl, owner_type_name);
+            if (value_item == hir_id_invalid()) { return; }
+            self.unit.set_expr_type(expr_id, self.unit.item_type(value_item));
+            self.unit.set_expr_semantic(expr_id, expr_sem_CONST(), hir_target_item(), value_item);
+            return;
+        }
+        if (decl_get_kind(member_decl) == de_FIELD()) {
+            let field_item = self.concrete_field_target_for_type_text(member_decl, owner_decl, owner_type_name);
+            if (field_item == hir_id_invalid()) { return; }
+            self.unit.set_expr_type(expr_id, self.unit.item_type(field_item));
+            self.unit.set_expr_semantic(expr_id, expr_sem_FIELD(), hir_target_field(), field_item);
+            return;
+        }
+        if (decl_get_kind(member_decl) == de_VARIANT()) {
+            let variant_item = self.concrete_variant_target_for_type_text(member_decl, owner_decl, owner_type_name);
+            if (variant_item == hir_id_invalid()) { return; }
+            let variant_type = self.variant_constructor_type_id_for_type_text(member_decl, owner_decl, owner_type_name);
+            if (variant_type != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id, variant_type);
+            } else {
+                self.unit.set_expr_type(expr_id, self.unit.item_type(variant_item));
+            }
+            self.unit.set_expr_semantic(expr_id, expr_sem_VARIANT(), hir_target_variant(), variant_item);
+            return;
+        }
+        if (decl_get_kind(member_decl) == de_CONST() || decl_get_kind(member_decl) == de_GLOBAL_VAR()) {
+            let value_item = self.concrete_member_value_target_for_type_text(member_decl, owner_decl, owner_type_name);
+            if (value_item == hir_id_invalid()) { return; }
+            self.unit.set_expr_type(expr_id, self.unit.item_type(value_item));
+            var value_sem = expr_sem_CONST();
+            if (decl_get_kind(member_decl) == de_GLOBAL_VAR()) { value_sem = expr_sem_GLOBAL(); }
+            self.unit.set_expr_semantic(expr_id, value_sem, hir_target_item(), value_item);
+            return;
+        }
+        if (decl_get_kind(member_decl) == de_METHOD()) {
+            if (defer_method_resolution_for_direct_call) { return; }
+            var selected_method_decl = semantic_method_decl;
+            if (selected_method_decl == null) { selected_method_decl = member_decl; }
+            var method_fn = self.closed_method_target_for_type_text(owner_type_name,
+                                                                    member_name,
+                                                                    null,
+                                                                    hir_id_invalid(),
+                                                                    selected_method_decl,
+                                                                    decl_get_is_static(selected_method_decl) || want_static_member);
+            if (method_fn == hir_id_invalid()) { return; }
+            method_fn = self.prefer_closed_function_instance_for_owner_method(owner_type_name,
+                                                                              member_name,
+                                                                              method_fn);
+            self.unit.set_expr_type(expr_id, self.function_type_id(method_fn));
+            self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), method_fn);
+        }
+    }
+}

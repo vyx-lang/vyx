@@ -4,9 +4,9 @@
 [Language surface](LANGUAGE_SURFACE.md)
 
 **Source:** the current self-hosted compiler in `bootstrap_compiler/`.
-This page is reconstructed from `src/core/lexer.vyx`, `src/core/policy.vyx`,
-`src/core/parser.vyx`, `src/core/sema.vyx`, `src/core/diag.vyx`,
-`src/core/main.vyx`, and `src/hir/hir_builder.vyx`. Older host-era version
+This page is reconstructed from `src/core/syntax/lexer.vyx`, `src/core/sema/policy.vyx`,
+`src/core/syntax/parser.vyx`, `src/core/sema/sema.vyx`, `src/core/syntax/diag.vyx`,
+`src/core/driver/main.vyx`, and `src/hir/builder/hir_builder.vyx`. Older host-era version
 lists and examples do not describe the current compiler.
 
 Tutorials teach this surface with runnable files. The [compiler architecture](COMPILER.md)

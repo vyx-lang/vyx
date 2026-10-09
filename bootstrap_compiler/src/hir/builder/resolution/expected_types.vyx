@@ -1,0 +1,442 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Expected types for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn apply_expected_variant_arg_types(self,
+                                               call_expr_id: i32,
+                                               owner_type_id: i32,
+                                               variant_decl: rawptr) {
+        if (call_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(call_expr_id) != ex_CALL()
+            || !self.type_id_is_valid(owner_type_id)
+            || variant_decl == null) {
+            return;
+        }
+        var arg = self.unit.expr_first_arg(call_expr_id);
+        var arg_index: i32 = 0;
+        while (arg != hir_id_invalid()) {
+            let param_type = self.variant_param_type_id_for_owner(owner_type_id, variant_decl, arg_index);
+            if (self.type_id_is_valid(param_type)) {
+                self.apply_expected_expr_type(arg, param_type);
+            }
+            arg = self.unit.expr_next_arg(arg);
+            arg_index = arg_index + 1;
+        }
+    }
+
+    fn resolve_expected_variant_expr(self, expr_id: i32, expected_type_id: i32) -> bool {
+        if (expr_id == hir_id_invalid() || !self.type_id_is_valid(expected_type_id)) { return false; }
+        let expected_type_text = hir_type_table_text(self.unit.types, expected_type_id);
+        if (expected_type_text.len == 0 || self.type_text_has_open_template_atom(expected_type_text)) { return false; }
+        let owner_decl = self.raw_class_decl_for_type_text(expected_type_text);
+        if (owner_decl == null) { return false; }
+        let expr_kind = self.unit.expr_kind(expr_id);
+        var variant_expr_id = expr_id;
+        if (expr_kind == ex_CALL()) {
+            variant_expr_id = self.unit.expr_lhs(expr_id);
+        } else if (expr_kind != ex_IDENT()) {
+            return false;
+        }
+        if (variant_expr_id == hir_id_invalid()) { return false; }
+        let variant_target_kind = self.unit.expr_target_kind(variant_expr_id);
+        if (variant_target_kind != hir_target_none()
+            && variant_target_kind != hir_target_variant()) {
+            return false;
+        }
+        let variant_name = policy_generic_call_base(self.unit.expr_name(variant_expr_id).clone());
+        if (variant_name.len == 0) { return false; }
+        let variant_decl = self.raw_member_decl_for_type_text(expected_type_text, variant_name);
+        if (variant_decl == null || decl_get_kind(variant_decl) != de_VARIANT()) { return false; }
+        self.ensure_concrete_type_text_ready(expected_type_text);
+        let variant_item = self.concrete_variant_target_for_type_text(variant_decl,
+                                                                      owner_decl,
+                                                                      expected_type_text);
+        if (variant_item == hir_id_invalid()) { return false; }
+        let variant_type = self.variant_constructor_type_id_for_type_text(variant_decl,
+                                                                          owner_decl,
+                                                                          expected_type_text);
+        if (variant_type != hir_id_invalid()) {
+            self.unit.set_expr_type(variant_expr_id, variant_type);
+        } else {
+            self.unit.set_expr_type(variant_expr_id, expected_type_id);
+        }
+        self.unit.set_expr_semantic(variant_expr_id,
+                                   expr_sem_VARIANT(),
+                                   hir_target_variant(),
+                                   variant_item);
+        if (expr_kind == ex_CALL()) {
+            self.unit.set_expr_type(expr_id, expected_type_id);
+            self.unit.set_expr_semantic(expr_id,
+                                       expr_sem_VARIANT(),
+                                       hir_target_variant(),
+                                       variant_item);
+            self.apply_expected_variant_arg_types(expr_id, expected_type_id, variant_decl);
+        } else {
+            self.unit.set_expr_type(expr_id, expected_type_id);
+            self.unit.set_expr_semantic(expr_id,
+                                       expr_sem_VARIANT(),
+                                       hir_target_variant(),
+                                       variant_item);
+        }
+        return true;
+    }
+
+    fn type_id_for_item(self, item_id: i32) -> i32 {
+        let direct = self.unit.item_type(item_id);
+        if (direct != hir_id_invalid()) { return direct; }
+        let name = self.unit.item_name(item_id);
+        if (name.len == 0) { return hir_id_invalid(); }
+        var type_id: i32 = 1;
+        while (type_id <= self.unit.types.count) {
+            if (hir_type_table_text(self.unit.types, type_id) == name) { return type_id; }
+            type_id = type_id + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    fn resolve_struct_init_type_id(self, e: rawptr, expr_id: i32) -> i32 {
+        let existing = self.unit.expr_type(expr_id);
+        if (self.type_id_is_valid(existing)) { return existing; }
+        var name = "";
+        if (e != null) { name = expr_get_name(e); }
+        let ret_type = self.unit.function_return_type(self.current_function_id);
+        if (self.type_id_is_valid(ret_type) && name.len > 0) {
+            let ret_text = hir_type_table_text(self.unit.types, ret_type);
+            if (hir_builder_last_path_segment(hir_builder_type_base_name(ret_text))
+                == hir_builder_last_path_segment(policy_generic_call_base(name.clone()))) {
+                self.unit.set_expr_type(expr_id, ret_type);
+                return ret_type;
+            }
+        }
+        if (name.len > 0) {
+            let resolved = self.resolve_type_text_in_current_env(name);
+            if (resolved.len > 0 && self.raw_class_decl_for_type_text(resolved) != null) {
+                let type_id = self.type_id_from_text(resolved);
+                self.unit.set_expr_type(expr_id, type_id);
+                return type_id;
+            }
+        }
+        return existing;
+    }
+
+    fn type_id_is_integer_primitive(self, type_id: i32) -> bool {
+        if (!self.type_id_is_valid(type_id)) { return false; }
+        let kind = hir_type_table_kind(self.unit.types, type_id);
+        if (kind == ty_I8() || kind == ty_I16() || kind == ty_I32() || kind == ty_I64()) { return true; }
+        if (kind == ty_U8() || kind == ty_U16() || kind == ty_U32() || kind == ty_U64()) { return true; }
+        return kind == ty_ISIZE() || kind == ty_USIZE();
+    }
+
+    fn apply_expected_expr_type_from_current_env(self,
+                                                        expr_id: i32,
+                                                        current_type_id: i32,
+                                                        expected_type_id: i32) -> bool {
+        if (expr_id == hir_id_invalid()
+            || !self.type_id_is_valid(current_type_id)
+            || !self.type_id_is_valid(expected_type_id)
+            || current_type_id == expected_type_id) {
+            return false;
+        }
+        let expected_text = hir_type_table_text(self.unit.types, expected_type_id);
+        if (expected_text.len == 0 || self.type_text_has_open_template_atom(expected_text)) {
+            return false;
+        }
+        let current_text = hir_type_table_text(self.unit.types, current_type_id);
+        if (current_text.len == 0) { return false; }
+        let resolved_text = self.resolve_type_text_in_current_env(current_text);
+        if (resolved_text.len == 0) { return false; }
+        let resolved_type_id = self.type_id_from_text(resolved_text);
+        if ((self.type_id_is_valid(resolved_type_id) && resolved_type_id == expected_type_id)
+            || policy_type_name_equal(resolved_text, expected_text)) {
+            self.unit.set_expr_type(expr_id, expected_type_id);
+            return true;
+        }
+        return false;
+    }
+
+    fn expected_static_owner_type_for_call(self, expr_id: i32, expected_type_id: i32) -> string {
+        if (expr_id == hir_id_invalid()
+            || !self.type_id_is_valid(expected_type_id)
+            || self.unit.expr_kind(expr_id) != ex_CALL()) {
+            return "";
+        }
+        let callee_expr_id = self.unit.expr_lhs(expr_id);
+        if (callee_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) {
+            return "";
+        }
+        let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+        if (owner_expr_id == hir_id_invalid()) { return ""; }
+        var expected_text = hir_type_table_text(self.unit.types, expected_type_id);
+        if (expected_text.len == 0) { return ""; }
+        let resolved_expected = self.resolve_type_text_in_current_env(expected_text);
+        if (resolved_expected.len > 0) { expected_text = resolved_expected; }
+        if (expected_text.len == 0 || self.type_text_has_open_template_atom(expected_text)) {
+            return "";
+        }
+        if (policy_generic_call_args(expected_text.clone()).len == 0) { return ""; }
+        if (self.raw_class_decl_for_type_text(expected_text) == null) { return ""; }
+        let expected_base = hir_builder_type_base_name(expected_text);
+        if (expected_base.len == 0) { return ""; }
+        var owner_text = self.unit.expr_name(owner_expr_id);
+        if (owner_text.len > 0) {
+            let resolved_owner = self.resolve_type_text_in_current_env(owner_text);
+            if (resolved_owner.len > 0) { owner_text = resolved_owner; }
+        }
+        if (owner_text.len == 0) {
+            let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(owner_expr_id));
+            if (self.type_id_is_valid(owner_type_id)) {
+                owner_text = self.member_lookup_type_name(owner_type_id);
+            }
+        }
+        if (owner_text.len == 0) { return ""; }
+        let owner_base = hir_builder_type_base_name(owner_text);
+        if (!hir_builder_type_owner_names_match(owner_base, expected_base)) { return ""; }
+        let owner_args = policy_generic_call_args(owner_text.clone());
+        // A call whose static owner is already closed has nothing to infer
+        // from the expected result type. Re-resolving such a call can select a
+        // second generic-pack instance and disconnect the already-built HIR
+        // argument chain (most visibly in direct return expressions).
+        if (owner_args.len > 0 && !self.type_text_has_open_template_atom(owner_text)) {
+            return "";
+        }
+        return expected_text;
+    }
+
+    fn rebind_expected_static_member_call(self, expr_id: i32, expected_type_id: i32) -> bool {
+        let owner_type_name = self.expected_static_owner_type_for_call(expr_id, expected_type_id);
+        if (owner_type_name.len == 0) { return false; }
+        let owner_decl = self.raw_class_decl_for_type_text(owner_type_name);
+        if (owner_decl == null) { return false; }
+        self.ensure_concrete_type_text_ready(owner_type_name);
+        let concrete_owner_type = self.type_id_from_text(owner_type_name);
+        if (!self.type_id_is_valid(concrete_owner_type)) { return false; }
+        let callee_expr_id = self.unit.expr_lhs(expr_id);
+        let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+        let method_name = policy_versioned_generic_call_base(self.unit.expr_name(callee_expr_id).clone());
+        if (method_name.len == 0) { return false; }
+        if (!self.raw_method_decl_exists_for_type_text(owner_type_name, method_name, true)) {
+            return false;
+        }
+        let raw_class = owner_decl;
+        if (raw_class == null) { return false; }
+        let owner_item = hir_pointer_map_item(self.decl_map,raw_class);
+        self.unit.set_expr_name(owner_expr_id, owner_type_name);
+        self.unit.set_expr_type(owner_expr_id, concrete_owner_type);
+        self.unit.set_expr_semantic(owner_expr_id,
+                                   expr_sem_CLASS(),
+                                   hir_target_item(),
+                                   owner_item);
+        self.unit.set_expr_semantic(callee_expr_id,
+                                   expr_sem_NONE(),
+                                   hir_target_none(),
+                                   hir_id_invalid());
+        self.unit.set_expr_semantic(expr_id,
+                                   expr_sem_NONE(),
+                                   hir_target_none(),
+                                   hir_id_invalid());
+        self.resolve_call_expr_after_children(null, expr_id, callee_expr_id);
+        if (self.unit.expr_target_kind(expr_id) != hir_target_function()) { return false; }
+        let target_id = self.unit.expr_target_id(expr_id);
+        if (target_id == hir_id_invalid() || self.function_has_open_template_types(target_id)) {
+            return false;
+        }
+        return true;
+    }
+
+    fn apply_expected_expr_type(self, expr_id: i32, expected_type_id: i32) {
+        if (expr_id == hir_id_invalid() || !self.type_id_is_valid(expected_type_id)) { return; }
+        let expected_timing = hir_builder_env_enabled("VYX_HIR_EXPECTED_TIMING");
+        var expected_start: i64 = 0;
+        var expected_mark: i64 = 0;
+        var expected_dyn_ms: i64 = 0;
+        var expected_variant_ms: i64 = 0;
+        var expected_rebind_ms: i64 = 0;
+        var expected_env_ms: i64 = 0;
+        var expected_open_ms: i64 = 0;
+        if (expected_timing) {
+            expected_start = vyx_bootstrap_now_ms();
+            expected_mark = expected_start;
+        }
+        self.materialize_dyn_expected_arg_impl(expr_id, expected_type_id);
+        if (expected_timing) {
+            let now_dyn = vyx_bootstrap_now_ms();
+            expected_dyn_ms = now_dyn - expected_mark;
+            expected_mark = now_dyn;
+        }
+        let expr_kind = self.unit.expr_kind(expr_id);
+        if (expr_kind == ex_CALL()) {
+            let expected_callee = self.unit.expr_lhs(expr_id);
+            var retry_generic_call = false;
+            if (expected_callee != hir_id_invalid()
+                && (self.unit.expr_sem_kind(expected_callee) == expr_sem_BUILTIN()
+                    || self.unit.expr_sem_kind(expected_callee) == expr_sem_DIRECT_FN())) {
+                let expected_target = self.unit.expr_target_id(expected_callee);
+                retry_generic_call = expected_target <= 0
+                    || self.function_has_open_template_types(expected_target);
+                let explicit_name = self.unit.expr_name(expected_callee);
+                if (!retry_generic_call && policy_generic_call_args(explicit_name.clone()).len > 0
+                    && expected_target > 0) {
+                    let expected_ret = self.unit.function_return_type(expected_target);
+                    retry_generic_call = hir_type_table_kind(self.unit.types, expected_ret) == ty_RAWPTR();
+                }
+            }
+            if (retry_generic_call) {
+                // A call in a return expression is built before its expected
+                // result type is available. Retry imported generic recovery
+                // here so an explicit `<i32>` closes the function instance
+                // instead of leaving the provisional rawptr shell in place.
+                self.resolve_call_expr_after_children(null, expr_id, expected_callee);
+                let refreshed_target = self.unit.expr_target_id(expected_callee);
+                if (self.unit.expr_target_kind(expected_callee) == hir_target_function()
+                    && refreshed_target != hir_id_invalid()) {
+                    let refreshed_ret = self.unit.function_return_type(refreshed_target);
+                    if (self.type_id_is_valid(refreshed_ret)) {
+                        self.unit.set_expr_type(expr_id, refreshed_ret);
+                    }
+                }
+            }
+        }
+        if (expr_kind == ex_ARRAY_LIT()) {
+            let expected_kind = hir_type_table_kind(self.unit.types, expected_type_id);
+            if (expected_kind == ty_ARRAY()) {
+                self.unit.set_expr_type(expr_id, expected_type_id);
+                let elem_type = hir_type_table_elem(self.unit.types, expected_type_id);
+                if (self.type_id_is_valid(elem_type)) {
+                    var arg = self.unit.expr_first_arg(expr_id);
+                    while (arg != hir_id_invalid()) {
+                        self.apply_expected_expr_type(arg, elem_type);
+                        arg = self.unit.expr_next_arg(arg);
+                    }
+                }
+                return;
+            }
+            // Bare array literal flowing into a `*T` parameter (call
+            // argument decay): retype the literal to `[N x T]` so its
+            // elements materialize at the pointed-to element type and the
+            // MIR array→pointer decay sees matching element types.
+            // Without this, elements keep their standalone inference
+            // (`10` → i32) and `Vec<i64>::from_array([10, 20], 2)` /
+            // `Vec<i64>{10, 20}` fail with an element mismatch.
+            if (expected_kind == ty_PTR()) {
+                let elem_type = hir_type_table_elem(self.unit.types, expected_type_id);
+                var count: i64 = 0;
+                var arg = self.unit.expr_first_arg(expr_id);
+                while (arg != hir_id_invalid()) {
+                    count = count + 1;
+                    arg = self.unit.expr_next_arg(arg);
+                }
+                if (self.type_id_is_valid(elem_type) && count > 0) {
+                    let elem_text = hir_type_table_text(self.unit.types, elem_type);
+                    let arr_text = "[" + elem_text + "; " + policy_i64_to_string(count) + "]";
+                    let arr_type = self.type_id_from_text(arr_text);
+                    if (self.type_id_is_valid(arr_type)) {
+                        self.unit.set_expr_type(expr_id, arr_type);
+                        arg = self.unit.expr_first_arg(expr_id);
+                        while (arg != hir_id_invalid()) {
+                            self.apply_expected_expr_type(arg, elem_type);
+                            arg = self.unit.expr_next_arg(arg);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if (expr_kind == ex_INT_LIT() && self.type_id_is_integer_primitive(expected_type_id)) {
+            self.unit.set_expr_type(expr_id, expected_type_id);
+            return;
+        }
+        if (expr_kind == ex_INT_LIT()
+            && hir_builder_lit_is_float(self.unit.expr_value_text(expr_id))
+            && self.type_id_is_floatish(expected_type_id)) {
+            self.unit.set_expr_type(expr_id, expected_type_id);
+            return;
+        }
+        if (self.resolve_expected_variant_expr(expr_id, expected_type_id)) { return; }
+        if (expected_timing) {
+            let now_variant = vyx_bootstrap_now_ms();
+            expected_variant_ms = now_variant - expected_mark;
+            expected_mark = now_variant;
+        }
+        let current_type = self.unit.expr_type(expr_id);
+        if (expr_kind == ex_CALL()) {
+            if (self.rebind_expected_static_member_call(expr_id, expected_type_id)) {
+                self.unit.set_expr_type(expr_id, expected_type_id);
+                return;
+            }
+        }
+        if (expected_timing) {
+            let now_rebind = vyx_bootstrap_now_ms();
+            expected_rebind_ms = now_rebind - expected_mark;
+            expected_mark = now_rebind;
+        }
+        if (expr_kind == ex_STRUCT_INIT()) {
+            if (!self.type_id_is_valid(current_type)) {
+                self.unit.set_expr_type(expr_id, expected_type_id);
+                return;
+            }
+            if (current_type == expected_type_id
+                || self.apply_expected_expr_type_from_current_env(expr_id, current_type, expected_type_id)) {
+                return;
+            }
+            if (self.type_id_has_template_atom(current_type)
+                && !self.type_id_has_template_atom(expected_type_id)) {
+                self.unit.set_expr_type(expr_id, expected_type_id);
+            }
+            return;
+        }
+        if (self.apply_expected_expr_type_from_current_env(expr_id, current_type, expected_type_id)) {
+            return;
+        }
+        if (expected_timing) {
+            let now_env = vyx_bootstrap_now_ms();
+            expected_env_ms = now_env - expected_mark;
+            expected_mark = now_env;
+        }
+        if (self.type_id_is_valid(current_type)
+            && self.type_id_has_template_atom(current_type)
+            && !self.type_id_has_template_atom(expected_type_id)) {
+            self.unit.set_expr_type(expr_id, expected_type_id);
+            return;
+        }
+        if (expected_timing) {
+            let now_open = vyx_bootstrap_now_ms();
+            expected_open_ms = now_open - expected_mark;
+        }
+        if (!self.type_id_is_valid(self.unit.expr_type(expr_id))) {
+            self.unit.set_expr_type(expr_id, expected_type_id);
+        }
+        if (expected_timing) {
+            let total = vyx_bootstrap_now_ms() - expected_start;
+            if (total >= hir_builder_slow_expr_threshold_ms()) {
+                var current_type_text = "<invalid>";
+                if (self.type_id_is_valid(current_type)) {
+                    current_type_text = hir_type_table_text(self.unit.types, current_type);
+                }
+                print("[hir-expected-phase] fn=" + self.unit.function_name(self.current_function_id)
+                      + " total=" + policy_i64_to_string(total)
+                      + " dyn=" + policy_i64_to_string(expected_dyn_ms)
+                      + " variant=" + policy_i64_to_string(expected_variant_ms)
+                      + " rebind=" + policy_i64_to_string(expected_rebind_ms)
+                      + " env=" + policy_i64_to_string(expected_env_ms)
+                      + " open=" + policy_i64_to_string(expected_open_ms)
+                      + " expr_kind=" + self.i32_text(expr_kind)
+                      + " expr_type=" + current_type_text
+                      + " expected=" + hir_type_table_text(self.unit.types, expected_type_id)
+                      + " expr_id=" + self.i32_text(expr_id));
+            }
+        }
+    }
+}

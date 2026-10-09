@@ -1,0 +1,333 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn getenv(name: rawptr) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn strncmp(a: rawptr, b: rawptr, n: i64) -> i32;
+    fn vyx_bootstrap_profile_level() -> i32;
+    fn vyx_bootstrap_now_ms() -> i64;
+    fn vyx_rt_string_arena_checkpoint() -> rawptr;
+    fn vyx_rt_string_arena_release(mark: rawptr);
+    fn vyx_rt_string_arena_reserved_bytes() -> i64;
+    fn vyx_rt_string_arena_active_bytes() -> i64;
+    fn vyx_rt_ast_dup_bytes_total() -> i64;
+    fn vyx_rt_ast_node_bytes_total() -> i64;
+    fn vyx_rt_raw_dup_bytes_total() -> i64;
+    fn vyx_rt_raw_dup_bytes_live() -> i64;
+    fn vyx_rt_string_len_entry_count() -> i64;
+    fn vyx_rt_process_private_bytes() -> i64;
+    fn vyx_rt_process_working_set_bytes() -> i64;
+    fn vyx_rt_process_peak_private_bytes() -> i64;
+    fn vyx_rt_process_peak_working_set_bytes() -> i64;
+    fn vyx_rt_heap_used_bytes() -> i64;
+    fn vyx_rt_heap_bucket_report(label: rawptr);
+    fn vyx_rt_heap_trim();
+    fn cJSON_Parse(value: rawptr) -> rawptr;
+    fn cJSON_Delete(item: rawptr);
+    fn cJSON_CreateArray() -> rawptr;
+    fn cJSON_AddItemToArray(array: rawptr, item: rawptr) -> i32;
+}
+public class MirUnitBuilder {
+    public h: HirUnit
+    public hir_codegen_builder: rawptr
+    public has_hir_codegen_builder: bool
+    public hir_codegen_error_count: i32
+    public unit: MirUnit
+    public function_map: rawptr
+    public reachable_function_map: rawptr
+    public lowered_function_map: rawptr
+    // HIR body provenance can become available only after another live body
+    // registers a nested closed instance.  Keep that retry state in the
+    // shared builder, rather than making either MIR consumer guess at a
+    // backend-specific fallback.
+    public deferred_materialization_map: rawptr
+    public local_map: rawptr
+    public place_map: rawptr
+    public hir_open_template_cache: rawptr
+    public name_function_index: MirNameIdMap
+    public name_hir_function_index: MirNameIdMap
+    public owner_method_function_index: MirPairIdMap
+    public owner_method_hir_function_index: MirPairIdMap
+    public field_name_index: MirPairIdMap
+    public field_ordinal_index: MirPairIdMap
+    public type_equivalence_index: MirIntPairIdMap
+    public registered_type_atom_index: MirNameIdMap
+    public type_text_id_index: MirNameIdMap
+    public layout_type_index: MirNameIdMap
+    public layout_type_id_map: rawptr
+    public layout_materialized_type_id_map: rawptr
+    public layout_owner_type_item_map: rawptr
+    public field_owner_first_map: rawptr
+    public field_owner_next_map: rawptr
+    public variant_owner_first_map: rawptr
+    public variant_owner_next_map: rawptr
+    public field_owner_done_map: rawptr
+    public variant_owner_done_map: rawptr
+    public layout_item_count: i32
+    public layout_owner_item_count: i32
+    public type_open_template_cache: rawptr
+    public indexed_hir_function_next: i32
+    public indexed_type_atom_item_next: i32
+    public indexed_type_text_next: i32
+    public function_table_scan_next: i32
+    public reachable_function_queue_head: rawptr
+    public reachable_function_queue_tail: rawptr
+    public current_function_id: i32
+    public current_hir_function_id: i32
+    public current_block_id: i32
+    public break_target_block_id: i32
+    public continue_target_block_id: i32
+    public drop_stack_head: rawptr
+    public defer_stack_head: rawptr
+    // Source let/var storage is tracked independently from auto-drop state:
+    // scalar locals need a lifetime boundary too, while temporary/drop-only
+    // locals intentionally remain outside this lexical stack.
+    public storage_stack_head: rawptr
+    public break_drop_mark: rawptr
+    public continue_drop_mark: rawptr
+    public break_defer_mark: rawptr
+    public continue_defer_mark: rawptr
+    public break_storage_mark: rawptr
+    public continue_storage_mark: rawptr
+    public labeled_loop_head: rawptr
+    public expected_expr_type_id: i32
+    public static_item_scan_next: i32
+    public field_item_scan_next: i32
+    public variant_item_scan_next: i32
+    public partition_codegen_roots: bool
+    public emit_root_names: string
+    public emit_root_names_specified: bool
+    public dci_lifecycle_root: rawptr
+    public dci_lifecycle_skip: bool
+    // Lexical `unsafe { ... }` nesting depth.  While > 0, deref/index places
+    // are created with the unchecked check-policy so backends skip the
+    // checked-address audit for them.
+    public unsafe_depth: i32
+    public async_await_index: i32
+    public async_pc_place_id: i32
+
+    public static fn create(h: HirUnit) -> MirUnitBuilder {
+        let mir_unit = MirUnit.create(h.types);
+        mir_unit.set_reflection_manifest( hir_unit_reflection_manifest(h));
+        mir_unit.set_reflection_name_map( hir_unit_reflection_name_map(h));
+        mir_unit.set_foreign_cpp_includes( hir_unit_foreign_cpp_includes(h));
+        mir_unit.set_dci_stub_specs( hir_unit_dci_stub_specs(h));
+        mir_unit.set_interface_supers( hir_unit_interface_supers(h));
+        var type_cache_cap: i32 = h.types.count;
+        type_cache_cap = type_cache_cap + 1;
+        return MirUnitBuilder {
+            h: h,
+            hir_codegen_builder: null,
+            has_hir_codegen_builder: false,
+            hir_codegen_error_count: 0,
+            unit: mir_unit,
+            function_map: mir_i32_map_alloc(h.function_count + 1),
+            reachable_function_map: mir_i32_map_alloc(h.function_count + 1),
+            lowered_function_map: mir_i32_map_alloc(h.function_count + 1),
+            deferred_materialization_map: mir_i32_map_alloc(h.function_count + 1),
+            local_map: mir_i32_map_alloc(h.local_count + 1),
+            place_map: mir_i32_map_alloc(h.local_count + 1),
+            hir_open_template_cache: mir_i32_map_alloc(h.function_count + 1),
+            name_function_index: MirNameIdMap.create(),
+            name_hir_function_index: MirNameIdMap.create(),
+            owner_method_function_index: MirPairIdMap.create(),
+            owner_method_hir_function_index: MirPairIdMap.create(),
+            field_name_index: MirPairIdMap.create(),
+            field_ordinal_index: MirPairIdMap.create(),
+            type_equivalence_index: MirIntPairIdMap.create(),
+            registered_type_atom_index: MirNameIdMap.create(),
+            type_text_id_index: MirNameIdMap.create(),
+            layout_type_index: MirNameIdMap.create(),
+            layout_type_id_map: mir_i32_map_alloc(type_cache_cap),
+            layout_materialized_type_id_map: mir_i32_map_alloc(type_cache_cap),
+            layout_owner_type_item_map: mir_i32_map_alloc(type_cache_cap),
+            field_owner_first_map: mir_i32_map_alloc(h.item_count + 1),
+            field_owner_next_map: mir_i32_map_alloc(h.item_count + 1),
+            variant_owner_first_map: mir_i32_map_alloc(h.item_count + 1),
+            variant_owner_next_map: mir_i32_map_alloc(h.item_count + 1),
+            field_owner_done_map: mir_i32_map_alloc(h.item_count + 1),
+            variant_owner_done_map: mir_i32_map_alloc(h.item_count + 1),
+            layout_item_count: 0,
+            layout_owner_item_count: 0,
+            type_open_template_cache: mir_i32_map_alloc(type_cache_cap),
+            indexed_hir_function_next: 1,
+            indexed_type_atom_item_next: 1,
+            indexed_type_text_next: 1,
+            function_table_scan_next: 1,
+            reachable_function_queue_head: null,
+            reachable_function_queue_tail: null,
+            current_function_id: mir_id_invalid(),
+            current_hir_function_id: hir_id_invalid(),
+            current_block_id: mir_id_invalid(),
+            break_target_block_id: mir_id_invalid(),
+            continue_target_block_id: mir_id_invalid(),
+            drop_stack_head: null,
+            defer_stack_head: null,
+            storage_stack_head: null,
+            break_drop_mark: null,
+            continue_drop_mark: null,
+            break_defer_mark: null,
+            continue_defer_mark: null,
+            break_storage_mark: null,
+            continue_storage_mark: null,
+            labeled_loop_head: null,
+            expected_expr_type_id: hir_id_invalid(),
+            static_item_scan_next: 1,
+            field_item_scan_next: 1,
+            variant_item_scan_next: 1,
+            partition_codegen_roots: false,
+            emit_root_names: "",
+            emit_root_names_specified: false,
+            dci_lifecycle_root: null,
+            dci_lifecycle_skip: false,
+            unsafe_depth: 0,
+            async_await_index: 0,
+            async_pc_place_id: mir_id_invalid()
+        };
+    }
+
+    public static fn create_for_codegen(builder: rawptr) -> MirUnitBuilder {
+        var out = MirUnitBuilder.create(hir_codegen_builder_handle_unit(builder));
+        out.hir_codegen_builder = builder;
+        out.has_hir_codegen_builder = true;
+        out.hir_codegen_error_count = 0;
+        return out;
+    }
+
+    public fn release_raw_node_chain(self, head: rawptr, next_offset: i32) {
+        var cur = head;
+        while (cur != null) {
+            let next = ast_read_rawptr(ptr_offset(cur, next_offset));
+            free(cur);
+            cur = next;
+        }
+    }
+
+    public fn release_build_state(self) {
+        self.function_map = mir_i32_map_dispose(self.function_map);
+        self.reachable_function_map = mir_i32_map_dispose(self.reachable_function_map);
+        self.lowered_function_map = mir_i32_map_dispose(self.lowered_function_map);
+        self.deferred_materialization_map = mir_i32_map_dispose(self.deferred_materialization_map);
+        self.local_map = mir_i32_map_dispose(self.local_map);
+        self.place_map = mir_i32_map_dispose(self.place_map);
+        self.hir_open_template_cache = mir_i32_map_dispose(self.hir_open_template_cache);
+        self.type_open_template_cache = mir_i32_map_dispose(self.type_open_template_cache);
+        self.name_function_index = mir_name_id_map_dispose(self.name_function_index);
+        self.name_hir_function_index = mir_name_id_map_dispose(self.name_hir_function_index);
+        self.owner_method_function_index = mir_pair_id_map_dispose(self.owner_method_function_index);
+        self.owner_method_hir_function_index = mir_pair_id_map_dispose(self.owner_method_hir_function_index);
+        self.field_name_index = mir_pair_id_map_dispose(self.field_name_index);
+        self.field_ordinal_index = mir_pair_id_map_dispose(self.field_ordinal_index);
+        self.type_equivalence_index = mir_int_pair_id_map_dispose(self.type_equivalence_index);
+        self.registered_type_atom_index = mir_name_id_map_dispose(self.registered_type_atom_index);
+        self.type_text_id_index = mir_name_id_map_dispose(self.type_text_id_index);
+        self.layout_type_index = mir_name_id_map_dispose(self.layout_type_index);
+        self.layout_type_id_map = mir_i32_map_dispose(self.layout_type_id_map);
+        self.layout_materialized_type_id_map = mir_i32_map_dispose(self.layout_materialized_type_id_map);
+        self.layout_owner_type_item_map = mir_i32_map_dispose(self.layout_owner_type_item_map);
+        self.field_owner_first_map = mir_i32_map_dispose(self.field_owner_first_map);
+        self.field_owner_next_map = mir_i32_map_dispose(self.field_owner_next_map);
+        self.variant_owner_first_map = mir_i32_map_dispose(self.variant_owner_first_map);
+        self.variant_owner_next_map = mir_i32_map_dispose(self.variant_owner_next_map);
+        self.field_owner_done_map = mir_i32_map_dispose(self.field_owner_done_map);
+        self.variant_owner_done_map = mir_i32_map_dispose(self.variant_owner_done_map);
+        self.layout_item_count = 0;
+        self.layout_owner_item_count = 0;
+        self.release_raw_node_chain(self.reachable_function_queue_head, 8);
+        self.release_raw_node_chain(self.drop_stack_head, 8);
+        self.release_raw_node_chain(self.defer_stack_head, 8);
+        self.release_raw_node_chain(self.storage_stack_head, 8);
+        self.reachable_function_queue_head = null;
+        self.reachable_function_queue_tail = null;
+        self.drop_stack_head = null;
+        self.defer_stack_head = null;
+        self.storage_stack_head = null;
+        self.break_drop_mark = null;
+        self.continue_drop_mark = null;
+        self.break_defer_mark = null;
+        self.continue_defer_mark = null;
+        self.break_storage_mark = null;
+        self.continue_storage_mark = null;
+        if (self.dci_lifecycle_root != null) {
+            cJSON_Delete(self.dci_lifecycle_root);
+            self.dci_lifecycle_root = null;
+        }
+        self.dci_lifecycle_skip = false;
+        if (self.has_hir_codegen_builder) {
+            // The HIR codegen builder handle is borrowed from the caller.
+            // The driver/LLVM lowering pipeline owns release+free.
+            self.hir_codegen_builder = null;
+            self.has_hir_codegen_builder = false;
+        }
+        vyx_rt_heap_trim();
+    }
+
+    public fn build(self) -> MirUnit {
+        self.prepare_streaming_codegen_round();
+        self.drain_reachable_function_bodies();
+        self.prepare_streaming_codegen_round();
+        self.drain_reachable_function_bodies();
+        var deferred_retry: i32 = 0;
+        while (self.pending_deferred_materializations() > 0 && deferred_retry < 64) {
+            self.prepare_streaming_codegen_round();
+            self.drain_reachable_function_bodies();
+            deferred_retry = deferred_retry + 1;
+        }
+        self.finalize_field_layouts_for_refs();
+        let built = self.unit;
+        self.release_build_state();
+        return built;
+    }
+}
+
+public fn mir_build_from_hir(h: HirUnit) -> MirUnit {
+    let builder = MirUnitBuilder.create(h);
+    return builder.build();
+}
+
+public fn mir_build_from_hir_codegen_builder_handle(hir_builder: rawptr) -> MirUnit {
+    return mir_build_from_hir_codegen_builder_handle_with_emit_roots(hir_builder,
+                                                                     "",
+                                                                     false);
+}
+
+public fn mir_build_from_hir_codegen_builder_handle_with_emit_roots(hir_builder: rawptr,
+                                                                    emit_root_names: string,
+                                                                    emit_root_names_specified: bool) -> MirUnit {
+    return mir_build_from_hir_codegen_builder_handle_with_emit_roots_and_dci(hir_builder,
+                                                                             emit_root_names,
+                                                                             emit_root_names_specified,
+                                                                             "");
+}
+
+public fn mir_build_from_hir_codegen_builder_handle_with_emit_roots_and_dci(hir_builder: rawptr,
+                                                                            emit_root_names: string,
+                                                                            emit_root_names_specified: bool,
+                                                                            dci_abi_text: string) -> MirUnit {
+    let builder = MirUnitBuilder.create_for_codegen(hir_builder);
+    // This path emits one linked MIR2CPP project, so there are no sibling
+    // root-partition objects that could provide declaration-only bodies.
+    builder.partition_codegen_roots = false;
+    builder.emit_root_names = emit_root_names;
+    builder.emit_root_names_specified = emit_root_names_specified;
+    if (dci_abi_text.len > 0) {
+        builder.unit.set_dci_abi_text( dci_abi_text.clone());
+    }
+    return builder.build();
+}

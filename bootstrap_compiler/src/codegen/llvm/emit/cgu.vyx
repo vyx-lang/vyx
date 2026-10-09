@@ -1,0 +1,872 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn cgu_intern_key(self, key: string) -> i32 {
+        var id: i32 = 1;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        let table = self.cgu_key_table;
+        while (i <= table.len) {
+            if (i == table.len || table.charAt(i) == 10) {
+                if (i > start) {
+                    if (table.substring(start, i) == key) { return id; }
+                    id = id + 1;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        self.cgu_key_table = self.cgu_key_table + key + "\n";
+        return id;
+    }
+
+    public fn function_cgu_key(self, function_id: i32) -> string {
+        let disc = mir_unit_function_symbol_discriminator(&self.m, function_id);
+        if (disc.len >= 7 && disc.substring(0, 7) == "source=") {
+            var end: i32 = 7;
+            while (end < disc.len) {
+                if (disc.charAt(end) == 124) { break; }
+                end = end + 1;
+            }
+            let src = disc.substring(7, end);
+            if (src.len > 0) { return src; }
+        }
+        if (self.debug_source_path.len > 0) { return self.debug_source_path; }
+        return self.module_symbol_name;
+    }
+
+    public fn cgu_grow_collected(self) {
+        var next = self.cgu_collected_cap * 2;
+        if (next < 64) { next = 64; }
+        let bytes = (next * 4) as u64;
+        let ids = malloc(bytes);
+        let sizes = malloc(bytes);
+        let keys = malloc(bytes);
+        let sig_off = malloc(bytes);
+        let marks = malloc((next * CGU_RETAIN_STRIDE * 4) as u64);
+        if (ids != null) { memset(ids, 0, bytes); }
+        if (sizes != null) { memset(sizes, 0, bytes); }
+        if (keys != null) { memset(keys, 0, bytes); }
+        if (marks != null) { memset(marks, 0, (next * CGU_RETAIN_STRIDE * 4) as u64); }
+        // 0xFF per byte is -1 per i32: "no signature snapshot for this slot".
+        if (sig_off != null) { memset(sig_off, 255, bytes); }
+        if (self.cgu_collected_ids != null && ids != null) {
+            memcpy(ids, self.cgu_collected_ids, (self.cgu_collected_n * 4) as u64);
+            free(self.cgu_collected_ids);
+        }
+        if (self.cgu_collected_sizes != null && sizes != null) {
+            memcpy(sizes, self.cgu_collected_sizes, (self.cgu_collected_n * 4) as u64);
+            free(self.cgu_collected_sizes);
+        }
+        if (self.cgu_collected_keys != null && keys != null) {
+            memcpy(keys, self.cgu_collected_keys, (self.cgu_collected_n * 4) as u64);
+            free(self.cgu_collected_keys);
+        }
+        if (self.dyn_sig_off != null && sig_off != null) {
+            memcpy(sig_off, self.dyn_sig_off, (self.cgu_collected_n * 4) as u64);
+            free(self.dyn_sig_off);
+        }
+        if (self.cgu_retain_marks != null && marks != null) {
+            memcpy(marks, self.cgu_retain_marks,
+                   (self.cgu_collected_n * CGU_RETAIN_STRIDE * 4) as u64);
+            free(self.cgu_retain_marks);
+        }
+        self.cgu_collected_ids = ids;
+        self.cgu_collected_sizes = sizes;
+        self.cgu_collected_keys = keys;
+        self.cgu_retain_marks = marks;
+        self.dyn_sig_off = sig_off;
+        self.cgu_collected_cap = next;
+    }
+
+    public fn grow_dyn_sig_buf(self, min_need: i32) {
+        var next = self.dyn_sig_cap * 2;
+        if (next < 256) { next = 256; }
+        while (next < min_need) { next = next * 2; }
+        let bytes = (next * 4) as u64;
+        let buf = malloc(bytes);
+        if (buf == null) { return; }
+        if (self.dyn_sig_buf != null) {
+            memcpy(buf, self.dyn_sig_buf, (self.dyn_sig_n * 4) as u64);
+            free(self.dyn_sig_buf);
+        }
+        self.dyn_sig_buf = buf;
+        self.dyn_sig_cap = next;
+    }
+
+    // Snapshot `[arity, param0_type, param1_type, ...]` for one partition slot.
+    // Runs while the body is still materialized (immediately before the body is
+    // released), which is the only point where the parameter locals of a
+    // function owned by another unit can be read safely.
+    public fn cgu_record_dyn_signature(self, slot: i32, function_id: i32) {
+        if (self.dyn_sig_off == null) { return; }
+        if (self.cgu_shell_sweep) { return; }
+        var arity = self.function_source_param_count(function_id);
+        if (arity < 1) { arity = 0; }
+        let need = arity + 1;
+        if (self.dyn_sig_buf == null || self.dyn_sig_n + need > self.dyn_sig_cap) {
+            self.grow_dyn_sig_buf(self.dyn_sig_n + need);
+            if (self.dyn_sig_buf == null) { return; }
+        }
+        let base = self.dyn_sig_n;
+        ast_write_i32(ptr_offset(self.dyn_sig_buf, base * 4), arity);
+        var i: i32 = 0;
+        while (i < arity) {
+            ast_write_i32(ptr_offset(self.dyn_sig_buf, (base + 1 + i) * 4),
+                          self.function_source_param_type(function_id, i));
+            i = i + 1;
+        }
+        self.dyn_sig_n = base + need;
+        ast_write_i32(ptr_offset(self.dyn_sig_off, slot * 4), base);
+    }
+
+    // Index one partition slot under its method name for the `dyn` fallback.
+    // The index stores `slot + 1` -- everything downstream needs the slot, not
+    // just the function id, because the signature snapshot lives in a parallel
+    // array -- and slot 0 has to survive the index's "id 0 means empty" guard.
+    // Reached either from the one-shot pass below or incrementally from
+    // `cgu_record_function`, which de-duplicates through `cgu_member_map`, so a
+    // slot is never indexed twice.  Walking the whole partition on every lookup
+    // is what made an earlier version of this fallback exhaust the string pool
+    // while compiling the compiler.
+    public fn remember_dyn_partition_slot(self, slot: i32) {
+        if (self.dyn_partition_index == null) { return; }
+        if (self.cgu_collected_ids == null) { return; }
+        if (slot < 0 || slot >= self.cgu_collected_n) { return; }
+        let fn_id = ast_read_i32(ptr_offset(self.cgu_collected_ids, slot * 4));
+        if (fn_id == mir_id_invalid()) { return; }
+        if (mir_unit_function_owner_item_kind(&self.m, fn_id) == hir_item_interface()) { return; }
+        let method_name = self.function_method_name(fn_id);
+        if (method_name.len == 0) { return; }
+        llvm_mir_method_candidate_index_put(self.dyn_partition_index,
+                                            self.dyn_partition_index_cap,
+                                            method_name,
+                                            slot + 1);
+    }
+
+    // Fold any not-yet-indexed partition slots into `dyn_partition_index`.  The
+    // index is built lazily so a build that never needs the `dyn` fallback pays
+    // nothing, and it is extended incrementally so a lookup never rescans the
+    // slots it has already seen.  Only the function *record* is read here (name,
+    // owner, item kind); signatures come from `dyn_sig_off`, which was filled in
+    // at record time while the bodies were still live.
+    public fn ensure_dyn_partition_index(self) {
+        if (self.dyn_partition_index == null || self.cgu_collected_ids == null) { return; }
+        while (self.dyn_partition_index_n < self.cgu_collected_n) {
+            self.remember_dyn_partition_slot(self.dyn_partition_index_n);
+            self.dyn_partition_index_n = self.dyn_partition_index_n + 1;
+        }
+    }
+
+    // Returns the collected slot the function was given, or -1 when it was not
+    // recorded (invalid id, already a member, or the arrays could not grow).
+    public fn cgu_record_function(self, function_id: i32, instr_delta: i32) -> i32 {
+        if (function_id == mir_id_invalid()) { return -1; }
+        if (llvm_mir_i32_map_get(self.cgu_member_map, function_id) != 0) { return -1; }
+        if (self.cgu_collected_n >= self.cgu_collected_cap) { self.cgu_grow_collected(); }
+        if (self.cgu_collected_ids == null) { return -1; }
+        var size = instr_delta;
+        if (size < 1) { size = 1; }
+        let key_id = self.cgu_intern_key(self.function_cgu_key(function_id));
+        ast_write_i32(ptr_offset(self.cgu_collected_ids, self.cgu_collected_n * 4), function_id);
+        ast_write_i32(ptr_offset(self.cgu_collected_sizes, self.cgu_collected_n * 4), size);
+        ast_write_i32(ptr_offset(self.cgu_collected_keys, self.cgu_collected_n * 4), key_id);
+        self.cgu_collected_n = self.cgu_collected_n + 1;
+        llvm_mir_i32_map_put(self.cgu_member_map, function_id, 1);
+        // Snapshot the parameter signature right here: this is the last moment
+        // at which the body is still materialized, and a body registered for a
+        // sibling unit is released before that unit's `dyn` vtables are lowered.
+        self.cgu_record_dyn_signature(self.cgu_collected_n - 1, function_id);
+        if (policy_phase_summary_enabled() && ((self.cgu_collected_n % 256) == 0)) {
+            print("[llvm-cgu] collect-fns=" + policy_i64_to_string(self.cgu_collected_n as i64));
+        }
+        return self.cgu_collected_n - 1;
+    }
+
+    // Collect walk: may this body be released, or must it stay in the arena
+    // for the emit walk?
+    //
+    // The emit walk rebuilds every released body from its provenance, so a body
+    // that has no provenance cannot be released -- the loss is permanent and
+    // the emit walk then fails with `I0100 ... still unavailable after
+    // streaming deferred retries`.  A lambda's synthesized `closure$N`
+    // function is exactly such a body: it was built inline from the enclosing
+    // expression and never had a declaration of its own.  `VYX_CGU_RETAIN=1`
+    // turns the retention on for the whole unit; this keeps it to the bodies
+    // that actually need it.
+    public fn cgu_must_retain_collected_body(self, builder: &mut MirUnitBuilder, fn_id: i32) -> bool {
+        if (self.cgu_retain_bodies) { return true; }
+        let hir_fn = builder.unit.function_hir_id(fn_id);
+        if (hir_fn == hir_id_invalid()) { return false; }
+        return !builder.hir_function_body_is_recoverable(hir_fn);
+    }
+
+    // Must an otherwise releasable body be kept anyway, because something
+    // retained was built inside it?
+    //
+    // The arena is a stack: a nested function's region sits directly above the
+    // region of the body whose build pulled it in, and both share the same
+    // tables.  `discard_recent_body_records` rewinds every counter to the
+    // released body's *start* marks and zeroes every record above them, so
+    // releasing an enclosing body destroys any retained body inside it; the
+    // emit walk then copies the frozen marks of a region that holds nothing and
+    // dies with `I0100 ... references invalid block #N`.  `retained_before` is
+    // `cgu_retain_count` as it stood before this body was built, so a change
+    // means a retained body lies inside this one and this body has to survive
+    // until the emit walk is done -- regardless of whether *itself* it could
+    // have been rebuilt from provenance.
+    public fn cgu_must_retain_enclosing_body(self, retained_before: i32) -> bool {
+        return self.cgu_retain_count != retained_before;
+    }
+
+    // Remember where a collected body lives so the emit walk can reuse it
+    // instead of materialising the function again.  The body has to still be in
+    // the arena, which is why the emit walk must not release it as it goes.
+    // Membership of `cgu_retain_slot` -- not the unit-wide flag -- is what the
+    // emit walk and the final release both key off, because
+    // `cgu_must_retain_collected_body` can retain a single body on its own.
+    public fn cgu_retain_record(self, slot: i32, function_id: i32, rec: rawptr) -> bool {
+        if (slot < 0 || self.cgu_retain_marks == null) { return false; }
+        if (self.cgu_retain_slot == null) {
+            self.cgu_retain_slot = llvm_mir_alloc_i32_map(self.cgu_collected_cap + 1);
+            if (self.cgu_retain_slot == null) { return false; }
+        }
+        let base = ptr_offset(self.cgu_retain_marks,
+                              slot * CGU_RETAIN_STRIDE * 4);
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_BLOCK * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_BLOCK_MARK)));
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_LOCAL * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_LOCAL_MARK)));
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_PLACE * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_PLACE_MARK)));
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_VALUE * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_VALUE_MARK)));
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_INSTR * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_INSTR_MARK)));
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_CASE * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_CASE_MARK)));
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_VALUE_END * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_VALUE_END)));
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_INSTR_END * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_INSTR_END)));
+        ast_write_i32(ptr_offset(base, CGU_RETAIN_FUNC_MARK * 4),
+                      ast_read_i32(ptr_offset(rec, MIR_SLICE_FUNC_MARK)));
+        llvm_mir_i32_map_put(self.cgu_retain_slot, function_id, slot + 1);
+        self.cgu_retain_count = self.cgu_retain_count + 1;
+        return true;
+    }
+
+    // True when the collect walk left a body behind for this function, in which
+    // case the frozen marks are copied into `rec` and the emit walk can skip
+    // straight to the MIR pass.
+    public fn cgu_retain_load(self, function_id: i32, rec: rawptr) -> bool {
+        if (self.cgu_retain_marks == null || self.cgu_retain_slot == null) { return false; }
+        let at = llvm_mir_i32_map_get(self.cgu_retain_slot, function_id);
+        if (at <= 0) { return false; }
+        let base = ptr_offset(self.cgu_retain_marks, (at - 1) * CGU_RETAIN_STRIDE * 4);
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_BLOCK_MARK),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_BLOCK * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_LOCAL_MARK),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_LOCAL * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_PLACE_MARK),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_PLACE * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_VALUE_MARK),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_VALUE * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_INSTR_MARK),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_INSTR * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_CASE_MARK),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_CASE * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_VALUE_END),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_VALUE_END * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_INSTR_END),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_INSTR_END * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_FUNC_MARK),
+                      ast_read_i32(ptr_offset(base, CGU_RETAIN_FUNC_MARK * 4)));
+        ast_write_i32(ptr_offset(rec, MIR_SLICE_RETAINED), 1);
+        return true;
+    }
+
+    public fn cgu_retain_note_emitted(self, function_id: i32, emitted: bool) {
+        if (self.cgu_retain_marks == null || self.cgu_retain_slot == null) { return; }
+        let at = llvm_mir_i32_map_get(self.cgu_retain_slot, function_id);
+        if (at <= 0) { return; }
+        let base = ptr_offset(self.cgu_retain_marks, (at - 1) * CGU_RETAIN_STRIDE * 4);
+        if (emitted) {
+            ast_write_i32(ptr_offset(base, CGU_RETAIN_EMITTED * 4), 1);
+        }
+    }
+
+    // Give every retained body back to the arena once the whole emit phase is
+    // done.  Bodies are released in reverse collected order: they were
+    // materialised as a stack, so releasing from the top is what keeps each
+    // `discard` from destroying a body that is still above it.
+    public fn cgu_release_retained_bodies(self, builder: &mut MirUnitBuilder) {
+        if (self.cgu_retain_marks == null || self.cgu_collected_ids == null) { return; }
+        if (self.cgu_retain_slot == null) { return; }
+        var i = self.cgu_collected_n - 1;
+        while (i >= 0) {
+            let fn_id = ast_read_i32(ptr_offset(self.cgu_collected_ids, i * 4));
+            // Only slots that actually kept a body.  `cgu_collect_from_shells`
+            // appends functions with no body of their own, and their zeroed
+            // marks would rewind the arena to the very bottom.
+            if (llvm_mir_i32_map_get(self.cgu_retain_slot, fn_id) != i + 1) {
+                i = i - 1;
+                continue;
+            }
+            let base = ptr_offset(self.cgu_retain_marks, i * CGU_RETAIN_STRIDE * 4);
+            self.discard_streaming_function_body(builder,
+                                                 fn_id,
+                                                 ast_read_i32(ptr_offset(base, CGU_RETAIN_BLOCK * 4)),
+                                                 ast_read_i32(ptr_offset(base, CGU_RETAIN_LOCAL * 4)),
+                                                 ast_read_i32(ptr_offset(base, CGU_RETAIN_PLACE * 4)),
+                                                 ast_read_i32(ptr_offset(base, CGU_RETAIN_VALUE * 4)),
+                                                 ast_read_i32(ptr_offset(base, CGU_RETAIN_INSTR * 4)),
+                                                 ast_read_i32(ptr_offset(base, CGU_RETAIN_CASE * 4)));
+            if (ast_read_i32(ptr_offset(base, CGU_RETAIN_EMITTED * 4)) != 0) {
+                builder.unit.set_function_streamed_body_discarded(fn_id, true);
+                self.m = builder.unit;
+            }
+            i = i - 1;
+        }
+    }
+
+    public fn cgu_collect_from_shells(self, builder: &mut MirUnitBuilder) {
+        if (self.cgu_member_map == null) {
+            self.cgu_member_map = llvm_mir_alloc_i32_map(self.m.function_count + 1);
+        }
+        // Every function this sweep records has already had its body released by
+        // the collect-only walk, so its parameter locals cannot be read (see
+        // `cgu_shell_sweep` on `cgu_record_dyn_signature`).  Suppress the
+        // snapshot instead of walking a dead `local_next` chain.
+        self.cgu_shell_sweep = true;
+        var fn_id: i32 = 1;
+        let n = self.m.function_count;
+        while (fn_id <= n) {
+            if (builder.function_is_partition_external_root(fn_id)
+                || builder.function_is_partition_declaration_only(fn_id)) {
+                fn_id = fn_id + 1;
+                continue;
+            }
+            let hir_fn = builder.unit.function_hir_id(fn_id);
+            if (hir_fn == hir_id_invalid()) {
+                fn_id = fn_id + 1;
+                continue;
+            }
+            let flags = mir_unit_function_flags(&builder.unit, fn_id);
+            if ((flags & hir_function_flag_imported_body()) != 0) {
+                fn_id = fn_id + 1;
+                continue;
+            }
+            self.cgu_record_function(fn_id, 1);
+            fn_id = fn_id + 1;
+        }
+        self.cgu_shell_sweep = false;
+        if (policy_phase_summary_enabled()) {
+            print("[llvm-cgu] shells=" + policy_i64_to_string(n as i64)
+                  + " collected=" + policy_i64_to_string(self.cgu_collected_n as i64));
+        }
+    }
+
+    public fn cgu_key_count(self) -> i32 {
+        var n: i32 = 0;
+        var i: i32 = 0;
+        let table = self.cgu_key_table;
+        var start: i32 = 0;
+        while (i <= table.len) {
+            if (i == table.len || table.charAt(i) == 10) {
+                if (i > start) { n = n + 1; }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    public fn cgu_partition_collected(self, max_units: i32) {
+        let key_n = self.cgu_key_count();
+        if (self.cgu_member_map == null) {
+            self.cgu_member_map = llvm_mir_alloc_i32_map(self.m.function_count + 1);
+        }
+        if (self.cgu_static_defined_map == null) {
+            self.cgu_static_defined_map = llvm_mir_alloc_i32_map(self.m.function_count + 1);
+        }
+        if (key_n <= 0 || self.cgu_collected_n <= 0) {
+            self.cgu_unit_count = 1;
+            return;
+        }
+        var limit = max_units;
+        if (limit < 1) { limit = 1; }
+        let parent = malloc(((key_n + 1) * 4) as u64);
+        let key_size = malloc(((key_n + 1) * 4) as u64);
+        let dense = malloc(((key_n + 1) * 4) as u64);
+        if (parent == null || key_size == null || dense == null) {
+            self.cgu_unit_count = 1;
+            if (parent != null) { free(parent); }
+            if (key_size != null) { free(key_size); }
+            if (dense != null) { free(dense); }
+            return;
+        }
+        memset(parent, 0, ((key_n + 1) * 4) as u64);
+        memset(key_size, 0, ((key_n + 1) * 4) as u64);
+        memset(dense, 0, ((key_n + 1) * 4) as u64);
+        var k: i32 = 1;
+        while (k <= key_n) {
+            ast_write_i32(ptr_offset(parent, k * 4), k);
+            k = k + 1;
+        }
+        var i: i32 = 0;
+        while (i < self.cgu_collected_n) {
+            let kid = ast_read_i32(ptr_offset(self.cgu_collected_keys, i * 4));
+            let sz = ast_read_i32(ptr_offset(self.cgu_collected_sizes, i * 4));
+            if (kid > 0 && kid <= key_n) {
+                let cur = ast_read_i32(ptr_offset(key_size, kid * 4));
+                ast_write_i32(ptr_offset(key_size, kid * 4), cur + sz);
+            }
+            i = i + 1;
+        }
+        var alive = key_n;
+        while (alive > limit) {
+            var best_a: i32 = 0;
+            var best_b: i32 = 0;
+            var best_sa: i32 = 0;
+            var best_sb: i32 = 0;
+            k = 1;
+            while (k <= key_n) {
+                if (llvm_cgu_find_root(parent, k) == k) {
+                    let sz = ast_read_i32(ptr_offset(key_size, k * 4));
+                    if (best_a == 0 || sz < best_sa) {
+                        best_b = best_a;
+                        best_sb = best_sa;
+                        best_a = k;
+                        best_sa = sz;
+                    } elif (best_b == 0 || sz < best_sb) {
+                        best_b = k;
+                        best_sb = sz;
+                    }
+                }
+                k = k + 1;
+            }
+            if (best_a == 0 || best_b == 0) { break; }
+            ast_write_i32(ptr_offset(parent, best_b * 4), best_a);
+            ast_write_i32(ptr_offset(key_size, best_a * 4), best_sa + best_sb);
+            alive = alive - 1;
+        }
+        var next_dense: i32 = 1;
+        k = 1;
+        while (k <= key_n) {
+            if (llvm_cgu_find_root(parent, k) == k) {
+                ast_write_i32(ptr_offset(dense, k * 4), next_dense);
+                next_dense = next_dense + 1;
+            }
+            k = k + 1;
+        }
+        self.cgu_unit_count = next_dense - 1;
+        if (self.cgu_unit_count < 1) { self.cgu_unit_count = 1; }
+        i = 0;
+        while (i < self.cgu_collected_n) {
+            let fn_id = ast_read_i32(ptr_offset(self.cgu_collected_ids, i * 4));
+            let kid = ast_read_i32(ptr_offset(self.cgu_collected_keys, i * 4));
+            let root = llvm_cgu_find_root(parent, kid);
+            var unit = ast_read_i32(ptr_offset(dense, root * 4));
+            if (unit < 1) { unit = 1; }
+            llvm_mir_i32_map_put(self.cgu_member_map, fn_id, unit);
+            i = i + 1;
+        }
+        free(parent);
+        free(key_size);
+        free(dense);
+    }
+
+    public fn cgu_enqueue_members(self, builder: &mut MirUnitBuilder) {
+        var i: i32 = 0;
+        while (i < self.cgu_collected_n) {
+            let fn_id = ast_read_i32(ptr_offset(self.cgu_collected_ids, i * 4));
+            if (llvm_mir_i32_map_get(self.cgu_member_map, fn_id) == self.cgu_emit_index) {
+                builder.reset_function_codegen_marks(fn_id);
+                builder.mark_function_reachable(fn_id);
+            }
+            i = i + 1;
+        }
+    }
+
+    public fn cgu_reset_future_marks(self, builder: &mut MirUnitBuilder) {
+        var i: i32 = 0;
+        while (i < self.cgu_collected_n) {
+            let fn_id = ast_read_i32(ptr_offset(self.cgu_collected_ids, i * 4));
+            if (llvm_mir_i32_map_get(self.cgu_member_map, fn_id) > self.cgu_emit_index) {
+                builder.reset_function_codegen_marks(fn_id);
+            }
+            i = i + 1;
+        }
+    }
+
+    public fn null_llvm_cached_handles(self) {
+        self.string_ty = null;
+        self.closure_fat_ty = null;
+        self.pointer_handle_ty = null;
+        self.current_function_value = null;
+        self.current_entry_block = null;
+        self.current_function_id = mir_id_invalid();
+        self.current_block_id = mir_id_invalid();
+        self.current_instr_id = mir_id_invalid();
+        self.current_value_id = mir_id_invalid();
+        self.current_place_id = mir_id_invalid();
+        self.ptr_alias_domain = null;
+        self.runtime_argc_global = null;
+        self.runtime_argv_global = null;
+        self.runtime_args_defined = false;
+        self.last_print_call = null;
+        self.builtin_print_fn = null; self.builtin_print_fty = null;
+        self.builtin_println_fn = null; self.builtin_println_fty = null;
+        self.builtin_printf_fn = null; self.builtin_printf_fty = null;
+        self.builtin_snprintf_fn = null; self.builtin_snprintf_fty = null;
+        self.builtin_int_to_string_fn = null; self.builtin_int_to_string_fty = null;
+        self.builtin_int_to_string_len_fn = null; self.builtin_int_to_string_len_fty = null;
+        self.builtin_int_decimal_len_fn = null; self.builtin_int_decimal_len_fty = null;
+        self.builtin_int_to_string_into_fn = null; self.builtin_int_to_string_into_fty = null;
+        self.builtin_uint_to_string_fn = null; self.builtin_uint_to_string_fty = null;
+        self.builtin_uint_to_string_len_fn = null; self.builtin_uint_to_string_len_fty = null;
+        self.builtin_uint_decimal_len_fn = null; self.builtin_uint_decimal_len_fty = null;
+        self.builtin_uint_to_string_into_fn = null; self.builtin_uint_to_string_into_fty = null;
+        self.builtin_string_builder_create_fn = null; self.builtin_string_builder_create_fty = null;
+        self.builtin_string_builder_append_i64_fn = null; self.builtin_string_builder_append_i64_fty = null;
+        self.builtin_string_builder_append_u64_fn = null; self.builtin_string_builder_append_u64_fty = null;
+        self.builtin_string_clone_fn = null; self.builtin_string_clone_fty = null;
+        self.builtin_class_alloc_fn = null; self.builtin_class_alloc_fty = null;
+        self.builtin_bool_to_string_fn = null; self.builtin_bool_to_string_fty = null;
+        self.builtin_strlen_fn = null; self.builtin_strlen_fty = null;
+        self.builtin_arg_count_fn = null; self.builtin_arg_count_fty = null;
+        self.builtin_get_arg_fn = null; self.builtin_get_arg_fty = null;
+        self.runtime_arg_count_fn = null; self.runtime_arg_count_fty = null;
+        self.runtime_get_arg_cstr_fn = null; self.runtime_get_arg_cstr_fty = null;
+        self.runtime_set_args_fn = null; self.runtime_set_args_fty = null;
+        self.builtin_malloc_fn = null; self.builtin_malloc_fty = null;
+        self.builtin_pooled_string_alloc_fn = null; self.builtin_pooled_string_alloc_fty = null;
+        self.builtin_free_fn = null; self.builtin_free_fty = null;
+        self.pointer_region_create_fn = null; self.pointer_region_create_fty = null;
+        self.pointer_region_retag_fn = null; self.pointer_region_retag_fty = null;
+        self.pointer_region_set_dimension_fn = null; self.pointer_region_set_dimension_fty = null;
+        self.pointer_region_rank_fn = null; self.pointer_region_rank_fty = null;
+        self.pointer_handle_alive_fn = null; self.pointer_handle_alive_fty = null;
+        self.pointer_checked_address_fn = null; self.pointer_checked_address_fty = null;
+        self.pointer_checked_address_typed_fn = null; self.pointer_checked_address_typed_fty = null;
+        self.pointer_region_delete_fn = null; self.pointer_region_delete_fty = null;
+        self.builtin_pooled_string_free_fn = null; self.builtin_pooled_string_free_fty = null;
+        self.builtin_forget_string_len_fn = null; self.builtin_forget_string_len_fty = null;
+        self.builtin_runtime_string_free_fn = null; self.builtin_runtime_string_free_fty = null;
+        self.builtin_realloc_fn = null; self.builtin_realloc_fty = null;
+        self.builtin_memcpy_fn = null; self.builtin_memcpy_fty = null;
+        self.builtin_memmove_fn = null; self.builtin_memmove_fty = null;
+        self.builtin_memset_fn = null; self.builtin_memset_fty = null;
+        self.builtin_abort_fn = null; self.builtin_abort_fty = null;
+        self.builtin_exit_fn = null; self.builtin_exit_fty = null;
+        self.builtin_concat_fn = null; self.builtin_concat_fty = null;
+        self.builtin_string_trim_fn = null; self.builtin_string_trim_fty = null;
+        self.builtin_string_replace_fn = null; self.builtin_string_replace_fty = null;
+        self.builtin_string_to_upper_len_fn = null; self.builtin_string_to_upper_len_fty = null;
+        self.builtin_string_to_lower_len_fn = null; self.builtin_string_to_lower_len_fty = null;
+        self.builtin_strncmp_fn = null; self.builtin_strncmp_fty = null;
+        self.builtin_strcmp_fn = null; self.builtin_strcmp_fty = null;
+        self.builtin_memcmp_fn = null; self.builtin_memcmp_fty = null;
+        self.builtin_strstr_fn = null; self.builtin_strstr_fty = null;
+        self.builtin_string_contains_fn = null; self.builtin_string_contains_fty = null;
+        self.builtin_string_index_of_fn = null; self.builtin_string_index_of_fty = null;
+        self.builtin_get_file_attrs_fn = null; self.builtin_get_file_attrs_fty = null;
+        self.builtin_calloc_fn = null; self.builtin_calloc_fty = null;
+        self.builtin_fopen_fn = null; self.builtin_fopen_fty = null;
+        self.builtin_fclose_fn = null; self.builtin_fclose_fty = null;
+        self.builtin_fread_fn = null; self.builtin_fread_fty = null;
+        self.builtin_fwrite_fn = null; self.builtin_fwrite_fty = null;
+        self.builtin_fgetc_fn = null; self.builtin_fgetc_fty = null;
+        self.builtin_fputc_fn = null; self.builtin_fputc_fty = null;
+        self.builtin_feof_fn = null; self.builtin_feof_fty = null;
+        self.builtin_fseek_fn = null; self.builtin_fseek_fty = null;
+        self.builtin_ftell_fn = null; self.builtin_ftell_fty = null;
+        self.builtin_remove_fn = null; self.builtin_remove_fty = null;
+        self.builtin_rename_fn = null; self.builtin_rename_fty = null;
+    }
+
+    public fn reset_llvm_module_for_cgu(self) {
+        if (self.mod != null) {
+            vyx_rt_module_free(self.mod);
+            self.mod = null;
+        }
+        let mod_name = self.module_symbol_name
+                       + ".cgu"
+                       + policy_i64_to_string(self.cgu_emit_index as i64);
+        let triple = self.target_triple;
+        let mod_h = vyx_rt_module_new(mod_name.c_str(),
+                                      mod_name.len as u64,
+                                      triple.c_str(),
+                                      triple.len as u64);
+        if (mod_h != null && llvm_mir_pic_from_argv()) {
+            vyx_rt_set_relocation_model(mod_h, 2);
+        }
+        if (mod_h != null) { vyx_rt_builder_new(mod_h); }
+        if (mod_h != null && self.debug_enabled) {
+            vyx_rt_enable_debug(mod_h,
+                                self.debug_source_path.c_str(),
+                                self.debug_source_path.len as u64);
+        }
+        self.mod = mod_h;
+        self.ty_i1 = vyx_rt_int_type(mod_h, 1);
+        self.ty_i8 = vyx_rt_int_type(mod_h, 8);
+        self.ty_i16 = vyx_rt_int_type(mod_h, 16);
+        self.ty_i32 = vyx_rt_int_type(mod_h, 32);
+        self.ty_i64 = vyx_rt_int_type(mod_h, 64);
+        self.pointer_index_bits = vyx_rt_pointer_index_bits(mod_h);
+        self.ty_pointer_index = null;
+        if (self.pointer_index_bits > 0) {
+            self.ty_pointer_index = vyx_rt_int_type(mod_h, self.pointer_index_bits);
+        }
+        self.ty_ptr = vyx_rt_ptr_ty(mod_h);
+        self.ty_void = vyx_rt_void_ty(mod_h);
+        llvm_mir_ptr_map_zero(self.function_values);
+        llvm_mir_ptr_map_zero(self.function_types);
+        llvm_mir_i32_map_zero(self.function_definition_emitted_map);
+        llvm_mir_ptr_map_zero(self.function_closure_adapter_values);
+        llvm_mir_ptr_map_zero(self.function_raw_callback_adapter_values);
+        llvm_mir_ptr_map_zero(self.function_env_types);
+        llvm_mir_ptr_map_zero(self.async_context_types);
+        llvm_mir_ptr_map_zero(self.async_worker_values);
+        llvm_mir_ptr_map_zero(self.async_worker_types);
+        llvm_mir_ptr_map_zero(self.type_struct_values);
+        llvm_mir_ptr_map_zero(self.dyn_vtable_type_values);
+        llvm_mir_ptr_map_zero(self.hir_item_globals);
+        llvm_mir_ptr_map_zero(self.block_values);
+        llvm_mir_ptr_map_zero(self.local_slots);
+        llvm_mir_ptr_map_zero(self.foreach_iterator_slots);
+        llvm_mir_ptr_map_zero(self.value_cache);
+        llvm_mir_ptr_map_zero(self.instr_deref_addr_cache);
+        llvm_mir_ptr_map_zero(self.hoisted_borrow_handles);
+        self.pending_value_first = 0;
+        self.pending_value_last = 0;
+        if (self.function_value_ranges != null) {
+            free(self.function_value_ranges);
+            self.function_value_ranges = null;
+        }
+        llvm_mir_ptr_map_zero(self.dci_stub_factory_values);
+        llvm_mir_ptr_map_zero(self.dci_stub_destroy_values);
+        llvm_mir_ptr_map_zero(self.dci_layout_by_type_cache);
+        llvm_mir_ptr_map_zero(self.dci_symbol_object_cache);
+        llvm_mir_free_raw_chain(self.dyn_method_adapter_head, 16);
+        self.dyn_method_adapter_head = null;
+        llvm_mir_free_raw_chain(self.reflected_method_adapter_head, 24);
+        self.reflected_method_adapter_head = null;
+        llvm_mir_free_raw_chain(self.dyn_vtable_head, 16);
+        self.dyn_vtable_head = null;
+        llvm_mir_free_raw_chain(self.dyn_trait_impl_cache_head, 16);
+        self.dyn_trait_impl_cache_head = null;
+        self.null_llvm_cached_handles();
+        llvm_mir_dispose_symbol_index(self.function_symbol_index,
+                                      self.function_symbol_index_cap,
+                                      false);
+        self.function_symbol_index = llvm_mir_symbol_index_new(self.function_symbol_index_cap);
+        self.declared_function_scan_next = 1;
+        self.adapter_need_cache_ready = false;
+        if (self.str_lit_buf != null) {
+            var n = self.string_lit_count;
+            if (n > 8192) { n = 8192; }
+            var si: i32 = 0;
+            while (si < n) {
+                policy_entry_clear(llvm_mir_entry_at(self.str_lit_buf, si));
+                si = si + 1;
+            }
+        }
+        self.string_lit_count = 0;
+    }
+
+    /// Optimize the current unit's module and write its object file.  The
+    /// caller owns `self.mod` and keeps it alive; the pipelined path instead
+    /// detaches the module and lets the emit thread run this work.
+    public fn emit_object_now(self, path: string) -> i32 {
+        if (self.mod == null || path.len == 0) { return 1; }
+        let opt = llvm_mir_cli_opt_level();
+        if (opt > 0) {
+            let orc = vyx_rt_optimize(self.mod, opt);
+            if (orc != 0) {
+                var odetail = self.runtime_last_error();
+                var omsg = "LLVM optimize failed for codegen unit "
+                           + policy_i64_to_string(self.cgu_emit_index as i64)
+                           + " (opt=" + policy_i64_to_string(opt as i64)
+                           + ", rc=" + policy_i64_to_string(orc as i64) + ")";
+                if (odetail.len > 0) { omsg = omsg + ": " + odetail; }
+                self.report_error(omsg);
+                return orc;
+            }
+        }
+        let rc = llvm_mir_emit_module_file(self.mod, path.c_str(), path.len as u64, opt);
+        if (rc != 0) {
+            var edetail = self.runtime_last_error();
+            var emsg = "object emission failed for codegen unit "
+                       + policy_i64_to_string(self.cgu_emit_index as i64)
+                       + " (rc=" + policy_i64_to_string(rc as i64) + ")";
+            if (edetail.len > 0) { emsg = emsg + ": " + edetail; }
+            self.report_error(emsg);
+            return rc;
+        }
+        return 0;
+    }
+
+    public fn emit_cgu_objects_from_builder(self, builder: &mut MirUnitBuilder) -> bool {
+        let limit = llvm_mir_codegen_unit_limit();
+        self.cgu_partition_collected(limit);
+        if (self.cgu_unit_count < 1) { self.cgu_unit_count = 1; }
+        if (policy_phase_summary_enabled()) {
+            print("[llvm-cgu] units=" + policy_i64_to_string(self.cgu_unit_count as i64)
+                  + " functions=" + policy_i64_to_string(self.cgu_collected_n as i64)
+                  + " modules=" + policy_i64_to_string(self.cgu_key_count() as i64));
+        }
+        if (self.cgu_unit_count <= 1) {
+            self.cgu_emit_index = 1;
+            self.declare_runtime_builtins();
+            self.define_main_arg_runtime_helpers();
+            builder.prepare_streaming_codegen_round();
+            self.m = builder.unit;
+            builder.drop_reachable_queue();
+            self.cgu_enqueue_members(builder);
+            self.declare_functions();
+            self.emit_static_storage_roots();
+            self.drain_streaming_builder_queue(builder);
+            var deferred1: i32 = 0;
+            while (builder.pending_deferred_materializations() > 0 && deferred1 < 64) {
+                builder.prepare_streaming_codegen_round();
+                self.m = builder.unit;
+                self.declare_functions();
+                self.emit_static_storage_roots();
+                self.drain_streaming_builder_queue(builder);
+                deferred1 = deferred1 + 1;
+            }
+            self.dci_synthesize_stub_wrappers();
+            return self.error_count == 0;
+        }
+        let primary = llvm_mir_cli_output_path();
+        let obj_opt = llvm_mir_cli_opt_level();
+        let par_mode = llvm_cgu_parallel_mode();
+        var emit_threads = llvm_cgu_env_emit_threads();
+        if (emit_threads > self.cgu_unit_count - 1) {
+            emit_threads = self.cgu_unit_count - 1;
+        }
+        // `off` keeps every unit on the main thread so the object bytes can be
+        // diffed against a pooled build.
+        if (par_mode == CGU_PAR_MODE_OFF) { emit_threads = 0; }
+        var pipe_ok = false;
+        if (primary.len > 0 && emit_threads > 0) {
+            pipe_ok = cgu_pipe_start(self.cgu_unit_count, emit_threads);
+        }
+        if (policy_phase_summary_enabled()) {
+            var par_line = "[llvm-cgu] parallel=" + llvm_cgu_parallel_mode_name(par_mode)
+                           + " emit-threads=" + policy_i64_to_string(emit_threads as i64);
+            if (pipe_ok) {
+                par_line = par_line + " (lower serial, optimize+emit off-thread)";
+            } else {
+                par_line = par_line + " (fully serial)";
+            }
+            if (par_mode == CGU_PAR_MODE_FULL) {
+                // Per-CGU parallel lowering is not a scheduling change: every
+                // unit would need its own lowerer (the caches hanging off this
+                // one are shared mutable state) and its own MIR arena, because
+                // materialisation grows the arena that all units read through.
+                par_line = par_line + " [full=reserved: per-CGU lowering needs a per-unit arena]";
+            }
+            if (policy_cgu_phases_enabled()) { par_line = par_line + " [phases=split]"; }
+            print(par_line);
+        }
+        var cgu: i32 = 1;
+        while (cgu <= self.cgu_unit_count) {
+            self.cgu_emit_index = cgu;
+            if (cgu > 1) { self.reset_llvm_module_for_cgu(); }
+            self.declare_runtime_builtins();
+            self.define_main_arg_runtime_helpers();
+            builder.prepare_streaming_codegen_round();
+            self.m = builder.unit;
+            builder.drop_reachable_queue();
+            self.cgu_enqueue_members(builder);
+            self.declare_functions();
+            self.emit_static_storage_roots();
+            self.drain_streaming_builder_queue(builder);
+            var deferred: i32 = 0;
+            while (builder.pending_deferred_materializations() > 0 && deferred < 64) {
+                builder.prepare_streaming_codegen_round();
+                self.m = builder.unit;
+                self.declare_functions();
+                self.emit_static_storage_roots();
+                self.drain_streaming_builder_queue(builder);
+                deferred = deferred + 1;
+            }
+            if (cgu == 1) { self.dci_synthesize_stub_wrappers(); }
+            if (primary.len > 0) {
+                let unit_path = llvm_cgu_object_path(primary, cgu);
+                var handled = false;
+                // The last unit is emitted inline so `self.mod` is left valid
+                // for the caller, exactly as in the all-serial path.
+                if (pipe_ok && cgu < self.cgu_unit_count) {
+                    let path_p = llvm_mir_dup_cstr(unit_path);
+                    if (path_p != null
+                        && cgu_pipe_submit(cgu, self.mod, path_p,
+                                           unit_path.len as i64, obj_opt)) {
+                        // Ownership moved to the emit thread: it optimizes,
+                        // writes the object and frees the module.
+                        self.mod = null;
+                        handled = true;
+                    } else if (path_p != null) {
+                        free(path_p);
+                    }
+                }
+                if (!handled) {
+                    let erc = self.emit_object_now(unit_path);
+                    if (erc != 0) {
+                        if (pipe_ok) { cgu_pipe_finish(); cgu_pipe_dispose(); }
+                        return false;
+                    }
+                }
+            }
+            self.cgu_reset_future_marks(builder);
+            cgu = cgu + 1;
+        }
+        if (pipe_ok) { cgu_pipe_finish(); }
+        if (primary.len > 0) {
+            self.cgu_object_list = "";
+            cgu = 1;
+            while (cgu <= self.cgu_unit_count) {
+                // Only the final unit is emitted inline; every earlier unit,
+                // including unit 1, is dispatched to the pool.
+                if (!pipe_ok || cgu == 1 || cgu == self.cgu_unit_count
+                    || cgu_pipe_unit_ok(cgu)) {
+                    if (self.cgu_object_list.len > 0) {
+                        self.cgu_object_list = self.cgu_object_list + "\n";
+                    }
+                    self.cgu_object_list = self.cgu_object_list
+                                           + llvm_cgu_object_path(primary, cgu);
+                }
+                cgu = cgu + 1;
+            }
+            if (self.cgu_object_list.len > 0) {
+                writeFile(primary + ".cgu.list", self.cgu_object_list + "\n");
+                self.cgu_emitted_objects = true;
+            }
+        }
+        if (pipe_ok) {
+            // Unit 1 is dispatched to the pool too (1 < cgu_unit_count), so its
+            // slot must be inspected as well; only the final unit is inline.
+            cgu = 1;
+            while (cgu <= self.cgu_unit_count) {
+                if (cgu != self.cgu_unit_count && !cgu_pipe_unit_ok(cgu)) {
+                    self.report_error("object emission failed for codegen unit "
+                                      + policy_i64_to_string(cgu as i64));
+                }
+                cgu = cgu + 1;
+            }
+            cgu_pipe_dispose();
+        }
+        return self.error_count == 0;
+    }
+
+    // Lower one streamed function, driving it through the four explicit
+    // phases below.  The guards decide *whether* a function is lowered at all
+    // (already done, owned by a sibling unit, declaration-only, ...); the
+    // phases decide *how*.  Splitting them is what lets the lowering stage
+    // eventually move off this thread: everything the phases share travels in
+    // `slot`, not in the locals of this frame.
+}

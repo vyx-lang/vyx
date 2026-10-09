@@ -1,0 +1,301 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Packs for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn generic_param_index(self, name: string) -> i32 {
+        if (name.len == 0) { return -1; }
+        var i: i32 = 0;
+        while (i < 256) {
+            let p = hir_builder_generic_param_at(self.current_generic_params, i);
+            if (p.len == 0) { return -1; }
+            if (p == name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    fn current_pack_count(self, pack_name: string) -> i32 {
+        let pack_index = self.generic_param_index(pack_name);
+        if (pack_index < 0) { return 0; }
+        let param_count = hir_builder_generic_param_count(self.current_generic_params);
+        let arg_count = hir_builder_generic_arg_count(self.current_generic_args);
+        let trailing_params = param_count - pack_index - 1;
+        let count = arg_count - pack_index - trailing_params;
+        if (count < 0) { return 0; }
+        return count;
+    }
+
+    fn current_pack_arg_text(self, pack_name: string, idx: i32) -> string {
+        let pack_index = self.generic_param_index(pack_name);
+        if (pack_index < 0 || idx < 0) { return ""; }
+        if (idx >= self.current_pack_count(pack_name)) { return ""; }
+        return policy_generic_arg_at(self.current_generic_args, pack_index + idx);
+    }
+
+    fn pack_index_type_text_in_current_env(self, text: string) -> string {
+        if (text.len < 4) { return ""; }
+        if (self.current_generic_params.len == 0 || self.current_generic_args.len == 0) { return ""; }
+        if (text.charAt((text.len - 1) as i32) != 93) { return ""; }
+        var open_idx: i32 = -1;
+        var i: i32 = 0;
+        while (i < text.len) {
+            let ch = text.charAt(i);
+            if (ch == 91) {
+                if (open_idx >= 0) { return ""; }
+                open_idx = i;
+            } elif (ch == 93 && i != text.len - 1) {
+                return "";
+            }
+            i = i + 1;
+        }
+        if (open_idx <= 0 || open_idx >= text.len - 2) { return ""; }
+        let pack_name = text.substring(0, open_idx);
+        if (self.generic_param_index(pack_name) < 0) { return ""; }
+        let index_text = hir_builder_trim(text.substring(open_idx + 1, (text.len - 1) as i32));
+        var resolved_index = index_text;
+        let bound_index = self.current_generic_binding(index_text);
+        if (bound_index.len > 0) { resolved_index = bound_index; }
+        if (!hir_builder_string_is_i64_lit(resolved_index)) { return ""; }
+        let idx_value = hir_builder_parse_i64_lit(resolved_index);
+        if (idx_value < 0 || idx_value > 2147483647) { return ""; }
+        let arg_text = self.current_pack_arg_text(pack_name, idx_value as i32);
+        if (arg_text.len == 0) { return ""; }
+        return self.resolve_type_text_in_current_env(arg_text);
+    }
+
+    fn build_current_const_generic_ident_expr(self, e: rawptr) -> i32 {
+        if (e == null || expr_get_kind(e) != ex_IDENT()) { return hir_id_invalid(); }
+        let bound = self.current_generic_binding(expr_get_name(e));
+        if (bound.len == 0 || !hir_builder_string_is_i64_lit(bound)) { return hir_id_invalid(); }
+        var type_id = self.type_id_from_expr(e);
+        if (type_id == hir_id_invalid()) {
+            type_id = self.type_id_from_text("i64");
+        }
+        return self.build_typed_int_const_expr(e, type_id, hir_builder_parse_i64_lit(bound));
+    }
+
+    fn build_pack_ref_expr(self, e: rawptr) -> i32 {
+        if (e == null || expr_get_kind(e) != ex_IDENT()) { return hir_id_invalid(); }
+        let pack_name = expr_get_name(e);
+        let binding = hir_pack_bindings_find(self.pack_bindings, pack_name);
+        if (binding == null) { return hir_id_invalid(); }
+        let first_local = hir_pack_bindings_local_at(self.pack_bindings, pack_name, 0);
+        if (first_local == hir_id_invalid()) { return hir_id_invalid(); }
+        let type_id = self.unit.local_type(first_local);
+        if (!self.type_id_is_valid(type_id)) { return hir_id_invalid(); }
+        let builtin_id = self.unit.add_or_get_builtin("pack",
+                                                     expr_sem_BUILTIN(),
+                                                     type_id,
+                                                     0);
+        if (builtin_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let expr_id = self.unit.add_expr(self.current_function_id,
+                                        ex_IDENT(),
+                                        pack_name,
+                                        "",
+                                        0,
+                                        type_id,
+                                        expr_sem_BUILTIN(),
+                                        hir_target_builtin(),
+                                        builtin_id,
+                                        0,
+                                        0);
+        self.set_hir_expr_loc_from_ast(expr_id, e);
+        self.unit.set_expr_owner_item(expr_id, self.current_item_id);
+        return expr_id;
+    }
+
+    fn build_pack_local_read_expr(self, source: rawptr, local_id: i32) -> i32 {
+        if (local_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let expr_id = self.unit.add_expr(self.current_function_id,
+                                        ex_IDENT(),
+                                        self.unit.local_name(local_id),
+                                        "",
+                                        0,
+                                        self.unit.local_type(local_id),
+                                        expr_sem_LOCAL(),
+                                        hir_target_local(),
+                                        local_id,
+                                        0,
+                                        0);
+        self.set_hir_expr_loc_from_ast(expr_id, source);
+        self.unit.set_expr_owner_item(expr_id, self.current_item_id);
+        return expr_id;
+    }
+
+    fn build_pack_member_expr(self, e: rawptr) -> i32 {
+        if (e == null || expr_get_kind(e) != ex_MEMBER()) { return hir_id_invalid(); }
+        if (expr_get_name(e) != "len" && expr_get_name(e) != "length" && expr_get_name(e) != "size") { return hir_id_invalid(); }
+        let base = expr_get_lhs(e);
+        if (base == null || expr_get_kind(base) != ex_IDENT()) { return hir_id_invalid(); }
+        let pack_name = expr_get_name(base);
+        if (hir_pack_bindings_find(self.pack_bindings, pack_name) == null) { return hir_id_invalid(); }
+        return self.build_i64_const_expr(e, hir_pack_bindings_count(self.pack_bindings, pack_name) as i64);
+    }
+
+    fn eval_pack_const_index_expr(self, e: rawptr, pack_name: string) -> i64 {
+        if (e == null || pack_name.len == 0) { return -1; }
+        let k = expr_get_kind(e);
+        if (k == ex_INT_LIT()) { return expr_get_int_val(e); }
+        if (k == ex_IDENT()) {
+            let bound = self.current_generic_binding(expr_get_name(e));
+            if (bound.len > 0 && hir_builder_string_is_i64_lit(bound)) {
+                return hir_builder_parse_i64_lit(bound);
+            }
+            return -1;
+        }
+        if (k == ex_MEMBER()) {
+            let member = expr_get_name(e);
+            if (member != "len" && member != "length" && member != "size") { return -1; }
+            let base = expr_get_lhs(e);
+            if (base == null || expr_get_kind(base) != ex_IDENT() || expr_get_name(base) != pack_name) { return -1; }
+            if (hir_pack_bindings_find(self.pack_bindings, pack_name) == null) { return -1; }
+            return hir_pack_bindings_count(self.pack_bindings, pack_name) as i64;
+        }
+        if (k == ex_UNARY()) {
+            let inner = self.eval_pack_const_index_expr(expr_get_lhs(e), pack_name);
+            if (inner < 0) { return -1; }
+            let op = expr_get_op(e);
+            if (op == tk_PLUS()) { return inner; }
+            if (op == tk_MINUS()) { return 0 - inner; }
+            return -1;
+        }
+        if (k == ex_BIN()) {
+            let lhs = self.eval_pack_const_index_expr(expr_get_lhs(e), pack_name);
+            let rhs = self.eval_pack_const_index_expr(expr_get_rhs(e), pack_name);
+            if (lhs < 0 || rhs < 0) { return -1; }
+            let op = expr_get_op(e);
+            if (op == tk_PLUS()) { return lhs + rhs; }
+            if (op == tk_MINUS()) { return lhs - rhs; }
+            if (op == tk_STAR()) { return lhs * rhs; }
+            if (op == tk_SLASH()) {
+                if (rhs == 0) { return -1; }
+                return lhs / rhs;
+            }
+            if (op == tk_PERCENT()) {
+                if (rhs == 0) { return -1; }
+                return lhs % rhs;
+            }
+            return -1;
+        }
+        return -1;
+    }
+
+    fn set_pack_index_expr_type_if_known(self, source: rawptr, expr_id: i32) -> bool {
+        if (source == null || expr_id == hir_id_invalid() || expr_get_kind(source) != ex_INDEX()) { return false; }
+        let base = expr_get_lhs(source);
+        if (base == null || expr_get_kind(base) != ex_IDENT()) { return false; }
+        let pack_name = expr_get_name(base);
+        if (hir_pack_bindings_find(self.pack_bindings, pack_name) == null) { return false; }
+        let local_id = hir_pack_bindings_local_at(self.pack_bindings, pack_name, 0);
+        if (local_id == hir_id_invalid()) { return false; }
+        self.unit.set_expr_type(expr_id, self.unit.local_type(local_id));
+        return true;
+    }
+
+    fn build_pack_index_expr(self, e: rawptr) -> i32 {
+        if (e == null || expr_get_kind(e) != ex_INDEX()) { return hir_id_invalid(); }
+        let base = expr_get_lhs(e);
+        let index = expr_get_rhs(e);
+        if (base == null || index == null) { return hir_id_invalid(); }
+        if (expr_get_kind(base) != ex_IDENT()) { return hir_id_invalid(); }
+        let pack_name = expr_get_name(base);
+        if (hir_pack_bindings_find(self.pack_bindings, pack_name) == null) { return hir_id_invalid(); }
+        let index_value = self.eval_pack_const_index_expr(index, pack_name);
+        if (index_value < 0 || index_value > 2147483647) { return hir_id_invalid(); }
+        let local_id = hir_pack_bindings_local_at(self.pack_bindings, pack_name, index_value as i32);
+        return self.build_pack_local_read_expr(e, local_id);
+    }
+
+    fn pack_fold_base_name(self, name: string) -> string {
+        if (name.len <= 3) { return ""; }
+        var i: i32 = 0;
+        while (i + 2 < name.len) {
+            if (name.charAt(i) == 46 && name.charAt(i + 1) == 46 && name.charAt(i + 2) == 46) {
+                if (i <= 0) { return ""; }
+                return name.substring(0, i);
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    fn pack_fold_op(self, name: string) -> i32 {
+        if (name.endsWith("...+")) { return tk_PLUS(); }
+        if (name.endsWith("...-")) { return tk_MINUS(); }
+        if (name.endsWith("...*")) { return tk_STAR(); }
+        if (name.endsWith("...&&")) { return tk_AND(); }
+        if (name.endsWith("...|")) { return tk_PIPE(); }
+        return 0;
+    }
+
+    fn build_pack_fold_identity_expr(self, source: rawptr, op: i32) -> i32 {
+        if (op == tk_PLUS() || op == tk_MINUS()) { return self.build_i64_const_expr(source, 0); }
+        if (op == tk_STAR()) { return self.build_i64_const_expr(source, 1); }
+        if (op == tk_AND()) { return self.build_bool_const_expr(source, true); }
+        if (op == tk_PIPE()) { return self.build_bool_const_expr(source, false); }
+        return hir_id_invalid();
+    }
+
+    fn build_pack_binary_expr(self, source: rawptr, op: i32, lhs_id: i32, rhs_id: i32) -> i32 {
+        if (lhs_id == hir_id_invalid() || rhs_id == hir_id_invalid()) { return hir_id_invalid(); }
+        var type_id = self.unit.expr_type(lhs_id);
+        if (op == tk_AND() || op == tk_PIPE()) {
+            type_id = self.builtin_bool_type_id();
+        }
+        let expr_id = self.unit.add_expr(self.current_function_id,
+                                        ex_BIN(),
+                                        "",
+                                        "",
+                                        0,
+                                        type_id,
+                                        expr_sem_NONE(),
+                                        hir_target_none(),
+                                        hir_id_invalid(),
+                                        0,
+                                        op);
+        self.set_hir_expr_loc_from_ast(expr_id, source);
+        self.unit.set_expr_owner_item(expr_id, self.current_item_id);
+        self.unit.set_expr_lhs(expr_id, lhs_id);
+        self.unit.set_expr_rhs(expr_id, rhs_id);
+        self.resolve_binary_expr_type_after_children(expr_id);
+        return expr_id;
+    }
+
+    fn build_pack_fold_expr(self, e: rawptr) -> i32 {
+        if (e == null || expr_get_kind(e) != ex_IDENT()) { return hir_id_invalid(); }
+        let name = expr_get_name(e);
+        let op = self.pack_fold_op(name);
+        if (op == 0) { return hir_id_invalid(); }
+        let pack_name = self.pack_fold_base_name(name);
+        if (pack_name.len == 0) { return hir_id_invalid(); }
+        let pack_count = hir_pack_bindings_count(self.pack_bindings, pack_name);
+        if (pack_count <= 0) { return self.build_pack_fold_identity_expr(e, op); }
+        var index: i32 = 0;
+        var acc = hir_id_invalid();
+        while (index < pack_count) {
+            let local_id = hir_pack_bindings_local_at(self.pack_bindings, pack_name, index);
+            let local_expr = self.build_pack_local_read_expr(e, local_id);
+            if (local_expr == hir_id_invalid()) { return hir_id_invalid(); }
+            if (acc == hir_id_invalid()) {
+                acc = local_expr;
+            } else {
+                acc = self.build_pack_binary_expr(e, op, acc, local_expr);
+                if (acc == hir_id_invalid()) { return hir_id_invalid(); }
+            }
+            index = index + 1;
+        }
+        return acc;
+    }
+}

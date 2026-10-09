@@ -131,8 +131,8 @@ The matrix ran on Windows x64, Intel Core Ultra 7 265KF, 20 logical processors,
 34,031,194,112 bytes of physical RAM, with LLVM 22.1.1. The repository HEAD was
 `8e44b87647c48584b89fdfd43b82fcdca882b7c7` with uncommitted changes in:
 
-- `bootstrap_compiler/src/codegen/llvm_lower.vyx`
-- `bootstrap_compiler/src/core/build_system.vyx`
+- `bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx`
+- `bootstrap_compiler/src/core/project/build_system.vyx`
 - `vyx_codegen/src/vyx_bootstrap_rt.cpp`
 
 The compiler-source diff SHA256 was

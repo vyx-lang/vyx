@@ -27,7 +27,7 @@ param(
 # How alignas(32) / alignas(64) / alignas(128) became supported: Vyx gives an
 # imported DCI record a *value* layout by picking an anchor type whose own ABI
 # alignment equals the descriptor's alignment (see `finalize_record_ty_body` in
-# bootstrap_compiler/src/codegen/llvm_lower.vyx).  Integers and arrays cap at
+# bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx).  Integers and arrays cap at
 # 16 bytes of alignment (measured: i256, i512 and [4 x i128] all report 16),
 # so the ladder now continues with vector anchors -- `<4 x i64>`, `<8 x i64>`,
 # `<16 x i64>` -- which the target does honour.  Because the anchor is

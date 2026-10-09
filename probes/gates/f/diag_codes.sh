@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$repo_root"
 
-if grep -n 'diag_classify_sema_message' -A 8 bootstrap_compiler/src/core/diag.vyx \
+if grep -n 'diag_classify_sema_message' -A 8 bootstrap_compiler/src/core/syntax/diag.vyx \
     | grep -E 'starts_with|undefined symbol|type mismatch'; then
     echo "FAIL: needle/prefix classify table came back"
     exit 1

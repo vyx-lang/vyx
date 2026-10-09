@@ -1,0 +1,478 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn c_sysv_cls_none(self) -> i32 { return 0; }
+    public fn c_sysv_cls_integer(self) -> i32 { return 1; }
+    public fn c_sysv_cls_sse(self) -> i32 { return 2; }
+    public fn c_sysv_cls_memory(self) -> i32 { return 3; }
+
+    public fn c_sysv_merge_class(self, a: i32, b: i32) -> i32 {
+        if (a == self.c_sysv_cls_none()) { return b; }
+        if (b == self.c_sysv_cls_none()) { return a; }
+        if (a == self.c_sysv_cls_memory() || b == self.c_sysv_cls_memory()) {
+            return self.c_sysv_cls_memory();
+        }
+        if (a != b) { return self.c_sysv_cls_integer(); }
+        return a;
+    }
+
+    public fn c_sysv_scalar_class(self, type_id: i32) -> i32 {
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (kind == ty_F32() || kind == ty_F64()) { return self.c_sysv_cls_sse(); }
+        if (kind == ty_VOID()) { return self.c_sysv_cls_none(); }
+        return self.c_sysv_cls_integer();
+    }
+
+    public fn c_sysv_set_eightbyte(self, acc: i32, eb: i64, cls: i32) -> i32 {
+        let mem = acc & 256;
+        var e0 = acc & 15;
+        var e1 = (acc >> 4) & 15;
+        if (eb == 0) {
+            e0 = self.c_sysv_merge_class(e0, cls);
+            return mem | e0 | (e1 << 4);
+        }
+        if (eb == 1) {
+            e1 = self.c_sysv_merge_class(e1, cls);
+            return mem | e0 | (e1 << 4);
+        }
+        return acc | 256;
+    }
+
+    public fn c_sysv_classify_at(self, type_id: i32, base: i64, acc: i32) -> i32 {
+        if ((acc & 256) != 0) { return acc; }
+        if (type_id == mir_id_invalid()) { return acc | 256; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let kind = llvm_mir_type_kind(&self.m, canonical);
+        if (kind == ty_CLASS() && self.type_is_value_struct_abi(canonical)) {
+            let packed = self.type_repr_is_packed(canonical);
+            var offset: i64 = 0;
+            let field_n = mir_unit_field_count_for_type(&self.m, canonical);
+            var fi: i32 = 0;
+            var next = acc;
+            while (fi < field_n) {
+                let field_id = mir_unit_field_id_for_type_index(&self.m, canonical, fi);
+                if (field_id != mir_id_invalid()) {
+                    let ft = mir_unit_field_type(&self.m, field_id);
+                    let fs = self.value_storage_size_fast(ft);
+                    if (fs <= 0) { return acc | 256; }
+                    var nat_align = self.value_storage_align(ft);
+                    if (nat_align <= 0) { nat_align = 1; }
+                    var place_align = nat_align;
+                    if (packed) { place_align = 1; }
+                    offset = self.align_up_i64(offset, place_align);
+                    if ((offset % nat_align) != 0) { return acc | 256; }
+                    next = self.c_sysv_classify_at(ft, base + offset, next);
+                    offset = offset + fs;
+                }
+                fi = fi + 1;
+            }
+            return next;
+        }
+        if (kind == ty_ARRAY()) {
+            let elem = hir_type_table_elem(self.m.types, canonical);
+            let count = self.array_length_for_type(canonical);
+            let elem_size = self.value_storage_size_fast(elem);
+            if (elem == mir_id_invalid() || count < 0 || elem_size <= 0) { return acc | 256; }
+            var idx: i32 = 0;
+            var next_arr = acc;
+            while (idx < count) {
+                next_arr = self.c_sysv_classify_at(elem, base + (elem_size * (idx as i64)), next_arr);
+                idx = idx + 1;
+            }
+            return next_arr;
+        }
+        if (kind == ty_TUPLE()) {
+            var offset2: i64 = 0;
+            let count2 = self.tuple_element_count_for_type(canonical);
+            var ti: i32 = 0;
+            var next_t = acc;
+            while (ti < count2) {
+                let et = self.tuple_element_type_id(canonical, ti);
+                let es = self.value_storage_size_fast(et);
+                if (es <= 0) { return acc | 256; }
+                var ea = self.value_storage_align(et);
+                if (ea <= 0) { ea = 1; }
+                offset2 = self.align_up_i64(offset2, ea);
+                next_t = self.c_sysv_classify_at(et, base + offset2, next_t);
+                offset2 = offset2 + es;
+                ti = ti + 1;
+            }
+            return next_t;
+        }
+        let bytes = self.value_storage_size_fast(canonical);
+        if (bytes <= 0) { return acc | 256; }
+        let cls = self.c_sysv_scalar_class(canonical);
+        let start = base;
+        let last = base + bytes - 1;
+        if (start < 0 || last >= 16) { return acc | 256; }
+        var eb = start / 8;
+        let end_eb = last / 8;
+        var next_s = acc;
+        while (eb <= end_eb) {
+            next_s = self.c_sysv_set_eightbyte(next_s, eb, cls);
+            eb = eb + 1;
+        }
+        return next_s;
+    }
+
+    public fn c_sysv_classify(self, type_id: i32) -> i32 {
+        if (type_id == mir_id_invalid()) {
+            return self.c_sysv_classify_at(type_id, 0, 0);
+        }
+        let cached = llvm_mir_i32_map_get(self.c_sysv_classify_cache, type_id);
+        if (cached != 0) { return cached - 1; }
+        let cls = self.c_sysv_classify_at(type_id, 0, 0);
+        llvm_mir_i32_map_put(self.c_sysv_classify_cache, type_id, cls + 1);
+        return cls;
+    }
+
+    public fn type_uses_c_sysv_memory(self, type_id: i32) -> bool {
+        if (!self.type_is_native_c_aggregate(type_id)) { return false; }
+        let bytes = self.value_storage_size(type_id);
+        if (bytes <= 0 || bytes > self.type_c_abi_max_direct_bytes()) { return true; }
+        return (self.c_sysv_classify(type_id) & 256) != 0;
+    }
+
+    public fn type_uses_c_sysv_direct_coerce(self, type_id: i32) -> bool {
+        if (!self.type_is_native_c_aggregate(type_id)) { return false; }
+        return !self.type_uses_c_sysv_memory(type_id);
+    }
+
+    public fn function_uses_c_sysv_aggregate_abi(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        // An open-generic instance has no descriptor at all: its parameter and
+        // return types are the consumer's own MIR types, and the materialized
+        // entrypoint was compiled by a C-ABI compiler (clang / rustc) that
+        // applies the target's aggregate rule.  So the consumer has to answer
+        // the same way -- opt-in here, and the existing coerce machinery
+        // supplies the matching LLVM type and value conversion on both the
+        // declaration and the callsite.  Checked before the blanket DCI guard
+        // below, which would otherwise refuse every instance.
+        if (self.function_name_is_foreign_dci_instance(function_id)) { return true; }
+        // A DCI override callback is materialized as an extern "C" free
+        // function too (the stub TU declares it with plain C types), so its
+        // register-classified records coerce the same way.  The helper below
+        // excludes every size the C free-function rule would not carry in a
+        // register, and the member facts keep driving sret/indirect shapes.
+        if (self.function_is_dci_vyx_override_callback(function_id)) { return true; }
+        if (self.function_is_foreign_dci(function_id)) { return false; }
+        return self.function_uses_c_calling_convention(function_id);
+    }
+
+    /// Whether a *direct* parameter of an open-generic instance has to be
+    /// coerced to the target's C aggregate machine type.
+    ///
+    /// Only the direct case: a parameter the synthesized ABI already routed to
+    /// `indirect`/`byval` travels as a pointer and is left alone.  This is the
+    /// value-side twin of `source_param_uses_c_sysv_coerce`, which covers the
+    /// signature side but is unreachable from the DCI argument path.
+    public fn dci_open_direct_param_uses_c_coerce(self, function_id: i32,
+                                                  type_id: i32) -> bool {
+        if (function_id == mir_id_invalid() || type_id == mir_id_invalid()) { return false; }
+        if (!self.function_name_is_foreign_dci_instance(function_id)) { return false; }
+        if (self.dci_open_lowering_passing(type_id) != "direct") { return false; }
+        return self.type_uses_c_sysv_direct_coerce(type_id);
+    }
+
+    public fn source_param_uses_c_sysv_coerce(self, function_id: i32, source_idx: i32) -> bool {
+        if (!self.function_uses_c_sysv_aggregate_abi(function_id)) { return false; }
+        if (self.source_param_uses_self_pointer_abi(function_id, source_idx)) { return false; }
+        let param_type = self.function_source_param_type(function_id, source_idx);
+        if (self.dci_override_crosses_as_c_register_record(function_id, param_type)) { return true; }
+        return self.type_uses_c_sysv_direct_coerce(param_type);
+    }
+
+    public fn function_return_uses_c_sysv_coerce(self, function_id: i32) -> bool {
+        if (!self.function_uses_c_sysv_aggregate_abi(function_id)) { return false; }
+        let ret_type = self.m.function_return_type(function_id);
+        if (self.dci_override_crosses_as_c_register_record(function_id, ret_type)) { return true; }
+        return self.type_uses_c_sysv_direct_coerce(ret_type);
+    }
+
+    public fn c_sysv_named_pair_ty(self, left: rawptr, right: rawptr, name: string) -> rawptr {
+        if (left == null || right == null) { return null; }
+        let st = vyx_rt_struct_ty_named(self.mod, name.c_str(), name.len as u64);
+        if (st == null) { return null; }
+        if (vyx_rt_get_struct_field_ty(self.mod, st, 0) != null) { return st; }
+        let fields = malloc(16);
+        if (fields == null) { return null; }
+        ast_write_rawptr(fields, left);
+        ast_write_rawptr(ptr_offset(fields, 8), right);
+        if (vyx_rt_struct_ty_set_body(self.mod, st, fields, 2, 0) != 0) {
+            free(fields);
+            return null;
+        }
+        free(fields);
+        return st;
+    }
+
+    public fn c_sysv_coerce_llvm_type(self, type_id: i32) -> rawptr {
+        let bytes = self.value_storage_size(type_id);
+        if (bytes <= 0 || bytes > 16) { return null; }
+        // Win64 answers with a different coercion than SysV: an aggregate that
+        // fits in one machine word travels in a *single integer register*,
+        // whatever its members are -- clang lowers `struct {float,float}` and
+        // `struct {double}` to `i64`, not to an XMM value, so the SSE branch
+        // below would pick the wrong class and the argument would arrive in
+        // the wrong register file.  Sizes above one word keep the SysV
+        // eightbyte rule (the DCI open-generic surface routes those to by
+        // reference before asking here).  `<=` rather than `==` on the widths
+        // so a padded 3-byte struct keeps answering the way it always did.
+        if (llvm_mir_effective_target_is_windows()
+            && bytes <= self.type_c_abi_word_bytes()) {
+            if (bytes <= 1) { return self.ty_i8; }
+            if (bytes <= 2) { return self.ty_i16; }
+            if (bytes <= 4) { return self.ty_i32; }
+            return self.ty_i64;
+        }
+        let cls = self.c_sysv_classify(type_id);
+        if ((cls & 256) != 0) { return null; }
+        let eb0 = cls & 15;
+        let eb1 = (cls >> 4) & 15;
+        if (bytes <= 8) {
+            if (eb0 == self.c_sysv_cls_sse()) {
+                if (bytes <= 4) { return vyx_rt_float_type(self.mod, 32); }
+                return vyx_rt_float_type(self.mod, 64);
+            }
+            if (bytes <= 1) { return self.ty_i8; }
+            if (bytes <= 2) { return self.ty_i16; }
+            if (bytes <= 4) { return self.ty_i32; }
+            return self.ty_i64;
+        }
+        if (eb0 == self.c_sysv_cls_sse() && eb1 == self.c_sysv_cls_sse()) {
+            return vyx_rt_array_ty(self.mod, vyx_rt_float_type(self.mod, 64), 2);
+        }
+        if (eb0 == self.c_sysv_cls_sse() && eb1 == self.c_sysv_cls_integer()) {
+            return self.c_sysv_named_pair_ty(vyx_rt_float_type(self.mod, 64), self.ty_i64, "c.abi.si");
+        }
+        if (eb0 == self.c_sysv_cls_integer() && eb1 == self.c_sysv_cls_sse()) {
+            return self.c_sysv_named_pair_ty(self.ty_i64, vyx_rt_float_type(self.mod, 64), "c.abi.is");
+        }
+        return vyx_rt_array_ty(self.mod, self.ty_i64, 2);
+    }
+
+    public fn c_sysv_coerce_value(self, value: rawptr, type_id: i32, label: string) -> rawptr {
+        let coerce_ty = self.c_sysv_coerce_llvm_type(type_id);
+        let storage_ty = self.lower_storage_type(type_id);
+        if (value == null || coerce_ty == null || storage_ty == null) { return null; }
+        let slot = vyx_rt_build_alloca(self.mod, storage_ty, label.c_str(), label.len as u64);
+        if (slot == null) { return null; }
+        var alignment = self.value_storage_align(type_id);
+        if (alignment <= 0) { alignment = 8; }
+        vyx_rt_set_alignment(self.mod, slot, alignment as i32);
+        vyx_rt_build_store(self.mod, value, slot);
+        return vyx_rt_build_load(self.mod, coerce_ty, slot, label.c_str(), label.len as u64);
+    }
+
+    public fn c_sysv_uncoerce_value(self, bits: rawptr, type_id: i32, label: string) -> rawptr {
+        let coerce_ty = self.c_sysv_coerce_llvm_type(type_id);
+        let storage_ty = self.lower_storage_type(type_id);
+        if (bits == null || coerce_ty == null || storage_ty == null) { return null; }
+        let slot = vyx_rt_build_alloca(self.mod, storage_ty, label.c_str(), label.len as u64);
+        if (slot == null) { return null; }
+        var alignment = self.value_storage_align(type_id);
+        if (alignment <= 0) { alignment = 8; }
+        vyx_rt_set_alignment(self.mod, slot, alignment as i32);
+        vyx_rt_build_store(self.mod, bits, slot);
+        return vyx_rt_build_load(self.mod, storage_ty, slot, label.c_str(), label.len as u64);
+    }
+
+    public fn function_uses_hidden_sret(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        // An override callback whose record return crosses as an extern "C"
+        // free function returns in RAX (1/2/4/8-byte record, C free-function
+        // rule); the member-style sret fact of the vtable slot must not leak
+        // into the thunk signature, which the stub TU declares without a
+        // hidden return pointer.
+        if (self.dci_override_crosses_as_c_register_record(
+                function_id, self.m.function_return_type(function_id))) {
+            return false;
+        }
+        if (self.dci_function_uses_sret(function_id)) { return true; }
+        if (self.function_is_foreign_dci(function_id)) { return false; }
+        if (self.function_uses_i32_main_abi(function_id)) { return false; }
+        if (self.function_uses_c_calling_convention(function_id)) {
+            return self.type_uses_c_sysv_memory(self.m.function_return_type(function_id));
+        }
+        return self.type_uses_indirect_c_abi(self.m.function_return_type(function_id));
+    }
+
+    public fn function_is_native_constructor(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.function_is_foreign_dci_ctor(function_id)) { return true; }
+        return self.function_name_matches_method(self.m.function_name(function_id), "constructor");
+    }
+
+    public fn source_param_uses_native_byval_abi(self, function_id: i32, source_idx: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.function_is_foreign_dci(function_id)) { return false; }
+        if (self.source_param_uses_dci_override_byval_abi(function_id, source_idx)) { return true; }
+        if (self.source_param_uses_self_pointer_abi(function_id, source_idx)) { return false; }
+        if (self.function_uses_c_calling_convention(function_id)) {
+            return self.type_uses_c_sysv_memory(self.function_source_param_type(function_id, source_idx));
+        }
+        return self.type_uses_indirect_c_abi(self.function_source_param_type(function_id, source_idx));
+    }
+
+    public fn native_aggregate_align_bytes(self, type_id: i32) -> u64 {
+        var align = self.dci_type_value_alignment(type_id);
+        if (align <= 0) { align = 8; }
+        return align as u64;
+    }
+
+    public fn materialize_aggregate_pointer_argument(self,
+                                                     value_id: i32,
+                                                     type_id: i32,
+                                                     label: string) -> rawptr {
+        let storage_type = self.lower_storage_type(type_id);
+        let value = self.lower_value_as(value_id, type_id);
+        if (storage_type == null || value == null) { return null; }
+        let slot = vyx_rt_build_alloca(self.mod, storage_type, label.c_str(), label.len as u64);
+        if (slot == null) { return null; }
+        let alignment = self.native_aggregate_align_bytes(type_id);
+        if (alignment > 0) { vyx_rt_set_alignment(self.mod, slot, alignment as i32); }
+        vyx_rt_build_store(self.mod, value, slot);
+        return slot;
+    }
+
+    public fn apply_native_c_aggregate_abi_attrs(self, function_id: i32, fn_or_call: rawptr) -> bool {
+        if (fn_or_call == null) { return false; }
+        if (self.function_is_foreign_dci(function_id)) { return true; }
+        var llvm_index: i32 = 0;
+        if (self.function_uses_hidden_sret(function_id)) {
+            let return_type = self.m.function_return_type(function_id);
+            let pointee_type = self.lower_storage_type(return_type);
+            let alignment = self.native_aggregate_align_bytes(return_type);
+            if (pointee_type == null
+                || vyx_rt_set_param_abi_attr(self.mod,
+                                             fn_or_call,
+                                             0,
+                                             "sret".c_str(),
+                                             4,
+                                             pointee_type,
+                                             alignment) != 0) {
+                self.report_error("cannot apply native sret ABI to `"
+                          + self.m.function_name(function_id)
+                          + "`: " + self.runtime_last_error());
+                return false;
+            }
+            llvm_index = 1;
+        }
+        if (self.function_uses_c_main_abi(function_id)) { llvm_index = llvm_index + 2; }
+        llvm_index = llvm_index + self.function_hidden_env_param_count(function_id);
+        var source_index: i32 = 0;
+        while (source_index < self.function_source_param_count(function_id)) {
+            if (self.source_param_uses_native_byval_abi(function_id, source_index)) {
+                let source_type = self.function_source_param_type(function_id, source_index);
+                let pointee = self.lower_storage_type(source_type);
+                let param_alignment = self.native_aggregate_align_bytes(source_type);
+                if (pointee == null
+                    || vyx_rt_set_param_abi_attr(self.mod,
+                                                 fn_or_call,
+                                                 llvm_index as u64,
+                                                 "byval".c_str(),
+                                                 5,
+                                                 pointee,
+                                                 param_alignment) != 0) {
+                    self.report_error("cannot apply native byval ABI to parameter #"
+                              + source_index.toString() + " of `" + self.m.function_name(function_id)
+                              + "`: " + self.runtime_last_error());
+                    return false;
+                }
+            }
+            llvm_index = llvm_index + 1;
+            source_index = source_index + 1;
+        }
+        return true;
+    }
+
+    public fn type_uses_self_pointer_abi(self, type_id_raw: i32) -> bool {
+        if (type_id_raw == mir_id_invalid()) { return false; }
+        let type_id = self.canonical_record_type_id(type_id_raw);
+        // Unique rule: method `self` is always a pointer so `self.field` is GEP.
+        // ty_STRING() is not ty_CLASS(); without this, `impl` bodies could not
+        // GEP `self.ptr` / `self.len`.
+        if (self.type_is_str_abi(type_id)) { return true; }
+        if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
+        if (self.type_is_dyn_trait(type_id)) { return false; }
+        return true;
+    }
+
+    public fn source_param_uses_self_pointer_abi(self, function_id: i32, source_idx: i32) -> bool {
+        if (source_idx != 0) { return false; }
+        let local = self.function_source_param_local(function_id, source_idx);
+        if (local == mir_id_invalid()) { return false; }
+        if (!self.local_is_self_receiver_param(local)) { return false; }
+        let flags = self.m.local_flags(local);
+        // Explicit Rust-style borrows are pointer ABI even for primitive or
+        // value-aggregate impl receivers. This is the ABI-level distinction
+        // that lets `&mut self` write through to the caller instead of
+        // mutating a copied scalar. Class receivers already use this ABI for
+        // compatibility `self` and owning `own self` below.
+        if ((flags & mir_local_flag_self_shared_ref()) != 0
+            || (flags & mir_local_flag_self_mut_ref()) != 0) {
+            return true;
+        }
+        return self.type_uses_self_pointer_abi(self.local_effective_type(local));
+    }
+
+    public fn local_is_self_pointer_abi_slot(self, function_id: i32, local_id: i32) -> bool {
+        if (function_id == mir_id_invalid() || local_id == mir_id_invalid()) { return false; }
+        let first_local = self.function_source_param_local(function_id, 0);
+        if (first_local == mir_id_invalid() || first_local != local_id) { return false; }
+        return self.source_param_uses_self_pointer_abi(function_id, 0);
+    }
+
+    public fn source_param_incoming_is_raw_pointer_handle(self,
+                                                          function_id: i32,
+                                                          source_idx: i32) -> bool {
+        let local = self.function_source_param_local(function_id, source_idx);
+        if (local == mir_id_invalid()) { return false; }
+        if (self.local_is_self_pointer_abi_slot(function_id, local)) { return false; }
+        let local_type = self.local_effective_type(local);
+        if (!llvm_mir_kind_pointer_handle(llvm_mir_type_kind(&self.m, local_type))) {
+            return false;
+        }
+        if (self.foreign_c_handle_uses_raw_pointer_abi(function_id, local_type)) {
+            return true;
+        }
+        if (self.function_is_foreign_dci(function_id)
+            && self.dci_direct_handle_uses_raw_pointer_abi(
+                   local_type,
+                   self.dci_source_parameter_abi(function_id, source_idx))) {
+            return true;
+        }
+        return false;
+    }
+
+    public fn place_slot_holds_raw_pointer(self, place_id: i32) -> bool {
+        if (place_id == mir_id_invalid()) { return false; }
+        if (self.place_is_self_pointer_abi_slot(place_id)) { return true; }
+        if (self.m.place_kind(place_id) != mir_place_local()) { return false; }
+        let local = self.m.place_local(place_id);
+        let function_id = self.m.place_function(place_id);
+        if (local == mir_id_invalid() || function_id == mir_id_invalid()) { return false; }
+        if (!self.local_is_source_param(local)) { return false; }
+        var source_idx: i32 = 0;
+        var cursor = self.m.function_first_local(function_id);
+        while (cursor != mir_id_invalid()) {
+            if (self.local_is_source_param(cursor)) {
+                if (cursor == local) {
+                    return self.source_param_incoming_is_raw_pointer_handle(function_id, source_idx);
+                }
+                source_idx = source_idx + 1;
+            }
+            cursor = self.m.local_next(cursor);
+        }
+        return false;
+    }
+
+    public fn local_uses_self_pointer_abi(self, function_id: i32, local_id: i32) -> bool {
+        // Legacy codegen allocates a mutable slot for every source parameter,
+        // including class receiver `self` whose LLVM ABI parameter is a raw
+        // object pointer. Assignments such as `self = self.next()` update that
+        // local slot, not the object pointed to by the incoming ABI parameter.
+        return false;
+    }
+}

@@ -174,12 +174,12 @@ fn main() -> i32 {
 # lose their source anchor to 0:0. Keep the audit broad across every MIR phase.
 # The dynamic probe also guarantees that a source-level call mismatch is
 # rejected by overload resolution before malformed MIR reaches a backend.
-$mirPhaseSources = Get-ChildItem -LiteralPath (Join-Path $root "src") -File |
-    Where-Object { $_.Name -match 'mir' } |
-    ForEach-Object { $_.Name }
-foreach ($name in $mirPhaseSources) {
-    $path = Join-Path $root ("src/" + $name)
-    $text = [System.IO.File]::ReadAllText($path)
+$mirPhaseSources = @(Get-ChildItem -LiteralPath (Join-Path $root "src/mir") -File -Recurse -Filter '*.vyx')
+if ($mirPhaseSources.Count -eq 0) { throw 'MIR diagnostic audit found no source files' }
+$mirPhaseSources += Get-Item -LiteralPath (Join-Path $root 'src/codegen/cpp/mir_cpp_lower.vyx')
+foreach ($source in $mirPhaseSources) {
+    $name = $source.FullName
+    $text = [System.IO.File]::ReadAllText($name)
     if ($text -match 'diag_emit(_at)?\s*\(') {
         Write-Host "[diag-smoke] FAIL $name bypasses unified MIR diagnostic entry"
         exit 8

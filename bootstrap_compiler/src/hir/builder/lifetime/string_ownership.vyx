@@ -1,0 +1,350 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// String ownership for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn primitive_str_init_is_fresh_owned_value(self, init_e: rawptr) -> bool {
+        if (init_e == null) { return false; }
+        let kind = expr_get_kind(init_e);
+        // The primitive ABI carries an explicit allocator-domain tag. Calling
+        // str_drop on a literal/view is therefore a no-op, while an
+        // interpolated string releases its runtime buffer. Both are safe
+        // lexical values; the aliasing gate below remains responsible for
+        // rejecting copies of an existing owning local.
+        if (kind == ex_STR_LIT() || kind == ex_FSTRING()) { return true; }
+        if (kind == ex_BIN() && expr_get_op(init_e) == tk_PLUS()) { return true; }
+        if (kind != ex_CALL()) { return false; }
+        let callee = expr_get_lhs(init_e);
+        if (callee == null) { return false; }
+        if (expr_get_kind(callee) == ex_MEMBER()) {
+            let name = policy_generic_call_base(expr_get_name(callee));
+            return name == "toUpper" || name == "toLower"
+                || name == "to_upper" || name == "to_lower"
+                || name == "trim" || name == "replace"
+                || name == "substring" || name == "repeat"
+                || name == "clone";
+        }
+        if (expr_get_kind(callee) != ex_IDENT()) { return false; }
+        let name = policy_generic_call_base(expr_get_name(callee));
+        return name == "int_to_string" || name == "bool_to_string"
+            || name == "float_to_string" || name == "str_concat"
+            || name == "str_dup" || name == "from_cstr_len"
+            || name == "readFile";
+    }
+
+    // Primitive str values have an explicit ownership tag.  A fresh
+    // initializer alone is not enough to schedule str_drop: later code may
+    // return a borrowed alias, pass the value to an unknown callee, take its
+    // address, aggregate it, or capture it.  Those paths cannot prove that a
+    // lexical drop remains valid, so they conservatively reject auto-drop.
+    //
+    // This is intentionally an AST-side gate while HIR is being materialized.
+    // Sema symbols can be rebuilt for a lazy generic body, so the same source
+    // binding need not retain pointer identity here. Matching the name makes
+    // the proof more conservative under shadowing, never less conservative.
+    fn primitive_str_expr_mentions_target(self, e: rawptr, target: string) -> bool {
+        if (e == null || target.len == 0) { return false; }
+        if (expr_get_kind(e) == ex_IDENT() && expr_get_name(e) == target) {
+            return true;
+        }
+        let k = expr_get_kind(e);
+        if (k == ex_BIN() || k == ex_ASSIGN() || k == ex_INDEX()) {
+            return self.primitive_str_expr_mentions_target(expr_get_lhs(e), target)
+                || self.primitive_str_expr_mentions_target(expr_get_rhs(e), target);
+        }
+        if (k == ex_UNARY() || k == ex_ADDR_OF() || k == ex_DEREF()
+            || k == ex_COMPTIME() || k == ex_FAIL() || k == ex_AWAIT() || k == ex_CAST()
+            || k == ex_MEMBER()) {
+            return self.primitive_str_expr_mentions_target(expr_get_lhs(e), target);
+        }
+        if (k == ex_CALL()) {
+            return self.primitive_str_expr_mentions_target(expr_get_lhs(e), target)
+                || self.primitive_str_stmt_chain_mentions_target(expr_get_args(e), target);
+        }
+        if (k == ex_STRUCT_INIT() || k == ex_FSTRING() || k == ex_TUPLE_LIT()
+            || k == ex_INLINE_ASM()) {
+            return self.primitive_str_stmt_chain_mentions_target(expr_get_args(e), target);
+        }
+        if (k == ex_ARRAY_LIT()) {
+            return self.primitive_str_stmt_chain_mentions_target(expr_get_args(e), target)
+                || self.primitive_str_expr_mentions_target(expr_get_captures(e), target);
+        }
+        if (k == ex_TERNARY()) {
+            return self.primitive_str_expr_mentions_target(expr_get_lhs(e), target)
+                || self.primitive_str_expr_mentions_target(expr_get_rhs(e), target)
+                || self.primitive_str_expr_mentions_target(expr_get_args(e), target);
+        }
+        if (k == ex_CLOSURE()) {
+            return self.primitive_str_stmt_chain_mentions_target(expr_get_lhs(e), target)
+                || self.primitive_str_stmt_chain_mentions_target(expr_get_captures(e), target);
+        }
+        if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+            if (self.primitive_str_expr_mentions_target(expr_get_lhs(e), target)) { return true; }
+            if (k == ex_IF_EXPR()) {
+                return self.primitive_str_stmt_mentions_target(expr_get_rhs(e), target)
+                    || self.primitive_str_stmt_chain_mentions_target(expr_get_args(e), target);
+            }
+            var match_arm = expr_get_args(e);
+            while (match_arm != null) {
+                if (self.primitive_str_expr_mentions_target(stmt_get_init(match_arm), target)
+                    || self.primitive_str_expr_mentions_target(stmt_get_cond(match_arm), target)
+                    || self.primitive_str_stmt_chain_mentions_target(stmt_get_body(match_arm), target)) {
+                    return true;
+                }
+                match_arm = stmt_get_next(match_arm);
+            }
+            return false;
+        }
+        return false;
+    }
+
+    fn primitive_str_stmt_mentions_target(self, s: rawptr, target: string) -> bool {
+        if (s == null || target.len == 0) { return false; }
+        let k = stmt_get_kind(s);
+        if (k == st_EXPR() || k == st_LET() || k == st_VAR() || k == st_RETURN()) {
+            return self.primitive_str_expr_mentions_target(stmt_get_init(s), target);
+        }
+        if (k == st_BLOCK()) {
+            return self.primitive_str_stmt_chain_mentions_target(stmt_get_body(s), target);
+        }
+        if (k == st_IF()) {
+            return self.primitive_str_expr_mentions_target(stmt_get_cond(s), target)
+                || self.primitive_str_stmt_mentions_target(stmt_get_then_blk(s), target)
+                || self.primitive_str_stmt_mentions_target(stmt_get_else_blk(s), target);
+        }
+        if (k == st_WHILE() || k == st_FOREACH()) {
+            return self.primitive_str_expr_mentions_target(stmt_get_cond(s), target)
+                || self.primitive_str_stmt_mentions_target(stmt_get_body(s), target);
+        }
+        if (k == st_FOR()) {
+            return self.primitive_str_stmt_mentions_target(stmt_get_init(s), target)
+                || self.primitive_str_expr_mentions_target(stmt_get_cond(s), target)
+                || self.primitive_str_stmt_mentions_target(stmt_get_body(s), target)
+                || self.primitive_str_stmt_mentions_target(stmt_get_then_blk(s), target);
+        }
+        if (k == st_MATCH()) {
+            return self.primitive_str_expr_mentions_target(stmt_get_init(s), target)
+                || self.primitive_str_stmt_chain_mentions_target(stmt_get_body(s), target);
+        }
+        if (k == st_DEFER()) {
+            return self.primitive_str_stmt_mentions_target(stmt_get_init(s), target);
+        }
+        if (k == st_STATIC_ASSERT()) {
+            return self.primitive_str_expr_mentions_target(stmt_get_cond(s), target);
+        }
+        return false;
+    }
+
+    fn primitive_str_stmt_chain_mentions_target(self, head: rawptr, target: string) -> bool {
+        var cur = head;
+        while (cur != null) {
+            if (self.primitive_str_stmt_mentions_target(cur, target)) { return true; }
+            cur = stmt_get_next(cur);
+        }
+        return false;
+    }
+
+    fn primitive_str_member_call_is_non_escaping(self, name: string) -> bool {
+        let base = policy_generic_call_base(name);
+        return base == "len" || base == "length" || base == "size" || base == "count"
+            || base == "charAt" || base == "char_at"
+            || base == "startsWith" || base == "starts_with"
+            || base == "endsWith" || base == "ends_with"
+            || base == "contains" || base == "indexOf" || base == "index_of"
+            || base == "toUpper" || base == "toLower"
+            || base == "to_upper" || base == "to_lower"
+            || base == "trim" || base == "replace" || base == "substring"
+            || base == "repeat" || base == "clone";
+    }
+
+    fn primitive_str_direct_call_is_non_escaping(self, name: string) -> bool {
+        let base = policy_generic_call_base(name);
+        return base == "str_concat" || base == "str_equals"
+            || base == "str_length" || base == "str_trim" || base == "str_replace"
+            || base == "str_to_upper" || base == "str_to_lower"
+            || base == "str_index_of" || base == "str_starts_with" || base == "str_ends_with"
+            || base == "str_drop";
+    }
+
+    fn primitive_str_member_call_returns_independent_scalar(self, name: string) -> bool {
+        let base = policy_generic_call_base(name);
+        return base == "len" || base == "length" || base == "size" || base == "count"
+            || base == "charAt" || base == "char_at"
+            || base == "startsWith" || base == "starts_with"
+            || base == "endsWith" || base == "ends_with"
+            || base == "contains" || base == "indexOf" || base == "index_of";
+    }
+
+    fn primitive_str_let_init_is_independent(self, init_e: rawptr, target: string) -> bool {
+        if (init_e == null || !self.primitive_str_expr_mentions_target(init_e, target)) {
+            return true;
+        }
+        // Fresh string producers copy the source bytes; the new local owns a
+        // distinct tagged result and cannot keep the source allocation alive.
+        if (self.primitive_str_init_is_fresh_owned_value(init_e)) {
+            return !self.primitive_str_expr_has_unsafe_use(init_e, target);
+        }
+        if (expr_get_kind(init_e) != ex_CALL()) { return false; }
+        let callee = expr_get_lhs(init_e);
+        if (callee == null || expr_get_kind(callee) != ex_MEMBER()
+            || !self.primitive_str_expr_mentions_target(expr_get_lhs(callee), target)
+            || !self.primitive_str_member_call_returns_independent_scalar(expr_get_name(callee))) {
+            return false;
+        }
+        return !self.primitive_str_expr_has_unsafe_use(init_e, target);
+    }
+
+    // Primitive str arguments to a language free function are borrowed by the
+    // calling ABI. A callee that needs to retain bytes must create an explicit
+    // owned copy; raw/foreign entrypoints have no such language contract and
+    // remain an escape barrier. This admits normal helper calls in a lexical
+    // owner proof without treating a return, aggregate, address or indirect
+    // call as non-escaping.
+    fn primitive_str_language_free_call_borrows_args(self, e: rawptr) -> bool {
+        if (e == null || expr_get_kind(e) != ex_CALL()) { return false; }
+        let callee = expr_get_lhs(e);
+        if (callee == null || expr_get_kind(callee) != ex_IDENT()) { return false; }
+        var target = expr_get_semantic_target(callee);
+        if (target == null) { target = expr_get_semantic_target(e); }
+        if (target == null || decl_get_kind(target) != de_FN()) { return false; }
+        return !hir_builder_decl_is_foreign_dci(target);
+    }
+
+    fn primitive_str_expr_has_unsafe_use(self, e: rawptr, target: string) -> bool {
+        if (!self.primitive_str_expr_mentions_target(e, target)) { return false; }
+        let k = expr_get_kind(e);
+        if (k == ex_IDENT()) { return false; }
+        if (k == ex_BIN()) {
+            return self.primitive_str_expr_has_unsafe_use(expr_get_lhs(e), target)
+                || self.primitive_str_expr_has_unsafe_use(expr_get_rhs(e), target);
+        }
+        if (k == ex_ASSIGN()) {
+            // `text = text + suffix` is the one reassignment form whose
+            // lowering preserves a single ownership slot: it either grows the
+            // existing allocation in place or replaces and releases it before
+            // storing the new tagged value. Other assignments can copy an
+            // external owner into this local and remain rejected.
+            let lhs = expr_get_lhs(e);
+            let rhs = expr_get_rhs(e);
+            if (lhs != null && rhs != null
+                && expr_get_kind(lhs) == ex_IDENT()
+                && expr_get_name(lhs) == target
+                && expr_get_kind(rhs) == ex_BIN()
+                && expr_get_op(rhs) == tk_PLUS()
+                && expr_get_lhs(rhs) != null
+                && expr_get_kind(expr_get_lhs(rhs)) == ex_IDENT()
+                && expr_get_name(expr_get_lhs(rhs)) == target
+                && !self.primitive_str_expr_mentions_target(expr_get_rhs(rhs), target)) {
+                return false;
+            }
+            // Assigning a fresh concat/transform result to some other owner
+            // only reads this local's bytes. The destination receives an
+            // independent tagged allocation; a direct `dest = source` copy is
+            // not fresh and therefore still fails this gate.
+            if (lhs != null && rhs != null
+                && !self.primitive_str_expr_mentions_target(lhs, target)
+                && self.primitive_str_init_is_fresh_owned_value(rhs)) {
+                return self.primitive_str_expr_has_unsafe_use(rhs, target);
+            }
+            return true;
+        }
+        if (k == ex_CALL()) {
+            let callee = expr_get_lhs(e);
+            if (callee == null) { return true; }
+            var allowed = self.primitive_str_language_free_call_borrows_args(e);
+            if (expr_get_kind(callee) == ex_MEMBER()) {
+                if (self.primitive_str_expr_mentions_target(expr_get_lhs(callee), target)) {
+                    allowed = self.primitive_str_member_call_is_non_escaping(expr_get_name(callee));
+                }
+            } else if (!allowed && expr_get_kind(callee) == ex_IDENT()) {
+                allowed = self.primitive_str_direct_call_is_non_escaping(expr_get_name(callee));
+            }
+            if (!allowed) { return true; }
+            return self.primitive_str_expr_has_unsafe_use(expr_get_lhs(callee), target)
+                || self.primitive_str_stmt_chain_has_unsafe_use(expr_get_args(e), target);
+        }
+        if (k == ex_MEMBER()) {
+            let name = policy_generic_call_base(expr_get_name(e));
+            if (name != "len" && name != "length" && name != "size" && name != "count"
+                && name != "cap" && name != "owned") { return true; }
+            return self.primitive_str_expr_has_unsafe_use(expr_get_lhs(e), target);
+        }
+        if (k == ex_FSTRING()) {
+            return self.primitive_str_stmt_chain_has_unsafe_use(expr_get_args(e), target);
+        }
+        // Address/raw-pointer extraction, indexing, casts, aggregates, closure
+        // capture and branch-result forwarding all need a later ownership
+        // proof. They are barriers for this lexical auto-drop contract.
+        return true;
+    }
+
+    fn primitive_str_stmt_has_unsafe_use(self, s: rawptr, target: string) -> bool {
+        if (s == null) { return false; }
+        let k = stmt_get_kind(s);
+        if (k == st_EXPR()) {
+            return self.primitive_str_expr_has_unsafe_use(stmt_get_init(s), target);
+        }
+        if (k == st_RETURN()) {
+            // MIR return lowering deactivates the source local before it emits
+            // the function-exit drops. A direct return therefore transfers this
+            // local rather than causing a double release. Composite/unknown
+            // return expressions still pass through the normal escape gate.
+            return self.primitive_str_expr_has_unsafe_use(stmt_get_init(s), target);
+        }
+        if (k == st_LET() || k == st_VAR()) {
+            // Direct copies such as `let alias = owner` remain an escape.
+            // Proven fresh string producers and scalar read-only queries do
+            // not retain a view into the source allocation.
+            return !self.primitive_str_let_init_is_independent(stmt_get_init(s), target);
+        }
+        if (k == st_IF()) {
+            return self.primitive_str_expr_has_unsafe_use(stmt_get_cond(s), target)
+                || self.primitive_str_stmt_has_unsafe_use(stmt_get_then_blk(s), target)
+                || self.primitive_str_stmt_has_unsafe_use(stmt_get_else_blk(s), target);
+        }
+        if (k == st_WHILE() || k == st_FOREACH()) {
+            return self.primitive_str_expr_has_unsafe_use(stmt_get_cond(s), target)
+                || self.primitive_str_stmt_has_unsafe_use(stmt_get_body(s), target);
+        }
+        if (k == st_FOR()) {
+            return self.primitive_str_stmt_has_unsafe_use(stmt_get_init(s), target)
+                || self.primitive_str_expr_has_unsafe_use(stmt_get_cond(s), target)
+                || self.primitive_str_stmt_has_unsafe_use(stmt_get_body(s), target)
+                || self.primitive_str_stmt_has_unsafe_use(stmt_get_then_blk(s), target);
+        }
+        if (k == st_BLOCK()) {
+            return self.primitive_str_stmt_chain_has_unsafe_use(stmt_get_body(s), target);
+        }
+        if (k == st_MATCH() || k == st_DEFER()) {
+            return self.primitive_str_stmt_mentions_target(s, target);
+        }
+        return false;
+    }
+
+    fn primitive_str_stmt_chain_has_unsafe_use(self, head: rawptr, target: string) -> bool {
+        var cur = head;
+        while (cur != null) {
+            if (self.primitive_str_stmt_has_unsafe_use(cur, target)) { return true; }
+            cur = stmt_get_next(cur);
+        }
+        return false;
+    }
+
+    fn primitive_str_local_has_proven_non_escaping_uses(self, s: rawptr) -> bool {
+        if (s == null) { return false; }
+        let target = stmt_get_name(s);
+        if (target.len == 0) { return false; }
+        return !self.primitive_str_stmt_chain_has_unsafe_use(stmt_get_next(s), target);
+    }
+}

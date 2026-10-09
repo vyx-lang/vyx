@@ -1,0 +1,534 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Expressions for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn add_expr_shell_from_ast(self, e: rawptr, ast_kind: i32) -> i32 {
+        var sem_kind = self.semantic_kind_for_expr(e, expr_get_semantic_kind(e));
+        let type_id = self.type_id_from_expr_semantic(e, sem_kind);
+        var target_kind = self.target_kind_for_expr(e, sem_kind);
+        var target_id = hir_id_invalid();
+        if (ast_kind == ex_CALL() || ast_kind == ex_MEMBER()) {
+            sem_kind = expr_sem_NONE();
+            target_kind = hir_target_none();
+        } else {
+            target_id = self.target_id_for_expr(e, sem_kind, target_kind);
+        }
+        var value_text = expr_get_str_val(e);
+        var name = expr_get_name(e);
+        if (target_kind == hir_target_builtin()) {
+            name = self.canonical_builtin_name_for_expr(e);
+        }
+        let expr_id = self.unit.add_expr(self.current_function_id,
+                                        ast_kind,
+                                        name,
+                                        value_text,
+                                        expr_get_int_val(e),
+                                        type_id,
+                                        sem_kind,
+                                        target_kind,
+                                        target_id,
+                                        expr_get_semantic_flags(e),
+                                        expr_get_op(e));
+        self.set_hir_expr_loc_from_ast(expr_id, e);
+        self.unit.set_expr_owner_item(expr_id, self.current_item_id);
+        self.profile_expr_trace("expr", e, expr_id);
+        self.resolve_literal_expr_type_after_create(expr_id, ast_kind);
+        return expr_id;
+    }
+
+    fn build_binary_expr_iterative(self, e: rawptr) -> i32 {
+        if (e == null || expr_get_kind(e) != ex_BIN()) { return hir_id_invalid(); }
+        var chain_head: rawptr = null;
+        var cur = e;
+        var depth: i32 = 0;
+        while (cur != null && expr_get_kind(cur) == ex_BIN()) {
+            depth = depth + 1;
+            if (depth > 4096) {
+                return hir_id_invalid();
+            }
+            let node = hir_profile_malloc(16);
+            if (node == null) { return hir_id_invalid(); }
+            memset(node, 0, 16);
+            ast_write_rawptr(node, cur);
+            ast_write_rawptr(ptr_offset(node, 8), chain_head);
+            chain_head = node;
+            cur = expr_get_lhs(cur);
+        }
+        var acc = self.build_expr(cur);
+        var node = chain_head;
+        while (node != null) {
+            let next = ast_read_rawptr(ptr_offset(node, 8));
+            let bin_expr = ast_read_rawptr(node);
+            free(node);
+            if (acc == hir_id_invalid() || bin_expr == null) {
+                node = next;
+                continue;
+            }
+            let expr_id = self.add_expr_shell_from_ast(bin_expr, ex_BIN());
+            self.unit.set_expr_lhs(expr_id, acc);
+            self.unit.set_expr_rhs(expr_id, self.build_expr(expr_get_rhs(bin_expr)));
+            self.unit.set_expr_aux(expr_id, self.build_expr(expr_get_args(bin_expr)));
+            self.resolve_binary_expr_type_after_children(expr_id);
+            acc = expr_id;
+            node = next;
+        }
+        return acc;
+    }
+
+    fn build_expr(self, e: rawptr) -> i32 {
+        e = hir_native_init_prepare(e, self.source_unit, self.unit.types);
+        if (e == null) { return hir_id_invalid(); }
+        let ast_kind = expr_get_kind(e);
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[hir-expr-enter] kind=" + self.i32_text(ast_kind)
+                  + " name=" + expr_get_name(e)
+                  + " fn=" + self.i32_text(self.current_function_id)
+                  + " stmts=" + self.i32_text(self.unit.stmt_count)
+                  + " exprs=" + self.i32_text(self.unit.expr_count)
+                  + " types=" + self.i32_text(self.unit.types.count));
+        }
+        if (ast_kind == ex_IDENT()) {
+            let pack_fold = self.build_pack_fold_expr(e);
+            if (pack_fold != hir_id_invalid()) { return pack_fold; }
+            let const_generic_expr = self.build_current_const_generic_ident_expr(e);
+            if (const_generic_expr != hir_id_invalid()) { return const_generic_expr; }
+            let pack_ref = self.build_pack_ref_expr(e);
+            if (pack_ref != hir_id_invalid()) { return pack_ref; }
+        }
+        if (ast_kind == ex_MEMBER()) {
+            let pack_member = self.build_pack_member_expr(e);
+            if (pack_member != hir_id_invalid()) { return pack_member; }
+        }
+        if (ast_kind == ex_STRUCT_INIT()) {
+            let new_call = self.build_empty_struct_init_new_call(e);
+            if (new_call != hir_id_invalid()) { return new_call; }
+            let list_call = self.build_container_list_init_from_array_call(e);
+            if (list_call != hir_id_invalid()) { return list_call; }
+        }
+        if (ast_kind == ex_INDEX()) {
+            let pack_index = self.build_pack_index_expr(e);
+            if (pack_index != hir_id_invalid()) { return pack_index; }
+        }
+        if (ast_kind == ex_BIN()) {
+            return self.build_binary_expr_iterative(e);
+        }
+        var sem_kind = self.semantic_kind_for_expr(e, expr_get_semantic_kind(e));
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[hir-expr-sem] kind=" + self.i32_text(ast_kind)
+                  + " name=" + expr_get_name(e)
+                  + " sem=" + self.i32_text(sem_kind)
+                  + " exprs=" + self.i32_text(self.unit.expr_count)
+                  + " types=" + self.i32_text(self.unit.types.count));
+        }
+        let type_id = self.type_id_from_expr_semantic(e, sem_kind);
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[hir-expr-type] kind=" + self.i32_text(ast_kind)
+                  + " name=" + expr_get_name(e)
+                  + " type=" + self.i32_text(type_id)
+                  + " exprs=" + self.i32_text(self.unit.expr_count)
+                  + " types=" + self.i32_text(self.unit.types.count));
+        }
+        var target_kind = self.target_kind_for_expr(e, sem_kind);
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[hir-expr-target-kind] kind=" + self.i32_text(ast_kind)
+                  + " name=" + expr_get_name(e)
+                  + " target_kind=" + self.i32_text(target_kind)
+                  + " exprs=" + self.i32_text(self.unit.expr_count)
+                  + " types=" + self.i32_text(self.unit.types.count));
+        }
+        var target_id = hir_id_invalid();
+        if (ast_kind == ex_CALL() || ast_kind == ex_MEMBER()) {
+            sem_kind = expr_sem_NONE();
+            target_kind = hir_target_none();
+        } else {
+            target_id = self.target_id_for_expr(e, sem_kind, target_kind);
+        }
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[hir-expr-target-id] kind=" + self.i32_text(ast_kind)
+                  + " name=" + expr_get_name(e)
+                  + " target_kind=" + self.i32_text(target_kind)
+                  + " target_id=" + self.i32_text(target_id)
+                  + " exprs=" + self.i32_text(self.unit.expr_count)
+                  + " types=" + self.i32_text(self.unit.types.count));
+        }
+        var value_text = expr_get_str_val(e);
+        var name = expr_get_name(e);
+        if (target_kind == hir_target_builtin()) {
+            name = self.canonical_builtin_name_for_expr(e);
+        }
+        let expr_id = self.unit.add_expr(self.current_function_id,
+                                        ast_kind,
+                                        name,
+                                        value_text,
+                                        expr_get_int_val(e),
+                                        type_id,
+                                        sem_kind,
+                                        target_kind,
+                                        target_id,
+                                        expr_get_semantic_flags(e),
+                                        expr_get_op(e));
+        self.set_hir_expr_loc_from_ast(expr_id, e);
+        self.unit.set_expr_owner_item(expr_id, self.current_item_id);
+        self.profile_expr_trace("expr", e, expr_id);
+        self.resolve_literal_expr_type_after_create(expr_id, ast_kind);
+        if (ast_kind == ex_IDENT()) {
+            self.resolve_ident_expr_after_create(e, expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_BIN()
+            || ast_kind == ex_TERNARY()) {
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            self.unit.set_expr_rhs(expr_id, self.build_expr(expr_get_rhs(e)));
+            self.unit.set_expr_aux(expr_id, self.build_expr(expr_get_args(e)));
+            if (ast_kind == ex_BIN()) {
+                self.resolve_binary_expr_type_after_children(expr_id);
+            } else {
+                let rhs_type = self.unit.expr_type(self.unit.expr_rhs(expr_id));
+                let aux_type = self.unit.expr_type(self.unit.expr_aux(expr_id));
+                if (self.type_id_is_valid(rhs_type)) { self.set_expr_type_if_empty(expr_id, rhs_type); }
+                else if (self.type_id_is_valid(aux_type)) { self.set_expr_type_if_empty(expr_id, aux_type); }
+            }
+            return expr_id;
+        }
+        if (ast_kind == ex_ASSIGN()) {
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            self.unit.set_expr_rhs(expr_id, self.build_expr(expr_get_rhs(e)));
+            self.unit.set_expr_aux(expr_id, self.build_expr(expr_get_args(e)));
+            self.apply_expected_expr_type(self.unit.expr_rhs(expr_id),
+                                          self.unit.expr_type(self.unit.expr_lhs(expr_id)));
+            self.resolve_assign_expr_type_after_children(expr_id);
+            self.resolve_assignment_method_after_children(e, expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_UNARY()
+            || ast_kind == ex_CAST()
+            || ast_kind == ex_FAIL()) {
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            if (ast_kind == ex_UNARY()) {
+                self.resolve_unary_expr_type_after_child(expr_id);
+            } else if (ast_kind == ex_FAIL()) {
+                self.set_expr_type_if_empty(expr_id, self.unit.function_return_type(self.current_function_id));
+            } else {
+                self.resolve_single_child_expr_type_after_child(expr_id);
+                self.materialize_dyn_expected_arg_impl(self.unit.expr_lhs(expr_id),
+                                                       self.unit.expr_type(expr_id));
+            }
+            return expr_id;
+        }
+        if (ast_kind == ex_ADDR_OF()) {
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            self.resolve_addr_of_expr_type(expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_DEREF()) {
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            self.resolve_deref_expr_type_after_child(expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_NEW()) {
+            let payload_type_id = self.type_id_from_ref(expr_get_captures(e));
+            if (payload_type_id != hir_id_invalid()
+                && self.unit.expr_target_kind(expr_id) == hir_target_none()) {
+                self.unit.set_expr_semantic(expr_id,
+                                           expr_sem_CLASS(),
+                                           hir_target_type(),
+                                           payload_type_id);
+            }
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            self.unit.set_expr_rhs(expr_id, self.build_expr(expr_get_rhs(e)));
+            self.build_arg_cells(expr_id, expr_get_args(e));
+            // Runtime-length array allocation (`new [T; expr]()`): carry the
+            // size expression as an explicit value so codegen can compute
+            // count * elem_size at run time. Only a plain integer literal
+            // keeps the compile-time allocation path; anything else (idents,
+            // binary expressions) is lowered as a value because the interned
+            // type text cannot carry a foldable expression.
+            let new_payload_tref = expr_get_captures(e);
+            if (new_payload_tref != null && tref_get_kind(new_payload_tref) == ty_ARRAY()) {
+                let new_size_e = tref_array_size_expr(new_payload_tref);
+                if (new_size_e != null && expr_get_kind(new_size_e) != ex_INT_LIT()) {
+                    self.unit.set_expr_aux(expr_id, self.build_expr(new_size_e));
+                }
+            }
+            return expr_id;
+        }
+        if (ast_kind == ex_DELETE()) {
+            let explicit_payload_type_id = self.type_id_from_ref(expr_get_captures(e));
+            if (explicit_payload_type_id != hir_id_invalid()) {
+                self.unit.set_expr_semantic(expr_id,
+                                           expr_sem_CLASS(),
+                                           hir_target_type(),
+                                           explicit_payload_type_id);
+            }
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            self.unit.set_expr_rhs(expr_id, self.build_expr(expr_get_rhs(e)));
+            return expr_id;
+        }
+        if (ast_kind == ex_COMPTIME()) {
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            self.resolve_single_child_expr_type_after_child(expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_AWAIT()) {
+            let awaited_expr = self.build_expr(expr_get_lhs(e));
+            self.unit.set_expr_lhs(expr_id, awaited_expr);
+            let await_fn = self.ensure_await_value_instance_for_type_id(self.unit.expr_type(awaited_expr));
+            if (await_fn != hir_id_invalid()) {
+                self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), await_fn);
+            }
+            return expr_id;
+        }
+        if (ast_kind == ex_CALL()) {
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] build-call-enter id=" + self.i32_text(expr_id)
+                      + " name=" + expr_get_name(e));
+            }
+            self.profile_expr_trace("call-enter", e, expr_id);
+            let saved_call_callee_ast = self.current_call_callee_ast;
+            self.current_call_callee_ast = expr_get_lhs(e);
+            let callee_expr = self.build_expr(expr_get_lhs(e));
+            self.current_call_callee_ast = saved_call_callee_ast;
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] build-call-after-callee id=" + self.i32_text(expr_id)
+                      + " callee=" + self.i32_text(callee_expr));
+            }
+            self.unit.set_expr_lhs(expr_id, callee_expr);
+            self.build_arg_cells(expr_id, expr_get_args(e));
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] build-call-before-resolve id=" + self.i32_text(expr_id));
+            }
+            let expr_timing_enabled = hir_builder_env_enabled("VYX_HIR_EXPR_TIMING");
+            var expr_timing_start: i64 = 0;
+            if (expr_timing_enabled) { expr_timing_start = vyx_bootstrap_now_ms(); }
+            if (hir_builder_env_enabled("VYX_HIR_HOT_TIMING")) {
+                let hot_call_start = vyx_bootstrap_now_ms();
+                self.resolve_call_expr_after_children(e, expr_id, callee_expr);
+                self.profile_ms_resolve_call = self.profile_ms_resolve_call + (vyx_bootstrap_now_ms() - hot_call_start);
+            } else {
+                self.resolve_call_expr_after_children(e, expr_id, callee_expr);
+            }
+            if (expr_timing_enabled) {
+                let expr_elapsed = vyx_bootstrap_now_ms() - expr_timing_start;
+                if (expr_elapsed >= hir_builder_slow_expr_threshold_ms()) {
+                    var callee_name = "";
+                    var owner_type = "";
+                    if (callee_expr != hir_id_invalid()) {
+                        callee_name = self.unit.expr_name(callee_expr);
+                        if (self.unit.expr_kind(callee_expr) == ex_MEMBER()) {
+                            let owner_expr_id = self.unit.expr_lhs(callee_expr);
+                            if (owner_expr_id != hir_id_invalid()) {
+                                let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(owner_expr_id));
+                                if (self.type_id_is_valid(owner_type_id)) {
+                                    owner_type = self.member_lookup_type_name(owner_type_id);
+                                }
+                            }
+                        }
+                    }
+                    print("[hir-expr-timing] kind=call fn=" + self.unit.function_name(self.current_function_id)
+                          + " elapsed=" + policy_i64_to_string(expr_elapsed)
+                          + " name=" + callee_name
+                          + " owner=" + owner_type
+                          + " line=" + self.i32_text(expr_loc_line(e))
+                          + " col=" + self.i32_text(expr_loc_col(e))
+                          + " expr_id=" + self.i32_text(expr_id)
+                          + " callee_id=" + self.i32_text(callee_expr)
+                          + " target=" + self.i32_text(self.unit.expr_target_id(callee_expr)));
+                }
+            }
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] build-call-leave id=" + self.i32_text(expr_id));
+            }
+            self.profile_expr_trace("call-leave", e, expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_MEMBER()) {
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] build-member-enter id=" + self.i32_text(expr_id)
+                      + " name=" + expr_get_name(e));
+            }
+            self.profile_expr_trace("member-enter", e, expr_id);
+            let member_lhs = self.build_expr(expr_get_lhs(e));
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] build-member-after-lhs id=" + self.i32_text(expr_id)
+                      + " lhs=" + self.i32_text(member_lhs));
+            }
+            self.unit.set_expr_lhs(expr_id, member_lhs);
+            let expr_timing_enabled = hir_builder_env_enabled("VYX_HIR_EXPR_TIMING");
+            var expr_timing_start: i64 = 0;
+            if (expr_timing_enabled) { expr_timing_start = vyx_bootstrap_now_ms(); }
+            if (hir_builder_env_enabled("VYX_HIR_HOT_TIMING")) {
+                let hot_member_start = vyx_bootstrap_now_ms();
+                self.resolve_member_expr_after_children(e, expr_id, member_lhs);
+                self.profile_ms_resolve_member = self.profile_ms_resolve_member + (vyx_bootstrap_now_ms() - hot_member_start);
+            } else {
+                self.resolve_member_expr_after_children(e, expr_id, member_lhs);
+            }
+            if (expr_timing_enabled) {
+                let expr_elapsed = vyx_bootstrap_now_ms() - expr_timing_start;
+                if (expr_elapsed >= hir_builder_slow_expr_threshold_ms()) {
+                    var owner_type = "";
+                    let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(member_lhs));
+                    if (self.type_id_is_valid(owner_type_id)) {
+                        owner_type = self.member_lookup_type_name(owner_type_id);
+                    }
+                    print("[hir-expr-timing] kind=member fn=" + self.unit.function_name(self.current_function_id)
+                          + " elapsed=" + policy_i64_to_string(expr_elapsed)
+                          + " name=" + policy_versioned_generic_call_base(expr_get_name(e).clone())
+                          + " owner=" + owner_type
+                          + " line=" + self.i32_text(expr_loc_line(e))
+                          + " col=" + self.i32_text(expr_loc_col(e))
+                          + " expr_id=" + self.i32_text(expr_id)
+                          + " target=" + self.i32_text(self.unit.expr_target_id(expr_id)));
+                }
+            }
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] build-member-leave id=" + self.i32_text(expr_id));
+            }
+            self.profile_expr_trace("member-leave", e, expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_INDEX()) {
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            self.unit.set_expr_rhs(expr_id, self.build_expr(expr_get_rhs(e)));
+            self.set_pack_index_expr_type_if_known(e, expr_id);
+            self.resolve_index_expr_type_after_children(e, expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_STRUCT_INIT()) {
+            self.profile_expr_trace("struct-enter", e, expr_id);
+            let struct_type = self.resolve_struct_init_type_id(e, expr_id);
+            self.build_struct_arg_cells(expr_id, struct_type, expr_get_args(e));
+            self.profile_expr_trace("struct-leave", e, expr_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_FSTRING()
+            || ast_kind == ex_TUPLE_LIT()
+            || ast_kind == ex_INLINE_ASM()) {
+            self.build_arg_cells(expr_id, expr_get_args(e));
+            return expr_id;
+        }
+        if (ast_kind == ex_ARRAY_LIT()) {
+            self.build_arg_cells(expr_id, expr_get_args(e));
+            self.unit.set_expr_aux(expr_id, self.build_expr(expr_get_captures(e)));
+            return expr_id;
+        }
+        if (ast_kind == ex_CLOSURE()) {
+            self.build_closure_expr(e, expr_id, type_id);
+            return expr_id;
+        }
+        if (ast_kind == ex_IF_EXPR()) {
+            self.unit.set_expr_lhs(expr_id, self.build_expr(expr_get_lhs(e)));
+            let saved_then = self.locals.head;
+            self.unit.set_expr_stmt_rhs(expr_id, self.build_stmt(expr_get_rhs(e)));
+            self.locals = hir_local_scope_drop_to(self.locals, saved_then);
+            let else_part = expr_get_args(e);
+            var else_expr_id = hir_id_invalid();
+            if (else_part != null && expr_get_kind(else_part) == ex_IF_EXPR()) {
+                self.unit.set_expr_aux(expr_id, self.build_expr(else_part));
+                else_expr_id = self.unit.expr_aux(expr_id);
+            } else {
+                self.unit.set_expr_stmt_aux(expr_id, self.build_stmt(else_part));
+            }
+            // Type closure for the if-expression itself. Sema skips generic
+            // method bodies whose owner has a template head
+            // (host_analyze_all_method_bodies), so the AST ty stamp this
+            // expression normally inherits may never have been written.
+            // Derive it here from the branches we just built: prefer the
+            // then-branch tail expression's type, then the else branch,
+            // mirroring sema's resolve order. Without this, the MIR layer
+            // allocates the result place with an empty type and codegen
+            // fails with "cannot allocate local ... invalid type".
+            if (!self.type_id_is_valid(self.unit.expr_type(expr_id))) {
+                let then_type = self.hir_branch_tail_type(self.unit.expr_stmt_rhs(expr_id));
+                if (self.type_id_is_valid(then_type)) {
+                    self.unit.set_expr_type(expr_id, then_type);
+                } else if (else_expr_id != hir_id_invalid()) {
+                    let else_type = self.unit.expr_type(else_expr_id);
+                    if (self.type_id_is_valid(else_type)) {
+                        self.unit.set_expr_type(expr_id, else_type);
+                    }
+                } else {
+                    let else_stmt_type = self.hir_branch_tail_type(
+                        self.unit.expr_stmt_aux(expr_id));
+                    if (self.type_id_is_valid(else_stmt_type)) {
+                        self.unit.set_expr_type(expr_id, else_stmt_type);
+                    }
+                }
+            }
+            return expr_id;
+        }
+        if (ast_kind == ex_MATCH_EXPR()) {
+            // Match expressions retain the statement matcher’s arm layout
+            // in a value expression.  The MIR builder consumes the arm chain
+            // from expr_stmt_rhs and writes the selected arm value into its
+            // result place.
+            let scrutinee_expr = self.build_expr(expr_get_lhs(e));
+            self.unit.set_expr_lhs(expr_id, scrutinee_expr);
+            let scrutinee_type = self.unit.expr_type(scrutinee_expr);
+            var arm = expr_get_args(e);
+            var first_arm = hir_id_invalid();
+            var last_arm = hir_id_invalid();
+            var result_type = self.unit.expr_type(expr_id);
+            while (arm != null) {
+                let saved_arm = self.locals.head;
+                let arm_stmt = self.unit.add_stmt(self.current_function_id,
+                                                  hir_stmt_expr(), "",
+                                                  hir_id_invalid());
+                self.set_hir_stmt_loc_from_ast(arm_stmt, arm);
+                self.unit.set_stmt_owner_item(arm_stmt, self.current_item_id);
+                let pat = stmt_get_init(arm);
+                self.push_pattern_binds_for_type(pat, scrutinee_type);
+                let pat_expr = self.build_expr(pat);
+                self.resolve_expected_variant_expr(pat_expr, scrutinee_type);
+                self.unit.set_stmt_expr(arm_stmt, pat_expr);
+                self.unit.set_stmt_cond(arm_stmt, self.build_expr(stmt_get_cond(arm)));
+                self.unit.set_stmt_child(arm_stmt, self.build_stmt(stmt_get_body(arm)));
+                let arm_body = self.unit.stmt_child(arm_stmt);
+                var arm_type = hir_id_invalid();
+                if (arm_body != hir_id_invalid()) {
+                    if (self.unit.stmt_kind(arm_body) == hir_stmt_expr()) {
+                        arm_type = self.unit.expr_type(self.unit.stmt_expr(arm_body));
+                    } else {
+                        arm_type = self.hir_branch_tail_type(arm_body);
+                    }
+                }
+                if (!self.type_id_is_valid(result_type) && self.type_id_is_valid(arm_type)) {
+                    result_type = arm_type;
+                }
+                self.locals = hir_local_scope_drop_to(self.locals, saved_arm);
+                if (first_arm == hir_id_invalid()) {
+                    first_arm = arm_stmt;
+                }
+                if (last_arm != hir_id_invalid()) {
+                    self.unit.set_stmt_next(last_arm, arm_stmt);
+                }
+                last_arm = arm_stmt;
+                arm = stmt_get_next(arm);
+            }
+            self.unit.set_expr_stmt_rhs(expr_id, first_arm);
+            if (!self.type_id_is_valid(self.unit.expr_type(expr_id))
+                && self.type_id_is_valid(result_type)) {
+                self.unit.set_expr_type(expr_id, result_type);
+            }
+            return expr_id;
+        }
+        return expr_id;
+    }
+
+    /// Type of the last value-producing statement in an already-built HIR
+    /// block chain: the init expression of a trailing st_EXPR/st_LET/st_VAR
+    /// or the payload of a st_RETURN. Returns invalid when the block falls
+    /// through without a value.
+}

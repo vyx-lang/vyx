@@ -1,0 +1,319 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    fn reachable_queue_len(self) -> i32 {
+        var count: i32 = 0;
+        var cur = self.reachable_function_queue_head;
+        while (cur != null) {
+            count = count + 1;
+            cur = ast_read_rawptr(ptr_offset(cur, 8));
+        }
+        return count;
+    }
+
+    public fn build_function_body(self, hir_function_id: i32) {
+        var temp_string_mark = vyx_rt_string_arena_checkpoint();
+        let mir_fn = self.ensure_function_shell_for_hir(hir_function_id);
+        if (mir_fn == mir_id_invalid()) {
+            mir_builder_release_temp_strings(temp_string_mark);
+            return;
+        }
+        if (self.function_is_lowered(mir_fn)) {
+            mir_builder_release_temp_strings(temp_string_mark);
+            return;
+        }
+        var materialized_here = false;
+        var stmt_mark: i32 = 0;
+        var expr_mark: i32 = 0;
+        var local_mark: i32 = 0;
+        if (self.has_hir_codegen_builder) {
+            // Snapshot before any work.  Marks of 0 make
+            // `function_owns_latest_body_range` treat the whole HIR stmt/expr
+            // table as this function's tail; after streaming discard has
+            // zeroed earlier records that is often vacuously true, and
+            // cleanup then truncates `stmt_count` to 0.
+            stmt_mark = self.h.stmt_count;
+            expr_mark = self.h.expr_count;
+            local_mark = self.h.local_count;
+        }
+        let timing_enabled = mir_builder_env_enabled("VYX_MIR_BODY_TIMING");
+        var timing_total_start: i64 = 0;
+        var timing_mark: i64 = 0;
+        var timing_materialize_ms: i64 = 0;
+        var timing_places_ms: i64 = 0;
+        var timing_drops_ms: i64 = 0;
+        var timing_stmt_ms: i64 = 0;
+        var timing_copy_locs_ms: i64 = 0;
+        var timing_cleanup_ms: i64 = 0;
+        if (timing_enabled) {
+            timing_total_start = vyx_bootstrap_now_ms();
+            timing_mark = timing_total_start;
+        }
+        if (!self.hir_function_has_executable_body(hir_function_id)) {
+            if (self.has_hir_codegen_builder) {
+                stmt_mark = self.h.stmt_count;
+                expr_mark = self.h.expr_count;
+                local_mark = self.h.local_count;
+            }
+            self.ensure_hir_function_body_for_codegen(hir_function_id, stmt_mark, expr_mark);
+            if (timing_enabled) {
+                let now_materialize = vyx_bootstrap_now_ms();
+                timing_materialize_ms = timing_materialize_ms + (now_materialize - timing_mark);
+                timing_mark = now_materialize;
+            }
+            if (self.has_hir_codegen_builder
+                && self.hir_function_has_executable_body(hir_function_id)
+                && self.h.function_body(hir_function_id) != hir_id_invalid()) {
+                materialized_here = true;
+            }
+        }
+        if (!self.hir_function_has_executable_body(hir_function_id)) {
+            // A closed, non-foreign function that still advertises a
+            // materializable body must not silently become an LLVM declaration.
+            // Keep declaration-only/interface/extern contracts valid, but make
+            // a lost generic reachability edge fail at its source.
+            let hir_item = self.h.function_item(hir_function_id);
+            let hir_flags = hir_unit_function_flags(self.h, hir_function_id);
+            let declaration_contract = (hir_flags & hir_function_flag_declaration_only()) != 0
+                || (hir_flags & hir_function_flag_foreign_dci()) != 0
+                || (hir_item != hir_id_invalid()
+                    && self.h.item_kind(hir_item) == hir_item_extern_function())
+                || self.function_is_imported_callable_declaration(mir_fn);
+            if (!declaration_contract
+                && self.hir_function_can_materialize_executable_body(hir_function_id)) {
+                // `HirUnitBuilder.materialize_function_body_for_codegen`
+                // explicitly leaves missing provenance retryable.  Preserve
+                // that contract for both LLVM and MIR2CPP: the next shared
+                // prepare round may have registered the concrete source.
+                self.defer_function_materialization_retry(mir_fn);
+                self.cleanup_hir_codegen_scope(hir_function_id, stmt_mark, expr_mark, local_mark);
+                mir_builder_release_temp_strings(temp_string_mark);
+                return;
+            }
+            self.mark_function_lowered(mir_fn);
+            self.cleanup_hir_codegen_scope(hir_function_id, stmt_mark, expr_mark, local_mark);
+            mir_builder_release_temp_strings(temp_string_mark);
+            return;
+        }
+        if (self.unit.function_first_block(mir_fn) != mir_id_invalid()) {
+            self.mark_function_lowered(mir_fn);
+            self.cleanup_hir_codegen_scope(hir_function_id, stmt_mark, expr_mark, local_mark);
+            mir_builder_release_temp_strings(temp_string_mark);
+            return;
+        }
+        let profile_level = vyx_bootstrap_profile_level();
+        let trace_enabled = mir_builder_env_enabled("VYX_MIR_MEM_TRACE");
+        let heap_buckets_enabled = mir_builder_env_enabled("VYX_MIR_HEAP_BUCKETS");
+        if ((profile_level > 0 || trace_enabled)
+            && (profile_level > 1 || mir_fn <= 24 || (mir_fn % 32) == 0 || mir_fn >= 850)) {
+            print("[mir-build] before fn=" + mir_builder_i32_text(mir_fn)
+                  + " hir=" + mir_builder_i32_text(hir_function_id)
+                  + " name=" + self.unit.function_name(mir_fn)
+                  + " funcs=" + mir_builder_i32_text(self.unit.function_count)
+                  + " queue=" + mir_builder_i32_text(self.reachable_queue_len())
+                  + " hitems=" + mir_builder_i32_text(self.h.item_count)
+                  + " hfuncs=" + mir_builder_i32_text(self.h.function_count)
+                  + " hstmts=" + mir_builder_i32_text(self.h.stmt_count)
+                  + " hexprs=" + mir_builder_i32_text(self.h.expr_count)
+                  + " str_active_mb=" + mir_builder_memory_mb_text(vyx_rt_string_arena_active_bytes())
+                  + " str_reserved_mb=" + mir_builder_memory_mb_text(vyx_rt_string_arena_reserved_bytes())
+                  + " astdup_mb=" + mir_builder_memory_mb_text(vyx_rt_ast_dup_bytes_total())
+                  + " astnode_mb=" + mir_builder_memory_mb_text(vyx_rt_ast_node_bytes_total())
+                  + " rawdup_live_mb=" + mir_builder_memory_mb_text(vyx_rt_raw_dup_bytes_live())
+                  + " rawdup_total_mb=" + mir_builder_memory_mb_text(vyx_rt_raw_dup_bytes_total())
+                  + " strlen_entries=" + policy_i64_to_string(vyx_rt_string_len_entry_count())
+                  + " heap_mb=" + mir_builder_memory_mb_text(vyx_rt_heap_used_bytes())
+                  + " private_mb=" + mir_builder_memory_mb_text(vyx_rt_process_private_bytes())
+                  + " working_mb=" + mir_builder_memory_mb_text(vyx_rt_process_working_set_bytes())
+                  + " peak_private_mb=" + mir_builder_memory_mb_text(vyx_rt_process_peak_private_bytes())
+                  + " peak_working_mb=" + mir_builder_memory_mb_text(vyx_rt_process_peak_working_set_bytes()));
+        }
+        self.mark_function_lowered(mir_fn);
+        self.current_function_id = mir_fn;
+        self.current_hir_function_id = hir_function_id;
+        self.async_await_index = 0;
+        self.async_pc_place_id = mir_id_invalid();
+        self.break_target_block_id = mir_id_invalid();
+        self.continue_target_block_id = mir_id_invalid();
+        self.break_drop_mark = null;
+        self.continue_drop_mark = null;
+        self.break_defer_mark = null;
+        self.continue_defer_mark = null;
+        self.break_storage_mark = null;
+        self.continue_storage_mark = null;
+        self.labeled_loop_head = null;
+        self.drop_stack_head = null;
+        self.defer_stack_head = null;
+        self.storage_stack_head = null;
+        let body = self.h.function_body(hir_function_id);
+        if (body == hir_id_invalid()) {
+            self.cleanup_hir_codegen_scope(hir_function_id, stmt_mark, expr_mark, local_mark);
+            mir_builder_release_temp_strings(temp_string_mark);
+            return;
+        }
+        mir_builder_release_temp_strings(temp_string_mark);
+        temp_string_mark = vyx_rt_string_arena_checkpoint();
+        let mir_block_mark = self.unit.block_count;
+        let mir_local_mark = self.unit.local_count;
+        let mir_value_mark = self.unit.value_count;
+        let mir_instr_mark = self.unit.instr_count;
+        self.lower_local_places_for_function(hir_function_id);
+        if (timing_enabled) {
+            let now_places = vyx_bootstrap_now_ms();
+            timing_places_ms = now_places - timing_mark;
+            timing_mark = now_places;
+        }
+        self.push_parameter_drops_for_function(hir_function_id);
+        if (timing_enabled) {
+            let now_drops = vyx_bootstrap_now_ms();
+            timing_drops_ms = now_drops - timing_mark;
+            timing_mark = now_drops;
+        }
+        var entry = self.unit.add_block( mir_fn, body);
+        var dispatch_block = mir_id_invalid();
+        var body_entry = entry;
+        if ((self.unit.function_flags(mir_fn) & hir_function_flag_async_task()) != 0) {
+            dispatch_block = entry;
+            self.async_pc_place_id = self.add_temp_place(self.i32_type_id(), body, "__async_pc");
+            body_entry = self.unit.add_block( mir_fn, body);
+            entry = body_entry;
+        }
+        self.current_block_id = entry;
+        if (!self.try_lower_implicit_function_return(body, self.h.function_return_type(hir_function_id))) {
+            self.lower_stmt(body);
+        }
+        if (!self.current_block_terminated()) {
+            let ret_text = self.type_text(self.h.function_return_type(hir_function_id));
+            if (ret_text == "void") {
+                self.emit_function_exit(body);
+                self.terminate_current(mir_term_return(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), body);
+            } else if (self.type_text_is_awaitable(ret_text)) {
+                let ready_ret_value = self.lower_awaitable_ready_default_return(self.h.function_return_type(hir_function_id), body);
+                self.emit_function_exit(body);
+                if (ready_ret_value != mir_id_invalid()) {
+                    self.terminate_current(mir_term_return(), ready_ret_value, mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), body);
+                } else {
+                    self.terminate_current(mir_term_unreachable(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), body);
+                }
+            } else {
+                // For constructors (class-pointer-ABI), emit an implicit return of self.
+                var mir_ret_value = mir_id_invalid();
+                if (self.return_type_is_constructor(hir_function_id, self.h.function_return_type(hir_function_id))) {
+                    mir_ret_value = self.implicit_self_return_value(hir_function_id);
+                }
+                self.emit_function_exit(body);
+                if (mir_ret_value != mir_id_invalid()) {
+                    self.terminate_current(mir_term_return(), mir_ret_value, mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), body);
+                } else {
+                    self.terminate_current(mir_term_unreachable(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), body);
+                }
+            }
+        }
+        if (dispatch_block != mir_id_invalid()) {
+            self.finish_async_dispatch(dispatch_block, body_entry);
+        }
+        if (timing_enabled) {
+            let now_stmt = vyx_bootstrap_now_ms();
+            timing_stmt_ms = now_stmt - timing_mark;
+            timing_mark = now_stmt;
+        }
+        self.copy_value_source_locs_since(mir_value_mark);
+        self.copy_instr_source_locs_since(mir_instr_mark);
+        self.copy_block_source_locs_since(mir_block_mark);
+        self.copy_local_source_locs_since(mir_local_mark, mir_fn, hir_function_id);
+        if (timing_enabled) {
+            let now_copy = vyx_bootstrap_now_ms();
+            timing_copy_locs_ms = now_copy - timing_mark;
+            timing_mark = now_copy;
+        }
+        self.cleanup_hir_codegen_scope(hir_function_id, stmt_mark, expr_mark, local_mark);
+        if (timing_enabled) {
+            let now_cleanup = vyx_bootstrap_now_ms();
+            timing_cleanup_ms = now_cleanup - timing_mark;
+            let timing_total = now_cleanup - timing_total_start;
+            if (timing_total >= mir_builder_slow_body_threshold_ms()) {
+                print("[mir-body-timing] fn=" + self.unit.function_name(mir_fn)
+                      + " mir=" + mir_builder_i32_text(mir_fn)
+                      + " hir=" + mir_builder_i32_text(hir_function_id)
+                      + " total=" + policy_i64_to_string(timing_total)
+                      + " materialize=" + policy_i64_to_string(timing_materialize_ms)
+                      + " places=" + policy_i64_to_string(timing_places_ms)
+                      + " drops=" + policy_i64_to_string(timing_drops_ms)
+                      + " stmt=" + policy_i64_to_string(timing_stmt_ms)
+                      + " copy_locs=" + policy_i64_to_string(timing_copy_locs_ms)
+                      + " cleanup=" + policy_i64_to_string(timing_cleanup_ms)
+                      + " values=" + mir_builder_i32_text(self.unit.value_count - mir_value_mark)
+                      + " instrs=" + mir_builder_i32_text(self.unit.instr_count)
+                      + " hstmts=" + mir_builder_i32_text(self.h.stmt_count)
+                      + " hexprs=" + mir_builder_i32_text(self.h.expr_count));
+            }
+        }
+        if ((profile_level > 0 || trace_enabled)
+            && (profile_level > 1 || mir_fn <= 24 || (mir_fn % 32) == 0)) {
+            print("[mir-build] lowered fn=" + mir_builder_i32_text(mir_fn)
+                  + " hir=" + mir_builder_i32_text(hir_function_id)
+                  + " name=" + self.unit.function_name(mir_fn)
+                  + " funcs=" + mir_builder_i32_text(self.unit.function_count)
+                  + " queue=" + mir_builder_i32_text(self.reachable_queue_len())
+                  + " blocks=" + mir_builder_i32_text(self.unit.block_count)
+                  + " locals=" + mir_builder_i32_text(self.unit.local_count)
+                  + " fields=" + mir_builder_i32_text(self.unit.field_count)
+                  + " variants=" + mir_builder_i32_text(self.unit.variant_count)
+                  + " statics=" + mir_builder_i32_text(self.unit.static_count)
+                  + " places=" + mir_builder_i32_text(self.unit.place_count)
+                  + " values=" + mir_builder_i32_text(self.unit.value_count)
+                  + " instrs=" + mir_builder_i32_text(self.unit.instr_count)
+                  + " cases=" + mir_builder_i32_text(self.unit.case_count)
+                  + " caps=" + mir_builder_i32_text(self.unit.function_cap)
+                  + "/" + mir_builder_i32_text(self.unit.block_cap)
+                  + "/" + mir_builder_i32_text(self.unit.local_cap)
+                  + "/" + mir_builder_i32_text(self.unit.place_cap)
+                  + "/" + mir_builder_i32_text(self.unit.value_cap)
+                  + "/" + mir_builder_i32_text(self.unit.instr_cap)
+                  + "/" + mir_builder_i32_text(self.unit.case_cap)
+                  + " hitems=" + mir_builder_i32_text(self.h.item_count)
+                  + " hfuncs=" + mir_builder_i32_text(self.h.function_count)
+                  + " hlocals=" + mir_builder_i32_text(self.h.local_count)
+                  + " htypes=" + mir_builder_i32_text(self.h.types.count)
+                  + " hstmts=" + mir_builder_i32_text(self.h.stmt_count)
+                  + " hexprs=" + mir_builder_i32_text(self.h.expr_count)
+                  + " hlocalcap=" + mir_builder_i32_text(self.h.local_cap)
+                  + " hstmtcap=" + mir_builder_i32_text(self.h.stmt_cap)
+                  + " hexprcap=" + mir_builder_i32_text(self.h.expr_cap)
+                  + " str_active_mb=" + mir_builder_memory_mb_text(vyx_rt_string_arena_active_bytes())
+                  + " str_reserved_mb=" + mir_builder_memory_mb_text(vyx_rt_string_arena_reserved_bytes())
+                  + " astdup_mb=" + mir_builder_memory_mb_text(vyx_rt_ast_dup_bytes_total())
+                  + " astnode_mb=" + mir_builder_memory_mb_text(vyx_rt_ast_node_bytes_total())
+                  + " rawdup_live_mb=" + mir_builder_memory_mb_text(vyx_rt_raw_dup_bytes_live())
+                  + " rawdup_total_mb=" + mir_builder_memory_mb_text(vyx_rt_raw_dup_bytes_total())
+                  + " strlen_entries=" + policy_i64_to_string(vyx_rt_string_len_entry_count())
+                  + " heap_mb=" + mir_builder_memory_mb_text(vyx_rt_heap_used_bytes())
+                  + " private_mb=" + mir_builder_memory_mb_text(vyx_rt_process_private_bytes())
+                  + " working_mb=" + mir_builder_memory_mb_text(vyx_rt_process_working_set_bytes())
+                  + " peak_private_mb=" + mir_builder_memory_mb_text(vyx_rt_process_peak_private_bytes())
+                  + " peak_working_mb=" + mir_builder_memory_mb_text(vyx_rt_process_peak_working_set_bytes()));
+        }
+        if (heap_buckets_enabled && (mir_fn == 1 || (mir_fn % 256) == 0)) {
+            let heap_label = "lowered fn=" + mir_builder_i32_text(mir_fn)
+                + " hir=" + mir_builder_i32_text(hir_function_id)
+                + " name=" + self.unit.function_name(mir_fn);
+            vyx_rt_heap_bucket_report(heap_label.c_str());
+        }
+        mir_builder_release_temp_strings(temp_string_mark);
+    }
+}

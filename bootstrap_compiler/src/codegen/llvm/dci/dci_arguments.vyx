@@ -1,0 +1,386 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn dci_materialize_indirect_argument(self,
+                                                value_id: i32,
+                                                type_id: i32,
+                                                lowering: rawptr,
+                                                label: string) -> rawptr {
+        if (self.type_is_class_pointer_abi(type_id)) {
+            self.report_error("DCI class-by-value indirect argument requires lifecycle materialization");
+            return null;
+        }
+        let storage_type = self.lower_storage_type(type_id);
+        let value = self.lower_value_as(value_id, type_id);
+        if (storage_type == null || value == null) { return null; }
+        let slot = vyx_rt_build_alloca(self.mod, storage_type, label.c_str(), label.len as u64);
+        if (slot == null) { return null; }
+        var alignment = self.dci_json_i64(lowering, "alignment");
+        if (alignment <= 0) { alignment = self.dci_type_value_alignment(type_id); }
+        if (alignment > 0) { vyx_rt_set_alignment(self.mod, slot, alignment as i32); }
+        if (self.dci_abi_passing(lowering) == "inalloca") {
+            if (vyx_rt_set_alloca_inalloca(self.mod, slot) != 0) {
+                self.report_error("cannot mark DCI inalloca slot: "
+                          + self.runtime_last_error());
+                return null;
+            }
+        }
+        vyx_rt_build_store(self.mod, value, slot);
+        return slot;
+    }
+
+    public fn dci_value_parameter_lifecycle_supported(self,
+                                                       function_id: i32,
+                                                       source_index: i32,
+                                                       type_id: i32) -> bool {
+        let parameter = self.dci_source_parameter_object(function_id, source_index);
+        let type_object = self.dci_json_item(parameter, "type");
+        if (self.dci_json_string(type_object, "reference") != "value") { return true; }
+        let canonical_type = self.canonical_record_type_id(type_id);
+        if (!mir_unit_type_is_foreign_dci(&self.m, canonical_type)
+            || llvm_mir_type_kind(&self.m, canonical_type) != ty_CLASS()) {
+            return true;
+        }
+        if (!self.dci_type_uses_stable_value_layout(canonical_type)) {
+            let lowering = self.dci_source_parameter_abi(function_id, source_index);
+            let passing = self.dci_abi_passing(lowering);
+            self.report_error("DCI class-by-value " + passing
+                      + " argument requires lifecycle materialization");
+            return false;
+        }
+        let layout = self.dci_layout_object_for_type(type_id);
+        if (layout == null) { return true; }
+        var has_trivial_evidence = false;
+        var nontrivial = false;
+        let pod_item = self.dci_json_item(layout, "is_pod");
+        let trivial_destroy_item = self.dci_json_item(layout, "is_trivially_destructible");
+        // A non-POD type is NOT thereby non-trivial to pass by value: POD also
+        // demands a trivial default constructor, which is irrelevant to copying
+        // an already-built object. What actually matters is trivially-copyable
+        // (copy/move) + trivially-destructible, checked from the lifecycle below.
+        // fmt::basic_string_view<char> is non-POD (user default ctor) yet fully
+        // trivial to copy and destroy.
+        if (trivial_destroy_item != null && cJSON_IsFalse(trivial_destroy_item) != 0) {
+            nontrivial = true;
+        }
+        if (pod_item != null && cJSON_IsTrue(pod_item) != 0
+            && trivial_destroy_item != null && cJSON_IsTrue(trivial_destroy_item) != 0) {
+            has_trivial_evidence = true;
+        }
+        let lifecycle = self.dci_json_item(layout, "lifecycle");
+        if (lifecycle != null && cJSON_IsObject(lifecycle) != 0) {
+            let copy_semantics = self.dci_json_string(lifecycle, "copy_semantics");
+            let move_semantics = self.dci_json_string(lifecycle, "move_semantics");
+            let destruction = self.dci_json_string(lifecycle, "destruction");
+            if (copy_semantics == "trivial" && move_semantics == "trivial"
+                && (destruction == "trivial" || destruction == "none")) {
+                has_trivial_evidence = true;
+            }
+            if ((copy_semantics.len > 0 && copy_semantics != "trivial")
+                || (move_semantics.len > 0 && move_semantics != "trivial")
+                || (destruction.len > 0 && destruction != "trivial" && destruction != "none")) {
+                nontrivial = true;
+            }
+        }
+        if (has_trivial_evidence && !nontrivial) { return true; }
+        var ownership = self.dci_json_string(parameter, "ownership");
+        if (ownership.len == 0) { ownership = "unspecified"; }
+        self.report_error("DCI value parameter #" + source_index.toString()
+                  + " of `" + self.m.function_name(function_id) + "` with ownership `"
+                  + ownership
+                  + "` requires lifecycle materialization because triviality is not proven");
+        return false;
+    }
+
+    public fn dci_coerce_argument(self,
+                                  value_id: i32,
+                                  type_id: i32,
+                                  lowering: rawptr) -> rawptr {
+        if (!self.dci_coerce_contract_supported(type_id,
+                                                lowering,
+                                                "call argument")) {
+            return null;
+        }
+        let coerce_type = self.dci_abi_coerce_type(lowering);
+        let storage_type = self.lower_storage_type(type_id);
+        let value = self.lower_value_as(value_id, type_id);
+        if (coerce_type == null || storage_type == null || value == null) { return null; }
+        if (self.type_is_class_pointer_abi(type_id)) {
+            self.report_error("DCI class-by-value coerce argument requires lifecycle materialization");
+            return null;
+        }
+        let slot = vyx_rt_build_alloca(self.mod, storage_type, "dci.coerce.arg".c_str(), 14);
+        if (slot == null) { return null; }
+        var alignment = self.dci_json_i64(lowering, "alignment");
+        if (alignment <= 0) { alignment = self.dci_type_value_alignment(type_id); }
+        if (alignment > 0) {
+            vyx_rt_set_alignment(self.mod, slot, alignment as i32);
+            if (vyx_rt_build_store_aligned(self.mod,
+                                           value,
+                                           slot,
+                                           alignment as i32) == null) {
+                self.report_error("cannot store DCI coerce argument with contract alignment");
+                return null;
+            }
+            return vyx_rt_build_load_aligned(self.mod,
+                                             coerce_type,
+                                             slot,
+                                             alignment as i32,
+                                             "dci.coerce.bits".c_str(),
+                                             15);
+        }
+        vyx_rt_build_store(self.mod, value, slot);
+        return vyx_rt_build_load(self.mod,
+                                 coerce_type,
+                                 slot,
+                                 "dci.coerce.bits".c_str(),
+                                 15);
+    }
+
+    public fn dci_append_call_argument(self,
+                                       function_id: i32,
+                                       source_index: i32,
+                                       value_id: i32,
+                                       type_id: i32,
+                                       args: rawptr,
+                                       out_idx: i32,
+                                       argc: i32) -> i32 {
+        let lowering = self.dci_source_parameter_abi(function_id, source_index);
+        if (self.function_is_foreign_dci(function_id)
+            && self.dci_abi_passing(lowering) == "inalloca"
+            && self.dci_function_inalloca_count(function_id) > 1) {
+            if (!self.dci_value_parameter_lifecycle_supported(function_id,
+                                                              source_index,
+                                                              type_id)) {
+                return -1;
+            }
+            if (!self.dci_store_packed_inalloca_value(function_id,
+                                                      source_index,
+                                                      args,
+                                                      argc,
+                                                      value_id,
+                                                      type_id)) {
+                return -1;
+            }
+            return out_idx;
+        }
+        if (self.function_is_foreign_dci(function_id)
+            && self.dci_abi_passing(lowering) == "split") {
+            if (!self.dci_split_contract_supported(type_id, lowering, "call argument")) {
+                return -1;
+            }
+            let value = self.lower_value_as(value_id, type_id);
+            let storage_type = self.lower_storage_type(type_id);
+            if (value == null || storage_type == null) { return -1; }
+            let slot = vyx_rt_build_alloca(self.mod, storage_type, "dci.split.arg".c_str(), 13);
+            if (slot == null) { return -1; }
+            var alignment = self.dci_json_i64(lowering, "alignment");
+            if (alignment <= 0) { alignment = self.dci_type_value_alignment(type_id); }
+            if (alignment > 0) {
+                vyx_rt_set_alignment(self.mod, slot, alignment as i32);
+                if (vyx_rt_build_store_aligned(self.mod, value, slot, alignment as i32) == null) {
+                    return -1;
+                }
+            } else {
+                vyx_rt_build_store(self.mod, value, slot);
+            }
+            let n = self.dci_register_count(lowering);
+            var i: i32 = 0;
+            var dest = out_idx;
+            while (i < n) {
+                let ty = self.dci_llvm_type_for_token(self.dci_register_token_at(lowering, i));
+                let offset = self.dci_register_offset_at(lowering, i);
+                if (ty == null || offset < 0) { return -1; }
+                let piece_ptr = self.ptr_offset_bytes(slot,
+                                                      vyx_rt_const_int(self.mod, self.ty_i64, offset, 0),
+                                                      "dci.split.piece");
+                let piece = vyx_rt_build_load(self.mod,
+                                              ty,
+                                              piece_ptr,
+                                              "dci.split.bits".c_str(),
+                                              14);
+                if (piece == null) { return -1; }
+                ast_write_rawptr(ptr_offset(args, dest * 8), piece);
+                dest = dest + 1;
+                i = i + 1;
+            }
+            return dest;
+        }
+        let arg_val = self.lower_dci_call_argument(function_id, source_index, value_id, type_id);
+        if (arg_val == null) { return -1; }
+        ast_write_rawptr(ptr_offset(args, out_idx * 8), arg_val);
+        return out_idx + 1;
+    }
+
+    public fn lower_dci_call_argument(self,
+                                      function_id: i32,
+                                      source_index: i32,
+                                      value_id: i32,
+                                      type_id: i32) -> rawptr {
+        // Foreign C/DCI declarations use a raw machine pointer. Direct-call
+        // arguments are still Vyx two-word handles; extract the address before
+        // build_call. Drop already does this via lower_place_addr.
+        if (function_id != mir_id_invalid()
+            && self.m.function_item_kind(function_id) == hir_item_extern_function()
+            && llvm_mir_kind_pointer_handle(llvm_mir_type_kind(&self.m, type_id))) {
+            let wrapped = self.lower_value_as(value_id, type_id);
+            if (wrapped != null) {
+                let extracted = self.pointer_handle_address(wrapped, "dci.arg.raw");
+                if (extracted != null) { return extracted; }
+            }
+        }
+        if (!self.function_is_foreign_dci(function_id)) {
+            if (self.foreign_c_handle_uses_raw_pointer_abi(function_id, type_id)) {
+                return self.lower_value_as(value_id, self.type_id_by_text("rawptr"));
+            }
+            if (self.source_param_uses_self_pointer_abi(function_id, source_index)) {
+                return self.lower_self_receiver_address(value_id, type_id);
+            }
+            if (self.source_param_uses_native_byval_abi(function_id, source_index)) {
+                return self.materialize_aggregate_pointer_argument(value_id, type_id, "mir.byval.arg");
+            }
+            if (self.source_param_uses_c_sysv_coerce(function_id, source_index)) {
+                let raw = self.lower_value_as(value_id, type_id);
+                return self.c_sysv_coerce_value(raw, type_id, "c.abi.arg");
+            }
+            return self.lower_value_as(value_id, type_id);
+        }
+        let lowering = self.dci_source_parameter_abi(function_id, source_index);
+        if (!self.dci_value_parameter_lifecycle_supported(function_id,
+                                                          source_index,
+                                                          type_id)) {
+            return null;
+        }
+        let passing = self.dci_abi_passing(lowering);
+        if (passing == "indirect" || passing == "byval" || passing == "inalloca") {
+            return self.dci_materialize_indirect_argument(value_id,
+                                                          type_id,
+                                                          lowering,
+                                                          "dci.indirect.arg");
+        }
+        if (passing == "coerce") {
+            return self.dci_coerce_argument(value_id, type_id, lowering);
+        }
+        if (passing == "split") {
+            self.report_error("DCI split argument must be expanded by the callsite for `"
+                      + self.m.function_name(function_id) + "`");
+            return null;
+        }
+        if (passing != "direct") {
+            self.report_error("unsupported DCI call argument passing `" + passing + "` for `"
+                      + self.m.function_name(function_id) + "`");
+            return null;
+        }
+        if (self.dci_direct_handle_uses_raw_pointer_abi(type_id, lowering)) {
+            return self.lower_value_as(value_id, self.type_id_by_text("rawptr"));
+        }
+        // A direct aggregate argument still has to reach the producer in the
+        // shape its compiler chose: on Win64 that is one integer register for
+        // a 1/2/4/8-byte record, not the two the LLVM backend would pick for a
+        // bare `{i32,i32}`.  Passing the struct uncoerced also shifts every
+        // argument after it, so the failure shows up as a wrong *earlier*
+        // value rather than as a type error.
+        if (self.dci_open_direct_param_uses_c_coerce(function_id, type_id)) {
+            let raw = self.lower_value_as(value_id, type_id);
+            return self.c_sysv_coerce_value(raw, type_id, "c.abi.dci.arg");
+        }
+        return self.lower_value_as(value_id, type_id);
+    }
+
+    public fn wrap_foreign_direct_pointer_return(self,
+                                                 value: rawptr,
+                                                 function_id: i32,
+                                                 name: string) -> rawptr {
+        if (value == null) { return value; }
+        let type_id = self.m.function_return_type(function_id);
+        var uses_raw_pointer_abi = self.foreign_c_handle_uses_raw_pointer_abi(
+            function_id, type_id);
+        if (self.function_is_foreign_dci(function_id)) {
+            uses_raw_pointer_abi = self.dci_direct_handle_uses_raw_pointer_abi(
+                type_id, self.dci_return_abi(function_id));
+        }
+        if (!uses_raw_pointer_abi) {
+            return value;
+        }
+        let elem = hir_type_table_elem(self.m.types, type_id);
+        // TypePointer: safe `*p` / `p[i]` on C (and scalar DCI) pointers need
+        // a region. DCI class objects only extract the address for methods,
+        // vtables, and field GEP.
+        if (elem != mir_id_invalid()
+            && (self.type_is_foreign_dci(elem) || self.type_is_dci_stub_class(elem))) {
+            return self.pointer_handle_from_foreign_raw(value, name);
+        }
+        return self.pointer_handle_from_raw(value, elem, 0, 0, name);
+    }
+
+    public fn dci_uncoerce_return_value(self,
+                                        value: rawptr,
+                                        function_id: i32,
+                                        type_id: i32) -> rawptr {
+        if (value == null) { return null; }
+        if (!self.dci_coerce_contract_supported(type_id,
+                                                self.dci_return_abi(function_id),
+                                                "return of `" + self.m.function_name(function_id) + "`")) {
+            return null;
+        }
+        let storage_type = self.lower_storage_type(type_id);
+        if (storage_type == null) { return null; }
+        var slot: rawptr = null;
+        if (self.type_is_class_pointer_abi(type_id)) {
+            slot = self.lower_class_pointer_aggregate_value_with_type(mir_id_invalid(), type_id);
+        } else {
+            slot = vyx_rt_build_alloca(self.mod, storage_type, "dci.coerce.ret".c_str(), 14);
+        }
+        if (slot == null) { return null; }
+        var alignment = self.dci_json_i64(self.dci_return_abi(function_id), "alignment");
+        if (alignment <= 0) { alignment = self.dci_type_value_alignment(type_id); }
+        let return_lowering = self.dci_return_abi(function_id);
+        let piece_count = self.dci_register_count(return_lowering);
+        if (piece_count > 1) {
+            if (alignment > 0) { vyx_rt_set_alignment(self.mod, slot, alignment as i32); }
+            var piece: i32 = 0;
+            while (piece < piece_count) {
+                let offset = self.dci_register_offset_at(return_lowering, piece);
+                if (offset < 0) { return null; }
+                let part_name = "dci.ret.piece";
+                let part = vyx_rt_build_extract_value(self.mod,
+                                                      value,
+                                                      piece,
+                                                      part_name.c_str(),
+                                                      part_name.len as u64);
+                let dest = self.ptr_offset_bytes(slot,
+                                                 vyx_rt_const_int(self.mod, self.ty_i64, offset, 0),
+                                                 "dci.ret.off");
+                if (part == null || dest == null) { return null; }
+                vyx_rt_build_store(self.mod, part, dest);
+                piece = piece + 1;
+            }
+        } else if (alignment > 0) {
+            vyx_rt_set_alignment(self.mod, slot, alignment as i32);
+            if (vyx_rt_build_store_aligned(self.mod,
+                                           value,
+                                           slot,
+                                           alignment as i32) == null) {
+                self.report_error("cannot store DCI coerce return with contract alignment");
+                return null;
+            }
+        } else {
+            vyx_rt_build_store(self.mod, value, slot);
+        }
+        if (self.type_is_class_pointer_abi(type_id)) { return slot; }
+        if (alignment > 0) {
+            return vyx_rt_build_load_aligned(self.mod,
+                                             self.lower_type(type_id),
+                                             slot,
+                                             alignment as i32,
+                                             "dci.return.value".c_str(),
+                                             16);
+        }
+        return vyx_rt_build_load(self.mod,
+                                 self.lower_type(type_id),
+                                 slot,
+                                 "dci.return.value".c_str(),
+                                 16);
+    }
+}

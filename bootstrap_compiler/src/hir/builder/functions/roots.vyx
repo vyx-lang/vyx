@@ -1,0 +1,271 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Roots for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn imported_body_should_materialize(self, d: rawptr, body_decl: rawptr) -> bool {
+        if (!self.materialize_imported_bodies) { return false; }
+        if (hir_builder_decl_template_artifact(d)
+            || hir_builder_decl_template_artifact(body_decl)) {
+            // The artifact was hash-verified by sema before being admitted to
+            // the imported declaration graph.  Its body is the only complete
+            // definition available to a consumer and must be materialized.
+            return true;
+        }
+        if (!self.export_root_bodies) { return true; }
+        if (self.decl_effectively_project_local(d)
+            || self.decl_effectively_project_local(body_decl)) {
+            return true;
+        }
+        if (self.decl_effectively_from_std_module(d)) { return true; }
+        if (self.decl_effectively_from_std_module(body_decl)) { return true; }
+        return false;
+    }
+
+    fn export_root_name_allowed(self, name: string) -> bool {
+        if (!self.export_root_names_specified) { return true; }
+        if (name.len == 0) { return false; }
+        return hir_builder_string_contains("|" + self.export_root_names + "|",
+                                           "|" + name + "|");
+    }
+
+    fn export_root_base_matches_name(self, root_name: string, name: string) -> bool {
+        if (root_name.len == 0 || name.len == 0) { return false; }
+        if (root_name == name) { return true; }
+        let base = policy_generic_call_base(root_name.clone());
+        if (base == name) { return true; }
+        return hir_builder_last_path_segment(base) == hir_builder_last_path_segment(name);
+    }
+
+    fn export_root_decl_template_params(self, d: rawptr) -> string {
+        if (d == null) { return ""; }
+        var params = hir_builder_decl_template_params(d);
+        if (params.len > 0) { return params; }
+        let body_decl = self.raw_function_body_decl_for(d);
+        if (body_decl != null
+            && (decl_get_kind(body_decl) == de_FN()
+                || decl_get_kind(body_decl) == de_METHOD())) {
+            params = hir_builder_decl_template_params(body_decl);
+        }
+        if (params.len > 0) { return params; }
+        return hir_builder_inferred_decl_template_params_except(d, "");
+    }
+
+    fn materialize_exported_generic_root_instances_for_decl(self, d: rawptr) {
+        if (!self.export_root_names_specified || d == null) { return; }
+        let kind = decl_get_kind(d);
+        if (kind != de_FN() && kind != de_METHOD()) { return; }
+        if (decl_get_body(d) == null) {
+            let body_decl = self.raw_function_body_decl_for(d);
+            if (body_decl == null || decl_get_body(body_decl) == null) { return; }
+        }
+        let name = decl_get_name(d);
+        let owner_decl = hir_raw_owner_map_get(self.decl_owner_map,d);
+        var owner_type = "";
+        if (owner_decl != null) {
+            owner_type = decl_get_name(owner_decl);
+        }
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i <= self.export_root_names.len) {
+            if (i == self.export_root_names.len || self.export_root_names.charAt(i) == 124) {
+                let root_name = self.export_root_names.substring(start, i);
+                let root_args = policy_generic_call_args(root_name.clone());
+                if (root_args.len > 0 && self.export_root_base_matches_name(root_name, name)) {
+                    let params = self.export_root_decl_template_params(d);
+                    if (params.len > 0) {
+                        let fn_id = self.ensure_function_instance(d, owner_decl, owner_type, params, root_args);
+                        if (fn_id != hir_id_invalid()) {
+                            self.unit.add_function_flags(fn_id, hir_function_flag_codegen_root());
+                        }
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    fn unit_has_local_main_function(self, head: rawptr) -> bool {
+        var cur = head;
+        while (cur != null) {
+            if (!self.decl_effectively_imported(cur)
+                && decl_get_kind(cur) == de_FN()
+                && decl_get_name(cur) == "main"
+                && decl_get_body(cur) != null) {
+                return true;
+            }
+            cur = decl_get_next(cur);
+        }
+        return false;
+    }
+
+    fn materialize_local_main_function(self, head: rawptr) -> bool {
+        var cur = head;
+        while (cur != null) {
+            if (!self.decl_effectively_imported(cur)
+                && decl_get_kind(cur) == de_FN()
+                && decl_get_name(cur) == "main"
+                && decl_get_body(cur) != null) {
+                let fn_id = hir_pointer_map_function(self.decl_map,cur);
+                self.unit.add_function_flags(fn_id, hir_function_flag_codegen_root());
+                self.ensure_reachable_function_body(cur, fn_id, false);
+                return self.unit.function_body(fn_id) != hir_id_invalid();
+            }
+            cur = decl_get_next(cur);
+        }
+        return false;
+    }
+
+    fn materialize_exported_function_roots_for_decl_chain(self,
+                                                                head: rawptr,
+                                                                owner_template: bool,
+                                                                owner_exports: bool) {
+        var cur = head;
+        while (cur != null) {
+            if (self.decl_is_foreign_import(cur)) {
+                cur = decl_get_next(cur);
+                continue;
+            }
+            let k = decl_get_kind(cur);
+            if (k == de_FN()) {
+                self.materialize_exported_generic_root_instances_for_decl(cur);
+                if (!owner_template
+                    && !hir_builder_decl_template_head(cur)
+                    && self.export_root_name_allowed(decl_get_name(cur))
+                    && (hir_builder_decl_exports_world(cur) || self.export_root_names_specified)
+                    && decl_get_body(cur) != null) {
+                    let root_fn = hir_pointer_map_function(self.decl_map,cur);
+                    self.unit.add_function_flags(root_fn, hir_function_flag_codegen_root());
+                }
+            } else if (k == de_METHOD()) {
+                self.materialize_exported_generic_root_instances_for_decl(cur);
+                if (!owner_template
+                    && !hir_builder_decl_template_head(cur)
+                    && self.export_method_roots
+                    && self.export_root_name_allowed(decl_get_name(cur))
+                    && ((owner_exports && hir_builder_decl_exports_world(cur)) || self.export_root_names_specified)
+                    && decl_get_body(cur) != null) {
+                    let root_method_fn = hir_pointer_map_function(self.decl_map,cur);
+                    self.unit.add_function_flags(root_method_fn, hir_function_flag_codegen_root());
+                }
+            } else if (k == de_CLASS() || k == de_ENUM()) {
+                let templ = owner_template
+                    || hir_builder_decl_template_head(cur)
+                    || self.decl_members_have_template_type(cur);
+                let next_owner_exports = hir_builder_decl_exports_world(cur);
+                self.materialize_exported_function_roots_for_decl_chain(decl_get_members(cur),
+                                                                        templ,
+                                                                        next_owner_exports);
+            }
+            cur = decl_get_next(cur);
+        }
+    }
+
+    fn mark_exported_function_roots_for_decl_chain(self,
+                                                          head: rawptr,
+                                                          owner_template: bool,
+                                                          owner_exports: bool) {
+        var cur = head;
+        while (cur != null) {
+            if (self.decl_is_foreign_import(cur)) {
+                cur = decl_get_next(cur);
+                continue;
+            }
+            let k = decl_get_kind(cur);
+            if (k == de_FN()) {
+                self.materialize_exported_generic_root_instances_for_decl(cur);
+                if (!owner_template
+                    && !hir_builder_decl_template_head(cur)
+                    && self.export_root_name_allowed(decl_get_name(cur))
+                    && (hir_builder_decl_exports_world(cur) || self.export_root_names_specified)
+                    && decl_get_body(cur) != null) {
+                    let root_fn = hir_pointer_map_function(self.decl_map,cur);
+                    self.unit.add_function_flags(root_fn, hir_function_flag_codegen_root());
+                }
+            } else if (k == de_METHOD()) {
+                self.materialize_exported_generic_root_instances_for_decl(cur);
+                if (!owner_template
+                    && !hir_builder_decl_template_head(cur)
+                    && self.export_method_roots
+                    && self.export_root_name_allowed(decl_get_name(cur))
+                    && ((owner_exports && hir_builder_decl_exports_world(cur)) || self.export_root_names_specified)
+                    && decl_get_body(cur) != null) {
+                    let root_method_fn = hir_pointer_map_function(self.decl_map,cur);
+                    self.unit.add_function_flags(root_method_fn, hir_function_flag_codegen_root());
+                }
+            } else if (k == de_CLASS() || k == de_ENUM()) {
+                let templ = owner_template
+                    || hir_builder_decl_template_head(cur)
+                    || self.decl_members_have_template_type(cur);
+                let next_owner_exports = hir_builder_decl_exports_world(cur);
+                self.mark_exported_function_roots_for_decl_chain(decl_get_members(cur),
+                                                                 templ,
+                                                                 next_owner_exports);
+            }
+            cur = decl_get_next(cur);
+        }
+    }
+
+    fn materialize_c_abi_export_functions(self, head: rawptr) {
+        var cur = head;
+        while (cur != null) {
+            if (!self.decl_effectively_imported(cur)
+                && decl_get_kind(cur) == de_FN()
+                && decl_get_body(cur) != null) {
+                let fn_id = hir_pointer_map_function(self.decl_map, cur);
+                if (fn_id != hir_id_invalid()
+                    && (self.unit.function_flags(fn_id) & hir_function_flag_no_mangle()) != 0) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_codegen_root());
+                    self.ensure_reachable_function_body(cur, fn_id, false);
+                }
+            }
+            cur = decl_get_next(cur);
+        }
+    }
+
+    fn materialize_function_roots(self, unit_ptr: rawptr) {
+        let head = unit_get_decls(unit_ptr);
+        let has_main = self.unit_has_local_main_function(head);
+        if (has_main && self.export_root_name_allowed("main")) {
+            self.materialize_local_main_function(head);
+        }
+        self.materialize_c_abi_export_functions(head);
+        if (self.export_root_bodies) {
+            if (self.lazy_codegen) {
+                self.mark_exported_function_roots_for_decl_chain(head, false, true);
+            } else {
+                self.materialize_exported_function_roots_for_decl_chain(head, false, true);
+            }
+        }
+    }
+
+    public fn materialize_marked_codegen_roots(self) {
+        self.profile_build_phase("marked-roots-enter");
+        var fn_id: i32 = 1;
+        while (fn_id <= self.unit.function_count) {
+            if ((hir_unit_function_flags(self.unit, fn_id) & hir_function_flag_codegen_root()) != 0) {
+                if (self.unit.function_body(fn_id) == hir_id_invalid()) {
+                    self.materialize_function_body_for_codegen(fn_id);
+                    self.materialize_reachable_function_bodies();
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        self.materialize_concrete_type_items();
+        self.resolve_deferred_member_exprs_once();
+        self.materialize_reachable_function_bodies();
+        self.profile_build_phase("marked-roots-leave");
+    }
+}

@@ -1,0 +1,316 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn drop_local_for_place_before_reassign(self, place_id: i32, source_expr_id: i32) {
+        if (place_id == mir_id_invalid()) { return; }
+        if (self.unit.place_kind(place_id) != mir_place_local()) { return; }
+        let mir_local_id = self.unit.place_local(place_id);
+        let hir_local_id = self.unit.local_hir_id(mir_local_id);
+        self.emit_drop_for_hir_local(hir_local_id, hir_id_invalid(), source_expr_id, false);
+    }
+
+    public fn emit_pointer_delete_for_place(self, place_id: i32, source_expr_id: i32) {
+        if (place_id == mir_id_invalid() || self.unit.place_kind(place_id) != mir_place_local()) { return; }
+        let pointer_type = self.unit.place_type(place_id);
+        if (hir_type_table_kind(self.h.types, pointer_type) != ty_PTR()) { return; }
+        let old_value = self.add_read_value(place_id, source_expr_id);
+        if (old_value == mir_id_invalid()) { return; }
+        let payload_type = hir_type_table_elem(self.h.types, pointer_type);
+        let delete_value = self.unit.add_value(
+                                              self.current_function_id,
+                                              mir_value_intrinsic(),
+                                              self.intern_type_id_by_text("void"),
+                                              place_id,
+                                              mir_target_type(),
+                                              payload_type,
+                                              source_expr_id,
+                                              0,
+                                              0,
+                                              0,
+                                              "__vyx_delete",
+                                              self.type_text(payload_type));
+        self.unit.set_value_lhs( delete_value, old_value);
+        self.emit_eval_value(delete_value, hir_id_invalid(), source_expr_id);
+    }
+
+    public fn note_assignment_makes_local_live(self, place_id: i32) {
+        if (place_id == mir_id_invalid()) { return; }
+        if (self.unit.place_kind(place_id) != mir_place_local()) { return; }
+        let mir_local_id = self.unit.place_local(place_id);
+        let hir_local_id = self.unit.local_hir_id(mir_local_id);
+        if (hir_local_id != hir_id_invalid() && self.hir_local_has_drop(hir_local_id)) {
+            self.drop_stack_set_active(hir_local_id, true);
+        }
+    }
+
+    public fn hir_local_for_place(self, place_id: i32) -> i32 {
+        if (place_id == mir_id_invalid()) { return hir_id_invalid(); }
+        if (self.unit.place_kind(place_id) != mir_place_local()) { return hir_id_invalid(); }
+        let mir_local_id = self.unit.place_local(place_id);
+        return self.unit.local_hir_id(mir_local_id);
+    }
+
+    public fn expr_arg_chain_refs_hir_local(self, first_arg_id: i32, hir_local_id: i32) -> bool {
+        if (hir_local_id == hir_id_invalid()) { return false; }
+        var arg = first_arg_id;
+        while (arg != hir_id_invalid()) {
+            if (self.expr_refs_hir_local(arg, hir_local_id)) { return true; }
+            arg = self.h.expr_next_arg(arg);
+        }
+        return false;
+    }
+
+    public fn stmt_tree_refs_hir_local(self, stmt_id: i32, hir_local_id: i32) -> bool {
+        if (stmt_id == hir_id_invalid() || hir_local_id == hir_id_invalid()) { return false; }
+        if (self.expr_refs_hir_local(self.h.stmt_expr(stmt_id), hir_local_id)
+            || self.expr_refs_hir_local(self.h.stmt_cond(stmt_id), hir_local_id)) {
+            return true;
+        }
+        if (self.stmt_chain_refs_hir_local(self.h.stmt_child(stmt_id), hir_local_id)
+            || self.stmt_chain_refs_hir_local(self.h.stmt_else(stmt_id), hir_local_id)
+            || self.stmt_chain_refs_hir_local(self.h.stmt_aux(stmt_id), hir_local_id)) {
+            return true;
+        }
+        return false;
+    }
+
+    public fn stmt_chain_refs_hir_local(self, first_stmt_id: i32, hir_local_id: i32) -> bool {
+        var cur = first_stmt_id;
+        while (cur != hir_id_invalid()) {
+            if (self.stmt_tree_refs_hir_local(cur, hir_local_id)) { return true; }
+            cur = self.h.stmt_next(cur);
+        }
+        return false;
+    }
+
+    public fn expr_refs_hir_local(self, expr_id: i32, hir_local_id: i32) -> bool {
+        if (expr_id == hir_id_invalid() || hir_local_id == hir_id_invalid()) { return false; }
+        let k = self.h.expr_kind(expr_id);
+        if (k == ex_IDENT()) {
+            return self.h.expr_target_kind(expr_id) == hir_target_local()
+                   && self.h.expr_target_id(expr_id) == hir_local_id;
+        }
+        if (k == ex_BIN() || k == ex_ASSIGN() || k == ex_TERNARY()) {
+            if (self.expr_refs_hir_local(self.h.expr_lhs(expr_id), hir_local_id)) { return true; }
+            if (self.expr_refs_hir_local(self.h.expr_rhs(expr_id), hir_local_id)) { return true; }
+            return self.expr_refs_hir_local(self.h.expr_aux(expr_id), hir_local_id);
+        }
+        if (k == ex_UNARY()
+            || k == ex_ADDR_OF()
+            || k == ex_DEREF()
+            || k == ex_AWAIT()
+            || k == ex_COMPTIME()
+            || k == ex_FAIL()
+            || k == ex_CAST()) {
+            return self.expr_refs_hir_local(self.h.expr_lhs(expr_id), hir_local_id);
+        }
+        if (k == ex_CALL()) {
+            if (self.expr_refs_hir_local(self.h.expr_lhs(expr_id), hir_local_id)) { return true; }
+            return self.expr_arg_chain_refs_hir_local(self.h.expr_first_arg(expr_id), hir_local_id);
+        }
+        if (k == ex_MEMBER()) {
+            return self.expr_refs_hir_local(self.h.expr_lhs(expr_id), hir_local_id);
+        }
+        if (k == ex_INDEX()) {
+            if (self.expr_refs_hir_local(self.h.expr_lhs(expr_id), hir_local_id)) { return true; }
+            return self.expr_refs_hir_local(self.h.expr_rhs(expr_id), hir_local_id);
+        }
+        if (k == ex_STRUCT_INIT()
+            || k == ex_FSTRING()
+            || k == ex_TUPLE_LIT()
+            || k == ex_INLINE_ASM()) {
+            return self.expr_arg_chain_refs_hir_local(self.h.expr_first_arg(expr_id), hir_local_id);
+        }
+        if (k == ex_ARRAY_LIT()) {
+            if (self.expr_arg_chain_refs_hir_local(self.h.expr_first_arg(expr_id), hir_local_id)) { return true; }
+            return self.expr_refs_hir_local(self.h.expr_aux(expr_id), hir_local_id);
+        }
+        if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+            if (self.expr_refs_hir_local(self.h.expr_lhs(expr_id), hir_local_id)) { return true; }
+            if (k == ex_IF_EXPR()) {
+                return self.expr_refs_hir_local(self.h.expr_aux(expr_id), hir_local_id);
+            }
+            return self.stmt_chain_refs_hir_local(self.h.expr_stmt_rhs(expr_id), hir_local_id);
+        }
+        if (k == ex_CLOSURE()) {
+            if (self.expr_refs_hir_local(self.h.expr_rhs(expr_id), hir_local_id)) { return true; }
+            return self.expr_refs_hir_local(self.h.expr_aux(expr_id), hir_local_id);
+        }
+        return false;
+    }
+
+    public fn assignment_rhs_refs_place_local(self, place_id: i32, rhs_expr_id: i32) -> bool {
+        return self.expr_refs_hir_local(rhs_expr_id, self.hir_local_for_place(place_id));
+    }
+
+    public fn deactivate_moved_source_expr_except(self, expr_id: i32, except_hir_local_id: i32) {
+        if (expr_id == hir_id_invalid()) { return; }
+        let k = self.h.expr_kind(expr_id);
+        if (k == ex_CAST() || k == ex_COMPTIME()
+            || (k == ex_UNARY() && self.h.expr_op(expr_id) == unary_op_own())) {
+            self.deactivate_moved_source_expr_except(self.h.expr_lhs(expr_id), except_hir_local_id);
+            return;
+        }
+        if (k == ex_CALL()) {
+            if (self.expr_is_variant_constructor_call(expr_id)) {
+                self.deactivate_moved_arg_chain(self.h.expr_first_arg(expr_id), except_hir_local_id);
+            }
+            return;
+        }
+        if (k == ex_STRUCT_INIT() || k == ex_TUPLE_LIT() || k == ex_ARRAY_LIT()) {
+            self.deactivate_moved_arg_chain(self.h.expr_first_arg(expr_id), except_hir_local_id);
+            return;
+        }
+        if (k != ex_IDENT()) { return; }
+        if (self.h.expr_target_kind(expr_id) != hir_target_local()) { return; }
+        let hir_local_id = self.h.expr_target_id(expr_id);
+        if (hir_local_id == hir_id_invalid() || hir_local_id == except_hir_local_id) { return; }
+        if (!self.hir_local_has_drop(hir_local_id)) { return; }
+        self.drop_stack_set_active(hir_local_id, false);
+    }
+
+    public fn deactivate_assignment_source(self, expr_id: i32, destination_type: i32, except_hir_local_id: i32) {
+        if (expr_id == hir_id_invalid()) { return; }
+        let source_type = self.h.expr_type(expr_id);
+        // String -> str produces a borrowed UTF-8 view. Keep the original
+        // String's drop active: the conversion transfers no owned storage.
+        if (hir_type_table_kind(self.h.types, destination_type) == ty_STRING()
+            && hir_type_table_kind(self.h.types, source_type) == ty_CLASS()
+            && self.type_text_is_std_string_class(self.type_text(source_type))) {
+            return;
+        }
+        self.deactivate_moved_source_expr_except(expr_id, except_hir_local_id);
+    }
+
+    public fn expr_is_variant_constructor_call(self, expr_id: i32) -> bool {
+        if (expr_id == hir_id_invalid()) { return false; }
+        if (self.h.expr_kind(expr_id) != ex_CALL()) { return false; }
+        if (self.h.expr_target_kind(expr_id) == hir_target_variant()) { return true; }
+        if (self.h.expr_sem_kind(expr_id) == expr_sem_VARIANT()) { return true; }
+        let callee_expr_id = self.h.expr_lhs(expr_id);
+        if (callee_expr_id == hir_id_invalid()) { return false; }
+        if (self.h.expr_target_kind(callee_expr_id) == hir_target_variant()) { return true; }
+        if (self.h.expr_sem_kind(callee_expr_id) == expr_sem_VARIANT()) { return true; }
+        return false;
+    }
+
+    public fn deactivate_moved_arg_chain(self, first_arg_id: i32, except_hir_local_id: i32) {
+        var arg = first_arg_id;
+        while (arg != hir_id_invalid()) {
+            self.deactivate_moved_source_expr_except(arg, except_hir_local_id);
+            arg = self.h.expr_next_arg(arg);
+        }
+    }
+
+    public fn first_user_param_for_call(self, hir_function_id: i32) -> i32 {
+        var param = self.h.function_first_local(hir_function_id);
+        if (param != hir_id_invalid()
+            && (self.h.local_flags(param) & hir_local_flag_self_receiver()) != 0) {
+            param = self.h.local_next(param);
+        }
+        return param;
+    }
+
+    public fn next_param_local(self, local_id: i32) -> i32 {
+        var cur = self.h.local_next(local_id);
+        while (cur != hir_id_invalid()) {
+            if ((self.h.local_flags(cur) & hir_local_flag_param()) != 0) { return cur; }
+            cur = self.h.local_next(cur);
+        }
+        return hir_id_invalid();
+    }
+
+    public fn deactivate_call_moved_prefix(self, call_expr_id: i32, prefix_expr_id: i32) {
+        if (self.h.expr_target_kind(call_expr_id) != hir_target_function()) { return; }
+        let hir_function_id = self.h.expr_target_id(call_expr_id);
+        if (hir_function_id == hir_id_invalid()) { return; }
+        let param = self.first_user_param_for_call(hir_function_id);
+        if (param == hir_id_invalid()) { return; }
+        if ((self.h.local_flags(param) & hir_local_flag_move_arg()) != 0) {
+            self.deactivate_moved_source_expr_except(prefix_expr_id, hir_id_invalid());
+        }
+    }
+
+    public fn deactivate_call_moved_args_from(self,
+                                             call_expr_id: i32,
+                                             first_arg_id: i32,
+                                             skip_user_param_count: i32) {
+        if (self.h.expr_target_kind(call_expr_id) != hir_target_function()) { return; }
+        let hir_function_id = self.h.expr_target_id(call_expr_id);
+        if (hir_function_id == hir_id_invalid()) { return; }
+        var param = self.first_user_param_for_call(hir_function_id);
+        var skip = skip_user_param_count;
+        while (skip > 0 && param != hir_id_invalid()) {
+            param = self.next_param_local(param);
+            skip = skip - 1;
+        }
+        var arg = first_arg_id;
+        while (arg != hir_id_invalid() && param != hir_id_invalid()) {
+            if ((self.h.local_flags(param) & hir_local_flag_move_arg()) != 0) {
+                self.deactivate_moved_source_expr_except(arg, hir_id_invalid());
+            }
+            arg = self.h.expr_next_arg(arg);
+            param = self.next_param_local(param);
+        }
+    }
+
+    public fn deactivate_call_moved_args(self, call_expr_id: i32) {
+        if (call_expr_id != hir_id_invalid()
+            && self.h.expr_target_kind(call_expr_id) == hir_target_builtin()) {
+            let callee_expr_id = self.h.expr_lhs(call_expr_id);
+            if (callee_expr_id != hir_id_invalid()) {
+                let builtin_base = policy_generic_call_base(self.h.expr_name(callee_expr_id).clone());
+                let first_arg = self.h.expr_first_arg(call_expr_id);
+                if ((builtin_base == "new" || builtin_base == "construct")
+                    && first_arg != hir_id_invalid()
+                    && self.h.expr_next_arg(first_arg) == hir_id_invalid()) {
+                    // Builtin one-argument value construction has no HIR
+                    // function parameter record, so deactivate the source
+                    // explicitly just as a consuming function call would;
+                    // primitive/non-owning sources are naturally no-op.
+                    self.deactivate_moved_source_expr_except(first_arg, hir_id_invalid());
+                }
+            }
+            return;
+        }
+        self.deactivate_call_moved_args_from(call_expr_id, self.h.expr_first_arg(call_expr_id), 0);
+    }
+
+    public fn deactivate_call_moved_receiver(self, call_expr_id: i32) {
+        if (call_expr_id == hir_id_invalid()) { return; }
+        var target_fn = hir_id_invalid();
+        if (self.h.expr_target_kind(call_expr_id) == hir_target_function()) {
+            target_fn = self.h.expr_target_id(call_expr_id);
+        }
+        let callee = self.h.expr_lhs(call_expr_id);
+        if (target_fn == hir_id_invalid()
+            && callee != hir_id_invalid()
+            && self.h.expr_target_kind(callee) == hir_target_function()) {
+            target_fn = self.h.expr_target_id(callee);
+        }
+        if (target_fn == hir_id_invalid()) { return; }
+        let first_param = self.h.function_first_local(target_fn);
+        if (first_param == hir_id_invalid()
+            || (self.h.local_flags(first_param) & hir_local_flag_self_receiver()) == 0
+            || (self.h.local_flags(first_param) & hir_local_flag_move_arg()) == 0) {
+            return;
+        }
+        if (callee == hir_id_invalid() || self.h.expr_kind(callee) != ex_MEMBER()) { return; }
+        self.deactivate_moved_source_expr_except(self.h.expr_lhs(callee), hir_id_invalid());
+    }
+}

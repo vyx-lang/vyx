@@ -1,0 +1,236 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Body storage for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn clear_hir_string_slot(self, rec: rawptr, ptr_off: i32, len_off: i32) {
+        if (rec == null) { return; }
+        let slot = ptr_offset(rec, ptr_off);
+        let old_ptr = ast_read_rawptr(slot);
+        if (old_ptr != null) {
+            vyx_forget_string_len(old_ptr);
+            free(old_ptr);
+        }
+        ast_write_rawptr(slot, null);
+        ast_write_i64(ptr_offset(rec, len_off), 0);
+    }
+
+    fn clear_stmt_record_strings(self, stmt_id: i32) {
+        let rec = self.unit.stmt_record(stmt_id);
+        if (rec == null) { return; }
+        self.clear_hir_string_slot(rec, 48, 56);
+        memset(rec, 0, 64);
+    }
+
+    fn clear_expr_record_strings(self, expr_id: i32) {
+        let rec = self.unit.expr_record(expr_id);
+        if (rec == null) { return; }
+        self.clear_hir_string_slot(rec, 56, 64);
+        self.clear_hir_string_slot(rec, 72, 80);
+        self.clear_hir_string_slot(rec, 112, 120);
+        memset(rec, 0, 144);
+    }
+
+    fn clear_local_record_strings(self, local_id: i32) {
+        let rec = self.unit.local_record(local_id);
+        if (rec == null) { return; }
+        self.clear_hir_string_slot(rec, 16, 24);
+        memset(rec, 0, 48);
+    }
+
+    fn function_owns_latest_body_range(self, function_id: i32, stmt_mark: i32, expr_mark: i32) -> bool {
+        if (function_id == hir_id_invalid()) { return false; }
+        var stmt_id = stmt_mark + 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            let stmt_rec = self.unit.stmt_record(stmt_id);
+            if (stmt_rec != null
+                && ast_read_i32(stmt_rec) != hir_id_invalid()
+                && ast_read_i32(ptr_offset(stmt_rec, 8)) != function_id) {
+                return false;
+            }
+            stmt_id = stmt_id + 1;
+        }
+        var expr_id = expr_mark + 1;
+        while (expr_id <= self.unit.expr_count) {
+            let expr_rec = self.unit.expr_record(expr_id);
+            if (expr_rec != null
+                && ast_read_i32(expr_rec) != hir_id_invalid()
+                && ast_read_i32(ptr_offset(expr_rec, 8)) != function_id) {
+                return false;
+            }
+            expr_id = expr_id + 1;
+        }
+        return true;
+    }
+
+    fn function_owns_latest_local_range(self, function_id: i32, local_mark: i32) -> bool {
+        if (function_id == hir_id_invalid()) { return false; }
+        var local_id = local_mark + 1;
+        while (local_id <= self.unit.local_count) {
+            let rec = self.unit.local_record(local_id);
+            if (rec != null) {
+                if (ast_read_i32(ptr_offset(rec, 4)) != function_id) { return false; }
+                if (self.local_survives_codegen_discard(local_id, local_mark)) { return false; }
+            }
+            local_id = local_id + 1;
+        }
+        return true;
+    }
+
+    fn local_survives_codegen_discard(self, local_id: i32, local_mark: i32) -> bool {
+        if (local_id <= local_mark) { return true; }
+        let rec = self.unit.local_record(local_id);
+        if (rec == null) { return false; }
+        let flags = ast_read_i32(ptr_offset(rec, 12));
+        if ((flags & hir_local_flag_param()) != 0) { return true; }
+        if ((flags & hir_local_flag_capture()) != 0) { return true; }
+        return false;
+    }
+
+    fn trim_function_locals_after_mark(self, function_id: i32, local_mark: i32) {
+        if (function_id == hir_id_invalid()) { return; }
+        let fn_rec = self.unit.function_record(function_id);
+        if (fn_rec == null) { return; }
+        var cur = ast_read_i32(ptr_offset(fn_rec, 12));
+        var prev: i32 = hir_id_invalid();
+        var kept: i32 = 0;
+        var guard: i32 = 0;
+        var guard_limit = self.unit.local_count + 2;
+        while (cur != hir_id_invalid() && guard < guard_limit) {
+            let rec = self.unit.local_record(cur);
+            let next = self.unit.local_next(cur);
+            if (rec == null || !self.local_survives_codegen_discard(cur, local_mark)) {
+                if (prev == hir_id_invalid()) {
+                    ast_write_i32(ptr_offset(fn_rec, 12), next);
+                } else {
+                    let prev_rec = self.unit.local_record(prev);
+                    if (prev_rec != null) { ast_write_i32(ptr_offset(prev_rec, 32), next); }
+                }
+                cur = next;
+            } else {
+                kept = kept + 1;
+                prev = cur;
+                cur = next;
+            }
+            guard = guard + 1;
+        }
+        ast_write_i32(ptr_offset(fn_rec, 100), prev);
+        ast_write_i32(ptr_offset(fn_rec, 16), kept);
+    }
+
+    fn trim_unit_local_tail_after_codegen(self) {
+        var new_count = self.unit.local_count;
+        while (new_count > 0) {
+            let rec = self.unit.local_record(new_count);
+            if (rec == null) { return; }
+            if (ast_read_i32(rec) != 0) { break; }
+            new_count = new_count - 1;
+        }
+        if (new_count < self.unit.local_count) {
+            self.unit.local_count = new_count;
+            self.unit.ids.next_local_id = new_count + 1;
+        }
+    }
+
+    fn discard_function_locals_after_codegen(self, function_id: i32, local_mark: i32) {
+        if (function_id == hir_id_invalid()) { return; }
+        if (self.function_owns_latest_local_range(function_id, local_mark)) {
+            var local_id = local_mark + 1;
+            while (local_id <= self.unit.local_count) {
+                self.clear_local_record_strings(local_id);
+                local_id = local_id + 1;
+            }
+            self.trim_function_locals_after_mark(function_id, local_mark);
+            self.trim_unit_local_tail_after_codegen();
+            return;
+        }
+        var id: i32 = 1;
+        while (id <= self.unit.local_count) {
+            let rec = self.unit.local_record(id);
+            if (id > local_mark
+                && rec != null
+                && ast_read_i32(ptr_offset(rec, 4)) == function_id
+                && !self.local_survives_codegen_discard(id, local_mark)) {
+                self.clear_local_record_strings(id);
+            }
+            id = id + 1;
+        }
+        self.trim_function_locals_after_mark(function_id, local_mark);
+        self.trim_unit_local_tail_after_codegen();
+    }
+
+    fn discard_latest_function_body_range_after_codegen(self,
+                                                         function_id: i32,
+                                                         stmt_mark: i32,
+                                                         expr_mark: i32,
+                                                         local_mark: i32) {
+        var stmt_id = stmt_mark + 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            self.clear_stmt_record_strings(stmt_id);
+            stmt_id = stmt_id + 1;
+        }
+        var expr_id = expr_mark + 1;
+        while (expr_id <= self.unit.expr_count) {
+            self.clear_expr_record_strings(expr_id);
+            expr_id = expr_id + 1;
+        }
+        self.unit.stmt_count = stmt_mark;
+        self.unit.expr_count = expr_mark;
+        self.unit.ids.next_stmt_id = stmt_mark + 1;
+        self.unit.ids.next_expr_id = expr_mark + 1;
+        if (self.materialized_expr_count > expr_mark) {
+            self.materialized_expr_count = expr_mark;
+        }
+        self.unit.set_function_body(function_id, hir_id_invalid(), 0);
+        self.discard_function_locals_after_codegen(function_id, local_mark);
+    }
+
+    public fn discard_function_body_after_codegen(self, function_id: i32, stmt_mark: i32, expr_mark: i32, local_mark: i32) {
+        if (function_id == hir_id_invalid()) { return; }
+        if (!self.function_owns_latest_body_range(function_id, stmt_mark, expr_mark)) { return; }
+        self.discard_latest_function_body_range_after_codegen(function_id,
+                                                               stmt_mark,
+                                                               expr_mark,
+                                                               local_mark);
+    }
+
+    public fn discard_function_body_records_after_codegen(self, function_id: i32, stmt_mark: i32, expr_mark: i32, local_mark: i32) {
+        if (function_id == hir_id_invalid()) { return; }
+        if (self.function_owns_latest_body_range(function_id, stmt_mark, expr_mark)) {
+            self.discard_latest_function_body_range_after_codegen(function_id,
+                                                                   stmt_mark,
+                                                                   expr_mark,
+                                                                   local_mark);
+            return;
+        }
+        var stmt_id: i32 = stmt_mark + 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            let rec = self.unit.stmt_record(stmt_id);
+            if (rec != null && ast_read_i32(ptr_offset(rec, 8)) == function_id) {
+                self.clear_stmt_record_strings(stmt_id);
+            }
+            stmt_id = stmt_id + 1;
+        }
+        var expr_id: i32 = expr_mark + 1;
+        while (expr_id <= self.unit.expr_count) {
+            let rec2 = self.unit.expr_record(expr_id);
+            if (rec2 != null && ast_read_i32(ptr_offset(rec2, 8)) == function_id) {
+                self.clear_expr_record_strings(expr_id);
+            }
+            expr_id = expr_id + 1;
+        }
+        self.unit.set_function_body(function_id, hir_id_invalid(), 0);
+        self.discard_function_locals_after_codegen(function_id, local_mark);
+    }
+}

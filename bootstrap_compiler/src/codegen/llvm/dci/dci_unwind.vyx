@@ -1,0 +1,607 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn dci_control_flow_boundary(self, control: rawptr) -> string {
+        if (control == null || cJSON_IsObject(control) == 0) { return ""; }
+        var boundary = self.dci_json_string(control, "default_boundary");
+        if (boundary.len == 0) { boundary = self.dci_json_string(control, "boundary"); }
+        if (boundary.len == 0) {
+            let propagation = self.dci_json_item(control, "propagation");
+            boundary = self.dci_json_string(propagation, "mode");
+        }
+        return boundary;
+    }
+
+    public fn dci_control_flow_boundary_supported(self, boundary: string) -> bool {
+        return boundary.len == 0 || boundary == "no_unwind" || boundary == "forbidden"
+            || boundary == "abort";
+    }
+
+    // Runtime realizability of a declared `translated` propagation boundary
+    // (SPEC 11 / 16.4). A translated boundary means the producer side converts a
+    // failing control flow into a value via a declared translator symbol before
+    // crossing, so no foreign unwind ever reaches Vyx. The Consumer can execute
+    // this at runtime iff the translator resolves to a uniquely exported Direct
+    // function whose own leaf control-flow contract is itself no-unwind. Only the
+    // translator's OWN boundary is inspected here so the check never recurses back
+    // through the enclosing translated contract.
+    public fn dci_translator_symbol_realizable(self, translator_ref: string) -> bool {
+        if (translator_ref.len == 0) { return false; }
+        let sym = self.dci_symbol_object_for_reference(translator_ref);
+        if (sym == null) { return false; }
+        if (self.dci_json_string(sym, "kind") != "function") { return false; }
+        let leaf = self.dci_json_item(sym, "control_flow");
+        if (leaf == null) { return true; }
+        if (cJSON_IsObject(leaf) == 0) { return false; }
+        let leaf_boundary = self.dci_control_flow_boundary(leaf);
+        if (!self.dci_control_flow_boundary_supported(leaf_boundary)) { return false; }
+        let leaf_prop = self.dci_json_item(leaf, "propagation");
+        let leaf_mode = self.dci_json_string(leaf_prop, "mode");
+        return leaf_mode.len == 0 || leaf_mode == "forbidden" || leaf_mode == "abort";
+    }
+
+    public fn dci_control_flow_contract_supported(self, control: rawptr) -> bool {
+        if (control == null) { return true; }
+        if (cJSON_IsObject(control) == 0) { return false; }
+        let boundary = self.dci_control_flow_boundary(control);
+        let propagation = self.dci_json_item(control, "propagation");
+        let mode = self.dci_json_string(propagation, "mode");
+        if (boundary == "translated" || mode == "translated") {
+            var translator: string = "";
+            if (propagation != null && cJSON_IsObject(propagation) != 0) {
+                translator = self.dci_json_string(propagation, "translator_symbol");
+            }
+            if (mode == "shared_abi" || boundary == "shared_abi") { return false; }
+            return self.dci_translator_symbol_realizable(translator);
+        }
+        if (boundary == "shared_abi" || mode == "shared_abi") {
+            var abi: string = "";
+            if (propagation != null && cJSON_IsObject(propagation) != 0) {
+                abi = self.dci_json_string(propagation, "abi");
+            }
+            return llvm_unwind_shared_abi_supported(abi, self.target_triple);
+        }
+        if (!self.dci_control_flow_boundary_supported(boundary)) {
+            return false;
+        }
+        return mode.len == 0 || mode == "forbidden" || mode == "abort";
+    }
+
+    // A declared cross-boundary propagation contract MUST carry the data both
+    // sides need before the Consumer can even reason about it (SPEC 11.2). This
+    // is orthogonal to whether Vyx can execute the mode: a `translated` boundary
+    // without a translator symbol or a `shared_abi` boundary without a shared ABI
+    // identity is malformed and must fail closed with a precise diagnostic rather
+    // than the generic "unsupported propagation ABI" fallback.
+    public fn dci_control_flow_boundary_data_error(self, control: rawptr) -> string {
+        if (control == null || cJSON_IsObject(control) == 0) { return ""; }
+        let propagation = self.dci_json_item(control, "propagation");
+        var mode: string = "";
+        if (propagation != null && cJSON_IsObject(propagation) != 0) {
+            mode = self.dci_json_string(propagation, "mode");
+        }
+        let boundary = self.dci_control_flow_boundary(control);
+        if (mode == "translated" || boundary == "translated") {
+            var translator: string = "";
+            if (propagation != null && cJSON_IsObject(propagation) != 0) {
+                translator = self.dci_json_string(propagation, "translator_symbol");
+            }
+            if (translator.len == 0) {
+                return "DCI control-flow boundary `translated` requires a declared translator symbol";
+            }
+        }
+        if (mode == "shared_abi" || boundary == "shared_abi") {
+            var abi: string = "";
+            if (propagation != null && cJSON_IsObject(propagation) != 0) {
+                abi = self.dci_json_string(propagation, "abi");
+            }
+            if (abi.len == 0) {
+                return "DCI control-flow boundary `shared_abi` requires a declared shared propagation ABI";
+            }
+        }
+        return "";
+    }
+
+    public fn dci_consumer_modes_contains(self, root: rawptr, mode: string) -> bool {
+        let profile = self.dci_json_item(root, "profile");
+        if (profile == null || cJSON_IsObject(profile) == 0) { return false; }
+        let modes = self.dci_json_item(profile, "consumer_modes");
+        if (modes == null || cJSON_IsArray(modes) == 0) { return false; }
+        return self.dci_json_array_contains_string(modes, mode);
+    }
+
+    // Consumer recognition of normalized Stub requests (SPEC 8.2.1 / 16.1).
+    // The Adapter emits language-neutral `exports.stub_requests`; the Core
+    // Consumer validates them, requires the Stub Consumer mode, and enforces
+    // that each requested wrapper is a fresh link identity that does not shadow
+    // an already-exported Direct symbol. Concrete wrapper synthesis and call
+    // rebinding are performed by a capability-matched Stub backend at build
+    // time; nothing here is inferred from a source language name.
+    public fn dci_validate_stub_requests(self,
+                                         root: rawptr,
+                                         exports: rawptr,
+                                         has_stub_mode: bool) -> bool {
+        let requests = self.dci_json_item(exports, "stub_requests");
+        if (requests == null) { return true; }
+        if (cJSON_IsArray(requests) == 0) {
+            self.report_error("DCI exports.stub_requests must be an array");
+            return false;
+        }
+        let n = cJSON_GetArraySize(requests);
+        if (n == 0) { return true; }
+        if (!has_stub_mode) {
+            self.report_error("DCI descriptor declares stub_requests but the profile has no stub Consumer mode");
+            return false;
+        }
+        var i: i32 = 0;
+        while (i < n) {
+            let request = cJSON_GetArrayItem(requests, i);
+            if (request == null || cJSON_IsObject(request) == 0) {
+                self.report_error("DCI stub request must be an object");
+                return false;
+            }
+            let id = self.dci_json_string(request, "id");
+            if (id.len == 0) {
+                self.report_error("DCI stub request is missing an `id`");
+                return false;
+            }
+            var j: i32 = 0;
+            while (j < i) {
+                let other = cJSON_GetArrayItem(requests, j);
+                if (self.dci_json_string(other, "id") == id) {
+                    self.report_error("duplicate DCI stub request id `" + id + "`");
+                    return false;
+                }
+                j = j + 1;
+            }
+            let wrapper = self.dci_json_item(request, "wrapper");
+            if (wrapper == null || cJSON_IsObject(wrapper) == 0) {
+                self.report_error("DCI stub request `" + id + "` is missing its wrapper");
+                return false;
+            }
+            let wrapper_link = self.dci_json_string(wrapper, "link_name");
+            if (wrapper_link.len == 0) {
+                self.report_error("DCI stub request `" + id + "` wrapper is missing a link_name");
+                return false;
+            }
+            let synthesis = self.dci_json_item(request, "synthesis");
+            let strategy = self.dci_json_string(synthesis, "strategy");
+            // translate_unwind wrappers ARE the exported translator; collision
+            // is required, not an error.  forward_direct still must not shadow.
+            if (strategy != "translate_unwind"
+                && self.dci_symbol_object_for_reference(wrapper_link) != null) {
+                self.report_error("DCI stub request wrapper `" + wrapper_link
+                          + "` collides with an exported symbol");
+                return false;
+            }
+            var k: i32 = 0;
+            while (k < i) {
+                let other = cJSON_GetArrayItem(requests, k);
+                let other_wrapper = self.dci_json_item(other, "wrapper");
+                if (self.dci_json_string(other_wrapper, "link_name") == wrapper_link) {
+                    self.report_error("duplicate DCI stub request wrapper `" + wrapper_link + "`");
+                    return false;
+                }
+                k = k + 1;
+            }
+            let request_control = self.dci_json_item(request, "control_flow");
+            if (request_control != null && cJSON_IsObject(request_control) != 0) {
+                let request_boundary_error = self.dci_control_flow_boundary_data_error(request_control);
+                if (request_boundary_error.len > 0) {
+                    self.report_error(request_boundary_error);
+                    return false;
+                }
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // Find the imported foreign DCI function whose resolved link identity equals
+    // `link_name`. The Consumer only synthesizes a wrapper over a target that the
+    // consuming unit actually imports, so its full LLVM signature is already
+    // materialized and can be forwarded verbatim.
+    public fn dci_find_foreign_function_by_link(self, link_name: string) -> i32 {
+        if (link_name.len == 0) { return mir_id_invalid(); }
+        var function_id: i32 = 1;
+        var found: i32 = mir_id_invalid();
+        while (function_id <= self.m.function_count) {
+            if (self.function_is_foreign_dci(function_id)
+                && self.dci_link_name_for_function(function_id) == link_name) {
+                found = function_id;
+            }
+            function_id = function_id + 1;
+        }
+        return found;
+    }
+
+    // General in-Consumer Stub wrapper synthesis (SPEC 8.2.1 / 16.1). For any
+    // Direct `requires_stub` operation a request may opt into in-Consumer
+    // synthesis via `synthesis.strategy`. `forward_direct` emits a forwarding
+    // wrapper. `translate_unwind` is compiled by the producer Adapter; the
+    // Consumer must import that translator and must not emit LLVM EH. The
+    // wrapper link name is unique for `forward_direct` and must not shadow a
+    // Direct symbol; `translate_unwind` requires the wrapper to BE the exported
+    // translator. Requests without a `synthesis` block keep the previous
+    // backend-routed behavior untouched.
+    public fn dci_synthesize_stub_wrappers(self) -> bool {
+        if (!mir_unit_has_dci_abi(&self.m)) { return true; }
+        if (self.dci_json() == null) { return true; }
+        var ok: bool = true;
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let requests = self.dci_exports_array_from(self.dci_contract_at(root_i), "stub_requests");
+            if (requests == null) {
+                root_i = root_i + 1;
+                continue;
+            }
+            let n = cJSON_GetArraySize(requests);
+            var i: i32 = 0;
+            while (i < n) {
+                let request = cJSON_GetArrayItem(requests, i);
+                let synthesis = self.dci_json_item(request, "synthesis");
+                if (synthesis != null && cJSON_IsObject(synthesis) != 0) {
+                let strategy = self.dci_json_string(synthesis, "strategy");
+                if (strategy == "forward_direct" || strategy == "reverse_override") {
+                    if (!self.dci_synthesize_forward_wrapper(request, synthesis)) {
+                        ok = false;
+                    }
+                } else if (strategy == "translate_unwind") {
+                    if (!self.dci_translate_unwind_request_supported(request, synthesis)) {
+                        ok = false;
+                    }
+                } else if (strategy.len > 0) {
+                    self.report_error("unsupported DCI stub wrapper synthesis strategy `"
+                              + strategy + "`");
+                    ok = false;
+                } else {
+                    self.report_error("DCI stub wrapper synthesis requires a `strategy`");
+                    ok = false;
+                }
+            }
+            i = i + 1;
+        }
+            root_i = root_i + 1;
+        }
+        return ok;
+    }
+
+    // `translate_unwind`: the producer compiled a catch translator. The Consumer
+    // never synthesizes LLVM EH for that strategy (no personality, no
+    // `__CxxFrameHandler3`, no landingpad). The wrapper link must resolve to an
+    // exported no_unwind Direct function; the original may_unwind target stays
+    // Direct-rejected. Host conversion to Result is Converter/frontend work.
+    // `shared_abi` host definitions are a different path: they already carry
+    // personality/`uwtable` and emit `invoke` plus a cleanup pad.
+    public fn dci_translate_unwind_request_supported(self, request: rawptr, synthesis: rawptr) -> bool {
+        let wrapper = self.dci_json_item(request, "wrapper");
+        let wrapper_link = self.dci_json_string(wrapper, "link_name");
+        if (wrapper_link.len == 0) {
+            self.report_error("DCI translate_unwind wrapper is missing a link_name");
+            return false;
+        }
+        var target_ref = self.dci_json_string(synthesis, "target");
+        if (target_ref.len == 0) { target_ref = self.dci_json_string(request, "target"); }
+        if (target_ref.len == 0) {
+            self.report_error("DCI translate_unwind wrapper `" + wrapper_link
+                      + "` has no target symbol");
+            return false;
+        }
+        if (wrapper_link == target_ref) {
+            self.report_error("DCI translate_unwind translator cannot be the may_unwind target");
+            return false;
+        }
+        let translator = self.dci_symbol_lookup_unique(wrapper_link, true);
+        if (translator == null) {
+            self.report_error("DCI translate_unwind translator `" + wrapper_link
+                      + "` is not an exported Direct symbol");
+            return false;
+        }
+        if (!self.dci_translator_symbol_realizable(wrapper_link)) {
+            self.report_error("DCI translate_unwind translator `" + wrapper_link
+                      + "` is not Direct-callable under its leaf control-flow contract");
+            return false;
+        }
+        return true;
+    }
+
+    public fn dci_host_return_is_result_failure(self, function_id: i32) -> bool {
+        let result_type = self.m.function_return_type(function_id);
+        if (!self.type_is_result_abi(result_type)) { return false; }
+        let err_type = self.result_err_type(result_type);
+        if (err_type == mir_id_invalid()) { return false; }
+        return self.last_path_segment(llvm_mir_type_text(&self.m, err_type)) == "Failure";
+    }
+
+    public fn dci_symbol_name_matches_host(self, symbol_name: string, host: string) -> bool {
+        if (symbol_name == host) { return true; }
+        if (host.len == 0 || symbol_name.len <= host.len) { return false; }
+        let prefix_len = symbol_name.len - host.len;
+        if (symbol_name.substring(prefix_len, symbol_name.len) != host) { return false; }
+        let ch = symbol_name.charAt(prefix_len - 1);
+        return ch == 46 || ch == 58;
+    }
+
+    public fn dci_symbol_is_translate_unwind_target(self, target: rawptr, function_id: i32) -> bool {
+        if (target == null || cJSON_IsObject(target) == 0) { return false; }
+        if (self.dci_json_string(target, "kind") != self.dci_symbol_kind_for_function(function_id)) {
+            return false;
+        }
+        if (self.dci_symbol_owner_match_rank(self.dci_json_string(target, "owner"), function_id) == 0) {
+            return false;
+        }
+        if (!self.dci_symbol_params_match_function(self.dci_json_item(target, "params"), function_id)) {
+            return false;
+        }
+        if (!self.dci_symbol_flags_match_function(target, function_id)) { return false; }
+        let host = self.dci_symbol_name_for_function(function_id);
+        if (self.dci_symbol_name_matches_host(self.dci_json_string(target, "name"), host)) {
+            return true;
+        }
+        if (self.dci_symbol_name_matches_host(self.dci_json_string(target, "member_name"), host)) {
+            return true;
+        }
+        return self.dci_symbol_name_matches_host(self.dci_symbol_link_name(target), host);
+    }
+
+    public fn dci_translate_unwind_translator_for_function(self, function_id: i32) -> rawptr {
+        if (!self.function_is_foreign_dci(function_id)) { return null; }
+        if (!self.dci_host_return_is_result_failure(function_id)) { return null; }
+        var found: rawptr = null;
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let requests = self.dci_exports_array_from(self.dci_contract_at(root_i), "stub_requests");
+            if (requests == null) {
+                root_i = root_i + 1;
+                continue;
+            }
+            var request = dci_cjson_child(requests);
+            while (request != null) {
+                let synthesis = self.dci_json_item(request, "synthesis");
+                if (self.dci_json_string(synthesis, "strategy") == "translate_unwind") {
+                    var target_ref = self.dci_json_string(synthesis, "target");
+                    if (target_ref.len == 0) { target_ref = self.dci_json_string(request, "target"); }
+                    let target = self.dci_symbol_object_for_reference(target_ref);
+                    if (self.dci_symbol_is_translate_unwind_target(target, function_id)) {
+                        let wrapper = self.dci_json_item(request, "wrapper");
+                        let wrapper_link = self.dci_json_string(wrapper, "link_name");
+                        let translator = self.dci_symbol_object_for_reference(wrapper_link);
+                        if (translator != null && self.dci_translator_symbol_realizable(wrapper_link)) {
+                            if (found != null
+                                && !self.dci_symbol_contracts_equivalent(found, translator)) {
+                                self.report_error("conflicting DCI translate_unwind translators for `"
+                                          + self.m.function_name(function_id) + "`");
+                                return null;
+                            }
+                            found = translator;
+                        }
+                    }
+                }
+                request = dci_cjson_next(request);
+            }
+            root_i = root_i + 1;
+        }
+        return found;
+    }
+
+    public fn dci_call_converts_translated_to_result(self, function_id: i32) -> bool {
+        if (!self.dci_host_return_is_result_failure(function_id)) { return false; }
+        let symbol = self.dci_symbol_object_for_function(function_id);
+        if (symbol == null) { return false; }
+        let ret = self.dci_json_item(symbol, "return");
+        let type_obj = self.dci_json_item(ret, "type");
+        let name = self.dci_json_string(type_obj, "name");
+        return name.contains("Translated");
+    }
+
+    public fn dci_translated_return_layout(self, function_id: i32) -> rawptr {
+        let symbol = self.dci_symbol_object_for_function(function_id);
+        let ret = self.dci_json_item(symbol, "return");
+        let type_obj = self.dci_json_item(ret, "type");
+        return self.dci_layout_object_for_record_name(self.dci_json_string(type_obj, "name"));
+    }
+
+    public fn dci_layout_blob_ty(self, layout: rawptr) -> rawptr {
+        if (layout == null) { return null; }
+        let size = self.dci_json_i64(layout, "size");
+        if (size < 1) { return null; }
+        return vyx_rt_array_ty(self.mod, self.ty_i8, size as u64);
+    }
+
+    public fn dci_translated_sret_ty(self, function_id: i32) -> rawptr {
+        return self.dci_layout_blob_ty(self.dci_translated_return_layout(function_id));
+    }
+
+    public fn dci_layout_field_offset(self, layout: rawptr, field_name: string) -> i64 {
+        let fields = self.dci_json_item(layout, "fields");
+        if (fields == null || cJSON_IsArray(fields) == 0) { return -1; }
+        let n = cJSON_GetArraySize(fields);
+        var i: i32 = 0;
+        while (i < n) {
+            let field = cJSON_GetArrayItem(fields, i);
+            if (self.dci_json_string(field, "name") == field_name) {
+                return self.dci_json_i64(field, "offset");
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn dci_load_layout_field(self,
+                                     base: rawptr,
+                                     layout: rawptr,
+                                     field_name: string,
+                                     llvm_ty: rawptr,
+                                     label: string) -> rawptr {
+        if (base == null || llvm_ty == null) { return null; }
+        let off = self.dci_layout_field_offset(layout, field_name);
+        if (off < 0) { return null; }
+        var addr = base;
+        if (off > 0) {
+            addr = self.ptr_offset_bytes(base,
+                                         vyx_rt_const_int(self.mod, self.ty_i64, off, 1),
+                                         label);
+        }
+        if (addr == null) { return null; }
+        return vyx_rt_build_load(self.mod, llvm_ty, addr, label.c_str(), label.len as u64);
+    }
+
+    public fn dci_result_from_translated_sret(self, function_id: i32, sret_slot: rawptr) -> rawptr {
+        let result_type = self.m.function_return_type(function_id);
+        let layout = self.dci_translated_return_layout(function_id);
+        if (sret_slot == null || layout == null) {
+            self.report_error("DCI translate_unwind cannot read translator return for `"
+                      + self.m.function_name(function_id) + "`");
+            return null;
+        }
+        let tag8 = self.dci_load_layout_field(sret_slot, layout, "tag", self.ty_i8, "dci.tr.tag");
+        if (tag8 == null) {
+            self.report_error("DCI translate_unwind translator is missing field `tag`");
+            return null;
+        }
+        let tag = vyx_rt_build_zext(self.mod, tag8, self.ty_i32, "dci.tr.tag32".c_str(), 12);
+        let ok_type = self.result_ok_type(result_type);
+        let err_type = self.result_err_type(result_type);
+        var ok_v: rawptr = null;
+        if (ok_type != mir_id_invalid() && llvm_mir_type_kind(&self.m, ok_type) != ty_VOID()) {
+            let ok_ll = self.lower_type(ok_type);
+            ok_v = self.dci_load_layout_field(sret_slot, layout, "ok", ok_ll, "dci.tr.ok");
+            if (ok_v == null) {
+                self.report_error("DCI translate_unwind translator is missing field `ok`");
+                return null;
+            }
+        }
+        let err_ll = self.lower_type(err_type);
+        let err_v = self.dci_load_layout_field(sret_slot, layout, "err", err_ll, "dci.tr.err");
+        if (err_v == null) {
+            self.report_error("DCI translate_unwind translator is missing field `err`");
+            return null;
+        }
+        return self.build_result_value_from_parts(result_type, tag, ok_v, err_v);
+    }
+
+    // `forward_direct`: the wrapper exposes the requested unique link name with
+    // the exact ABI of the exported Direct target and forwards every argument to
+    // it. Reusing the target's materialized LLVM function type means sret, byval,
+    // coerce, this-pointer and hidden parameters are forwarded verbatim without
+    // re-deriving the lowering. The synthesized wrapper is a genuine Direct
+    // surface: calls that reference the wrapper name link against this definition,
+    // so the Consumer no longer requires a matching external Stub backend for the
+    // forwarding case.
+    public fn dci_link_name_for_function(self, function_id: i32) -> string {
+        if (!mir_unit_has_dci_abi(&self.m) || function_id == mir_id_invalid()) { return ""; }
+        let cached = llvm_mir_map_get(self.dci_symbol_name_cache, function_id);
+        if (cached != null) { return from_cstr(cached); }
+        var best_symbol: string = "";
+        let best = self.dci_symbol_object_for_function(function_id);
+        if (best != null) { best_symbol = self.dci_symbol_link_name(best); }
+        llvm_mir_map_put(self.dci_symbol_name_cache, function_id, ast_dup_c_string(best_symbol.clone()));
+        return best_symbol;
+    }
+
+    public fn dci_function_is_no_unwind(self, function_id: i32) -> bool {
+        let sym = self.dci_symbol_object_for_function(function_id);
+        let boundary = self.dci_symbol_control_flow_boundary(sym);
+        // `translated` is machine-level no-unwind: the producer converts a failing
+        // control flow into a value via the declared translator before crossing,
+        // so no foreign unwind is ever allowed to propagate through Vyx frames.
+        return boundary == "forbidden" || boundary == "no_unwind" || boundary == "abort"
+            || boundary == "translated";
+    }
+
+    public fn dci_module_default_shared_abi(self) -> bool {
+        if (!mir_unit_has_dci_abi(&self.m)) { return false; }
+        let control = self.dci_json_item(self.dci_json(), "control_flow");
+        let boundary = self.dci_control_flow_boundary(control);
+        let mode = self.dci_json_string(self.dci_json_item(control, "propagation"), "mode");
+        return boundary == "shared_abi" || mode == "shared_abi";
+    }
+
+    public fn dci_personality_symbol(self) -> string {
+        var triple = self.target_triple;
+        if (triple.len == 0) {
+            triple = self.dci_descriptor_target_triple(self.dci_json());
+        }
+        if (triple.contains("windows") && triple.contains("msvc")) {
+            return "__CxxFrameHandler3";
+        }
+        return "__gxx_personality_v0";
+    }
+
+    public fn apply_dci_unwind_attrs(self, function_id: i32, function_value: rawptr) {
+        if (function_value == null) { return; }
+        let foreign = self.function_is_foreign_dci(function_id);
+        let has_body = self.m.function_first_block(function_id) != mir_id_invalid();
+        var shared = false;
+        if (foreign) {
+            shared = self.dci_symbol_control_flow_boundary(
+                self.dci_symbol_object_for_function(function_id)) == "shared_abi";
+        } elif (has_body) {
+            shared = self.dci_module_default_shared_abi();
+        }
+        if (shared) {
+            // LLVM forbids personality on declarations. Foreign shared_abi
+            // callees stay declarations; host functions become definitions.
+            if (!foreign) {
+                let pname = self.dci_personality_symbol();
+                vyx_rt_set_function_attr(self.mod,
+                                         function_value,
+                                         "personality".c_str(),
+                                         11,
+                                         pname.c_str(),
+                                         pname.len as u64);
+            }
+            vyx_rt_set_function_attr(self.mod,
+                                     function_value,
+                                     "uwtable".c_str(),
+                                     7,
+                                     "".c_str(),
+                                     0);
+            return;
+        }
+        if (has_body || (foreign && self.dci_function_is_no_unwind(function_id))) {
+            vyx_rt_set_function_attr(self.mod,
+                                     function_value,
+                                     "nounwind".c_str(),
+                                     8,
+                                     "".c_str(),
+                                     0);
+        }
+    }
+
+    public fn dci_caller_participates_in_shared_unwind(self) -> bool {
+        if (self.current_function_id == mir_id_invalid()) { return false; }
+        if (self.function_is_foreign_dci(self.current_function_id)) { return false; }
+        return self.dci_module_default_shared_abi();
+    }
+
+    public fn dci_call_needs_invoke(self, callee_function_id: i32) -> bool {
+        if (!self.dci_caller_participates_in_shared_unwind()) { return false; }
+        if (callee_function_id == mir_id_invalid()) { return false; }
+        if (self.dci_function_is_no_unwind(callee_function_id)) { return false; }
+        return true;
+    }
+
+    public fn build_abi_call(self,
+                             fty: rawptr,
+                             fn_value: rawptr,
+                             args: rawptr,
+                             argc: u64,
+                             name: string,
+                             callee_function_id: i32) -> rawptr {
+        if (self.dci_caller_participates_in_shared_unwind() && callee_function_id != mir_id_invalid()) {
+            let drop = llvm_unwind_drop_for_type(&self.m, self.current_function_id,
+                                                 self.m.function_return_type(callee_function_id));
+            if (drop != mir_id_invalid()) { self.declare_function_signature(drop); }
+        }
+        return llvm_unwind_build_call(&self.m, self.current_function_id, callee_function_id,
+                                       self.mod, fty, fn_value, args, argc, name,
+                                       self.dci_call_needs_invoke(callee_function_id),
+                                       self.dci_caller_participates_in_shared_unwind(),
+                                       self.function_values, self.function_types,
+                                       self.builtin_free_fty, self.builtin_free_fn);
+    }
+}

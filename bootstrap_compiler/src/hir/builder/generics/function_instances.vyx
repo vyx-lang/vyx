@@ -1,0 +1,1051 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Function instances for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn raw_decl_owner_name(self, d: rawptr) -> string {
+        if (d == null) { return ""; }
+        let owner = hir_raw_owner_map_get(self.decl_owner_map,d);
+        if (owner == null) { return ""; }
+        return decl_get_name(owner);
+    }
+
+    fn raw_function_body_decl_for(self, d: rawptr) -> rawptr {
+        if (d == null) { return null; }
+        if (hir_builder_decl_is_foreign_dci_native(d)) { return null; }
+        if (decl_get_body(d) != null) { return d; }
+        let owner_name = self.raw_decl_owner_name(d);
+        var cur = self.decl_map.head;
+        while (cur != null) {
+            let candidate = ast_read_rawptr(cur);
+            if (candidate != null
+                && candidate != d
+                && decl_get_body(candidate) != null
+                && hir_builder_type_owner_names_match(self.raw_decl_owner_name(candidate), owner_name)
+                && hir_builder_decl_signature_matches(d, candidate)) {
+                return candidate;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        return null;
+    }
+
+    fn decl_signature_matches_in_env(self, concrete_decl: rawptr, template_decl: rawptr, params: string, args: string) -> bool {
+        if (concrete_decl == null || template_decl == null) { return false; }
+        if (params.len == 0 || args.len == 0) { return false; }
+        if (decl_get_kind(concrete_decl) != decl_get_kind(template_decl)) { return false; }
+        if (decl_get_name(concrete_decl) != decl_get_name(template_decl)) { return false; }
+        if (hir_builder_decl_param_count(concrete_decl) != hir_builder_decl_param_count(template_decl)) {
+            return false;
+        }
+        let concrete_ret = self.type_text_from_ref_env(decl_get_ty(concrete_decl), params, args);
+        let template_ret = self.type_text_from_ref_env(decl_get_ty(template_decl), params, args);
+        if (concrete_ret != template_ret) { return false; }
+        var cp = decl_get_params(concrete_decl);
+        var tp = decl_get_params(template_decl);
+        while (cp != null && tp != null) {
+            let concrete_param = self.type_text_from_ref_env(decl_get_ty(cp), params, args);
+            let template_param = self.type_text_from_ref_env(decl_get_ty(tp), params, args);
+            if (concrete_param != template_param) { return false; }
+            cp = decl_get_next(cp);
+            tp = decl_get_next(tp);
+        }
+        return cp == null && tp == null;
+    }
+
+    fn imported_impl_matches_trait_requirement(self,
+                                                implementation: rawptr,
+                                                requirement: rawptr,
+                                                owner_type: string) -> bool {
+        if (implementation == null || requirement == null || owner_type.len == 0
+            || decl_get_kind(implementation) != de_METHOD()
+            || decl_get_kind(requirement) != de_METHOD()
+            || decl_get_name(implementation) != decl_get_name(requirement)
+            || decl_get_is_static(implementation) != decl_get_is_static(requirement)) {
+            return false;
+        }
+        // The receiver belongs to two different owners: the concrete type
+        // and the interface. Compare the value parameters after substituting
+        // Self, while requiring both declarations to have a receiver.
+        var concrete_param = decl_get_params(implementation);
+        var required_param = decl_get_params(requirement);
+        if (concrete_param == null || required_param == null
+            || decl_get_name(concrete_param) != "self"
+            || decl_get_name(required_param) != "self") {
+            return false;
+        }
+        concrete_param = decl_get_next(concrete_param);
+        required_param = decl_get_next(required_param);
+        while (concrete_param != null && required_param != null) {
+            let concrete_type = self.type_text_from_ref_env(decl_get_ty(concrete_param), "Self", owner_type);
+            let required_type = self.type_text_from_ref_env(decl_get_ty(required_param), "Self", owner_type);
+            if (concrete_type != required_type) { return false; }
+            concrete_param = decl_get_next(concrete_param);
+            required_param = decl_get_next(required_param);
+        }
+        if (concrete_param != null || required_param != null) { return false; }
+        return self.type_text_from_ref_env(decl_get_ty(implementation), "Self", owner_type)
+            == self.type_text_from_ref_env(decl_get_ty(requirement), "Self", owner_type);
+    }
+
+    fn raw_function_body_decl_for_env(self, d: rawptr, params: string, args: string) -> rawptr {
+        let exact = self.raw_function_body_decl_for(d);
+        if (exact != null) { return exact; }
+        if (d == null || params.len == 0 || args.len == 0) { return null; }
+        let owner_name = self.raw_decl_owner_name(d);
+        var cur = self.decl_map.head;
+        while (cur != null) {
+            let candidate = ast_read_rawptr(cur);
+            if (candidate != null
+                && candidate != d
+                && decl_get_body(candidate) != null
+                && hir_builder_type_owner_names_match(self.raw_decl_owner_name(candidate), owner_name)
+                && self.decl_signature_matches_in_env(d, candidate, params, args)) {
+                return candidate;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        return null;
+    }
+
+    fn method_body_decl_for_instance(self, method_decl: rawptr) -> rawptr {
+        let body_decl = self.raw_function_body_decl_for(method_decl);
+        if (body_decl != null) { return body_decl; }
+        return method_decl;
+    }
+
+    fn method_env_is_exact_self_owner(self,
+                                              owner_type_name: string,
+                                              params: string,
+                                              args: string) -> bool {
+        if (owner_type_name.len == 0) { return false; }
+        if (hir_builder_generic_param_count(params) != 1) { return false; }
+        if (hir_builder_generic_arg_count(args) != 1) { return false; }
+        if (hir_builder_generic_param_at(params, 0) != "Self") { return false; }
+        let self_arg = policy_generic_arg_at(args, 0);
+        if (self_arg == owner_type_name) { return true; }
+        return policy_type_name_equal(self_arg, owner_type_name);
+    }
+
+    fn method_receiver_env_can_use_direct_owner_body(self,
+                                                     method_decl: rawptr,
+                                                     owner_decl: rawptr,
+                                                     receiver_type_name: string,
+                                                     params: string,
+                                                     args: string) -> bool {
+        if (method_decl == null
+            || owner_decl == null
+            || receiver_type_name.len == 0
+            || decl_get_kind(method_decl) != de_METHOD()) {
+            return false;
+        }
+        if (hir_builder_decl_template_params(owner_decl).len > 0) { return false; }
+        if (hir_builder_decl_template_params(method_decl).len > 0) { return false; }
+        if (self.decl_body_has_template_type(method_decl)) { return false; }
+        if (policy_generic_call_args(receiver_type_name.clone()).len > 0) { return false; }
+        if (params.len == 0 && args.len == 0) { return true; }
+        if (hir_builder_generic_param_count(params) != 1) { return false; }
+        if (hir_builder_generic_arg_count(args) != 1) { return false; }
+        if (hir_builder_generic_param_at(params, 0) != "Self") { return false; }
+        let self_arg = policy_generic_arg_at(args, 0);
+        if (self_arg.len == 0) { return false; }
+        let method_owner = hir_raw_owner_map_get(self.decl_owner_map,method_decl);
+        if (method_owner == null) { return false; }
+        var receiver_decl = self.raw_class_decl_for_type_text(self_arg);
+        if (receiver_decl == null) { receiver_decl = self.raw_class_decl_for_type_text(receiver_type_name); }
+        if (receiver_decl == null) { return false; }
+        if (receiver_decl == method_owner) { return true; }
+        if (!self.class_decl_is_or_inherits(receiver_decl, method_owner, 0)) { return false; }
+        let body_decl = self.method_body_decl_for_instance(method_decl);
+        return !self.decl_body_has_self_member_call_cached(body_decl);
+    }
+
+    fn decl_body_has_self_member_call_cached(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        let cached = hir_raw_int_map_get(self.decl_self_member_call_cache,d);
+        if (cached == 2) { return true; }
+        if (cached == 1) { return false; }
+        let out = hir_builder_decl_body_has_self_member_call(d);
+        if (out) {
+            self.decl_self_member_call_cache = hir_raw_int_map_put(self.decl_self_member_call_cache,d, 2);
+        } else {
+            self.decl_self_member_call_cache = hir_raw_int_map_put(self.decl_self_member_call_cache,d, 1);
+        }
+        return out;
+    }
+
+    fn direct_closed_method_function_if_no_instance_env(self,
+                                                               method_decl: rawptr,
+                                                               owner_decl: rawptr,
+                                                               owner_type_name: string,
+                                                               params: string,
+                                                              args: string) -> i32 {
+        let timing_enabled = hir_builder_env_enabled("VYX_HIR_DIRECT_METHOD_TIMING");
+        var timing_start: i64 = 0;
+        var timing_mark: i64 = 0;
+        var timing_receiver_ms: i64 = 0;
+        var timing_owner_ms: i64 = 0;
+        var timing_generic_ms: i64 = 0;
+        var timing_body_ms: i64 = 0;
+        var timing_function_ms: i64 = 0;
+        if (timing_enabled) {
+            timing_start = vyx_bootstrap_now_ms();
+            timing_mark = timing_start;
+        }
+        if (method_decl == null || decl_get_kind(method_decl) != de_METHOD()) {
+            return hir_id_invalid();
+        }
+        let exact_self_owner_env = self.method_env_is_exact_self_owner(owner_type_name, params, args);
+        if (params.len != 0 || args.len != 0) {
+            if (!exact_self_owner_env
+                && !self.method_receiver_env_can_use_direct_owner_body(method_decl,
+                                                                       owner_decl,
+                                                                       owner_type_name,
+                                                                       params,
+                                                                       args)) {
+                return hir_id_invalid();
+            }
+        }
+        if (timing_enabled) {
+            let now_receiver = vyx_bootstrap_now_ms();
+            timing_receiver_ms = now_receiver - timing_mark;
+            timing_mark = now_receiver;
+        }
+        let method_owner_decl = hir_raw_owner_map_get(self.decl_owner_map,method_decl);
+        var receiver_decl_for_owner: rawptr = null;
+        if (method_owner_decl != null && owner_type_name.len > 0) {
+            receiver_decl_for_owner = self.raw_class_decl_for_type_text(owner_type_name);
+        }
+        if (receiver_decl_for_owner != null) {
+            let cached_direct_fn = hir_raw_pair_int_map_get(self.direct_method_function_cache,
+                                                            receiver_decl_for_owner,
+                                                            method_decl);
+            if (cached_direct_fn > 0 && cached_direct_fn != hir_id_invalid()) {
+                return cached_direct_fn;
+            }
+        }
+        if (method_owner_decl != null && owner_type_name.len > 0) {
+            if (receiver_decl_for_owner != method_owner_decl) {
+                var inherited_owner = false;
+                if (receiver_decl_for_owner != null
+                    && self.class_decl_is_or_inherits(receiver_decl_for_owner, method_owner_decl, 0)) {
+                    inherited_owner = true;
+                }
+                if (inherited_owner) {
+                    let body_decl = self.method_body_decl_for_instance(method_decl);
+                    if (self.decl_body_has_self_member_call_cached(body_decl)) {
+                        return hir_id_invalid();
+                    }
+                } else if (!self.raw_owner_decl_matches_type_exact(method_owner_decl, owner_type_name)
+                           && !hir_builder_str_lang_owner_names_match(decl_get_name(method_owner_decl),
+                                                                      owner_type_name)) {
+                    return hir_id_invalid();
+                }
+            }
+        }
+        if (timing_enabled) {
+            let now_owner = vyx_bootstrap_now_ms();
+            timing_owner_ms = now_owner - timing_mark;
+            timing_mark = now_owner;
+        }
+        let exact_non_generic_owner_env = owner_type_name.len > 0
+            && params.len == 0
+            && args.len == 0
+            && method_owner_decl != null
+            && receiver_decl_for_owner == method_owner_decl
+            && hir_builder_decl_template_params(method_owner_decl).len == 0
+            && policy_generic_call_args(owner_type_name.clone()).len == 0;
+        if (timing_enabled) {
+            let now_generic = vyx_bootstrap_now_ms();
+            timing_generic_ms = now_generic - timing_mark;
+            timing_mark = now_generic;
+        }
+        if (method_owner_decl != null
+            && owner_decl != null
+            && method_owner_decl != owner_decl
+            && (decl_get_generic_flags(method_owner_decl) & 2) != 0) {
+            return hir_id_invalid();
+        }
+        if (owner_decl != null && hir_builder_decl_template_params(owner_decl).len > 0) {
+            return hir_id_invalid();
+        }
+        if (owner_type_name.len > 0 && policy_generic_call_args(owner_type_name.clone()).len > 0) {
+            return hir_id_invalid();
+        }
+        let method_body_has_template = self.decl_body_has_template_type(method_decl);
+        if (method_body_has_template && !exact_self_owner_env && !exact_non_generic_owner_env) {
+            return hir_id_invalid();
+        }
+        if (timing_enabled) {
+            let now_body = vyx_bootstrap_now_ms();
+            timing_body_ms = now_body - timing_mark;
+            timing_mark = now_body;
+        }
+        let direct_fn = hir_pointer_map_function(self.decl_map,method_decl);
+        if (direct_fn == hir_id_invalid()) {
+            return hir_id_invalid();
+        }
+        let direct_fn_known_closed = !method_body_has_template
+            && method_owner_decl != null
+            && hir_builder_decl_template_params(method_owner_decl).len == 0
+            && hir_builder_decl_template_params(method_decl).len == 0
+            && owner_type_name.len > 0
+            && policy_generic_call_args(owner_type_name.clone()).len == 0;
+        if (!direct_fn_known_closed && self.function_has_open_template_types(direct_fn)) {
+            return hir_id_invalid();
+        }
+        self.ensure_reachable_function_body(method_decl, direct_fn, false);
+        if (receiver_decl_for_owner != null) {
+            self.direct_method_function_cache = hir_raw_pair_int_map_put(self.direct_method_function_cache,
+                                                                         receiver_decl_for_owner,
+                                                                         method_decl,
+                                                                         direct_fn);
+        }
+        if (timing_enabled) {
+            timing_function_ms = vyx_bootstrap_now_ms() - timing_mark;
+            let total = vyx_bootstrap_now_ms() - timing_start;
+            if (total >= hir_builder_slow_expr_threshold_ms()) {
+                print("[hir-direct-method] owner=" + owner_type_name
+                      + " method=" + decl_get_name(method_decl)
+                      + " total=" + policy_i64_to_string(total)
+                      + " receiver=" + policy_i64_to_string(timing_receiver_ms)
+                      + " ownercheck=" + policy_i64_to_string(timing_owner_ms)
+                      + " generic=" + policy_i64_to_string(timing_generic_ms)
+                      + " body=" + policy_i64_to_string(timing_body_ms)
+                      + " function=" + policy_i64_to_string(timing_function_ms)
+                      + " fn=" + self.i32_text(direct_fn));
+            }
+        }
+        return direct_fn;
+    }
+
+    fn generic_owner_decl_for_method_body(self, method_decl: rawptr, default_owner: rawptr) -> rawptr {
+        if (method_decl != null) {
+            let body_decl = self.method_body_decl_for_instance(method_decl);
+            let body_owner = hir_raw_owner_map_get(self.decl_owner_map,body_decl);
+            if (body_owner != null
+                && hir_builder_decl_template_params(body_owner).len > 0) {
+                return body_owner;
+            }
+            let direct_owner = hir_raw_owner_map_get(self.decl_owner_map,method_decl);
+            if (direct_owner != null
+                && hir_builder_decl_template_params(direct_owner).len > 0) {
+                return direct_owner;
+            }
+        }
+        return default_owner;
+    }
+
+    fn ensure_function_instance(self,
+                                       fn_decl: rawptr,
+                                       owner_decl: rawptr,
+                                       owner_type_name: string,
+                                       params: string,
+                                       args: string) -> i32 {
+        if (fn_decl == null) { return hir_id_invalid(); }
+        if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+            print("[hir-progress] ensure-instance fn=" + decl_get_name(fn_decl)
+                  + " params_in=" + params
+                  + " decl_params=" + hir_builder_decl_template_params(fn_decl)
+                  + " args=" + args);
+        }
+        // A generic caller's environment is lexical context, not an implicit
+        // template list for every callee.  Reusing it for an ordinary free
+        // function creates a bodyless `mir2$helper::T=>...` symbol even though
+        // the declared helper has one stable, non-generic ABI identity.
+        // Methods stay on the instance path because synthetic `Self` and a
+        // generic owner can legitimately specialize their bodies.
+        if (decl_get_kind(fn_decl) == de_FN()
+            && hir_builder_decl_template_params(fn_decl).len == 0) {
+            let direct_fn = hir_pointer_map_function(self.decl_map,fn_decl);
+            if (direct_fn != hir_id_invalid()) {
+                self.ensure_reachable_function_body(fn_decl, direct_fn, false);
+                return direct_fn;
+            }
+            return hir_id_invalid();
+        }
+        // Foreign DCI declarations name a concrete native ABI entrypoint.
+        // They are never language templates, even if a derived receiver
+        // contributes a synthetic `Self` environment during method lookup.
+        // Reusing the declaration target preserves the original DCI owner so
+        // LLVM can perform any required base-subobject adjustment. Creating a
+        // specialized shell here instead changes that owner to the derived
+        // type and silently corrupts non-primary C++ base calls.
+        // Constructors are overload-selected before instantiation (for
+        // example A() versus A(i32)); retain that resolver path so argument
+        // shape remains part of the selection. Ordinary native methods have
+        // no language specialization semantics and can use their declaration
+        // target directly.
+        // DCI *open generic* declarations (`fn f<T>(...) -> T;` inside
+        // `extern "dci"`) are the exception: each call site closes `T` and
+        // the Active Adapter materializes the concrete native entrypoint, so
+        // they must fall through to the instance machinery below.
+        //
+        // A method of a *generic record* is the second exception, and for the
+        // same reason: `struct Pair2<A, B> { fn get_first() const -> A; }` has
+        // no template parameters of its own, but both its `self` receiver and
+        // its signature stay open until the owner's arguments are substituted.
+        // Reusing the declaration target would hand back a function whose
+        // receiver is the bare `Pair2` and whose return type is the unbound
+        // `A`; the caller rejects it as still-open and the call site ends up
+        // with no callee at all.  Falling through builds the concrete owner
+        // class instance plus a bodiless `foreign_dci | declaration_only`
+        // method closed to `Pair2::<f64,i32> -> f64`, which is the shape the
+        // contract's per-instance `kind=method` symbol links against.
+        //
+        // The guard is deliberately narrow: it fires only when the owner is a
+        // template *and* the receiver names concrete arguments, so plain DCI
+        // records (`Vec2::norm1`) and non-primary base-subobject adjustment
+        // keep the original declaration-target behaviour untouched.
+        let owner_needs_instance = owner_decl != null
+            && hir_builder_decl_template_params(owner_decl).len > 0
+            && policy_generic_call_args(owner_type_name.clone()).len > 0;
+        if (hir_builder_decl_is_foreign_dci_native(fn_decl)
+            && hir_builder_decl_template_params(fn_decl).len == 0
+            && !hir_builder_decl_is_foreign_dci_ctor(fn_decl)
+            && !owner_needs_instance) {
+            let direct_fn = hir_pointer_map_function(self.decl_map,fn_decl);
+            if (direct_fn != hir_id_invalid()) {
+                self.ensure_reachable_function_body(fn_decl, direct_fn, false);
+                return direct_fn;
+            }
+            return hir_id_invalid();
+        }
+        let timing_enabled = hir_builder_env_enabled("VYX_HIR_FUNCTION_INSTANCE_TIMING");
+        var timing_start: i64 = 0;
+        var timing_mark: i64 = 0;
+        var timing_key_ms: i64 = 0;
+        var timing_checks_ms: i64 = 0;
+        var timing_owner_ms: i64 = 0;
+        var timing_shell_ms: i64 = 0;
+        var timing_ret_ms: i64 = 0;
+        var timing_async_ms: i64 = 0;
+        var timing_params_ms: i64 = 0;
+        var timing_locals_ready_ms: i64 = 0;
+        var timing_schedule_ms: i64 = 0;
+        if (timing_enabled) {
+            timing_start = vyx_bootstrap_now_ms();
+            timing_mark = timing_start;
+        }
+        var owner_key = owner_type_name;
+        // Like explicit arguments, a receiver owner can carry an outer
+        // template atom (`Self`, `T`, or `Box::<T>`).  Resolve it at the
+        // instance sink before deriving the ABI/cache identity.
+        let resolved_owner = self.canonical_type_text_in_current_env(owner_key);
+        if (resolved_owner.len > 0) {
+            owner_key = resolved_owner;
+        }
+        if (owner_key.len > 0) {
+            owner_key = self.canonical_owner_type_text_for_decl(owner_decl, owner_key);
+        }
+        let args_key = self.canonical_type_args_csv(args);
+        self.profile_function_instance_phase("enter-instance", fn_decl, owner_key, params, args_key);
+        if (timing_enabled) {
+            let now_key = vyx_bootstrap_now_ms();
+            timing_key_ms = now_key - timing_mark;
+            timing_mark = now_key;
+        }
+        if (!self.owner_type_covers_owner_decl(owner_decl, owner_key)) {
+            return hir_id_invalid();
+        }
+        let key = hir_builder_env_key(params, args_key);
+        if (key.len == 0) {
+            let direct_fn = hir_pointer_map_function(self.decl_map,fn_decl);
+            self.ensure_reachable_function_body(fn_decl, direct_fn, false);
+            self.profile_function_instance_phase("direct-instance", fn_decl, owner_key, params, args_key);
+            return direct_fn;
+        }
+        if (!self.env_args_cover_params_for_decl(fn_decl, params, args_key)) {
+            return hir_id_invalid();
+        }
+        if (!self.env_args_closed_for_decl(fn_decl, params, args_key)) {
+            return hir_id_invalid();
+        }
+        if (owner_key.len > 0) {
+            self.ensure_concrete_type_text_known(owner_key);
+        }
+        if (timing_enabled) {
+            let now_checks = vyx_bootstrap_now_ms();
+            timing_checks_ms = now_checks - timing_mark;
+            timing_mark = now_checks;
+        }
+        let existing = hir_decl_instance_map_function(self.function_instances,fn_decl, key);
+        if (existing != hir_id_invalid()) {
+            self.ensure_reachable_function_body(fn_decl, existing, false);
+            self.profile_function_instance_phase("reuse-instance", fn_decl, owner_key, params, args_key);
+            return existing;
+        }
+        var owner_item = hir_id_invalid();
+        let owner_params = hir_builder_decl_template_params(owner_decl);
+        let owner_args = hir_builder_owner_args_for_params(owner_params, owner_key);
+        if (owner_decl != null && owner_params.len > 0 && owner_args.len > 0) {
+            owner_item = self.ensure_class_instance(owner_decl, owner_key, owner_params, owner_args);
+        } else if (owner_decl != null) {
+            owner_item = hir_pointer_map_item(self.decl_map,owner_decl);
+        }
+        if (timing_enabled) {
+            let now_owner = vyx_bootstrap_now_ms();
+            timing_owner_ms = now_owner - timing_mark;
+            timing_mark = now_owner;
+        }
+        // Register the instance shell in the cache BEFORE the heavy
+        // re-materialization steps (return type, param locals, body). Those
+        // steps can re-enter ensure_function_instance with the same key;
+        // without the early registration each re-entry missed the cache and
+        // built a fresh duplicate instance, recursing without a floor.
+        var item_name = hir_builder_function_instance_name(decl_get_name(fn_decl), owner_key, params, args_key);
+        if (hir_builder_decl_is_foreign_dci(fn_decl)
+            && hir_builder_decl_template_params(fn_decl).len > 0) {
+            // Open-generic DCI instances keep a flat, linkable name: the
+            // Active Adapter exports the native entrypoint under exactly
+            // this symbol, so it must never wear the `mir2$` mask.
+            item_name = hir_builder_foreign_dci_instance_name(decl_get_name(fn_decl), args_key);
+        }
+        let item_id = self.unit.add_item(hir_builder_item_kind_from_decl(fn_decl),
+                                        item_name,
+                                        hir_id_invalid(),
+                                        owner_item);
+        self.unit.set_item_source_module(item_id, self.decl_source_module(fn_decl));
+        let fn_id = self.unit.add_function(item_id, item_name, hir_id_invalid());
+        self.unit.set_function_symbol_discriminator(fn_id,
+            hir_builder_decl_symbol_discriminator(fn_decl, owner_decl));
+        // The instance is registered under its mangled name, so carry the
+        // "is a value constructor" fact on the function itself. Without it
+        // `add_function_param_locals_with_owner` never synthesized the hidden
+        // `self` receiver and every `self.field = …` in the body resolved to
+        // no place at all, silently dropping the whole constructor body.
+        // Foreign DCI constructors own their ABI; leave them untouched.
+        if (decl_get_name(fn_decl) == "constructor"
+            && !hir_builder_decl_is_foreign_dci(fn_decl)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_constructor());
+        }
+        self.apply_function_codegen_attr_flags(fn_decl, fn_id);
+        self.unit.set_function_generic_env(fn_id, params, args_key, owner_key);
+        // Publish the reverse provenance as soon as the textual environment is
+        // available. Type interning while constructing the structured env can
+        // re-enter generic lookup; it must observe this closed instance rather
+        // than treating its fresh FunctionId as an unbound declaration shell.
+        self.function_instances = hir_decl_instance_map_put(self.function_instances,
+                                                             fn_decl,
+                                                             key,
+                                                             item_id,
+                                                             fn_id);
+        self.set_structured_generic_env(fn_id, params, args_key, owner_key);
+        self.unit.clear_function_generic_env_strings(fn_id);
+        if (self.env_args_closed_for_decl(fn_decl, params, args_key)
+            && (owner_key.len == 0
+                || !self.type_text_has_open_template_atom_without_env(owner_key))) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_closed_generic_env());
+        }
+        if (self.decl_is_foreign_import(fn_decl) || self.decl_is_foreign_import(owner_decl)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_imported_body());
+        }
+        if (hir_builder_decl_is_task_callable(fn_decl)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_async_task());
+        }
+            if (hir_builder_decl_is_foreign_dci_native(fn_decl)) {
+                self.unit.add_function_flags(fn_id,
+                                            hir_function_flag_foreign_dci()
+                                            | hir_function_flag_declaration_only());
+                if (hir_builder_decl_is_foreign_dci_ctor(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_ctor());
+                }
+                if (hir_builder_decl_is_foreign_dci_dtor(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_dtor());
+                }
+                if (hir_builder_decl_is_foreign_dci_const_method(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_const_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_virtual_method(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_virtual_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_override_method(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_override_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_final_method(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_final_method());
+                }
+            }
+            if (hir_builder_decl_is_foreign_dci(fn_decl)) {
+                if (hir_builder_decl_is_foreign_dci_virtual_method(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_virtual_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_override_method(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_override_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_final_method(fn_decl)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_final_method());
+                }
+            }
+            if (owner_decl != null && self.class_decl_requires_dci_stub(owner_decl, 0)) {
+                if (hir_builder_decl_has_marker(fn_decl, "virtual")) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_virtual_method());
+                }
+                if (hir_builder_decl_has_marker(fn_decl, "override")) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_override_method());
+                }
+                if (hir_builder_decl_has_marker(fn_decl, "final")) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_final_method());
+                }
+            }
+        if (timing_enabled) {
+            let now_shell = vyx_bootstrap_now_ms();
+            timing_shell_ms = now_shell - timing_mark;
+            timing_mark = now_shell;
+        }
+        var ret_type = self.canonical_function_return_type_id_from_env(fn_decl, params, args_key);
+        if (ret_type != hir_id_invalid()) {
+            self.ensure_concrete_type_text_known(hir_type_table_text(self.unit.types, ret_type));
+        }
+        let item_rec = self.unit.item_record(item_id);
+        if (item_rec != null) { ast_write_i32(ptr_offset(item_rec, 8), ret_type); }
+        let fn_rec = self.unit.function_record(fn_id);
+        if (fn_rec != null) { ast_write_i32(ptr_offset(fn_rec, 8), ret_type); }
+        self.index_free_function(hir_builder_item_kind_from_decl(fn_decl), item_name, fn_id);
+        if (timing_enabled) {
+            let now_ret = vyx_bootstrap_now_ms();
+            timing_ret_ms = now_ret - timing_mark;
+            timing_mark = now_ret;
+        }
+        self.ensure_async_runtime_methods_for_task_return(fn_id);
+        if (timing_enabled) {
+            let now_async = vyx_bootstrap_now_ms();
+            timing_async_ms = now_async - timing_mark;
+            timing_mark = now_async;
+        }
+        if (hir_builder_item_kind_from_decl(fn_decl) == hir_item_method()
+            && hir_builder_decl_template_params(fn_decl).len == 0) {
+            self.note_closed_method_instance(owner_key, decl_get_name(fn_decl), fn_id);
+        }
+        let saved_params = self.current_generic_params;
+        let saved_args = self.current_generic_args;
+        self.current_generic_params = params;
+        self.current_generic_args = args_key;
+        self.add_function_param_locals_with_owner(fn_id, fn_decl, owner_key);
+        if (timing_enabled) {
+            let now_params = vyx_bootstrap_now_ms();
+            timing_params_ms = now_params - timing_mark;
+            timing_mark = now_params;
+        }
+        var local_id = self.unit.function_first_local(fn_id);
+        while (local_id != hir_id_invalid()) {
+            self.ensure_concrete_type_text_known(hir_type_table_text(self.unit.types, self.unit.local_type(local_id)));
+            local_id = self.unit.local_next(local_id);
+        }
+        if (timing_enabled) {
+            let now_locals = vyx_bootstrap_now_ms();
+            timing_locals_ready_ms = now_locals - timing_mark;
+            timing_mark = now_locals;
+        }
+        self.ensure_reachable_function_body(fn_decl, fn_id, false);
+        self.current_generic_params = saved_params;
+        self.current_generic_args = saved_args;
+        if (timing_enabled) {
+            timing_schedule_ms = vyx_bootstrap_now_ms() - timing_mark;
+        }
+        self.profile_function_instance_phase("leave-instance", fn_decl, owner_key, params, args_key);
+        if (timing_enabled) {
+            let total = vyx_bootstrap_now_ms() - timing_start;
+            if (total >= hir_builder_slow_expr_threshold_ms()) {
+                print("[hir-function-instance] fn=" + decl_get_name(fn_decl)
+                      + " owner=" + owner_key
+                      + " total=" + policy_i64_to_string(total)
+                      + " key=" + policy_i64_to_string(timing_key_ms)
+                      + " checks=" + policy_i64_to_string(timing_checks_ms)
+                      + " owner_item=" + policy_i64_to_string(timing_owner_ms)
+                      + " shell=" + policy_i64_to_string(timing_shell_ms)
+                      + " ret=" + policy_i64_to_string(timing_ret_ms)
+                      + " async=" + policy_i64_to_string(timing_async_ms)
+                      + " params=" + policy_i64_to_string(timing_params_ms)
+                      + " locals_ready=" + policy_i64_to_string(timing_locals_ready_ms)
+                      + " schedule=" + policy_i64_to_string(timing_schedule_ms)
+                      + " id=" + self.i32_text(fn_id));
+            }
+        }
+        return fn_id;
+    }
+
+    fn owner_type_covers_owner_decl(self, owner_decl: rawptr, owner_type_name: string) -> bool {
+        if (owner_decl == null) { return true; }
+        if (owner_type_name.len > 0 && !self.owner_decl_accepts_owner_type(owner_decl, owner_type_name)) {
+            return false;
+        }
+        let owner_params = hir_builder_decl_template_params(owner_decl);
+        if (owner_params.len == 0) { return true; }
+        if (owner_type_name.len == 0) { return false; }
+        let owner_args = hir_builder_owner_args_for_params(owner_params, owner_type_name);
+        return hir_builder_env_args_cover_params(owner_params, owner_args);
+    }
+
+    fn build_function_instance_body_if_ready(self,
+                                                   fn_decl: rawptr,
+                                                   fn_id: i32,
+                                                   item_id: i32,
+                                                   params: string,
+                                                   args: string) {
+        if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+            var fn_name_dbg = "";
+            if (fn_decl != null) { fn_name_dbg = decl_get_name(fn_decl); }
+            print("[hir-progress] instance-body-enter fn="
+                  + fn_name_dbg
+                  + " id=" + self.i32_text(fn_id)
+                  + " params=" + params
+                  + " args=" + args);
+        }
+        if (fn_decl == null || fn_id == hir_id_invalid()) { return; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) { return; }
+        if (self.body_building(fn_id)) {
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] instance-body-exit reason=body_building id=" + self.i32_text(fn_id));
+            }
+            return;
+        }
+        if (!self.env_args_are_closed(args)) {
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] instance-body-exit reason=args_open id=" + self.i32_text(fn_id) + " args=" + args);
+            }
+            return;
+        }
+        let body_decl = self.raw_function_body_decl_for_env(fn_decl, params, args);
+        if (body_decl == null) {
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] instance-body-exit reason=no_body_decl id=" + self.i32_text(fn_id) + " params=" + params);
+            }
+            return;
+        }
+        // A `@[discard]` tombstone never owns a body in any instantiation
+        // (see `hir_builder_decl_is_discarded`): publish the terminal
+        // decision instead of building an empty body or leaving the request
+        // retryable for MIR to trip over later.
+        if (hir_builder_decl_is_discarded(fn_decl)
+            || hir_builder_decl_is_discarded(body_decl)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+            self.close_function_body_request(fn_id);
+            return;
+        }
+        let saved_params = self.current_generic_params;
+        let saved_args = self.current_generic_args;
+        let saved_body_building = self.body_building_head;
+        self.current_generic_params = params;
+        self.current_generic_args = args;
+        if (self.function_has_open_template_types(fn_id)) {
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] instance-body-exit reason=fn_open_template_types id=" + self.i32_text(fn_id) + " params=" + params);
+            }
+            self.current_generic_params = saved_params;
+            self.current_generic_args = saved_args;
+            self.body_building_head = saved_body_building;
+            return;
+        }
+        if (!self.decl_body_types_close_in_current_env(body_decl)) {
+            if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+                print("[hir-progress] instance-body-exit reason=body_types_open id=" + self.i32_text(fn_id) + " params=" + params);
+            }
+            self.current_generic_params = saved_params;
+            self.current_generic_args = saved_args;
+            self.body_building_head = saved_body_building;
+            return;
+        }
+        let saved_function = self.current_function_id;
+        let saved_item = self.current_item_id;
+        let saved_locals = self.locals.head;
+        let saved_pack_bindings = self.pack_bindings.head;
+        self.push_body_building(body_decl, fn_id);
+        self.profile_body_phase("enter-instance", body_decl, fn_id);
+        self.current_function_id = fn_id;
+        self.current_item_id = item_id;
+        self.locals = hir_local_scope_restore(self.locals, null);
+        self.pack_bindings = hir_pack_bindings_restore(self.pack_bindings, null);
+        if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+            print("[hir-progress] instance-body-before-params id=" + self.i32_text(fn_id));
+        }
+        self.refresh_function_param_drop_metadata(fn_id, body_decl);
+        self.bind_function_param_scope(fn_id, body_decl);
+        self.ensure_task_ready_for_function_return(body_decl, fn_id);
+        if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+            print("[hir-progress] instance-body-before-stmts id=" + self.i32_text(fn_id));
+        }
+        let body_chain = self.build_stmt_chain(decl_get_body(body_decl));
+        if (hir_builder_env_enabled("VYX_HIR_PROGRESS")) {
+            print("[hir-progress] instance-body-after-stmts id=" + self.i32_text(fn_id)
+                  + " first=" + self.i32_text(body_chain.first)
+                  + " count=" + self.i32_text(body_chain.count));
+        }
+        self.unit.set_function_body(fn_id, body_chain.first, body_chain.count);
+        self.locals = hir_local_scope_drop_to(self.locals, saved_locals);
+        self.pack_bindings = hir_pack_bindings_drop_to(self.pack_bindings, saved_pack_bindings);
+        self.current_item_id = saved_item;
+        self.current_function_id = saved_function;
+        self.current_generic_params = saved_params;
+        self.current_generic_args = saved_args;
+        self.body_building_head = saved_body_building;
+        self.profile_body_phase("leave-instance", body_decl, fn_id);
+    }
+
+    fn owner_item_matches_type(self, owner_item: i32, owner_type_name: string) -> bool {
+        if (owner_item == hir_id_invalid() || owner_type_name.len == 0) { return false; }
+        let item_name = self.unit.item_name(owner_item);
+        if (item_name.len == 0) { return false; }
+        let owner_base = policy_generic_call_base(owner_type_name);
+        if (item_name == owner_base) { return true; }
+        if (hir_builder_last_path_segment(item_name) == hir_builder_last_path_segment(owner_base)) { return true; }
+        if (hir_builder_type_owner_names_match(item_name, owner_type_name)) { return true; }
+        return false;
+    }
+
+    fn owner_item_matches_type_exact(self, owner_item: i32, owner_type_name: string) -> bool {
+        if (owner_item == hir_id_invalid() || owner_type_name.len == 0) { return false; }
+        let item_name = self.unit.item_name(owner_item);
+        if (item_name.len == 0) { return false; }
+        if (item_name == owner_type_name || policy_type_name_equal(item_name, owner_type_name)) { return true; }
+        let owner_base = policy_generic_call_base(owner_type_name);
+        if (owner_base.len > 0 && (item_name == owner_base || policy_type_name_equal(item_name, owner_base))) {
+            return true;
+        }
+        return false;
+    }
+
+    fn function_candidate_has_exact_owner_type(self, fn_id: i32, owner_type_name: string) -> bool {
+        if (fn_id == hir_id_invalid() || owner_type_name.len == 0) { return false; }
+        let function_owner_type = hir_unit_function_owner_type(self.unit, fn_id);
+        if (function_owner_type.len > 0) {
+            if (function_owner_type == owner_type_name) { return true; }
+            return policy_type_name_equal(function_owner_type, owner_type_name);
+        }
+        let item_id = self.unit.function_item(fn_id);
+        if (item_id == hir_id_invalid()) { return false; }
+        return self.owner_item_matches_type_exact(self.unit.item_owner(item_id), owner_type_name);
+    }
+
+    fn function_candidate_covers_owner_type(self, fn_id: i32, owner_type_name: string) -> bool {
+        if (fn_id == hir_id_invalid() || owner_type_name.len == 0) { return true; }
+        let owner_args = policy_generic_call_args(owner_type_name.clone());
+        if (owner_args.len == 0) { return true; }
+        let function_owner_type = hir_unit_function_owner_type(self.unit, fn_id);
+        if (function_owner_type.len > 0) {
+            if (function_owner_type == owner_type_name) { return true; }
+            if (policy_type_name_equal(function_owner_type, owner_type_name)) { return true; }
+            return false;
+        }
+        let item_id = self.unit.function_item(fn_id);
+        if (item_id == hir_id_invalid()) { return false; }
+        let owner_item = self.unit.item_owner(item_id);
+        if (owner_item == hir_id_invalid()) { return true; }
+        let owner_item_name = self.unit.item_name(owner_item);
+        if (policy_generic_call_args(owner_item_name.clone()).len > 0) {
+            return owner_item_name == owner_type_name || policy_type_name_equal(owner_item_name, owner_type_name);
+        }
+        let owner_raw = hir_pointer_map_raw_for_item(self.decl_map,owner_item);
+        if (owner_raw != null && hir_builder_decl_template_params(owner_raw).len > 0) {
+            return false;
+        }
+        return true;
+    }
+
+    fn env_args_closed_for_decl(self, d: rawptr, params: string, args: string) -> bool {
+        if (!self.env_args_cover_params_for_decl(d, params, args)) { return false; }
+        if (self.env_args_reference_params(params, args)) { return false; }
+        return self.env_args_are_closed(args);
+    }
+
+    // The function environment may contain an unrelated owner or synthetic
+    // `Self` binding. Closure for a raw generic declaration requires every
+    // parameter declared by that declaration to be bound concretely, rather
+    // than merely treating an empty environment as vacuously closed.
+    fn decl_template_params_closed_in_function_env(self,
+                                                   d: rawptr,
+                                                   env_params: string,
+                                                   env_args: string) -> bool {
+        let required_params = hir_builder_decl_template_params(d);
+        if (required_params.len == 0) { return true; }
+        // `...args: Ts` is represented by one template parameter but zero or
+        // more flattened environment arguments.  In particular, `f()` for
+        // `fn f<...Ts>(...args: Ts)` has `params=Ts,args=""`: that is a
+        // closed empty pack, not an unbound ordinary generic parameter.
+        // First validate the complete parameter shape, then map trailing
+        // parameters around a pack back to their actual flattened arguments.
+        if (!self.env_args_cover_params_for_decl(d, env_params, env_args)) {
+            return false;
+        }
+        var pack_name = "";
+        var raw_param = decl_get_params(d);
+        while (raw_param != null && pack_name.len == 0) {
+            if (hir_builder_variadic_param(raw_param)) {
+                pack_name = hir_builder_param_pack_type_name(raw_param);
+            }
+            raw_param = decl_get_next(raw_param);
+        }
+        var env_param_count: i32 = 0;
+        var pack_index: i32 = -1;
+        while (env_param_count < 64) {
+            let env_param = hir_builder_generic_param_at(env_params, env_param_count);
+            if (env_param.len == 0) { break; }
+            if (env_param == pack_name) { pack_index = env_param_count; }
+            env_param_count = env_param_count + 1;
+        }
+        let arg_count = hir_builder_generic_arg_count(env_args);
+        let trailing_params = if (pack_index >= 0) {
+            env_param_count - pack_index - 1
+        } else {
+            0
+        };
+        var idx: i32 = 0;
+        while (idx < 64) {
+            let required = hir_builder_generic_param_at(required_params, idx);
+            if (required.len == 0) { return true; }
+            var env_index: i32 = 0;
+            while (env_index < env_param_count
+                   && hir_builder_generic_param_at(env_params, env_index) != required) {
+                env_index = env_index + 1;
+            }
+            if (env_index >= env_param_count) { return false; }
+            if (pack_index >= 0 && env_index == pack_index) {
+                // Empty is a valid closed pack.  A non-empty pack is closed
+                // only when every flattened member is concrete.
+                var pack_arg_index = pack_index;
+                let pack_arg_end = arg_count - trailing_params;
+                while (pack_arg_index < pack_arg_end) {
+                    let bound_pack_arg = policy_generic_arg_at(env_args, pack_arg_index);
+                    if (bound_pack_arg.len == 0
+                        || self.type_text_has_open_template_atom_without_env(bound_pack_arg)) {
+                        return false;
+                    }
+                    pack_arg_index = pack_arg_index + 1;
+                }
+            } else {
+                var arg_index = env_index;
+                if (pack_index >= 0 && env_index > pack_index) {
+                    arg_index = arg_count - trailing_params + (env_index - pack_index - 1);
+                }
+                let bound = policy_generic_arg_at(env_args, arg_index);
+                if (bound.len == 0 || self.type_text_has_open_template_atom_without_env(bound)) {
+                    return false;
+                }
+            }
+            idx = idx + 1;
+        }
+        return false;
+    }
+
+    fn concrete_impl_method_decl(self, method_name: string, owner_type_name: string) -> rawptr {
+        if (method_name.len == 0 || owner_type_name.len == 0) { return null; }
+        var item_id: i32 = 1;
+        while (item_id <= self.unit.item_count) {
+            if (self.unit.item_kind(item_id) == hir_item_method()
+                && self.unit.item_name(item_id) == method_name
+                && self.owner_item_matches_type(self.unit.item_owner(item_id), owner_type_name)) {
+                let raw_decl = hir_pointer_map_raw_for_item(self.decl_map,item_id);
+                if (raw_decl != null) {
+                    let body_decl = self.raw_function_body_decl_for(raw_decl);
+                    if (body_decl != null
+                        && (hir_builder_body_resolved(body_decl) || decl_get_body(body_decl) != null)) {
+                        return body_decl;
+                    }
+                }
+            }
+            item_id = item_id + 1;
+        }
+        return null;
+    }
+
+    fn concrete_impl_method_decl_for_call(self,
+                                           method_name: string,
+                                           owner_type_name: string,
+                                           call_expr: rawptr,
+                                           call_expr_id: i32) -> rawptr {
+        if (method_name.len == 0
+            || owner_type_name.len == 0
+            || call_expr_id == hir_id_invalid()) {
+            return null;
+        }
+        var best: rawptr = null;
+        var best_score: i32 = -1;
+        var tied = false;
+        var item_id: i32 = 1;
+        while (item_id <= self.unit.item_count) {
+            if (self.unit.item_kind(item_id) == hir_item_method()
+                && self.unit.item_name(item_id) == method_name
+                && self.owner_item_matches_type(self.unit.item_owner(item_id), owner_type_name)) {
+                let raw_decl = hir_pointer_map_raw_for_item(self.decl_map,item_id);
+                let body_decl = self.raw_function_body_decl_for(raw_decl);
+                if (raw_decl != null
+                    && body_decl != null
+                    && hir_builder_body_resolved(body_decl)
+                    && hir_builder_method_decl_matches_static_use(raw_decl, false)) {
+                    let score = self.method_decl_score_for_call(call_expr,
+                                                                call_expr_id,
+                                                                raw_decl,
+                                                                owner_type_name);
+                    if (score > best_score) {
+                        best = body_decl;
+                        best_score = score;
+                        tied = false;
+                    } else if (score == best_score && score >= 0 && body_decl != best) {
+                        tied = true;
+                    }
+                }
+            }
+            item_id = item_id + 1;
+        }
+        if (best_score < 0 || tied) { return null; }
+        return best;
+    }
+
+    fn concrete_impl_owner_decl(self, impl_decl: rawptr) -> rawptr {
+        if (impl_decl == null) { return null; }
+        let owner_item = hir_pointer_map_item(self.decl_map,impl_decl);
+        if (owner_item == hir_id_invalid()) { return hir_raw_owner_map_get(self.decl_owner_map,impl_decl); }
+        return hir_pointer_map_raw_for_item(self.decl_map,self.unit.item_owner(owner_item));
+    }
+
+    fn imported_impl_method_for_requirement(self,
+                                            requirement: rawptr,
+                                            owner_type: string) -> rawptr {
+        if (requirement == null || owner_type.len == 0) { return null; }
+        let trait_owner = hir_raw_owner_map_get(self.decl_owner_map,requirement);
+        if (trait_owner == null || (decl_get_generic_flags(trait_owner) & 2) == 0) {
+            return null;
+        }
+        let trait_name = decl_get_name(trait_owner);
+        let method_name = decl_get_name(requirement);
+        var found: rawptr = null;
+        var item_id: i32 = 1;
+        while (item_id <= self.unit.item_count) {
+            if (self.unit.item_kind(item_id) == hir_item_method()
+                && self.unit.item_name(item_id) == method_name
+                && self.owner_item_matches_type(self.unit.item_owner(item_id), owner_type)) {
+                let method = hir_pointer_map_raw_for_item(self.decl_map,item_id);
+                let impl_owner = self.concrete_impl_owner_decl(method);
+                if (method != null && self.decl_is_foreign_import(method)
+                    && decl_get_body(method) == null
+                    && self.raw_function_body_decl_for(method) == null
+                    && hir_builder_decl_template_params(method).len == 0
+                    && impl_owner != null
+                    && hir_builder_string_contains(decl_get_generic_params(impl_owner), "|kind:impl")
+                    && decl_get_name(impl_owner) == owner_type
+                    && hir_builder_trait_names_match(
+                        hir_builder_impl_trait_at(decl_get_generic_params(impl_owner), 0),
+                        trait_name)
+                    && self.imported_impl_matches_trait_requirement(method,
+                                                                     requirement,
+                                                                     owner_type)) {
+                    if (found != null && found != method) { return null; }
+                    found = method;
+                }
+            }
+            item_id = item_id + 1;
+        }
+        return found;
+    }
+}

@@ -1,0 +1,832 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Type resolution for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn concrete_type_ref(self, ty: rawptr) -> rawptr {
+        self.profile_concrete_type_ref_calls = self.profile_concrete_type_ref_calls + 1;
+        if (ty == null) { return null; }
+        if (self.current_generic_params.len == 0 || self.current_generic_args.len == 0) {
+            return ty;
+        }
+        let inferred = self.inference_type_text_from_ref_env(ty,
+                                                             self.current_generic_params,
+                                                             self.current_generic_args);
+        if (inferred.len > 0) {
+            let self_binding = self.current_generic_binding("Self");
+            if (self_binding.len > 0
+                && policy_generic_call_args(self_binding).len > 0
+                && policy_generic_call_args(inferred).len == 0
+                && policy_type_name_equal(inferred, policy_generic_call_base(self_binding))) {
+                return self.type_ref_from_text(self_binding);
+            }
+            return self.type_ref_from_text(inferred);
+        }
+        let concrete = sema_substitute_type_with_args(ty,
+                                                     self.current_generic_params,
+                                                     self.current_generic_args);
+        if (concrete != null && tref_get_kind(concrete) == ty_CLASS()) {
+            let name = tref_get_name(concrete);
+            let self_binding = self.current_generic_binding("Self");
+            if (self_binding.len > 0
+                && policy_generic_call_args(self_binding).len > 0
+                && policy_generic_call_args(name).len == 0
+                && policy_type_name_equal(name, policy_generic_call_base(self_binding))) {
+                return tref_alloc(ty_CLASS(), self_binding);
+            }
+        }
+        return concrete;
+    }
+
+    fn remember_type_ref_id(self, ty: rawptr, env_key: string, type_id: i32) -> i32 {
+        if (ty == null || type_id == hir_id_invalid()) { return type_id; }
+        if (env_key.len == 0) {
+            self.type_ref_ids = hir_raw_type_id_map_put(self.type_ref_ids,ty, type_id);
+        } else {
+            self.type_ref_env_ids = hir_decl_instance_map_put(self.type_ref_env_ids,ty, env_key, type_id, hir_id_invalid());
+        }
+        return type_id;
+    }
+
+    fn cached_type_ref_id(self, ty: rawptr, env_key: string) -> i32 {
+        if (ty == null) { return hir_id_invalid(); }
+        if (env_key.len == 0) {
+            return hir_raw_type_id_map_get(self.type_ref_ids,ty);
+        }
+        return hir_decl_instance_map_item(self.type_ref_env_ids,ty, env_key);
+    }
+
+    fn type_id_from_applied_alias(self, alias_decl: rawptr, applied_name: string) -> i32 {
+        if (alias_decl == null) { return hir_id_invalid(); }
+        let target = decl_get_ty(alias_decl);
+        if (target == null) { return hir_id_invalid(); }
+        let gp = hir_builder_generic_head(decl_get_generic_params(alias_decl));
+        let args = policy_generic_call_args(applied_name.clone());
+        if (gp.len > 0 && args.len > 0) {
+            return self.type_id_from_ref_env(target, gp, args);
+        }
+        return self.type_id_from_ref(target);
+    }
+
+    fn type_id_from_ref(self, ty: rawptr) -> i32 {
+        self.profile_type_id_ref_calls = self.profile_type_id_ref_calls + 1;
+        if (ty == null) { return hir_id_invalid(); }
+        let env_key = hir_builder_env_key(self.current_generic_params, self.current_generic_args);
+        let cached_id = self.cached_type_ref_id(ty, env_key);
+        if (cached_id != hir_id_invalid()) { return cached_id; }
+        if (self.current_generic_params.len > 0 && self.current_generic_args.len > 0) {
+            let inferred = self.inference_type_text_from_ref_env(ty,
+                                                                  self.current_generic_params,
+                                                                  self.current_generic_args);
+            if (inferred.len > 0) {
+                let self_binding = self.current_generic_binding("Self");
+                if (self_binding.len > 0
+                    && policy_generic_call_args(self_binding).len > 0
+                    && policy_generic_call_args(inferred).len == 0
+                    && policy_type_name_equal(inferred, policy_generic_call_base(self_binding))) {
+                    return self.remember_type_ref_id(ty, env_key, self.type_id_from_text(self_binding));
+                }
+                return self.remember_type_ref_id(ty, env_key, self.type_id_from_text(inferred));
+            }
+        }
+        if (tref_get_kind(ty) == ty_CLASS()) {
+            let name = tref_get_name(ty);
+            let resolved = self.resolve_type_text_in_current_env(name);
+            if (resolved.len > 0 && resolved != name) {
+                let resolved_alias = self.find_type_alias_decl(resolved);
+                if (resolved_alias != null && decl_get_ty(resolved_alias) != null) {
+                    return self.remember_type_ref_id(ty, env_key, self.type_id_from_applied_alias(resolved_alias, resolved));
+                }
+                return self.remember_type_ref_id(ty, env_key, self.type_id_from_text(resolved));
+            }
+            let alias_decl_fast = self.find_type_alias_decl(name);
+            if (alias_decl_fast != null && decl_get_ty(alias_decl_fast) != null) {
+                let alias_text_fast = self.type_name_for_ref(decl_get_ty(alias_decl_fast));
+                if (alias_text_fast.len > 0 && alias_text_fast != name) {
+                    return self.remember_type_ref_id(ty, env_key, self.type_id_from_applied_alias(alias_decl_fast, name));
+                }
+            }
+        }
+        let concrete = self.concrete_type_ref(ty);
+        var out_id = hir_id_invalid();
+        if (concrete != null && tref_get_kind(concrete) == ty_CLASS()) {
+            let name = tref_get_name(concrete);
+            let resolved = self.resolve_type_text_in_current_env(name);
+            if (resolved.len > 0 && resolved != name) {
+                let resolved_alias = self.find_type_alias_decl(resolved);
+                if (resolved_alias != null && decl_get_ty(resolved_alias) != null) {
+                    out_id = self.type_id_from_applied_alias(resolved_alias, resolved);
+                    return self.remember_type_ref_id(ty, env_key, out_id);
+                }
+                out_id = self.type_id_from_text(resolved);
+                return self.remember_type_ref_id(ty, env_key, out_id);
+            }
+            let alias_decl = self.find_type_alias_decl(name);
+            if (alias_decl != null && decl_get_ty(alias_decl) != null) {
+                let alias_text = self.type_name_for_ref(decl_get_ty(alias_decl));
+                if (alias_text.len > 0 && alias_text != name) {
+                    out_id = self.type_id_from_applied_alias(alias_decl, name);
+                    return self.remember_type_ref_id(ty, env_key, out_id);
+                }
+            }
+            let canonical_name = self.canonical_type_text_for_lookup(name, 0);
+            if (canonical_name.len > 0 && canonical_name != name) {
+                out_id = self.type_id_from_text(canonical_name);
+                return self.remember_type_ref_id(ty, env_key, out_id);
+            }
+        }
+        out_id = self.unit.types.intern_type_ref(concrete);
+        return self.remember_type_ref_id(ty, env_key, out_id);
+    }
+
+    fn fn_type_text_close_paren(self, text: string, open_idx: i32) -> i32 {
+        if (open_idx < 0 || open_idx >= text.len || text.charAt(open_idx) != 40) { return -1; }
+        var depth: i32 = 0;
+        var i: i32 = open_idx;
+        while (i < text.len) {
+            let c = text.charAt(i);
+            if (c == 40) {
+                depth = depth + 1;
+            } elif (c == 41) {
+                depth = depth - 1;
+                if (depth == 0) { return i; }
+                if (depth < 0) { return -1; }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    fn function_type_ref_from_text(self, text: string) -> rawptr {
+        if (text.len < 6) { return null; }
+        var open_idx: i32 = -1;
+        var c_abi: bool = false;
+        if (text.len >= 3 && text.substring(0, 3) == "fn(") {
+            open_idx = 2;
+        } elif (text.len >= 4 && text.substring(0, 4) == "cfn(") {
+            open_idx = 3;
+            c_abi = true;
+        } elif (text.len >= 10 && text.substring(0, 10) == "unsafe fn(") {
+            open_idx = 9;
+            c_abi = true;
+        }
+        if (open_idx < 0) { return null; }
+        let close_idx = self.fn_type_text_close_paren(text, open_idx);
+        if (close_idx < 0 || close_idx + 2 >= text.len) { return null; }
+        if (text.charAt(close_idx + 1) != 45 || text.charAt(close_idx + 2) != 62) { return null; }
+        let params_text = text.substring(open_idx + 1, close_idx);
+        let ret_text = text.substring(close_idx + 3, text.len);
+        var count: i32 = 0;
+        if (params_text.len > 0) {
+            while (count < 256) {
+                let arg = policy_generic_arg_at(params_text, count);
+                if (arg.len == 0) { break; }
+                count = count + 1;
+            }
+        }
+        var buf: rawptr = null;
+        if (count > 0) {
+            buf = hir_profile_malloc((count * 8) as u64);
+            if (buf == null) { return null; }
+            memset(buf, 0, (count * 8) as u64);
+            var idx: i32 = 0;
+            while (idx < count) {
+                let arg_text = policy_generic_arg_at(params_text, idx);
+                ast_write_rawptr(ptr_offset(buf, idx * 8), self.type_ref_from_text(arg_text));
+                idx = idx + 1;
+            }
+        }
+        let params_ref = tref_alloc_tuple(buf, count as i64);
+        let ret_ref = self.type_ref_from_text(ret_text);
+        if (c_abi) { return tref_alloc_c_fn(params_ref, ret_ref); }
+        return tref_alloc_fn(params_ref, ret_ref);
+    }
+
+    fn array_size_text_to_i64(self, size_text: string) -> i64 {
+        var clean = hir_builder_trim(size_text);
+        if (hir_builder_string_is_i64_lit(clean.clone())) {
+            return hir_builder_parse_i64_lit(clean);
+        }
+        if (clean.len >= 2
+            && clean.charAt(0) == 40
+            && clean.charAt((clean.len - 1) as i32) == 41) {
+            clean = hir_builder_trim(clean.substring(1, (clean.len - 1) as i32));
+        }
+        if (clean.startsWith("int ")) {
+            var start: i32 = 4;
+            while (start < clean.len) {
+                let ch_space = clean.charAt(start);
+                if (ch_space != 32 && ch_space != 9 && ch_space != 10 && ch_space != 13) { break; }
+                start = start + 1;
+            }
+            var end = start;
+            if (end < clean.len && clean.charAt(end) == 45) { end = end + 1; }
+            while (end < clean.len) {
+                let ch = clean.charAt(end);
+                if (ch < 48 || ch > 57) {
+                    return hir_builder_parse_i64_lit(clean.substring(start, end));
+                }
+                end = end + 1;
+            }
+            if (end > start) {
+                let lit = clean.substring(start, end);
+                if (hir_builder_string_is_i64_lit(lit.clone())) {
+                    return hir_builder_parse_i64_lit(lit);
+                }
+            }
+        }
+        return -1;
+    }
+
+    fn array_type_ref_from_text(self, text: string) -> rawptr {
+        let clean = hir_builder_trim(text);
+        if (clean.len < 5) { return null; }
+        if (clean.charAt(0) != 91 || clean.charAt((clean.len - 1) as i32) != 93) { return null; }
+        var depth: i32 = 0;
+        var split: i32 = -1;
+        var i: i32 = 1;
+        while (i < clean.len - 1) {
+            let ch = clean.charAt(i);
+            if (ch == 91) {
+                depth = depth + 1;
+            } else if (ch == 93) {
+                if (depth > 0) { depth = depth - 1; }
+            } else if (ch == 59 && depth == 0) {
+                split = i;
+                i = clean.len as i32;
+            }
+            i = i + 1;
+        }
+        if (split <= 1 || split >= clean.len - 2) { return null; }
+        let elem_text = hir_builder_trim(clean.substring(1, split));
+        let size_text = hir_builder_trim(clean.substring(split + 1, (clean.len - 1) as i32));
+        let arr_size = self.array_size_text_to_i64(size_text.clone());
+        if (elem_text.len == 0 || arr_size < 0) { return null; }
+        let elem_ref = self.type_ref_from_text(elem_text);
+        if (elem_ref == null) { return null; }
+        return tref_alloc_array(elem_ref, arr_size);
+    }
+
+    fn canonical_array_type_text_for_lookup(self, text: string, depth: i32) -> string {
+        let clean = hir_builder_trim(text);
+        if (clean.len < 5) { return ""; }
+        if (clean.charAt(0) != 91 || clean.charAt((clean.len - 1) as i32) != 93) { return ""; }
+        var nested: i32 = 0;
+        var split: i32 = -1;
+        var i: i32 = 1;
+        while (i < clean.len - 1) {
+            let ch = clean.charAt(i);
+            if (ch == 91) {
+                nested = nested + 1;
+            } else if (ch == 93) {
+                if (nested > 0) { nested = nested - 1; }
+            } else if (ch == 59 && nested == 0) {
+                split = i;
+                i = clean.len as i32;
+            }
+            i = i + 1;
+        }
+        if (split <= 1 || split >= clean.len - 2) { return ""; }
+        let elem_text = hir_builder_trim(clean.substring(1, split));
+        let size_text = hir_builder_trim(clean.substring(split + 1, (clean.len - 1) as i32));
+        if (elem_text.len == 0 || size_text.len == 0) { return ""; }
+        return "[" + self.canonical_type_text_for_lookup(elem_text, depth + 1)
+            + ";" + size_text + "]";
+    }
+
+    fn generic_text_with_args_like(self, original: string, base: string, args: string) -> string {
+        if (args.len == 0) { return base; }
+        let original_base = policy_generic_call_base(original);
+        if (original_base.len > 0
+            && original.len > original_base.len + 1
+            && original.substring(original_base.len as i32, (original_base.len + 2) as i32) == "::") {
+            return base + "::<" + args + ">";
+        }
+        return base + "<" + args + ">";
+    }
+
+    fn canonical_type_text_for_lookup(self, text: string, depth: i32) -> string {
+        if (text.len == 0 || depth > 64) { return text; }
+        if (hir_builder_is_primitive_str_name(text)) { return "str"; }
+        if (text.startsWith("*")) {
+            return "ptr<" + self.canonical_type_text_for_lookup(text.substring(1, text.len).trim(), depth + 1) + ">";
+        }
+        if (text.startsWith("&mut ")) {
+            return "mutref<" + self.canonical_type_text_for_lookup(text.substring(5, text.len).trim(), depth + 1) + ">";
+        }
+        if (text.startsWith("&")) {
+            return "ref<" + self.canonical_type_text_for_lookup(text.substring(1, text.len).trim(), depth + 1) + ">";
+        }
+        let fn_open = self.function_type_open_index(text);
+        if (fn_open >= 0) {
+            let fn_close = self.fn_type_text_close_paren(text, fn_open);
+            if (fn_close > fn_open
+                && fn_close + 2 < text.len
+                && text.charAt(fn_close + 1) == 45
+                && text.charAt(fn_close + 2) == 62) {
+                let prefix = text.substring(0, fn_open + 1);
+                let params_text = text.substring(fn_open + 1, fn_close);
+                let ret_text = text.substring(fn_close + 3, text.len);
+                var out_params = "";
+                var idx: i32 = 0;
+                while (idx < 256) {
+                    let part = policy_generic_arg_at(params_text.clone(), idx);
+                    if (part.len == 0) { break; }
+                    out_params = hir_builder_append_csv(out_params,
+                                                        self.canonical_type_text_for_lookup(part, depth + 1));
+                    idx = idx + 1;
+                }
+                return prefix + out_params + ")->"
+                    + self.canonical_type_text_for_lookup(ret_text, depth + 1);
+            }
+        }
+        let array_text = self.canonical_array_type_text_for_lookup(text, depth + 1);
+        if (array_text.len > 0) { return array_text; }
+        if (policy_generic_call_has_args(text) != 0) {
+            let base = policy_generic_call_base(text);
+            let raw_args = policy_generic_call_args(text);
+            var out_args = "";
+            var arg_idx: i32 = 0;
+            while (arg_idx < 256) {
+                let raw_arg = policy_generic_arg_at(raw_args.clone(), arg_idx);
+                if (raw_arg.len == 0) { break; }
+                out_args = hir_builder_append_csv(out_args,
+                                                  self.canonical_type_text_for_lookup(raw_arg, depth + 1));
+                arg_idx = arg_idx + 1;
+            }
+            var canonical_base = base;
+            let owner_decl = self.raw_class_decl_for_type_text(text);
+            if (owner_decl != null) {
+                let owner_name = decl_get_name(owner_decl);
+                let owner_base = policy_generic_call_base(owner_name);
+                if (owner_base.len > 0) { canonical_base = owner_base; }
+                else if (owner_name.len > 0) { canonical_base = owner_name; }
+            }
+            return self.generic_text_with_args_like(text, canonical_base, out_args);
+        }
+        let raw_owner = self.raw_class_decl_for_type_text(text);
+        if (raw_owner != null) {
+            let raw_name = decl_get_name(raw_owner);
+            let raw_base = policy_generic_call_base(raw_name);
+            if (raw_base.len > 0) { return raw_base; }
+            if (raw_name.len > 0) { return raw_name; }
+        }
+        return text;
+    }
+
+    fn pointer_type_ref_from_text(self, text: string) -> rawptr {
+        if (policy_generic_call_has_args(text) == 0) { return null; }
+        let base = policy_generic_call_base(text);
+        var kind = hir_type_unknown();
+        if (base == "ptr") {
+            kind = ty_PTR();
+        } elif (base == "ref") {
+            kind = ty_REF();
+        } elif (base == "mutref") {
+            kind = ty_MUTREF();
+        } else {
+            return null;
+        }
+        let args = policy_generic_call_args(text);
+        let pointee_text = policy_generic_arg_at(args, 0);
+        if (pointee_text.len == 0 || policy_generic_arg_at(args, 1).len > 0) {
+            return null;
+        }
+        let pointee = self.type_ref_from_text(pointee_text);
+        if (pointee == null) { return null; }
+        return tref_alloc_ptr_like(kind, pointee);
+    }
+
+    fn type_ref_from_text(self, text: string) -> rawptr {
+        // Bounded fixed-point canonicalization: the previous self-recursion
+        // had no depth cap, so a non-converging canonical form (e.g. alias
+        // oscillation) recursed forever while allocating on every level.
+        var canonical = text;
+        var canon_round: i32 = 0;
+        while (canon_round < 8) {
+            let next_canonical = self.canonical_type_text_for_lookup(canonical, 0);
+            if (next_canonical == canonical) { break; }
+            canonical = next_canonical;
+            canon_round = canon_round + 1;
+        }
+        if (canonical == "i32") { return tref_alloc(ty_I32(), ""); }
+        if (canonical == "i64") { return tref_alloc(ty_I64(), ""); }
+        if (canonical == "bool") { return tref_alloc(ty_BOOL(), ""); }
+        if (canonical == "char") { return tref_alloc(ty_CHAR(), ""); }
+        if (hir_builder_is_primitive_str_name(canonical)) { return tref_alloc(ty_STRING(), ""); }
+        if (canonical == "rawptr") { return tref_alloc(ty_RAWPTR(), ""); }
+        if (canonical == "void") { return tref_alloc(ty_VOID(), ""); }
+        if (canonical == "f32") { return tref_alloc(ty_F32(), ""); }
+        if (canonical == "f64") { return tref_alloc(ty_F64(), ""); }
+        if (canonical == "i8") { return tref_alloc(ty_I8(), ""); }
+        if (canonical == "i16") { return tref_alloc(ty_I16(), ""); }
+        if (canonical == "u8") { return tref_alloc(ty_U8(), ""); }
+        if (canonical == "u16") { return tref_alloc(ty_U16(), ""); }
+        if (canonical == "u32") { return tref_alloc(ty_U32(), ""); }
+        if (canonical == "u64") { return tref_alloc(ty_U64(), ""); }
+        if (canonical == "isize") { return tref_alloc(ty_ISIZE(), ""); }
+        if (canonical == "usize") { return tref_alloc(ty_USIZE(), ""); }
+        let pointer_ref = self.pointer_type_ref_from_text(canonical);
+        if (pointer_ref != null) { return pointer_ref; }
+        let fn_ref = self.function_type_ref_from_text(canonical);
+        if (fn_ref != null) { return fn_ref; }
+        let array_ref = self.array_type_ref_from_text(canonical);
+        if (array_ref != null) { return array_ref; }
+        return tref_alloc(ty_CLASS(), canonical);
+    }
+
+    fn type_id_from_text(self, text: string) -> i32 {
+        self.profile_type_id_text_calls = self.profile_type_id_text_calls + 1;
+        if (text.len == 0) { return hir_id_invalid(); }
+        let cached_text = hir_name_id_map_get(self.type_text_id_cache,text);
+        if (cached_text != hir_id_invalid()) { return cached_text; }
+        let canonical = self.canonical_type_text_for_lookup(text, 0);
+        let cached = hir_name_id_map_get(self.type_text_id_cache,canonical);
+        if (cached != hir_id_invalid()) { return cached; }
+        let out = self.unit.types.intern_type_ref(self.type_ref_from_text(canonical));
+        if (out != hir_id_invalid()) {
+            self.type_text_id_cache = hir_name_id_map_put(self.type_text_id_cache,canonical, out);
+            if (canonical != text) {
+                self.type_text_id_cache = hir_name_id_map_put(self.type_text_id_cache,text, out);
+            }
+        }
+        return out;
+    }
+
+    fn type_id_from_expr(self, expr: rawptr) -> i32 {
+        if (expr == null) { return hir_id_invalid(); }
+        return self.type_id_from_ref(expr_get_ty(expr));
+    }
+
+    fn reflect_method_value_type_id_from_name(self, raw_name: string) -> i32 {
+        let base = policy_generic_call_base(raw_name);
+        if (base != "reflect_method_value") { return hir_id_invalid(); }
+        let args = policy_generic_call_args(raw_name);
+        let target_text = policy_generic_arg_at(args, 0);
+        if (target_text.len == 0) { return hir_id_invalid(); }
+        let resolved = self.canonical_type_text_in_current_env(target_text);
+        if (resolved.len == 0) { return hir_id_invalid(); }
+        return self.type_id_from_text(resolved);
+    }
+
+    fn local_type_id_from_expr(self, expr: rawptr) -> i32 {
+        if (expr == null) { return hir_id_invalid(); }
+        let target = expr_get_semantic_target(expr);
+        let local_id = hir_local_scope_lookup_target(self.locals, target);
+        if (local_id != hir_id_invalid()) { return self.unit.local_type(local_id); }
+        let local_by_name = hir_local_scope_lookup(self.locals, expr_get_name(expr));
+        if (local_by_name != hir_id_invalid()) { return self.unit.local_type(local_by_name); }
+        let captured_id = self.ensure_capture_local(target);
+        if (captured_id != hir_id_invalid()) { return self.unit.local_type(captured_id); }
+        let captured_by_name = self.ensure_capture_local_by_name(expr_get_name(expr), target);
+        if (captured_by_name != hir_id_invalid()) { return self.unit.local_type(captured_by_name); }
+        return hir_id_invalid();
+    }
+
+    fn builtin_return_type_id(self, e: rawptr, sem_kind: i32) -> i32 {
+        if (e == null || sem_kind != expr_sem_BUILTIN()) { return hir_id_invalid(); }
+        let raw_name = self.builtin_name_for_expr(e);
+        let name = policy_generic_call_base(raw_name.clone());
+        self.note_reflection_builtin_use(name);
+        if (self.builtin_string_constructor_name_recognized(name)) {
+            return self.builtin_str_type_id();
+        }
+        let string_member_type = self.string_builtin_member_type_id(name);
+        if (string_member_type != hir_id_invalid()) { return string_member_type; }
+        if (name == "int_to_string" || name == "bool_to_string") {
+            return self.builtin_str_type_id();
+        }
+        if (name == "hash" || name == "sizeof" || name == "repr_sizeof") {
+            return self.type_id_from_text("i64");
+        }
+        if (name == "operator_eq" || name == "operator==") {
+            return self.type_id_from_text("bool");
+        }
+        if (name == "compare") {
+            return self.type_id_from_text("i32");
+        }
+        if (name == "argCount") {
+            return self.type_id_from_text("i32");
+        }
+        if (name == "getArg") {
+            return self.builtin_str_type_id();
+        }
+        if (name == "panic") {
+            return self.unit.types.intern_type_ref(null);
+        }
+        if (name == "assert" || name == "assert_eq") {
+            return self.unit.types.intern_type_ref(null);
+        }
+        if (name == "typeof" || name == "typeinfo" || name == "type_name"
+            || name == "reflect_manifest" || name == "reflect_name") {
+            return self.builtin_str_type_id();
+        }
+        if (name == "alignof") {
+            return self.type_id_from_text("i64");
+        }
+        if (name == "construct") {
+            let type_args = policy_generic_call_args(raw_name.clone());
+            let target_type = policy_generic_arg_at(type_args, 0);
+            if (target_type.len > 0) {
+                let concrete_type = self.resolve_type_text_in_current_env(target_type);
+                if (concrete_type.len > 0) {
+                    return self.type_id_from_text(concrete_type);
+                }
+            }
+            return hir_id_invalid();
+        }
+        if (name == "field_count") {
+            return self.type_id_from_text("i32");
+        }
+        if (name == "field_name" || name == "field_type") {
+            return self.builtin_str_type_id();
+        }
+        if (name == "reflect_method_value") {
+            let value_type = self.reflect_method_value_type_id_from_name(raw_name);
+            if (value_type != hir_id_invalid()) { return value_type; }
+            return self.type_id_from_text("rawptr");
+        }
+        if (name == "reflect_method_ptr_by_id") {
+            return self.type_id_from_text("rawptr");
+        }
+        if (name == "strlen") {
+            return self.type_id_from_text("i64");
+        }
+        if (name == "memcmp") {
+            return self.type_id_from_text("i32");
+        }
+        if (name == "free" || name == "ptr_write_i32" || name == "ptr_write_i64" || name == "memcpy") {
+            return self.unit.types.intern_type_ref(null);
+        }
+        if (name == "memmove" || name == "memset" || name == "alloc" || name == "realloc" || name == "transmute") {
+            return self.type_id_from_text("rawptr");
+        }
+        if (name == "dealloc") {
+            return self.unit.types.intern_type_ref(null);
+        }
+        return hir_id_invalid();
+    }
+
+    fn type_id_from_expr_semantic(self, expr: rawptr, sem_kind: i32) -> i32 {
+        if (sem_kind == expr_sem_LOCAL()) {
+            let local_type = self.local_type_id_from_expr(expr);
+            if (local_type != hir_id_invalid()) { return local_type; }
+        }
+        let builtin_type = self.builtin_return_type_id(expr, sem_kind);
+        if (builtin_type != hir_id_invalid()) { return builtin_type; }
+        return self.type_id_from_expr(expr);
+    }
+
+    fn type_id_from_ref_env(self, ty: rawptr, params: string, args: string) -> i32 {
+        if (ty == null) { return hir_id_invalid(); }
+        let key = hir_builder_env_key(params, args);
+        if (key.len > 0) {
+            let cached = hir_decl_instance_map_item(self.type_ref_env_ids,ty, key);
+            if (cached != hir_id_invalid()) { return cached; }
+        }
+        let saved_params = self.current_generic_params;
+        let saved_args = self.current_generic_args;
+        self.current_generic_params = params;
+        self.current_generic_args = args;
+        let out = self.type_id_from_ref(ty);
+        self.current_generic_params = saved_params;
+        self.current_generic_args = saved_args;
+        if (key.len > 0 && out != hir_id_invalid()) {
+            self.type_ref_env_ids = hir_decl_instance_map_put(self.type_ref_env_ids,ty, key, out, hir_id_invalid());
+        }
+        return out;
+    }
+
+    fn concrete_type_ref_from_env(self, ty: rawptr, params: string, args: string) -> rawptr {
+        let saved_params = self.current_generic_params;
+        let saved_args = self.current_generic_args;
+        self.current_generic_params = params;
+        self.current_generic_args = args;
+        let out = self.concrete_type_ref(ty);
+        self.current_generic_params = saved_params;
+        self.current_generic_args = saved_args;
+        return out;
+    }
+
+    fn canonical_function_return_type_id_from_env(self, d: rawptr, params: string, args: string) -> i32 {
+        var ret_type = self.type_id_from_ref_env(decl_get_ty(d), params, args);
+        if (ret_type == hir_id_invalid()) {
+            ret_type = self.unit.types.intern_type_ref(null);
+        }
+        if (!hir_builder_decl_is_task_callable(d)) { return ret_type; }
+        let ret_text = hir_type_table_text(self.unit.types, ret_type);
+        if (hir_builder_type_text_is_awaitable(ret_text)) { return ret_type; }
+        return self.type_id_from_text(hir_builder_task_type_text_for_payload(ret_text));
+    }
+
+    fn canonical_function_return_type_id(self, d: rawptr) -> i32 {
+        return self.canonical_function_return_type_id_from_env(d, "", "");
+    }
+
+    fn function_decl_needs_task_return_ready(self, d: rawptr, fn_id: i32) -> bool {
+        if (d == null || fn_id == hir_id_invalid()) { return false; }
+        if (!hir_builder_decl_is_task_callable(d)) { return false; }
+        let ret_type = self.unit.function_return_type(fn_id);
+        let ret_text = hir_type_table_text(self.unit.types, ret_type);
+        if (!hir_builder_type_text_is_awaitable(ret_text)) { return false; }
+        let declared_ret_type = self.type_id_from_ref(decl_get_ty(d));
+        var declared_ret_text = "";
+        if (declared_ret_type != hir_id_invalid()) {
+            declared_ret_text = hir_type_table_text(self.unit.types, declared_ret_type);
+        } else {
+            declared_ret_text = "void";
+        }
+        return !hir_builder_type_text_is_awaitable(declared_ret_text);
+    }
+
+    fn ensure_task_ready_for_function_return(self, d: rawptr, fn_id: i32) {
+        if (!self.function_decl_needs_task_return_ready(d, fn_id)) { return; }
+        let ret_text = hir_type_table_text(self.unit.types, self.unit.function_return_type(fn_id));
+        if (ret_text.len == 0) { return; }
+        self.ensure_static_method_instance_for_type_text(ret_text, "ready");
+    }
+
+    fn ensure_async_runtime_methods_for_task_return(self, fn_id: i32) {
+        if (fn_id == hir_id_invalid()) { return; }
+        if ((hir_unit_function_flags(self.unit, fn_id) & hir_function_flag_async_task()) == 0) { return; }
+        let ret_text = hir_type_table_text(self.unit.types, self.unit.function_return_type(fn_id));
+        if (ret_text.len == 0 || !hir_builder_type_text_is_awaitable(ret_text)) { return; }
+        self.ensure_static_method_instance_for_type_text(ret_text, "ready");
+        self.ensure_method_instance_for_type_text(ret_text, "await_value");
+        self.ensure_method_instance_for_type_text(ret_text, "resolve");
+        self.ensure_method_instance_for_type_text(ret_text, "drop");
+    }
+
+    fn type_text_from_ref_env(self, ty: rawptr, params: string, args: string) -> string {
+        let id = self.type_id_from_ref_env(ty, params, args);
+        if (id == hir_id_invalid()) { return ""; }
+        return hir_type_table_text(self.unit.types, id);
+    }
+
+    fn inference_type_text_from_ref(self, ty: rawptr) -> string {
+        if (ty == null) { return ""; }
+        let k = tref_get_kind(ty);
+        if (k == ty_CLASS()) {
+            let name = tref_get_name(ty);
+            let resolved = self.resolve_type_text_in_current_env(name);
+            if (resolved.len > 0) { return resolved; }
+            return name;
+        }
+        if (k == ty_STRING()) { return "str"; }
+        if (k == ty_I32()) { return "i32"; }
+        if (k == ty_I64()) { return "i64"; }
+        if (k == ty_BOOL()) { return "bool"; }
+        if (k == ty_CHAR()) { return "char"; }
+        if (k == ty_RAWPTR()) { return "rawptr"; }
+        if (k == ty_VOID()) { return "void"; }
+        if (k == ty_F32()) { return "f32"; }
+        if (k == ty_F64()) { return "f64"; }
+        if (k == ty_I8()) { return "i8"; }
+        if (k == ty_I16()) { return "i16"; }
+        if (k == ty_U8()) { return "u8"; }
+        if (k == ty_U16()) { return "u16"; }
+        if (k == ty_U32()) { return "u32"; }
+        if (k == ty_U64()) { return "u64"; }
+        if (k == ty_ISIZE()) { return "isize"; }
+        if (k == ty_USIZE()) { return "usize"; }
+        if (k == ty_PTR() || k == ty_REF() || k == ty_MUTREF()) {
+            var prefix = "ptr";
+            if (k == ty_REF()) { prefix = "ref"; }
+            if (k == ty_MUTREF()) { prefix = "mutref"; }
+            return prefix + "<" + self.inference_type_text_from_ref(tref_pointee(ty)) + ">";
+        }
+        if (k == ty_ARRAY()) {
+            let size_e = tref_array_size_expr(ty);
+            var size_text = "";
+            if (hir_builder_const_expr_known(size_e, self.current_generic_params, self.current_generic_args)) {
+                size_text = policy_i64_to_string(hir_builder_const_expr_value(size_e,
+                                                                               self.current_generic_params,
+                                                                               self.current_generic_args));
+            } else {
+                size_text = hir_builder_type_expr_text(size_e);
+            }
+            if (size_text.len == 0) { size_text = policy_i64_to_string(tref_array_size(ty)); }
+            return "[" + self.inference_type_text_from_ref(tref_array_elem(ty))
+                + ";" + size_text + "]";
+        }
+        if (k == ty_TUPLE()) {
+            var tuple_text = "";
+            var ti: i64 = 0;
+            while (ti < tref_tuple_count(ty)) {
+                if (tuple_text.len > 0) { tuple_text = tuple_text + ","; }
+                tuple_text = tuple_text + self.inference_type_text_from_ref(tref_tuple_elem_at(ty, ti));
+                ti = ti + 1;
+            }
+            return "(" + tuple_text + ")";
+        }
+        if (k == ty_FN() || k == ty_CFN()) {
+            var fn_text = "fn(";
+            if (k == ty_CFN()) { fn_text = "cfn("; }
+            let params_ref = tref_fn_params(ty);
+            if (params_ref != null && tref_get_kind(params_ref) == ty_TUPLE()) {
+                var pi: i64 = 0;
+                while (pi < tref_tuple_count(params_ref)) {
+                    if (pi > 0) { fn_text = fn_text + ","; }
+                    fn_text = fn_text + self.inference_type_text_from_ref(tref_tuple_elem_at(params_ref, pi));
+                    pi = pi + 1;
+                }
+            }
+            return fn_text + ")->" + self.inference_type_text_from_ref(tref_fn_ret(ty));
+        }
+        return tref_get_name(ty);
+    }
+
+    fn inference_type_text_from_ref_env(self, ty: rawptr, params: string, args: string) -> string {
+        if (ty == null) { return ""; }
+        let saved_params = self.current_generic_params;
+        let saved_args = self.current_generic_args;
+        self.current_generic_params = params;
+        self.current_generic_args = args;
+        // Inference only needs the substituted TEXT; walking the raw tref and
+        // resolving leaf names through the cached text-level env lookup avoids
+        // cloning the whole tref tree (concrete_type_ref ->
+        // sema_substitute_type_with_args) on every call.
+        let out = self.inference_type_text_from_ref(ty);
+        self.current_generic_params = saved_params;
+        self.current_generic_args = saved_args;
+        return out;
+    }
+
+    fn type_text_from_expr(self, expr: rawptr) -> string {
+        let id = self.type_id_from_expr_semantic(expr, expr_get_semantic_kind(expr));
+        if (id == hir_id_invalid()) { return ""; }
+        return hir_type_table_text(self.unit.types, id);
+    }
+
+    fn type_ref_from_type_id(self, type_id: i32) -> rawptr {
+        if (!self.type_id_is_valid(type_id)) { return tref_alloc(ty_VOID(), ""); }
+        return self.type_ref_from_text(hir_type_table_text(self.unit.types, type_id));
+    }
+
+    fn function_type_id(self, function_id: i32) -> i32 {
+        if (function_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let cached = hir_int_id_map_get(self.function_type_cache,function_id);
+        if (cached != -1 && cached != hir_id_invalid()) { return cached; }
+        var count: i32 = 0;
+        var local = self.unit.function_first_local(function_id);
+        while (local != hir_id_invalid()) {
+            if ((self.unit.local_flags(local) & hir_local_flag_param()) != 0
+                && !self.local_is_constructor_abi_self(function_id, local)) {
+                count = count + 1;
+            }
+            local = self.unit.local_next(local);
+        }
+        var buf: rawptr = null;
+        if (count > 0) {
+            buf = hir_profile_malloc((count * 8) as u64);
+            if (buf != null) { memset(buf, 0, (count * 8) as u64); }
+        }
+        var idx: i32 = 0;
+        local = self.unit.function_first_local(function_id);
+        while (local != hir_id_invalid()) {
+            if ((self.unit.local_flags(local) & hir_local_flag_param()) != 0
+                && !self.local_is_constructor_abi_self(function_id, local)) {
+                if (buf != null) {
+                    ast_write_rawptr(ptr_offset(buf, idx * 8), self.type_ref_from_type_id(self.unit.local_type(local)));
+                }
+                idx = idx + 1;
+            }
+            local = self.unit.local_next(local);
+        }
+        let params = tref_alloc_tuple(buf, count as i64);
+        let fn_ret_type_id = self.unit.function_return_type(function_id);
+        let ret_ref = self.type_ref_from_type_id(fn_ret_type_id);
+        let out = self.unit.types.intern_type_ref(tref_alloc_fn(params, ret_ref));
+        // Never cache a signature computed from an instance shell whose
+        // return type has not been backfilled yet; the stale void-ret fn
+        // type would survive the backfill and poison later lookups.
+        if (out != hir_id_invalid() && self.type_id_is_valid(fn_ret_type_id)) {
+            self.function_type_cache = hir_int_id_map_put(self.function_type_cache,function_id, out);
+        }
+        return out;
+    }
+
+    fn function_type_id_for_zero_arg_return(self, return_type_id: i32) -> i32 {
+        if (!self.type_id_is_valid(return_type_id)) { return hir_id_invalid(); }
+        let cached = hir_int_id_map_get(self.zero_arg_function_type_cache,return_type_id);
+        if (cached != -1 && cached != hir_id_invalid()) { return cached; }
+        let params_ref = tref_alloc_tuple(null, 0);
+        let ret_ref = self.type_ref_from_type_id(return_type_id);
+        let out = self.unit.types.intern_type_ref(tref_alloc_fn(params_ref, ret_ref));
+        if (out != hir_id_invalid()) {
+            self.zero_arg_function_type_cache = hir_int_id_map_put(self.zero_arg_function_type_cache,return_type_id, out);
+        }
+        return out;
+    }
+}

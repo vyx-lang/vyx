@@ -1,0 +1,263 @@
+module bootstrap.mir_verify;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_verify.MirVerifier {
+    public fn function_allows_bodyless_target(self, m: MirUnit, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (m.function_first_block(function_id) != mir_id_invalid()) { return true; }
+        if (m.function_item_kind(function_id) == hir_item_extern_function()) { return true; }
+        if ((m.function_flags( function_id) & hir_function_flag_declaration_only()) != 0) { return true; }
+        if ((m.function_flags( function_id) & hir_function_flag_imported_body()) != 0) { return true; }
+        if (m.function_owner_item_kind(function_id) == hir_item_interface()) { return true; }
+        // LLVM streaming lowering emits one function at a time and then
+        // releases its body tables. The marker is written only after that
+        // function's LLVM definition was emitted, so it is not a general
+        // exemption for an ordinary missing MIR body.
+        if (m.function_streamed_body_discarded(function_id)) { return true; }
+        return false;
+    }
+
+    public fn function_return_type_is_void(self, m: MirUnit, function_id: i32) -> bool {
+        let type_id = m.function_return_type(function_id);
+        if (type_id == mir_id_invalid()) { return false; }
+        return hir_type_table_kind(m.types, type_id) == ty_VOID();
+    }
+
+    public fn check_functions(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.function_count) {
+            self.focus_function(m, id);
+            self.valid_type(m, m.function_return_type(id), false, "function " + self.id_text(id) + " return");
+            self.valid_local(m, m.function_first_local(id), true, "function " + self.id_text(id) + " first local");
+            self.valid_block(m, m.function_first_block(id), true, "function " + self.id_text(id) + " first block");
+            if (m.function_name(id).len == 0) {
+                self.record_error("function " + self.id_text(id) + " has empty name");
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn check_blocks(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.block_count) {
+            self.focus_block(m, id);
+            if (m.block_is_removed( id)) {
+                id = id + 1;
+                continue;
+            }
+            self.valid_function(m, m.block_function(id), false, "block " + self.id_text(id) + " function");
+            self.valid_instr(m, m.block_first_instr(id), true, "block " + self.id_text(id) + " first instr");
+            self.valid_instr(m, m.block_last_instr(id), true, "block " + self.id_text(id) + " last instr");
+            let term = m.block_term_kind(id);
+            if (term == mir_id_invalid()) {
+                self.record_error("block " + self.id_text(id) + " has no terminator");
+            } else if (!self.term_kind_valid(term)) {
+                self.record_error("block " + self.id_text(id) + " has invalid terminator " + self.id_text(term));
+            }
+            if (term == mir_term_return()) {
+                let allow_empty_return = self.function_return_type_is_void(m, m.block_function(id));
+                self.valid_value(m, m.block_term_value(id), allow_empty_return, "block " + self.id_text(id) + " return value");
+            } else if (term == mir_term_goto()) {
+                self.valid_block(m, m.block_term_target(id), false, "block " + self.id_text(id) + " goto target");
+            } else if (term == mir_term_branch()) {
+                self.valid_value(m, m.block_term_value(id), false, "block " + self.id_text(id) + " branch cond");
+                self.valid_block(m, m.block_term_target(id), false, "block " + self.id_text(id) + " branch true");
+                self.valid_block(m, m.block_term_false(id), false, "block " + self.id_text(id) + " branch false");
+            } else if (term == mir_term_match()) {
+                self.valid_value(m, m.block_term_value(id), false, "block " + self.id_text(id) + " match subject");
+                self.valid_case(m, m.block_term_first_case(id), true, "block " + self.id_text(id) + " match first case");
+                self.valid_block(m, m.block_term_false(id), true, "block " + self.id_text(id) + " match fallback");
+            } else if (term == mir_term_foreach_next()) {
+                self.valid_value(m, m.block_term_value(id), false, "block " + self.id_text(id) + " foreach iterable");
+                self.valid_block(m, m.block_term_target(id), false, "block " + self.id_text(id) + " foreach body");
+                self.valid_block(m, m.block_term_false(id), false, "block " + self.id_text(id) + " foreach exit");
+            } else if (term == mir_term_yield()) {
+                self.valid_value(m, m.block_term_value(id), true, "block " + self.id_text(id) + " yield future");
+                self.valid_block(m, m.block_term_target(id), false, "block " + self.id_text(id) + " yield resume");
+            }
+            self.valid_block(m, m.block_next(id), true, "block " + self.id_text(id) + " next");
+            id = id + 1;
+        }
+    }
+
+    public fn check_locals(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.local_count) {
+            self.focus_local(m, id);
+            let flags = m.local_flags(id);
+            let owner_fn = m.local_function(id);
+            let owner_name = m.function_name(owner_fn);
+            self.valid_function(m, owner_fn, false, "local " + self.id_text(id) + " function");
+            self.valid_type(m,
+                            m.local_type(id),
+                            false,
+                            "local " + self.id_text(id) + " `" + m.local_name(id)
+                            + "` in function " + self.id_text(owner_fn)
+                            + " `" + owner_name + "` type");
+            var allow_empty_place = false;
+            if (owner_fn != mir_id_invalid()
+                && m.function_first_block(owner_fn) == mir_id_invalid()) {
+                allow_empty_place = true;
+            }
+            self.valid_place(m, m.local_place(id), allow_empty_place, "local " + self.id_text(id) + " place");
+            self.valid_local(m, m.local_next(id), true, "local " + self.id_text(id) + " next");
+            if (m.local_name(id).len == 0) {
+                self.record_error("local " + self.id_text(id) + " has empty name");
+            }
+            if ((flags & mir_local_flag_param()) != 0 && m.local_name(id) == "self"
+                && (flags & mir_local_flag_self_receiver()) == 0) {
+                self.record_error("local " + self.id_text(id)
+                                  + " is a self parameter but lacks receiver flag");
+            }
+            if ((flags & mir_local_flag_param()) != 0
+                && (flags & mir_local_flag_self_receiver()) != 0
+                && m.local_name(id) != "self") {
+                self.record_error("local " + self.id_text(id)
+                                  + " has receiver flag but parameter name is `"
+                                  + m.local_name(id)
+                                  + "`");
+            }
+            if ((flags & mir_local_flag_self_receiver()) != 0
+                && (flags & mir_local_flag_param()) == 0) {
+                self.record_error("local " + self.id_text(id)
+                                  + " has receiver flag but is not a parameter");
+            }
+            self.check_receiver_mode_flags(flags, id);
+            if ((flags & mir_local_flag_reference_capture()) != 0
+                && (flags & mir_local_flag_capture()) == 0) {
+                self.record_error("local " + self.id_text(id)
+                                  + " has reference-capture flag but is not a capture");
+            }
+            if ((flags & mir_local_flag_reference_capture()) != 0
+                && (flags & mir_local_flag_self_receiver()) != 0) {
+                self.record_error("local " + self.id_text(id)
+                                  + " cannot be both receiver parameter and reference capture");
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn check_receiver_mode_flags(self, flags: i32, local_id: i32) {
+        let receiver_modes = (((flags & mir_local_flag_self_compat()) != 0) as i32)
+            + (((flags & mir_local_flag_self_shared_ref()) != 0) as i32)
+            + (((flags & mir_local_flag_self_mut_ref()) != 0) as i32)
+            + (((flags & mir_local_flag_move_arg()) != 0) as i32);
+        if ((flags & mir_local_flag_self_receiver()) != 0 && receiver_modes != 1) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " receiver must carry exactly one ownership mode");
+        }
+        if ((flags & mir_local_flag_self_receiver()) == 0
+            && (flags & (mir_local_flag_self_compat()
+                | mir_local_flag_self_shared_ref()
+                | mir_local_flag_self_mut_ref())) != 0) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " has receiver ownership mode but is not a receiver");
+        }
+        if ((flags & mir_local_flag_self_receiver()) != 0
+            && (flags & mir_local_flag_auto_drop()) != 0
+            && (flags & mir_local_flag_move_arg()) == 0) {
+            self.record_error("local " + self.id_text(local_id)
+                              + " borrowed/compat receiver cannot own drop glue");
+        }
+    }
+
+    public fn check_statics(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.static_count) {
+            self.focus_type(m, m.static_type(id));
+            if (m.static_exists(id)) {
+                self.valid_type(m, m.static_type(id), false, "static " + self.id_text(id) + " type");
+                let item_kind = m.static_item_kind(id);
+                if (item_kind != hir_item_const() && item_kind != hir_item_global()) {
+                    self.record_error("static " + self.id_text(id) + " has invalid HIR item kind " + self.id_text(item_kind));
+                }
+                let flags = m.static_flags(id);
+                let known_flags = mir_static_flag_external() | mir_static_flag_exported() | mir_static_flag_odr();
+                if ((flags & known_flags) != flags) {
+                    self.record_error("static " + self.id_text(id) + " has unknown storage flags " + self.id_text(flags));
+                }
+                if ((flags & mir_static_flag_external()) != 0) {
+                    if ((flags & mir_static_flag_exported()) != 0) {
+                        self.record_error("static " + self.id_text(id) + " cannot be both external storage and an owned export root");
+                    }
+                    if ((flags & mir_static_flag_odr()) != 0) {
+                        self.record_error("static " + self.id_text(id) + " cannot be both external storage and an ODR definition");
+                    }
+                    if (m.static_module_name(id).len == 0) {
+                        self.record_error("external static " + self.id_text(id) + " has no declaring module identity");
+                    }
+                }
+                let init_kind = m.static_init_kind(id);
+                if (!self.static_init_kind_valid(init_kind)) {
+                    self.record_error("static " + self.id_text(id) + " has invalid initializer kind " + self.id_text(init_kind));
+                }
+                if (init_kind == mir_static_init_item_ref()) {
+                    if (m.static_init_target_kind(id) != mir_target_hir_item()) {
+                        self.record_error("static " + self.id_text(id) + " item-ref initializer has invalid target kind "
+                                          + self.id_text(m.static_init_target_kind(id)));
+                    }
+                    if (!m.static_exists(m.static_init_target_id(id))) {
+                        self.record_error("static " + self.id_text(id) + " item-ref initializer references missing static #"
+                                          + self.id_text(m.static_init_target_id(id)));
+                    }
+                }
+                if (m.static_name(id).len == 0) {
+                    self.record_error("static " + self.id_text(id) + " has empty name");
+                }
+            }
+            id = id + 1;
+        }
+    }
+
+    public fn check_places(self, m: MirUnit) {
+        var id: i32 = 1;
+        while (id <= m.place_count) {
+            self.focus_place(m, id);
+            let k = m.place_kind(id);
+            let owner_fn = m.place_function(id);
+            if (!self.place_kind_valid(k)) {
+                self.record_error("place " + self.id_text(id) + " has invalid kind " + self.id_text(k));
+            }
+            self.valid_function(m, owner_fn, false, "place " + self.id_text(id) + " function");
+            self.valid_type(m,
+                            m.place_type(id),
+                            false,
+                            "place " + self.id_text(id) + " `" + m.place_name(id)
+                            + "` in function " + self.id_text(owner_fn)
+                            + " `" + m.function_name(owner_fn) + "` type");
+            if (k == mir_place_local()) {
+                self.valid_local(m, m.place_local(id), false, "place " + self.id_text(id) + " local");
+            }
+            if (k == mir_place_field()) {
+                self.valid_place(m, m.place_base(id), false, "place " + self.id_text(id) + " field base");
+                if (self.valid_field_layout(m,
+                                            m.place_field(id),
+                                            false,
+                                            "place " + self.id_text(id) + " field")) {
+                    if (m.place_type(id) != m.field_type(m.place_field(id))) {
+                        self.record_error("place " + self.id_text(id)
+                                          + " field type "
+                                          + self.id_text(m.place_type(id))
+                                          + " does not match layout field type "
+                                          + self.id_text(m.field_type(m.place_field(id))));
+                    }
+                }
+            }
+            if (k == mir_place_index()) {
+                self.valid_place(m, m.place_base(id), true, "place " + self.id_text(id) + " index base");
+                self.valid_value(m, m.place_index_value(id), false, "place " + self.id_text(id) + " index value");
+            }
+            if (k == mir_place_deref()) {
+                self.valid_value(m, m.place_index_value(id), false, "place " + self.id_text(id) + " deref source");
+            }
+            id = id + 1;
+        }
+    }
+}

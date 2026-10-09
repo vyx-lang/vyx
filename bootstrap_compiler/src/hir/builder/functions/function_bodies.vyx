@@ -1,0 +1,665 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Function bodies for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn body_building(self, fn_id: i32) -> bool {
+        if (fn_id == hir_id_invalid()) { return false; }
+        var cur = self.body_building_head;
+        while (cur != null) {
+            if (ast_read_i32(ptr_offset(cur, 8)) == fn_id) { return true; }
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+        return false;
+    }
+
+    fn push_body_building(self, d: rawptr, fn_id: i32) {
+        let node = hir_profile_malloc(24);
+        if (node == null) { return; }
+        memset(node, 0, 24);
+        ast_write_rawptr(node, d);
+        ast_write_i32(ptr_offset(node, 8), fn_id);
+        ast_write_rawptr(ptr_offset(node, 16), self.body_building_head);
+        self.body_building_head = node;
+    }
+
+    fn decl_matches_function_param_locals(self, d: rawptr, fn_id: i32) -> bool {
+        if (d == null || fn_id == hir_id_invalid()) { return false; }
+        var param = decl_get_params(d);
+        var local_id = self.unit.function_first_local(fn_id);
+        if (local_id != hir_id_invalid()
+            && self.local_is_constructor_abi_self(fn_id, local_id)
+            && (param == null || decl_get_name(param) != "self")) {
+            local_id = self.unit.local_next(local_id);
+        }
+        while (param != null) {
+            while (local_id != hir_id_invalid()
+                && (self.unit.local_flags(local_id) & hir_local_flag_param()) == 0) {
+                local_id = self.unit.local_next(local_id);
+            }
+            if (local_id == hir_id_invalid()) { return false; }
+            let param_name = decl_get_name(param);
+            if (param_name.len > 0 && self.unit.local_name(local_id) != param_name) { return false; }
+            let param_type = self.type_id_from_ref(decl_get_ty(param));
+            let local_type = self.unit.local_type(local_id);
+            if (self.type_id_is_valid(param_type) && self.type_id_is_valid(local_type)) {
+                let param_text = hir_type_table_text(self.unit.types, param_type);
+                let local_text = hir_type_table_text(self.unit.types, local_type);
+                if (param_text != local_text && !policy_type_name_equal(param_text, local_text)) {
+                    return false;
+                }
+            }
+            param = decl_get_next(param);
+            local_id = self.unit.local_next(local_id);
+        }
+        while (local_id != hir_id_invalid()) {
+            if ((self.unit.local_flags(local_id) & hir_local_flag_param()) != 0
+                && !self.local_is_constructor_abi_self(fn_id, local_id)) {
+                return false;
+            }
+            local_id = self.unit.local_next(local_id);
+        }
+        return true;
+    }
+
+    fn function_body_source_decl(self, d: rawptr, fn_id: i32) -> rawptr {
+        if (fn_id == hir_id_invalid()) { return null; }
+        // A closed instance keeps its template declaration in the reverse
+        // instance map.  Its local types have already substituted that
+        // template's parameters, so comparing those locals to the raw
+        // declaration (`ptr<A>` versus `ptr<T>`) is not a valid provenance
+        // test.  The reverse map is keyed by the concrete function id and is
+        // therefore the authoritative source for an instance body.
+        let instance_decl = self.function_instances.decl_for_function(fn_id);
+        if (instance_decl != null) {
+            let instance_body = self.raw_function_body_decl_for(instance_decl);
+            if (instance_body != null) { return instance_body; }
+            var owner_type = hir_unit_function_owner_type(self.unit, fn_id);
+            if (owner_type.len == 0) {
+                let env_params = hir_unit_function_generic_params(self.unit, fn_id);
+                let env_args = hir_unit_function_generic_args(self.unit, fn_id);
+                if (hir_builder_generic_param_at(env_params, 0) == "Self") {
+                    owner_type = policy_generic_arg_at(env_args, 0);
+                }
+            }
+            if (owner_type.len > 0) {
+                let impl_body = self.concrete_impl_method_decl(decl_get_name(instance_decl), owner_type);
+                if (impl_body != null) { return impl_body; }
+            }
+            let env_body = self.raw_function_body_decl_for_env(
+                instance_decl,
+                hir_unit_function_generic_params(self.unit, fn_id),
+                hir_unit_function_generic_args(self.unit, fn_id));
+            if (env_body != null) { return env_body; }
+        }
+        // A caller-supplied declaration can be a stale overload/interface
+        // target, so only accept it after checking its local signature.
+        if (d != null && self.decl_matches_function_param_locals(d, fn_id)) {
+            let direct_body = self.raw_function_body_decl_for(d);
+            if (direct_body != null) { return direct_body; }
+        }
+        let mapped_decl = hir_pointer_map_raw_for_function(self.decl_map,fn_id);
+        // `decl_map` is keyed by the exact HIR function id.  Unlike an
+        // incoming semantic target it is not an overload guess, so it stays
+        // authoritative even when a lazily-created method has not populated
+        // every parameter-local record yet.  Requiring that transient local
+        // shape here made valid compiler-internal methods look declaration
+        // only to both MIR consumers and left dangling native symbols.
+        if (mapped_decl != null) {
+            let mapped_body = self.raw_function_body_decl_for(mapped_decl);
+            if (mapped_body != null) { return mapped_body; }
+        }
+        return null;
+    }
+
+    fn function_body_is_scheduled(self, fn_id: i32) -> bool {
+        if (fn_id == hir_id_invalid()) { return false; }
+        return hir_int_id_map_get(self.scheduled_function_ids,fn_id) == 1;
+    }
+
+    fn function_body_request_is_closed(self, fn_id: i32) -> bool {
+        if (fn_id == hir_id_invalid()) { return true; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) { return true; }
+        return hir_int_id_map_get(self.scheduled_function_ids,fn_id) == 2;
+    }
+
+    fn function_body_codegen_is_done(self, fn_id: i32) -> bool {
+        if (fn_id == hir_id_invalid()) { return true; }
+        return hir_int_id_map_get(self.codegen_body_done_ids,fn_id) == 1;
+    }
+
+    public fn mark_function_body_codegen_done(self, fn_id: i32) {
+        if (fn_id == hir_id_invalid()) { return; }
+        self.codegen_body_done_ids = hir_int_id_map_put(self.codegen_body_done_ids,fn_id, 1);
+        self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 2);
+    }
+
+    fn close_function_body_request(self, fn_id: i32) {
+        if (fn_id == hir_id_invalid()) { return; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) {
+            self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 0);
+            return;
+        }
+        self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 2);
+    }
+
+    fn schedule_reachable_function_body(self, d: rawptr, fn_id: i32, owner_template: bool) {
+        if (d == null || fn_id == hir_id_invalid()) { return; }
+        if (self.function_body_codegen_is_done(fn_id)) { return; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) { return; }
+        if (self.function_body_is_scheduled(fn_id) || self.function_body_request_is_closed(fn_id)) { return; }
+        let body_decl = self.raw_function_body_decl_for(d);
+        if (self.decl_effectively_imported(d) || self.decl_effectively_imported(body_decl)) {
+            if (!self.imported_body_should_materialize(d, body_decl)) {
+                self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+                self.close_function_body_request(fn_id);
+                return;
+            }
+        }
+        self.scheduled_body_count = self.scheduled_body_count + 1;
+        if (vyx_bootstrap_profile_level() > 0
+            && (self.scheduled_body_count <= 24
+                || (self.scheduled_body_count % 128) == 0)) {
+            print("[hir-schedule] count=" + policy_i64_to_string(self.scheduled_body_count)
+                  + " fn=" + self.i32_text(fn_id)
+                  + " name=" + self.unit.function_name(fn_id)
+                  + " raw=" + decl_get_name(d));
+        }
+        let node = hir_profile_malloc(32);
+        if (node == null) { return; }
+        memset(node, 0, 32);
+        ast_write_rawptr(node, d);
+        ast_write_i32(ptr_offset(node, 8), fn_id);
+        if (owner_template) {
+            ast_write_i32(ptr_offset(node, 12), 1);
+        } else {
+            ast_write_i32(ptr_offset(node, 12), 0);
+        }
+        ast_write_rawptr(ptr_offset(node, 16), null);
+        if (self.reachable_body_queue_tail != null) {
+            ast_write_rawptr(ptr_offset(self.reachable_body_queue_tail, 16), node);
+        } else {
+            self.reachable_body_queue_head = node;
+        }
+        self.reachable_body_queue_tail = node;
+        self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 1);
+    }
+
+    fn ensure_reachable_function_body(self, d: rawptr, fn_id: i32, owner_template: bool) {
+        self.schedule_reachable_function_body(d, fn_id, owner_template);
+    }
+
+    fn build_reachable_function_body_now(self, d: rawptr, fn_id: i32, owner_template: bool) {
+        if (d == null || fn_id == hir_id_invalid()) { return; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) { return; }
+        // Resolve the concrete source before the instance branch. A call can
+        // retain an interface/prototype semantic declaration while targeting
+        // a closed concrete method instance; passing that erased declaration
+        // into build_function_instance_body_if_ready leaves the instance
+        // bodyless and produces a dangling LLVM declaration.
+        // A `@[discard]` tombstone is a removal notice, not a definition —
+        // terminate BEFORE resolving the body source. `function_body_source_decl`
+        // only returns declarations that can provide a body, so for a tombstone
+        // it returns null and the early return below would leave the request
+        // retryable forever (the spurious-I0100 machine).
+        if (hir_builder_decl_is_discarded(d)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+            self.close_function_body_request(fn_id);
+            return;
+        }
+        let body_decl = self.function_body_source_decl(d, fn_id);
+        if (body_decl == null) { return; }
+        // A `@[discard]`-ed symbol is a removal notice, not a definition: it
+        // owns no body *by design* (see `hir_builder_decl_is_discarded`).
+        // Publish that terminal decision here — BEFORE the instance/env
+        // branch below — because a tombstone can never own a body in any
+        // instantiation. A cross-version method reference (a ctor calling a
+        // method that only the previous version defines) merges the class
+        // versions and reaches this point with env params set, so a check
+        // placed after the env branch would never run: MIR would defer the
+        // tombstone round after round and finally manufacture a spurious
+        // I0100 ("reachable function body was still unavailable") even though
+        // nothing ever calls it.
+        if (hir_builder_decl_is_discarded(d)
+            || hir_builder_decl_is_discarded(body_decl)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+            self.close_function_body_request(fn_id);
+            return;
+        }
+        let env_params = hir_unit_function_generic_params(self.unit, fn_id);
+        let env_args = hir_unit_function_generic_args(self.unit, fn_id);
+        if (env_params.len > 0 || env_args.len > 0) {
+            self.build_function_instance_body_if_ready(body_decl,
+                                                       fn_id,
+                                                       self.unit.function_item(fn_id),
+                                                       env_params,
+                                                       env_args);
+            return;
+        }
+        if (owner_template || hir_builder_decl_template_head(body_decl)) {
+            // An unspecialized template never owns an executable body of its
+            // own: closed instances are created on their own FunctionId and
+            // take the env branch above.  Publish that terminal decision
+            // instead of leaving the request retryable, otherwise MIR keeps
+            // deferring the bodyless shell (a generic owner such as
+            // `class Box<T>` leaves `hir_function_has_open_template_types`
+            // false on the MIR side) until the streaming retry budget
+            // manufactures a spurious I0100 at the first call site.
+            self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+            self.close_function_body_request(fn_id);
+            return;
+        }
+        let raw_owner = hir_raw_owner_map_get(self.decl_owner_map,body_decl);
+        if (raw_owner != null
+            && hir_builder_decl_template_head(raw_owner)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+            self.close_function_body_request(fn_id);
+            return;
+        }
+        // Safety net for any other body-less source declaration: it can never
+        // acquire a body either, so an unresolved request here would only
+        // resurface later as that same misleading I0100.
+        if (decl_get_body(body_decl) == null && decl_get_body(d) == null) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+            self.close_function_body_request(fn_id);
+            return;
+        }
+        if (self.decl_effectively_imported(d) || self.decl_effectively_imported(body_decl)) {
+            if (!self.imported_body_should_materialize(d, body_decl)) {
+                self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+                return;
+            }
+            self.build_function_body_core_for_function(body_decl, fn_id);
+            return;
+        }
+        if (!hir_builder_body_resolved(body_decl)
+            && !self.decl_body_types_close_in_current_env(body_decl)) {
+            return;
+        }
+        self.build_function_body_core_for_function(body_decl, fn_id);
+    }
+
+    fn raw_function_target_for_call_expr(self, e: rawptr) -> rawptr {
+        if (e == null) { return null; }
+        if (expr_get_kind(e) != ex_CALL()) { return expr_get_semantic_target(e); }
+        let callee = expr_get_lhs(e);
+        if (callee != null && expr_get_kind(callee) == ex_MEMBER()) {
+            return expr_get_semantic_target(callee);
+        }
+        var raw_target = expr_get_semantic_target(e);
+        if (raw_target == null && callee != null) {
+            raw_target = expr_get_semantic_target(callee);
+        }
+        return raw_target;
+    }
+
+    fn ensure_reachable_function_body_for_expr(self, e: rawptr, fn_id: i32) {
+        if (e == null || fn_id == hir_id_invalid()) { return; }
+        self.ensure_reachable_function_body(self.raw_function_target_for_call_expr(e), fn_id, false);
+    }
+
+    fn build_function_body_core_for_function(self, d: rawptr, fn_id: i32) {
+        if (d == null || fn_id == hir_id_invalid()) { return; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) { return; }
+        if (self.body_building(fn_id)) { return; }
+        if (self.function_has_open_template_types(fn_id)) { return; }
+        let saved_function = self.current_function_id;
+        let saved_item = self.current_item_id;
+        let saved_locals = self.locals.head;
+        let saved_params = self.current_generic_params;
+        let saved_args = self.current_generic_args;
+        let saved_pack_bindings = self.pack_bindings.head;
+        let saved_body_building = self.body_building_head;
+        let saved_call_callee_ast = self.current_call_callee_ast;
+        let timing_enabled = hir_builder_env_enabled("VYX_HIR_BODY_TIMING");
+        var timing_total_start: i64 = 0;
+        var timing_last: i64 = 0;
+        var timing_refresh_ms: i64 = 0;
+        var timing_bind_ms: i64 = 0;
+        var timing_ready_ms: i64 = 0;
+        var timing_stmts_ms: i64 = 0;
+        var timing_finish_ms: i64 = 0;
+        let timing_local_start = self.unit.local_count;
+        let timing_stmt_start = self.unit.stmt_count;
+        let timing_expr_start = self.unit.expr_count;
+        let timing_type_open_start = self.profile_type_open_calls;
+        let timing_resolve_start = self.profile_resolve_type_calls;
+        let timing_raw_class_start = self.profile_raw_class_calls;
+        let timing_ensure_method_start = self.profile_ensure_method_calls;
+        let timing_method_target_start = self.profile_method_target_calls;
+        let timing_field_start = self.profile_field_lookup_calls;
+        let timing_fnopen_start = self.profile_function_open_calls;
+        let timing_typeref_start = self.profile_type_id_ref_calls;
+        let timing_concrete_start = self.profile_concrete_type_ref_calls;
+        let timing_typetext_start = self.profile_type_id_text_calls;
+        let timing_ms_resolve_start = self.profile_ms_resolve_type;
+        let timing_ms_raw_class_start = self.profile_ms_raw_class;
+        let timing_ms_raw_method_start = self.profile_ms_raw_method_call;
+        let timing_ms_member_start = self.profile_ms_resolve_member;
+        let timing_ms_call_start = self.profile_ms_resolve_call;
+        if (timing_enabled) {
+            timing_total_start = vyx_bootstrap_now_ms();
+            timing_last = timing_total_start;
+        }
+        self.push_body_building(d, fn_id);
+        self.profile_body_phase("enter", d, fn_id);
+        self.current_generic_params = hir_unit_function_generic_params(self.unit, fn_id);
+        self.current_generic_args = hir_unit_function_generic_args(self.unit, fn_id);
+        self.current_function_id = fn_id;
+        self.current_item_id = self.unit.function_item(fn_id);
+        self.current_call_callee_ast = null;
+        self.locals = hir_local_scope_restore(self.locals, null);
+        self.pack_bindings = hir_pack_bindings_restore(self.pack_bindings, null);
+        self.profile_body_phase("before-refresh", d, fn_id);
+        self.refresh_function_param_drop_metadata(fn_id, d);
+        if (timing_enabled) {
+            let now_refresh = vyx_bootstrap_now_ms();
+            timing_refresh_ms = now_refresh - timing_last;
+            timing_last = now_refresh;
+        }
+        self.profile_body_phase("after-refresh", d, fn_id);
+        self.bind_function_param_scope(fn_id, d);
+        if (timing_enabled) {
+            let now_bind = vyx_bootstrap_now_ms();
+            timing_bind_ms = now_bind - timing_last;
+            timing_last = now_bind;
+        }
+        self.profile_body_phase("after-bind-params", d, fn_id);
+        if (timing_enabled) {
+            let now_ready = vyx_bootstrap_now_ms();
+            timing_ready_ms = now_ready - timing_last;
+            timing_last = now_ready;
+        }
+        self.profile_body_phase("before-stmts", d, fn_id);
+        let body_chain = self.build_stmt_chain(decl_get_body(d));
+        if (timing_enabled) {
+            let now_stmts = vyx_bootstrap_now_ms();
+            timing_stmts_ms = now_stmts - timing_last;
+            timing_last = now_stmts;
+        }
+        self.profile_body_phase("after-stmts", d, fn_id);
+        self.unit.set_function_body(fn_id, body_chain.first, body_chain.count);
+        self.locals = hir_local_scope_drop_to(self.locals, saved_locals);
+        self.pack_bindings = hir_pack_bindings_drop_to(self.pack_bindings, saved_pack_bindings);
+        self.current_generic_params = saved_params;
+        self.current_generic_args = saved_args;
+        self.current_item_id = saved_item;
+        self.current_function_id = saved_function;
+        self.current_call_callee_ast = saved_call_callee_ast;
+        self.body_building_head = saved_body_building;
+        if (timing_enabled) {
+            let now_finish = vyx_bootstrap_now_ms();
+            timing_finish_ms = now_finish - timing_last;
+            let timing_total = now_finish - timing_total_start;
+            if (timing_total >= hir_builder_slow_body_threshold_ms()) {
+                print("[hir-body-timing] fn=" + self.unit.function_name(fn_id)
+                      + " id=" + self.i32_text(fn_id)
+                      + " total=" + policy_i64_to_string(timing_total)
+                      + " refresh=" + policy_i64_to_string(timing_refresh_ms)
+                      + " bind=" + policy_i64_to_string(timing_bind_ms)
+                      + " ready=" + policy_i64_to_string(timing_ready_ms)
+                      + " stmts=" + policy_i64_to_string(timing_stmts_ms)
+                      + " finish=" + policy_i64_to_string(timing_finish_ms)
+                      + " body_stmts=" + self.i32_text(body_chain.count)
+                      + " locals_delta=" + self.i32_text(self.unit.local_count - timing_local_start)
+                      + " stmts_delta=" + self.i32_text(self.unit.stmt_count - timing_stmt_start)
+                      + " exprs_delta=" + self.i32_text(self.unit.expr_count - timing_expr_start)
+                      + " open_delta=" + policy_i64_to_string(self.profile_type_open_calls - timing_type_open_start)
+                      + " resolve_delta=" + policy_i64_to_string(self.profile_resolve_type_calls - timing_resolve_start)
+                      + " rawclass_delta=" + policy_i64_to_string(self.profile_raw_class_calls - timing_raw_class_start)
+                      + " ensuremeth_delta=" + policy_i64_to_string(self.profile_ensure_method_calls - timing_ensure_method_start)
+                      + " methodtarget_delta=" + policy_i64_to_string(self.profile_method_target_calls - timing_method_target_start)
+                      + " field_delta=" + policy_i64_to_string(self.profile_field_lookup_calls - timing_field_start)
+                      + " fnopen_delta=" + policy_i64_to_string(self.profile_function_open_calls - timing_fnopen_start)
+                      + " typeref_delta=" + policy_i64_to_string(self.profile_type_id_ref_calls - timing_typeref_start)
+                      + " concrete_delta=" + policy_i64_to_string(self.profile_concrete_type_ref_calls - timing_concrete_start)
+                      + " typetext_delta=" + policy_i64_to_string(self.profile_type_id_text_calls - timing_typetext_start)
+                      + " ms_resolve=" + policy_i64_to_string(self.profile_ms_resolve_type - timing_ms_resolve_start)
+                      + " ms_rawclass=" + policy_i64_to_string(self.profile_ms_raw_class - timing_ms_raw_class_start)
+                      + " ms_rawmethod=" + policy_i64_to_string(self.profile_ms_raw_method_call - timing_ms_raw_method_start)
+                      + " ms_member=" + policy_i64_to_string(self.profile_ms_resolve_member - timing_ms_member_start)
+                      + " ms_call=" + policy_i64_to_string(self.profile_ms_resolve_call - timing_ms_call_start));
+            }
+        }
+        self.profile_body_phase("leave", d, fn_id);
+    }
+
+    fn build_function_body_core(self, d: rawptr) {
+        let fn_id = hir_pointer_map_function(self.decl_map,d);
+        self.build_function_body_core_for_function(d, fn_id);
+    }
+
+    fn build_function_body(self, d: rawptr, owner_template: bool) {
+        if (d == null) { return; }
+        if (self.decl_effectively_imported(d)) { return; }
+        if (owner_template || hir_builder_decl_template_head(d)) { return; }
+        let raw_owner = hir_raw_owner_map_get(self.decl_owner_map,d);
+        if (raw_owner != null
+            && hir_builder_decl_template_head(raw_owner)) {
+            return;
+        }
+        if (decl_get_body(d) == null) { return; }
+        if (!hir_builder_body_resolved(d)
+            && !self.decl_body_types_close_in_current_env(d)) {
+            return;
+        }
+        self.build_function_body_core(d);
+    }
+
+    fn build_imported_function_body_if_reachable(self, d: rawptr, owner_template: bool) {
+        if (d == null) { return; }
+        let body_decl = self.raw_function_body_decl_for(d);
+        if (body_decl == null) { return; }
+        if (!self.decl_effectively_imported(d) && !self.decl_effectively_imported(body_decl)) { return; }
+        if (!self.imported_body_should_materialize(d, body_decl)) { return; }
+        if (owner_template || hir_builder_decl_template_head(body_decl)) { return; }
+        let raw_owner = hir_raw_owner_map_get(self.decl_owner_map,body_decl);
+        if (raw_owner != null
+            && hir_builder_decl_template_head(raw_owner)) {
+            return;
+        }
+        self.build_function_body_core_for_function(body_decl, hir_pointer_map_function(self.decl_map,d));
+    }
+
+    fn build_bodies_for_decl_chain(self, head: rawptr, owner_template: bool) {
+        var cur = head;
+        while (cur != null) {
+            if (self.decl_effectively_imported(cur)) {
+                cur = decl_get_next(cur);
+                continue;
+            }
+            let k = decl_get_kind(cur);
+            if (k == de_FN() || k == de_METHOD()) {
+                self.build_function_body(cur, owner_template);
+            } else if (k == de_CLASS() || k == de_ENUM()) {
+                let templ = owner_template
+                    || hir_builder_decl_template_head(cur)
+                    || self.decl_members_have_template_type(cur);
+                self.build_bodies_for_decl_chain(decl_get_members(cur), templ);
+            } else if (k == de_CONST() || k == de_GLOBAL_VAR() || hir_builder_decl_is_assoc_const_member(cur)) {
+                let fn_id_saved = self.current_function_id;
+                let item_id_saved = self.current_item_id;
+                self.current_function_id = hir_id_invalid();
+                self.current_item_id = hir_pointer_map_item(self.decl_map,cur);
+                let init_chain = self.build_stmt_chain(decl_get_body(cur));
+                self.unit.set_item_init(self.current_item_id, init_chain.first);
+                self.current_item_id = item_id_saved;
+                self.current_function_id = fn_id_saved;
+            }
+            cur = decl_get_next(cur);
+        }
+    }
+
+    fn materialize_reachable_function_bodies_once(self) -> bool {
+        let node = self.reachable_body_queue_head;
+        if (node == null) { return false; }
+        let next = ast_read_rawptr(ptr_offset(node, 16));
+        self.reachable_body_queue_head = next;
+        if (next == null) { self.reachable_body_queue_tail = null; }
+        let d = ast_read_rawptr(node);
+        let fn_id = ast_read_i32(ptr_offset(node, 8));
+        let owner_template = ast_read_i32(ptr_offset(node, 12)) != 0;
+        self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 0);
+        free(node);
+        if (fn_id == hir_id_invalid() || d == null) { return true; }
+        self.materialized_body_count = self.materialized_body_count + 1;
+        if (vyx_bootstrap_profile_level() > 0
+            && (self.materialized_body_count <= 24
+                || (self.materialized_body_count % 128) == 0)) {
+            print("[hir-drain-body] before count=" + policy_i64_to_string(self.materialized_body_count)
+                  + " fn=" + self.i32_text(fn_id)
+                  + " name=" + self.unit.function_name(fn_id)
+                  + " raw=" + decl_get_name(d));
+        }
+        self.build_reachable_function_body_now(d, fn_id, owner_template);
+        if (vyx_bootstrap_profile_level() > 0
+            && (self.materialized_body_count <= 24
+                || (self.materialized_body_count % 128) == 0)) {
+            print("[hir-drain-body] after count=" + policy_i64_to_string(self.materialized_body_count)
+                  + " fn=" + self.i32_text(fn_id)
+                  + " body=" + self.i32_text(self.unit.function_body(fn_id))
+                  + " stmts=" + self.i32_text(self.unit.stmt_count)
+                  + " exprs=" + self.i32_text(self.unit.expr_count));
+        }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) {
+            self.close_function_body_request(fn_id);
+        } else {
+            // A missing body can be recoverable after a later nested instance
+            // registration; keep the request retryable instead of terminal.
+            self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 0);
+        }
+        return true;
+    }
+
+    fn materialize_reachable_function_bodies(self) {
+        var drained = self.materialize_reachable_function_bodies_once();
+        while (drained) {
+            drained = self.materialize_reachable_function_bodies_once();
+        }
+    }
+
+    fn remove_scheduled_function_body_request(self, fn_id: i32, build_body: bool) -> bool {
+        if (fn_id == hir_id_invalid()) { return false; }
+        var prev: rawptr = null;
+        var node = self.reachable_body_queue_head;
+        while (node != null) {
+            let next = ast_read_rawptr(ptr_offset(node, 16));
+            if (ast_read_i32(ptr_offset(node, 8)) == fn_id) {
+                if (prev != null) {
+                    ast_write_rawptr(ptr_offset(prev, 16), next);
+                } else {
+                    self.reachable_body_queue_head = next;
+                }
+                if (self.reachable_body_queue_tail == node) {
+                    self.reachable_body_queue_tail = prev;
+                }
+                let d = ast_read_rawptr(node);
+                let owner_template = ast_read_i32(ptr_offset(node, 12)) != 0;
+                self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 0);
+                free(node);
+                if (!build_body) { return true; }
+                if (d == null) { return false; }
+                self.materialized_body_count = self.materialized_body_count + 1;
+                if (vyx_bootstrap_profile_level() > 0
+                    && (self.materialized_body_count <= 24
+                        || (self.materialized_body_count % 128) == 0)) {
+                    print("[hir-drain-body] before count=" + policy_i64_to_string(self.materialized_body_count)
+                          + " fn=" + self.i32_text(fn_id)
+                          + " name=" + self.unit.function_name(fn_id)
+                          + " raw=" + decl_get_name(d));
+                }
+                self.build_reachable_function_body_now(d, fn_id, owner_template);
+                if (vyx_bootstrap_profile_level() > 0
+                    && (self.materialized_body_count <= 24
+                        || (self.materialized_body_count % 128) == 0)) {
+                    print("[hir-drain-body] after count=" + policy_i64_to_string(self.materialized_body_count)
+                          + " fn=" + self.i32_text(fn_id)
+                          + " body=" + self.i32_text(self.unit.function_body(fn_id))
+                          + " stmts=" + self.i32_text(self.unit.stmt_count)
+                          + " exprs=" + self.i32_text(self.unit.expr_count));
+                }
+                if (self.unit.function_body(fn_id) != hir_id_invalid()) {
+                    self.close_function_body_request(fn_id);
+                } else {
+                    self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 0);
+                }
+                return self.unit.function_body(fn_id) != hir_id_invalid();
+            }
+            prev = node;
+            node = next;
+        }
+        return false;
+    }
+
+    public fn materialize_function_body_for_codegen(self, fn_id: i32) -> bool {
+        if (fn_id == hir_id_invalid()) { return false; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) { return true; }
+        let raw_target = hir_pointer_map_raw_for_function(self.decl_map,fn_id);
+        // A `@[discard]` tombstone must terminate here: it is a removal
+        // notice, not a definition (see `hir_builder_decl_is_discarded`).
+        // `function_body_source_decl` below only resolves declarations that
+        // can *provide a body*, so for a tombstone it always returns null and
+        // the fallback treats the gap as retryable — MIR then defers round
+        // after round and finally fails with a spurious I0100 even though
+        // nothing calls the symbol. Publishing `declaration_only` here makes
+        // both streaming consumers treat it as a valid declaration contract.
+        if (hir_builder_decl_is_discarded(raw_target)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_declaration_only());
+            self.close_function_body_request(fn_id);
+            return false;
+        }
+        let source_decl = self.function_body_source_decl(raw_target, fn_id);
+        if (source_decl != null) {
+            // A codegen demand may arrive after the reachable queue consumed its
+            // node. Remove any stale node, then materialize from the instance
+            // reverse map rather than relying on decl_map alone.
+            self.remove_scheduled_function_body_request(fn_id, false);
+            self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 0);
+            self.build_reachable_function_body_now(source_decl, fn_id, false);
+            if (self.unit.function_body(fn_id) != hir_id_invalid()) { return true; }
+        }
+        // Missing provenance/body is retryable: a nested closed instance may be
+        // registered later in the same HIR/MIR reachability walk. Do not mark it
+        // terminal and silently emit a declaration-only generic function.
+        self.remove_scheduled_function_body_request(fn_id, false);
+        self.scheduled_function_ids = hir_int_id_map_put(self.scheduled_function_ids,fn_id, 0);
+        return false;
+    }
+
+    /// Whether `materialize_function_body_for_codegen` could rebuild this
+    /// function's body *after* the body has been released.  The rebuild path is
+    /// exactly `function_body_source_decl`: a source declaration, or a closed
+    /// instance's reverse provenance.  A lambda's synthesized `closure$N`
+    /// function has neither -- its body was built inline from the enclosing
+    /// expression and never had a declaration of its own -- so once its body is
+    /// discarded nothing can bring it back.  Consumers that release a body for
+    /// memory and rebuild it later must consult this first.
+    public fn function_body_is_recoverable(self, fn_id: i32) -> bool {
+        if (fn_id == hir_id_invalid()) { return false; }
+        let raw_target = hir_pointer_map_raw_for_function(self.decl_map,fn_id);
+        return self.function_body_source_decl(raw_target, fn_id) != null;
+    }
+
+    fn materialize_function_body_by_name(self, name: string) {
+        let fn_id = self.function_id_for_name(name);
+        if (fn_id == hir_id_invalid()) { return; }
+        if (self.unit.function_body(fn_id) != hir_id_invalid()) { return; }
+        let raw_target = hir_pointer_map_raw_for_function(self.decl_map,fn_id);
+        self.ensure_reachable_function_body(raw_target, fn_id, false);
+    }
+
+    fn materialize_language_lowering_roots(self) {
+        self.materialize_function_body_by_name("__vio_await_yield");
+    }
+}

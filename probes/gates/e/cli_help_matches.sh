@@ -33,12 +33,12 @@ if ! echo "$HELP" | grep -q -- '--version'; then
   echo "FAIL: help must document --version"
   exit 1
 fi
-if grep -n 'a == "--legacy-codegen"' "$ROOT/bootstrap_compiler/src/core/main.vyx"; then
+if grep -n 'a == "--legacy-codegen"' "$ROOT/bootstrap_compiler/src/core/driver/main.vyx"; then
   echo "FAIL: --legacy-codegen is still parsed in main.vyx"
   exit 1
 fi
 
-python3 - "$BOOT" "$HELP" "$ROOT/bootstrap_compiler/src/core/main.vyx" <<'PY'
+python3 - "$BOOT" "$HELP" "$ROOT/bootstrap_compiler/src/core/driver/main.vyx" <<'PY'
 import re, subprocess, sys, tempfile, os
 boot, help_text, main_path = sys.argv[1], sys.argv[2], sys.argv[3]
 fail = False

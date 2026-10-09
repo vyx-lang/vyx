@@ -16,9 +16,9 @@ need() {
   fi
 }
 
-need "$ROOT/bootstrap_compiler/src/core/dci_ids.vyx" 'fn dci_ids_intern_type' "intern"
-need "$ROOT/bootstrap_compiler/src/codegen/dci_abi.vyx" 'dci_ids_lookup_type' "hot path by id"
-need "$ROOT/bootstrap_compiler/src/hir/dci_binder.vyx" 'dci_ids_note_declaration_noop()' "auditable declaration"
+need "$ROOT/bootstrap_compiler/src/core/dci/dci_ids.vyx" 'fn dci_ids_intern_type' "intern"
+need "$ROOT/bootstrap_compiler/src/codegen/abi/dci_abi.vyx" 'dci_ids_lookup_type' "hot path by id"
+need "$ROOT/bootstrap_compiler/src/hir/resolve/dci_binder.vyx" 'dci_ids_note_declaration_noop()' "auditable declaration"
 
 if [ ! -x "$BOOT" ]; then
   echo "FAIL: missing $BOOT"

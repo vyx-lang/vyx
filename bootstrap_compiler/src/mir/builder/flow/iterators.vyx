@@ -1,0 +1,310 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn mark_iterator_method_reachable(self, receiver_type_id: i32, method_name: string) {
+        let method_fn = self.executable_method_target_by_receiver_type(receiver_type_id, method_name);
+        if (method_fn != mir_id_invalid()) {
+            self.mark_function_reachable(method_fn);
+        }
+    }
+
+    public fn mark_foreach_iterator_methods_reachable(self, iter_type_id: i32) {
+        if (iter_type_id == hir_id_invalid()) { return; }
+        self.mark_iterator_method_reachable(iter_type_id, "has_next");
+        self.mark_iterator_method_reachable(iter_type_id, "next");
+    }
+
+    public fn lower_string_foreach_iterator(self, receiver_value: i32, source_expr_id: i32) -> i32 {
+        if (receiver_value == mir_id_invalid()) { return mir_id_invalid(); }
+        let receiver_type = self.unit.value_type(receiver_value);
+        let receiver_kind = hir_type_table_kind(self.unit.types, receiver_type);
+        let receiver_text = self.type_text(receiver_type);
+        let receiver_base = mir_builder_last_path_segment(policy_generic_call_base(receiver_text.clone()));
+        if (receiver_kind != ty_STRING() && receiver_base != "String") { return receiver_value; }
+
+        let target_fn = self.executable_method_target_by_receiver_type(receiver_type, "iter");
+        if (target_fn == mir_id_invalid()) { return receiver_value; }
+        let result_type = self.unit.function_return_type(target_fn);
+        if (result_type == mir_id_invalid()) { return receiver_value; }
+        self.mark_function_reachable(target_fn);
+
+        let callee_ref = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_target_ref(),
+                                           result_type,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           target_fn,
+                                           source_expr_id,
+                                           hir_unit_expr_flags(self.h, source_expr_id),
+                                           0,
+                                           0,
+                                           "iter",
+                                           "");
+        self.unit.set_value_lhs( callee_ref, receiver_value);
+        let call_value = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_call(),
+                                           result_type,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           target_fn,
+                                           source_expr_id,
+                                           hir_unit_expr_flags(self.h, source_expr_id),
+                                           0,
+                                           0,
+                                           "iter",
+                                           "");
+        self.unit.set_value_lhs( call_value, callee_ref);
+        return call_value;
+    }
+
+    public fn expr_is_direct_range(self, expr_id: i32) -> bool {
+        if (expr_id == hir_id_invalid()) { return false; }
+        if (self.h.expr_kind(expr_id) != ex_BIN()) { return false; }
+        let op = self.h.expr_op(expr_id);
+        return op == tk_DOTDOT() || op == tk_DOTDOTEQ();
+    }
+
+    public fn lower_range_foreach_stmt(self, stmt_id: i32) -> bool {
+        let range_expr = self.h.stmt_cond(stmt_id);
+        if (!self.expr_is_direct_range(range_expr)) { return false; }
+        let loop_place = mir_i32_map_get(self.place_map, self.h.stmt_local(stmt_id));
+        if (loop_place == mir_id_invalid()) { return false; }
+        let i64_type = self.i64_type_id();
+        let start_expr = self.h.expr_lhs(range_expr);
+        let end_expr = self.h.expr_rhs(range_expr);
+        let start_value = self.lower_expr_as(start_expr, i64_type);
+        var end_value = self.lower_expr_as(end_expr, i64_type);
+        if (self.h.expr_op(range_expr) == tk_DOTDOTEQ()) {
+            end_value = self.add_binary_value(i64_type,
+                                              tk_PLUS(),
+                                              end_value,
+                                              self.add_const_i64_value(1, range_expr),
+                                              range_expr,
+                                              "range.end.inclusive");
+        }
+        let end_place = self.add_temp_place(i64_type, range_expr, "__range_end");
+        self.emit_assign(loop_place, start_value, stmt_id, start_expr);
+        self.emit_assign(end_place, end_value, stmt_id, end_expr);
+
+        let cond_block = self.add_block(stmt_id);
+        let body_block = self.add_block(self.h.stmt_child(stmt_id));
+        let step_block = self.add_block(stmt_id);
+        let exit_block = self.add_block(hir_id_invalid());
+        self.terminate_current_goto(cond_block);
+        self.set_current_block(cond_block);
+        let current_value = self.add_read_value(loop_place, range_expr);
+        let limit_value = self.add_read_value(end_place, range_expr);
+        let cond_value = self.add_binary_value(self.bool_type_id(),
+                                               tk_LT(),
+                                               current_value,
+                                               limit_value,
+                                               range_expr,
+                                               "range.cond");
+        self.terminate_current(mir_term_branch(), cond_value, body_block, exit_block, mir_id_invalid(), stmt_id);
+
+        let saved_break = self.break_target_block_id;
+        let saved_continue = self.continue_target_block_id;
+        let saved_break_drop = self.break_drop_mark;
+        let saved_continue_drop = self.continue_drop_mark;
+        let saved_break_defer = self.break_defer_mark;
+        let saved_continue_defer = self.continue_defer_mark;
+        let saved_break_storage = self.break_storage_mark;
+        let saved_continue_storage = self.continue_storage_mark;
+        let loop_drop_mark = self.drop_stack_head;
+        let loop_defer_mark = self.defer_stack_head;
+        let loop_storage_mark = self.storage_stack_head;
+        let loop_drop_state = self.drop_stack_snapshot();
+        self.break_target_block_id = exit_block;
+        self.continue_target_block_id = step_block;
+        self.break_drop_mark = loop_drop_mark;
+        self.continue_drop_mark = loop_drop_mark;
+        self.break_defer_mark = loop_defer_mark;
+        self.continue_defer_mark = loop_defer_mark;
+        self.break_storage_mark = loop_storage_mark;
+        self.continue_storage_mark = loop_storage_mark;
+        self.push_labeled_loop(stmt_id,
+                                exit_block,
+                                step_block,
+                                loop_drop_mark,
+                                loop_defer_mark,
+                                loop_storage_mark);
+
+        self.set_current_block(body_block);
+        self.drop_stack_head = loop_drop_mark;
+        self.defer_stack_head = loop_defer_mark;
+        self.storage_stack_head = loop_storage_mark;
+        self.lower_stmt(self.h.stmt_child(stmt_id));
+        if (!self.current_block_terminated()) {
+            self.emit_scope_exit_until(loop_defer_mark,
+                                       loop_drop_mark,
+                                       loop_storage_mark,
+                                       stmt_id);
+            self.terminate_current_goto(step_block);
+        }
+        self.drop_stack_restore_activity(loop_drop_state);
+
+        self.set_current_block(step_block);
+        self.drop_stack_head = loop_drop_mark;
+        self.defer_stack_head = loop_defer_mark;
+        self.storage_stack_head = loop_storage_mark;
+        let step_current = self.add_read_value(loop_place, range_expr);
+        let next_value = self.add_binary_value(self.unit.place_type(loop_place),
+                                               tk_PLUS(),
+                                               step_current,
+                                               self.add_const_i64_value(1, range_expr),
+                                               range_expr,
+                                               "range.step");
+        self.emit_assign(loop_place, next_value, stmt_id, range_expr);
+        if (!self.current_block_terminated()) {
+            self.emit_scope_exit_until(loop_defer_mark,
+                                       loop_drop_mark,
+                                       loop_storage_mark,
+                                       stmt_id);
+            self.terminate_current_goto(cond_block);
+        }
+        self.drop_stack_restore_activity(loop_drop_state);
+
+        self.pop_labeled_loop(stmt_id);
+        self.break_target_block_id = saved_break;
+        self.continue_target_block_id = saved_continue;
+        self.break_drop_mark = saved_break_drop;
+        self.continue_drop_mark = saved_continue_drop;
+        self.break_defer_mark = saved_break_defer;
+        self.continue_defer_mark = saved_continue_defer;
+        self.break_storage_mark = saved_break_storage;
+        self.continue_storage_mark = saved_continue_storage;
+        self.set_current_block(exit_block);
+        self.drop_stack_head = loop_drop_mark;
+        self.defer_stack_head = loop_defer_mark;
+        self.storage_stack_head = loop_storage_mark;
+        return true;
+    }
+
+    public fn lower_foreach_stmt(self, stmt_id: i32) {
+        if (self.lower_range_foreach_stmt(stmt_id)) { return; }
+        let raw_iter_value = self.lower_expr(self.h.stmt_cond(stmt_id));
+        var iter_value = self.lower_string_foreach_iterator(raw_iter_value,
+                                                            self.h.stmt_cond(stmt_id));
+        if (raw_iter_value != mir_id_invalid()
+            && !(self.unit.value_kind(raw_iter_value) == mir_value_target_ref()
+                 && self.unit.value_target_kind(raw_iter_value) == mir_target_builtin()
+                 && (self.unit.value_name(raw_iter_value) == "fields"
+                     || self.unit.value_name(raw_iter_value) == "methods"))) {
+            self.mark_foreach_iterator_methods_reachable(self.unit.value_type(iter_value));
+            let iter_place = self.add_temp_place(self.unit.value_type(iter_value),
+                                                 self.h.stmt_cond(stmt_id),
+                                                 "__foreach_iter");
+            self.add_assign_instr(iter_place,
+                                  iter_value,
+                                  stmt_id,
+                                  self.h.stmt_cond(stmt_id),
+                                  "__foreach_iter");
+            iter_value = self.add_read_value(iter_place, self.h.stmt_cond(stmt_id));
+        }
+        let index_place = self.add_temp_place(self.i64_type_id(),
+                                              self.h.stmt_cond(stmt_id),
+                                              "__foreach_index");
+        self.add_assign_instr(index_place,
+                              self.add_const_i64_value(0, self.h.stmt_cond(stmt_id)),
+                              stmt_id,
+                              self.h.stmt_cond(stmt_id),
+                              "__foreach_index");
+        let loop_block = self.add_block(stmt_id);
+        let body_block = self.add_block(self.h.stmt_child(stmt_id));
+        let exit_block = self.add_block(hir_id_invalid());
+        self.terminate_current_goto(loop_block);
+        self.set_current_block(loop_block);
+        self.terminate_current(mir_term_foreach_next(),
+                               iter_value,
+                               body_block,
+                               exit_block,
+                               mir_id_invalid(),
+                               index_place);
+
+        let saved_break = self.break_target_block_id;
+        let saved_continue = self.continue_target_block_id;
+        let saved_break_drop = self.break_drop_mark;
+        let saved_continue_drop = self.continue_drop_mark;
+        let saved_break_defer = self.break_defer_mark;
+        let saved_continue_defer = self.continue_defer_mark;
+        let saved_break_storage = self.break_storage_mark;
+        let saved_continue_storage = self.continue_storage_mark;
+        let loop_drop_mark = self.drop_stack_head;
+        let loop_defer_mark = self.defer_stack_head;
+        let loop_storage_mark = self.storage_stack_head;
+        let loop_drop_state = self.drop_stack_snapshot();
+        self.break_target_block_id = exit_block;
+        self.continue_target_block_id = loop_block;
+        self.break_drop_mark = loop_drop_mark;
+        self.continue_drop_mark = loop_drop_mark;
+        self.break_defer_mark = loop_defer_mark;
+        self.continue_defer_mark = loop_defer_mark;
+        self.break_storage_mark = loop_storage_mark;
+        self.continue_storage_mark = loop_storage_mark;
+        self.push_labeled_loop(stmt_id,
+                                exit_block,
+                                loop_block,
+                                loop_drop_mark,
+                                loop_defer_mark,
+                                loop_storage_mark);
+        self.set_current_block(body_block);
+        self.drop_stack_head = loop_drop_mark;
+        self.defer_stack_head = loop_defer_mark;
+        self.storage_stack_head = loop_storage_mark;
+        self.unit.add_instr(
+                           self.current_function_id,
+                           self.current_block_id,
+                           mir_instr_foreach_bind(),
+                           self.h.stmt_type(stmt_id),
+                           mir_i32_map_get(self.place_map, self.h.stmt_local(stmt_id)),
+                           iter_value,
+                           mir_id_invalid(),
+                           mir_id_invalid(),
+                           mir_target_none(),
+                           mir_id_invalid(),
+                           stmt_id,
+                           self.h.stmt_cond(stmt_id),
+                           0,
+                           index_place,
+                           self.h.stmt_name(stmt_id));
+        self.lower_stmt(self.h.stmt_child(stmt_id));
+        if (!self.current_block_terminated()) {
+            self.emit_scope_exit_until(loop_defer_mark,
+                                       loop_drop_mark,
+                                       loop_storage_mark,
+                                       stmt_id);
+            self.terminate_current_goto(loop_block);
+        }
+        self.drop_stack_restore_activity(loop_drop_state);
+        self.pop_labeled_loop(stmt_id);
+        self.break_target_block_id = saved_break;
+        self.continue_target_block_id = saved_continue;
+        self.break_drop_mark = saved_break_drop;
+        self.continue_drop_mark = saved_continue_drop;
+        self.break_defer_mark = saved_break_defer;
+        self.continue_defer_mark = saved_continue_defer;
+        self.break_storage_mark = saved_break_storage;
+        self.continue_storage_mark = saved_continue_storage;
+        self.set_current_block(exit_block);
+        self.drop_stack_head = loop_drop_mark;
+        self.defer_stack_head = loop_defer_mark;
+        self.storage_stack_head = loop_storage_mark;
+    }
+}

@@ -455,9 +455,9 @@ Source and test entry points:
 | Active queries | [active_protocol.py](../tools/dci/active_protocol.py), [protocol tests](../tools/dci/tests/test_active_protocol.py) |
 | Artifact identity/publication | [artifact_bundle.py](../tools/dci/artifact_bundle.py), [bundle tests](../tools/dci/tests/test_artifact_bundle.py) |
 | C++ and Rust instantiation | [Active C++ tests](../tools/dci/tests/test_active_cpp.py), [Active Rust tests](../tools/dci/tests/test_active_rust.py), [open-generics project](../tests/projects/dci_opengeneric/README.md) |
-| Lifecycle and wrappers | [HIR binder](../bootstrap_compiler/src/hir/dci_binder.vyx), [LLVM Consumer](../bootstrap_compiler/src/codegen/llvm_lower.vyx), [Consumer tests](../tools/dci/tests/test_dci_consumer.py) |
+| Lifecycle and wrappers | [HIR binder](../bootstrap_compiler/src/hir/resolve/dci_binder.vyx), [LLVM Consumer](../bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx), [Consumer tests](../tools/dci/tests/test_dci_consumer.py) |
 | Native class/trait use | [dci_complex_abi](../tests/projects/dci_complex_abi/), [dci_rust_trait](../tests/projects/dci_rust_trait/) |
-| Object storage and exception cleanup | [llvm_lifetime.vyx](../bootstrap_compiler/src/codegen/llvm_lifetime.vyx), [llvm_unwind.vyx](../bootstrap_compiler/src/codegen/llvm_unwind.vyx), [dci-exceptions](../probes/gates/dci-exceptions/README.md) |
+| Object storage and exception cleanup | [llvm_lifetime.vyx](../bootstrap_compiler/src/codegen/llvm/lifetime/llvm_lifetime.vyx), [llvm_unwind.vyx](../bootstrap_compiler/src/codegen/llvm/lifetime/llvm_unwind.vyx), [dci-exceptions](../probes/gates/dci-exceptions/README.md) |
 | Ecosystem and pressure acceptance | [C++ ICU](../probes/gates/dci-cpp-ecosystem/README.md), [Rust Cargo](../probes/gates/dci-rust-ecosystem/README.md), [industrial runner](../probes/gates/dci-industrial/README.md) |
 
 Contract validation, producer verification, and linked execution answer different

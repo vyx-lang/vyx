@@ -4,8 +4,8 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
 $Compiler = (Resolve-Path -LiteralPath $Compiler).Path
 $runDir = Join-Path $PSScriptRoot ('.runs/epoch-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 New-Item -ItemType Directory -Path $runDir | Out-Null
-$sema = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/sema.vyx'))
-$policy = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/policy.vyx'))
+$sema = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/sema/sema.vyx'))
+$policy = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/sema/policy.vyx'))
 
 function Extract-Function([string]$Text, [string]$Name) {
     $found = [regex]::Match($Text, '(?m)^[ \t]*(?:public )?fn ' + [regex]::Escape($Name) + '\s*\(')
@@ -54,6 +54,6 @@ try {
     $exitCode=$LASTEXITCODE
     Get-Content (Join-Path $runDir 'run.log')
     if($exitCode -ne 0){throw "Epoch contract failed: $exitCode"}
-    [ordered]@{compiler_sha256=(Get-FileHash -LiteralPath $Compiler).Hash;sema_sha256=(Get-FileHash (Join-Path $repo 'bootstrap_compiler/src/core/sema.vyx')).Hash;exit=$exitCode;scope='Production lazy lookup control flow, controlled loader/known predicates; not a full Sema integration test.'} | ConvertTo-Json | Set-Content (Join-Path $runDir 'result.json')
+    [ordered]@{compiler_sha256=(Get-FileHash -LiteralPath $Compiler).Hash;sema_sha256=(Get-FileHash (Join-Path $repo 'bootstrap_compiler/src/core/sema/sema.vyx')).Hash;exit=$exitCode;scope='Production lazy lookup control flow, controlled loader/known predicates; not a full Sema integration test.'} | ConvertTo-Json | Set-Content (Join-Path $runDir 'result.json')
 } finally {$env:PATH=$oldPath;$env:LLVM_ROOT=$oldLlvm}
 Write-Host "artifacts: $runDir"

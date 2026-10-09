@@ -40,7 +40,7 @@ pwsh -NoProfile -File probes/gates/frontend_scaling/Measure-Fanout.ps1 -Compiler
 
 ## 明确的重复查询路径
 
-生产文件：`bootstrap_compiler/src/core/sema.vyx`。
+生产文件：`bootstrap_compiler/src/core/sema/sema.vyx`。
 
 1. `sema_lazy_load_pending_until_symbol` 遍历 `pending_imports` 文本。
 2. 原实现在**每个字符**后调用 `sema_symbol_known(name/base/short)`，而只有行末 `sema_load_module_symbol` 才可能加载声明、改变符号表。

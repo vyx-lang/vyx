@@ -3,10 +3,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-SRC="$ROOT/bootstrap_compiler/src/codegen/llvm_lower.vyx"
+SRC="$ROOT/bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx"
+LAYOUT="$ROOT/bootstrap_compiler/src/codegen/llvm/abi/type_layout.vyx"
+OWNERSHIP="$ROOT/bootstrap_compiler/src/codegen/llvm/storage/ownership.vyx"
 fail=0
 
-if ! grep -q 'fn ensure_type_text_index' "$SRC"; then
+if ! grep -q 'fn ensure_type_text_index' "$LAYOUT"; then
   echo "FAIL: missing type text intern index"
   fail=1
 fi
@@ -33,7 +35,7 @@ awk '
       exit 1
     }
   }
-' "$SRC" || fail=1
+' "$OWNERSHIP" || fail=1
 
 if [ "$fail" != 0 ]; then
   echo "mem type_text_index FAIL"

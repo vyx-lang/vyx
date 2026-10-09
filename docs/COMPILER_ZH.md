@@ -20,12 +20,24 @@ LLVM IR → 对象文件 → 链接成原生程序
 ```
 
 `bootstrap_compiler/src/core/` 包含驱动、前端与构建系统；`src/hir/`、
-`src/mir/` 分别实现两级中间表示；`src/codegen/llvm_lower.vyx` 将 MIR
-降低到 LLVM。具体构建命令见[编译器 README](../bootstrap_compiler/README.md)。
+`src/mir/` 分别实现两级中间表示；`src/codegen/llvm/llvm_lower.vyx` 保存 LLVM
+降低上下文与公开入口。方法实现在
+[`src/codegen/llvm/`](../bootstrap_compiler/src/codegen/llvm/README.md)，按值与存储操作、
+原生 ABI、DCI、函数与 CGU 编译组织。具体构建命令见[编译器 README](../bootstrap_compiler/README.md)。
+
+排查降低问题时，先从 `values.vyx`、`instructions.vyx` 或 `calls.vyx` 的分派入口
+找到对应操作，再进入实现模块；源码索引列出了各文件的职责与入口。
+这些文件在同一逻辑模块中通过 `impl` 实现同一个 `LlvmMirLowerer`；`Vyx.toml`
+列出模块的组成文件，上下文的存储和生命周期仍由入口文件管理。
+语义分析与项目构建仍有较大的集中实现。HIR 构建已按声明、实例化、表达式解析
+和函数体生命周期拆分，入口见[源码索引](../bootstrap_compiler/src/hir/builder/README.md)。
+HIR 与 LLVM 各自的实现文件仍共享构建器或降低上下文的状态。
+[源码树](../bootstrap_compiler/src/README.md)将前端进一步分为驱动、语法、语义、
+事实、DCI、项目构建和编辑器服务，各目录维护自己的职责边界。
 
 ## HIR：保留语言语义
 
-[`HirUnit`](../bootstrap_compiler/src/hir/hir_model.vyx) 将类型、声明、函数、
+[`HirUnit`](../bootstrap_compiler/src/hir/model/hir_model.vyx) 将类型、声明、函数、
 局部变量、语句、表达式、泛型环境与类型列表保存在分开的记录表中。逻辑上的
 语句与表达式关系使用数字 ID 连接；物理存储是带 `count`、`capacity` 的
 扁平记录池。ID 是当前编译单元内的索引，不是跨构建持久的全局身份。
@@ -35,13 +47,18 @@ LLVM IR → 对象文件 → 链接成原生程序
 依次进行 HIR 语义解析、DCI 生命周期绑定、所有权解析与 HIR 验证，失败时
 返回诊断。AST 阶段已有语义工作，因此不能将全部类型检查归于 HIR。
 
-`src/hir/hir.vyx` 是 AST 语义事实审计模块；HIR 的数据模型以
-`src/hir/hir_model.vyx` 为准。
+`src/hir/verify/hir.vyx` 是 AST 语义事实审计模块；HIR 的数据模型以
+`src/hir/model/hir_model.vyx` 为准。
+
+`src/hir/builder/hir_builder.vyx` 保存构建器存储、构造和原生 handle 入口；
+`src/hir/builder/` 中的实现属于同一个逻辑模块。`function_bodies.vyx`
+处理可达函数体的请求，`body_storage.vyx` 在代码生成后释放生成的记录。
+修改泛型实例、闭包或延迟类型解析时，需保留这一有界生命周期。
 
 ## 接口、泛型与跨模块定义
 
 `.vyi` 保留普通公开声明表面。包含泛型的用户模块还由
-[`template_artifact.vyx`](../bootstrap_compiler/src/core/template_artifact.vyx)
+[`template_artifact.vyx`](../bootstrap_compiler/src/core/sema/template_artifact.vyx)
 追加 v1 AST 图，携带泛型 body 和私有依赖。消费者重建语义引用，保留定义模块，
 供限定名称查找与私有 helper 可见性检查使用。显式与推导出的泛型参数先代入，
 再确定调用返回类型。图中携带私有 helper 不等于将它公开给消费者调用。
@@ -65,7 +82,7 @@ linkonce/weak ODR 定义附加 `Any` COMDAT，允许链接器合并重复实例�
 
 ## MIR：显式执行路径
 
-[`MirUnit`](../bootstrap_compiler/src/mir/mir_model.vyx) 保留类型表，另有
+[`MirUnit`](../bootstrap_compiler/src/mir/model/mir_model.vyx) 保留类型表，另有
 函数、基本块、局部变量、字段、存储位置（Place）、值（Value）、指令
 （Instr）和匹配分支（Case）等记录表。每个基本块以终结器结束，例如
 `return`、`goto`、`branch`、`match` 或 `yield`。
@@ -79,18 +96,23 @@ linkonce/weak ODR 定义附加 `Any` COMDAT，允许链接器合并重复实例�
 | Instr | 做什么操作？ | 求值、赋值、析构、存储开始与结束 |
 | Terminator | 下一步去哪？ | 返回、跳转、条件分支、迭代 |
 
-例如 `if` 在 HIR 中仍是语句；[`lower_if_stmt`](../bootstrap_compiler/src/mir/mir_builder.vyx)
+[MIR 源码树](../bootstrap_compiler/src/mir/README.md)分为记录模型、HIR 降低、分析、
+优化和验证。`builder/mir_builder.vyx` 保存构建状态；表达式、控制流、调用、生命周期
+和可达函数分别放在对应子目录。`model/records/` 管理记录访问，`verify/scope/`
+检查当前函数的追加范围，`verify/strict/` 负责完整编译单元检查。
+
+例如 `if` 在 HIR 中仍是语句；[`lower_if_stmt`](../bootstrap_compiler/src/mir/builder/flow/branches.vyx)
 把它变为 then、else、join 基本块及显式分支。builder 也会在作用域退出路径
 安排 `drop`、`defer` 和存储结束操作。MIR 有可变局部存储与 `assign`、
 `read_place`；`ValueId` 不表示整个 MIR 已经是 SSA。种类定义见
-[`mir_ids.vyx`](../bootstrap_compiler/src/mir/mir_ids.vyx)。
+[`mir_ids.vyx`](../bootstrap_compiler/src/mir/model/mir_ids.vyx)。
 
 `match` 可以产生值。builder 将 subject 求值一次，把模式测试和 guard 降低为
 控制流，再通过结果 place 汇合产生值的分支。嵌套 match、payload 绑定、block
 尾值和 arm 内 return 均有 [AOT 编译/运行门](../probes/gates/match-expression/README.md)；
 分支类型不一致、非 bool guard、缺少分支值与空值匹配有负向诊断检查。
 
-[`mir_pass.vyx`](../bootstrap_compiler/src/mir/mir_pass.vyx) 接入了常量折叠、
+[`mir_pass.vyx`](../bootstrap_compiler/src/mir/passes/mir_pass.vyx) 接入了常量折叠、
 常量分支折叠、SCCP、复制传播、考虑析构的死代码消除、select 形成及 CFG
 简化。优化等级大于 0 时，这些 pass 以有限轮数运行。MIR 通过验证并检查
 DCI 存储契约后交给 LLVM 后端。
@@ -98,8 +120,9 @@ DCI 存储契约后交给 LLVM 后端。
 ## 按函数处理与 CGU
 
 当前 LLVM 流式路径以函数为单位进行 MIR 物化、优化、LLVM 降低和记录释放；
-相关阶段在 [`llvm_lower.vyx`](../bootstrap_compiler/src/codegen/llvm_lower.vyx)
-中。CGU 把待生成的定义分到多个代码生成单元，后端可以并发发射对象文件。
+相关阶段在 [`streaming.vyx`](../bootstrap_compiler/src/codegen/llvm/functions/streaming.vyx)
+中。[`cgu.vyx`](../bootstrap_compiler/src/codegen/llvm/emit/cgu.vyx) 把待生成的定义分到
+多个代码生成单元，后端可以并发发射对象文件。
 这与项目构建系统按模块启动并行任务是两个不同层次。
 
 项目调度器使用 typed action、输入大小估计、运行中内存观测和成功任务成本历史。

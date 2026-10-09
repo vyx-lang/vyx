@@ -1,0 +1,514 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn function_is_foreign_dci_free_function(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_free_function(&self.m, function_id);
+    }
+
+    public fn function_source_param_count(self, function_id: i32) -> i32 {
+        var out: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_source_param(local)) { out = out + 1; }
+            local = self.m.local_next(local);
+        }
+        return out;
+    }
+
+    public fn function_llvm_param_count(self, function_id: i32) -> i32 {
+        var out: i32 = 0;
+        var source_index: i32 = 0;
+        while (source_index < self.function_source_param_count(function_id)) {
+            out = out + self.dci_source_param_llvm_slots(function_id, source_index);
+            source_index = source_index + 1;
+        }
+        if (self.function_uses_hidden_sret(function_id)) { out = out + 1; }
+        if (self.function_is_foreign_dci_ctor(function_id)) { out = out + 1; }
+        out = out + self.function_hidden_env_param_count(function_id);
+        if (self.function_uses_c_main_abi(function_id)) { out = out + 2; }
+        if (self.dci_function_inalloca_count(function_id) > 1) { out = out + 1; }
+        return out;
+    }
+
+    public fn function_source_param_type(self, function_id: i32, idx: i32) -> i32 {
+        var seen: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_source_param(local)) {
+                if (seen == idx) { return self.local_effective_type(local); }
+                seen = seen + 1;
+            }
+            local = self.m.local_next(local);
+        }
+        return mir_id_invalid();
+    }
+
+    public fn function_source_param_local(self, function_id: i32, idx: i32) -> i32 {
+        var seen: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_source_param(local)) {
+                if (seen == idx) { return local; }
+                seen = seen + 1;
+            }
+            local = self.m.local_next(local);
+        }
+        return mir_id_invalid();
+    }
+
+    // Interface-owner type names indexed by last path segment. The predicate
+    // formerly rescanned every function in the unit (with a per-function string
+    // compare) on each query; during lowering it is asked for nearly every type,
+    // so that walk was an O(types * functions) hot spot (top of the mir_codegen
+    // profile). policy_type_name_equal reduces to comparing policy_last_segment,
+    // so collect the interface owner segments once into a hashed set and answer
+    // in O(1). Rebuild if the function table grew (defensive; functions are
+    // frozen by the lowering stage in practice).
+    public fn ensure_interface_owner_name_index(self) {
+        if (self.interface_owner_name_index_ready
+            && self.interface_owner_name_index_functions == self.m.function_count) {
+            return;
+        }
+        if (self.interface_owner_name_index != null) {
+            llvm_mir_dispose_symbol_index(self.interface_owner_name_index, self.interface_owner_name_index_cap, false);
+            self.interface_owner_name_index = null;
+        }
+        if (self.interface_trait_type_cache != null) {
+            llvm_mir_id_map_dispose(self.interface_trait_type_cache);
+            self.interface_trait_type_cache = llvm_mir_alloc_i32_map(self.m.types.count + 16);
+        }
+        self.interface_owner_name_index_ready = true;
+        self.interface_owner_name_index_functions = self.m.function_count;
+        var cap = self.m.function_count * 2 + 16;
+        if (cap < 4096) { cap = 4096; }
+        let buf = llvm_mir_symbol_index_new(cap);
+        if (buf == null) { return; }
+        self.interface_owner_name_index = buf;
+        self.interface_owner_name_index_cap = cap;
+        var fn_id: i32 = 1;
+        while (fn_id <= self.m.function_count) {
+            if (mir_unit_function_owner_item_kind(&self.m, fn_id) == hir_item_interface()) {
+                let owner = self.m.function_owner_type(fn_id);
+                let seg = self.last_path_segment(owner);
+                if (seg.len > 0) {
+                    llvm_mir_symbol_index_put_first(buf, cap, seg, 1);
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+    }
+
+    public fn compute_type_is_interface_trait_type(self, type_id: i32) -> bool {
+        if (self.type_is_dyn_trait(type_id)) { return false; }
+        let text = llvm_mir_type_text(&self.m, type_id);
+        if (text.len == 0) { return false; }
+        let seg = self.last_path_segment(text);
+        if (seg.len == 0) { return false; }
+        self.ensure_interface_owner_name_index();
+        if (self.interface_owner_name_index == null) { return false; }
+        return llvm_mir_symbol_index_get(self.interface_owner_name_index,
+                                         self.interface_owner_name_index_cap,
+                                         seg) != mir_id_invalid();
+    }
+
+    public fn type_is_interface_trait_type(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        self.ensure_interface_owner_name_index();
+        let cached = llvm_mir_i32_map_get(self.interface_trait_type_cache, type_id);
+        if (cached != 0) { return cached == 2; }
+        let result = self.compute_type_is_interface_trait_type(type_id);
+        var state: i32 = 1;
+        if (result) { state = 2; }
+        llvm_mir_i32_map_put(self.interface_trait_type_cache, type_id, state);
+        return result;
+    }
+
+    public fn type_is_concrete_runtime_type(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        if (llvm_mir_type_kind(&self.m, type_id) == ty_VOID()
+            || llvm_mir_type_text(&self.m, type_id).len == 0) {
+            return false;
+        }
+        if (self.type_is_interface_trait_type(type_id)) { return false; }
+        if (self.type_id_has_open_template_for_function(self.current_function_id, type_id)) { return false; }
+        return true;
+    }
+
+    public fn direct_call_callee(self, value_id: i32) -> i32 {
+        if (value_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let callee = self.m.value_lhs(value_id);
+        if (callee != mir_id_invalid() && self.m.value_target_kind(callee) == mir_target_function()) {
+            return callee;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn direct_call_target_function(self, value_id: i32) -> i32 {
+        if (value_id == mir_id_invalid()) { return mir_id_invalid(); }
+        if (self.m.value_target_kind(value_id) == mir_target_function()) {
+            return self.m.value_target_id(value_id);
+        }
+        let callee = self.direct_call_callee(value_id);
+        if (callee != mir_id_invalid()) { return self.m.value_target_id(callee); }
+        return mir_id_invalid();
+    }
+
+    public fn raw_call_target_return_type(self, value_id: i32) -> i32 {
+        let target_fn = self.direct_call_target_function(value_id);
+        if (target_fn == mir_id_invalid()) { return mir_id_invalid(); }
+        let ret_type = self.m.function_return_type(target_fn);
+        if (self.type_is_concrete_runtime_type(ret_type)) { return ret_type; }
+        return mir_id_invalid();
+    }
+
+    public fn local_assignment_concrete_type(self, local_id: i32) -> i32 {
+        if (local_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let function_id = self.m.local_function(local_id);
+        var block = self.m.function_first_block(function_id);
+        while (block != mir_id_invalid()) {
+            var instr = self.m.block_first_instr(block);
+            while (instr != mir_id_invalid()) {
+                if (self.m.instr_kind(instr) == mir_instr_assign()) {
+                    let place_id = self.m.instr_place(instr);
+                    if (place_id != mir_id_invalid()
+                        && self.m.place_kind(place_id) == mir_place_local()
+                        && self.m.place_local(place_id) == local_id) {
+                        let value_id = self.m.instr_value(instr);
+                        let direct_ret = self.raw_call_target_return_type(value_id);
+                        if (direct_ret != mir_id_invalid()) { return direct_ret; }
+                        let value_type = self.m.value_type(value_id);
+                        if (self.type_is_concrete_runtime_type(value_type)) { return value_type; }
+                    }
+                }
+                instr = self.m.instr_next(instr);
+            }
+            block = self.m.block_next(block);
+        }
+        return mir_id_invalid();
+    }
+
+    public fn local_effective_type(self, local_id: i32) -> i32 {
+        if (local_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let raw_type = self.m.local_type(local_id);
+        if (raw_type == mir_id_invalid()
+            || llvm_mir_type_kind(&self.m, raw_type) == ty_VOID()
+            || llvm_mir_type_text(&self.m, raw_type).len == 0) {
+            let concrete_invalid = self.local_assignment_concrete_type(local_id);
+            if (concrete_invalid != mir_id_invalid()) { return concrete_invalid; }
+            return raw_type;
+        }
+        if (!self.type_is_interface_trait_type(raw_type)) { return raw_type; }
+        let concrete = self.local_assignment_concrete_type(local_id);
+        if (concrete != mir_id_invalid()) { return concrete; }
+        return raw_type;
+    }
+
+    public fn place_effective_type(self, place_id: i32) -> i32 {
+        if (place_id == mir_id_invalid()) { return mir_id_invalid(); }
+        if (self.m.place_kind(place_id) == mir_place_local()) {
+            return self.local_effective_type(self.m.place_local(place_id));
+        }
+        if (self.m.place_kind(place_id) == mir_place_field()) {
+            // Multi-level field chains (a.b.c) record template field types in
+            // MIR; refine through the remapped FieldId so nested bases report
+            // the concrete instance layout type.
+            let mapped = self.mapped_field_id_for_place(place_id);
+            if (mapped != mir_id_invalid()) {
+                let mapped_type = mir_unit_field_type(&self.m, mapped);
+                if (mapped_type != mir_id_invalid()) { return mapped_type; }
+            }
+        }
+        return self.m.place_type(place_id);
+    }
+
+    public fn place_skips_pointer_region_audit(self, place_id: i32) -> bool {
+        if (self.m.place_check_policy(place_id) == mir_check_policy_unchecked()) {
+            return true;
+        }
+        return self.type_is_foreign_dci(self.place_effective_type(place_id));
+    }
+
+    public fn call_arg_effective_type(self, value_id: i32, arg_index: i32) -> i32 {
+        let arg = self.call_arg_at(value_id, arg_index);
+        if (arg == mir_id_invalid()) { return mir_id_invalid(); }
+        return self.value_effective_type(arg);
+    }
+
+    public fn concrete_function_matches_call_args(self, value_id: i32, candidate_fn: i32, receiver_type: i32) -> bool {
+        if (candidate_fn == mir_id_invalid()) { return false; }
+        if (self.m.function_first_block(candidate_fn) == mir_id_invalid()) { return false; }
+        if (mir_unit_function_owner_item_kind(&self.m, candidate_fn) == hir_item_interface()) { return false; }
+        let receiver_id = self.direct_call_receiver(value_id);
+        var receiver_argc: i32 = 0;
+        if (receiver_id != mir_id_invalid()) { receiver_argc = 1; }
+        let source_count = self.function_source_param_count(candidate_fn);
+        if (source_count != self.call_arg_count(value_id) + receiver_argc) { return false; }
+        if (receiver_argc > 0) {
+            if (!self.type_is_concrete_runtime_type(receiver_type)) { return false; }
+            if (!self.type_ids_compatible(self.function_source_param_type(candidate_fn, 0), receiver_type)) { return false; }
+        }
+        var idx: i32 = 0;
+        while (idx < self.call_arg_count(value_id)) {
+            let arg_type = self.call_arg_effective_type(value_id, idx);
+            let param_type = self.function_source_param_type(candidate_fn, idx + receiver_argc);
+            if (arg_type == mir_id_invalid() || param_type == mir_id_invalid()) { return false; }
+            if (!self.type_ids_compatible(param_type, arg_type)) { return false; }
+            idx = idx + 1;
+        }
+        return true;
+    }
+
+    public fn concrete_interface_call_target(self, value_id: i32, prototype_fn: i32) -> i32 {
+        if (prototype_fn == mir_id_invalid()) { return mir_id_invalid(); }
+        if (mir_unit_function_owner_item_kind(&self.m, prototype_fn) != hir_item_interface()) { return mir_id_invalid(); }
+        let method_name = self.function_method_name(prototype_fn);
+        if (method_name.len == 0) { return mir_id_invalid(); }
+        let receiver_id = self.direct_call_receiver(value_id);
+        var receiver_type = mir_id_invalid();
+        if (receiver_id != mir_id_invalid()) {
+            receiver_type = self.value_effective_type(receiver_id);
+            if (self.type_is_concrete_runtime_type(receiver_type)) {
+                let direct = self.executable_method_for_receiver_type(receiver_type, method_name);
+                if (direct != mir_id_invalid()
+                    && self.concrete_function_matches_call_args(value_id, direct, receiver_type)) {
+                    return direct;
+                }
+            }
+        }
+        var fn_id: i32 = 1;
+        while (fn_id <= self.m.function_count) {
+            if (self.function_name_matches_method(self.m.function_name(fn_id), method_name)
+                && self.concrete_function_matches_call_args(value_id, fn_id, receiver_type)) {
+                return fn_id;
+            }
+            fn_id = fn_id + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn concrete_static_interface_call_target(self,
+                                                    value_id: i32,
+                                                    prototype_fn: i32,
+                                                    call_name: string) -> i32 {
+        if (value_id == mir_id_invalid() || prototype_fn == mir_id_invalid()) { return mir_id_invalid(); }
+        if (mir_unit_function_owner_item_kind(&self.m, prototype_fn) != hir_item_interface()) { return mir_id_invalid(); }
+        if (self.direct_call_receiver(value_id) != mir_id_invalid()) { return mir_id_invalid(); }
+        if (self.function_source_param_count(prototype_fn) != self.call_arg_count(value_id)) {
+            return mir_id_invalid();
+        }
+        var method_name = self.function_method_name(prototype_fn);
+        if (method_name.len == 0) { method_name = policy_generic_call_base(call_name.clone()); }
+        if (method_name.len == 0) { return mir_id_invalid(); }
+        let owner_type = self.value_effective_type(value_id);
+        if (!self.type_is_concrete_runtime_type(owner_type)) { return mir_id_invalid(); }
+        let direct = self.executable_method_for_receiver_type(owner_type, method_name);
+        if (direct == mir_id_invalid()) { return mir_id_invalid(); }
+        if (!self.concrete_function_matches_call_args(value_id, direct, mir_id_invalid())) {
+            return mir_id_invalid();
+        }
+        return direct;
+    }
+
+    public fn concrete_bodyless_static_call_target(self,
+                                                   value_id: i32,
+                                                   target_fn: i32,
+                                                   call_name: string) -> i32 {
+        if (value_id == mir_id_invalid() || target_fn == mir_id_invalid()) { return mir_id_invalid(); }
+        if (self.m.function_first_block(target_fn) != mir_id_invalid()) { return mir_id_invalid(); }
+        if (self.function_can_be_declared(target_fn)) { return mir_id_invalid(); }
+        let item_kind = mir_unit_function_item_kind(&self.m, target_fn);
+        let owner_kind = mir_unit_function_owner_item_kind(&self.m, target_fn);
+        if (item_kind != hir_item_method() && owner_kind != hir_item_interface()) {
+            return mir_id_invalid();
+        }
+        if (self.direct_call_receiver(value_id) != mir_id_invalid()) { return mir_id_invalid(); }
+        var method_name = self.function_method_name(target_fn);
+        if (method_name.len == 0) { method_name = policy_generic_call_base(call_name.clone()); }
+        if (method_name.len == 0) { return mir_id_invalid(); }
+        let owner_type = self.value_effective_type(value_id);
+        if (!self.type_is_concrete_runtime_type(owner_type)) { return mir_id_invalid(); }
+        let direct = self.executable_method_for_receiver_type(owner_type, method_name);
+        if (direct == mir_id_invalid() || direct == target_fn) { return mir_id_invalid(); }
+        if (!self.concrete_function_matches_call_args(value_id, direct, mir_id_invalid())) {
+            return mir_id_invalid();
+        }
+        return direct;
+    }
+
+    public fn value_effective_type(self, value_id: i32) -> i32 {
+        if (value_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let raw_type = self.m.value_type(value_id);
+        let kind = self.m.value_kind(value_id);
+        // Streaming MIR may retain a nominal import placeholder on a value
+        // (`kind=void`, non-empty qualified text) after its local or selected
+        // call has already been refined to a concrete runtime type.  Storage
+        // allocation uses that refinement; reads must use the same type or
+        // LLVM receives an invalid `load void` for an otherwise valid value.
+        if (raw_type == mir_id_invalid()
+            || llvm_mir_type_kind(&self.m, raw_type) == ty_VOID()
+            || llvm_mir_type_text(&self.m, raw_type).len == 0) {
+            if (kind == mir_value_read_place()) {
+                let place_type = self.place_effective_type(self.m.value_place(value_id));
+                if (self.type_is_concrete_runtime_type(place_type)) { return place_type; }
+            }
+            if (kind == mir_value_call()) {
+                let direct_ret = self.raw_call_target_return_type(value_id);
+                if (self.type_is_concrete_runtime_type(direct_ret)) { return direct_ret; }
+            }
+            if (kind == mir_value_arg() || kind == mir_value_cast()) {
+                let inner_type = self.value_effective_type(self.m.value_lhs(value_id));
+                if (self.type_is_concrete_runtime_type(inner_type)) { return inner_type; }
+            }
+            return raw_type;
+        }
+        if (kind == mir_value_arg()) {
+            let payload_type = self.value_effective_type(self.m.value_lhs(value_id));
+            if (self.type_is_concrete_runtime_type(payload_type)) { return payload_type; }
+            return raw_type;
+        }
+        if (self.type_is_dyn_trait(raw_type)) {
+            return raw_type;
+        }
+        if (!self.type_is_interface_trait_type(raw_type)) { return raw_type; }
+        if (kind == mir_value_read_place()) {
+            let place_type = self.place_effective_type(self.m.value_place(value_id));
+            if (place_type != mir_id_invalid()) { return place_type; }
+        }
+        if (kind == mir_value_cast()) {
+            let inner_type = self.value_effective_type(self.m.value_lhs(value_id));
+            if (self.type_is_concrete_runtime_type(inner_type)) { return inner_type; }
+        }
+        if (kind == mir_value_call()) {
+            let target_fn = self.direct_call_target_function(value_id);
+            let concrete_target = self.concrete_interface_call_target(value_id, target_fn);
+            if (concrete_target != mir_id_invalid()) {
+                let concrete_ret = self.m.function_return_type(concrete_target);
+                if (self.type_is_concrete_runtime_type(concrete_ret)) { return concrete_ret; }
+            }
+            let raw_ret = self.raw_call_target_return_type(value_id);
+            if (raw_ret != mir_id_invalid()) { return raw_ret; }
+        }
+        return raw_type;
+    }
+
+    public fn function_name_matches_method_direct(self, function_name: string, method_name: string) -> bool {
+        if (function_name == method_name) { return true; }
+        if (method_name.len == 0) { return false; }
+        let mangled = policy_mangle_part(method_name);
+        if (function_name == mangled) { return true; }
+        let marker = "_3A_3A";
+        var start = llvm_mir_string_find(function_name, marker, 0);
+        while (start >= 0) {
+            let method_start = start + (marker.len as i32);
+            var method_end = llvm_mir_string_find(function_name, marker, method_start);
+            if (method_end < 0) { method_end = function_name.len as i32; }
+            let segment = function_name.substring(method_start, method_end);
+            if (segment == method_name || segment == mangled || llvm_mir_demangle_part(segment) == method_name) {
+                return true;
+            }
+            start = llvm_mir_string_find(function_name, marker, method_start);
+        }
+        return false;
+    }
+
+    public fn function_name_matches_method(self, function_name: string, method_name: string) -> bool {
+        if (self.function_name_matches_method_direct(function_name, method_name)) { return true; }
+        let legacy = policy_operator_legacy_method_name(method_name);
+        if (legacy.len > 0 && self.function_name_matches_method_direct(function_name, legacy)) { return true; }
+        let symbol = policy_operator_symbol_method_name(method_name);
+        if (symbol.len > 0 && self.function_name_matches_method_direct(function_name, symbol)) { return true; }
+        return false;
+    }
+
+    public fn function_method_name(self, function_id: i32) -> string {
+        let name = self.m.function_name(function_id);
+        let marker = "_3A_3A";
+        var start = llvm_mir_string_find(name, marker, 0);
+        if (start < 0) { return llvm_mir_demangle_part(policy_generic_call_base(name.clone())); }
+        start = start + (marker.len as i32);
+        while (start <= name.len) {
+            var method_end = llvm_mir_string_find(name, marker, start);
+            if (method_end < 0) { method_end = name.len as i32; }
+            if (method_end > start) {
+                let segment = name.substring(start, method_end);
+                var generic_args = false;
+                // A generic-argument segment survives mangling with its `<`
+                // escape attached (`Pair2::<f64,i32>::get_first` splits into
+                // `_3Cf64_2Ci32_3E` / `get_5Ffirst`), so the marker-stripped
+                // segment starts with `_3C`.  The former bare `3C` test could
+                // never fire, which made the skip dead code and let the method
+                // name resolve to the *argument list* for any owner that is
+                // itself an instantiation.
+                if (segment.len >= 3 && segment.substring(0, 3) == "_3C") {
+                    generic_args = true;
+                } elif (segment.len >= 2 && segment.substring(0, 2) == "3C") {
+                    generic_args = true;
+                }
+                if (!generic_args) {
+                    return llvm_mir_demangle_part(segment);
+                }
+            }
+            if (method_end >= name.len) { break; }
+            start = method_end + (marker.len as i32);
+        }
+        return llvm_mir_demangle_part(policy_generic_call_base(name.clone()));
+    }
+
+    public fn remember_method_candidate_name(self, method_name: string, function_id: i32) {
+        if (method_name.len == 0 || function_id == mir_id_invalid()) { return; }
+        llvm_mir_method_candidate_index_put(self.method_candidate_index,
+                                            self.method_candidate_index_cap,
+                                            method_name,
+                                            function_id);
+    }
+
+    public fn remember_function_method_candidate(self, function_id: i32) {
+        if (function_id == mir_id_invalid()) { return; }
+        let method_name = self.function_method_name(function_id);
+        self.remember_method_candidate_name(method_name, function_id);
+        let legacy = policy_operator_legacy_method_name(method_name);
+        if (legacy.len > 0 && legacy != method_name) {
+            self.remember_method_candidate_name(legacy, function_id);
+        }
+        let symbol = policy_operator_symbol_method_name(method_name);
+        if (symbol.len > 0 && symbol != method_name && symbol != legacy) {
+            self.remember_method_candidate_name(symbol, function_id);
+        }
+    }
+
+    public fn ensure_method_candidate_index(self) {
+        if (self.method_candidate_index_ready) { return; }
+        var fn_id: i32 = self.m.function_count;
+        while (fn_id >= 1) {
+            if (self.function_has_callable_body_or_import(fn_id)) {
+                self.remember_function_method_candidate(fn_id);
+            }
+            fn_id = fn_id - 1;
+        }
+        self.method_candidate_index_ready = true;
+    }
+
+    public fn method_candidate_head(self, method_name: string) -> rawptr {
+        if (method_name.len == 0) { return null; }
+        self.ensure_method_candidate_index();
+        let direct = llvm_mir_method_candidate_index_lookup(self.method_candidate_index,
+                                                           self.method_candidate_index_cap,
+                                                           method_name);
+        if (direct != null) { return direct; }
+        let legacy = policy_operator_legacy_method_name(method_name);
+        if (legacy.len > 0) {
+            let legacy_head = llvm_mir_method_candidate_index_lookup(self.method_candidate_index,
+                                                                     self.method_candidate_index_cap,
+                                                                     legacy);
+            if (legacy_head != null) { return legacy_head; }
+        }
+        let symbol = policy_operator_symbol_method_name(method_name);
+        if (symbol.len > 0) {
+            return llvm_mir_method_candidate_index_lookup(self.method_candidate_index,
+                                                          self.method_candidate_index_cap,
+                                                          symbol);
+        }
+        return null;
+    }
+}

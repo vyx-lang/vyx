@@ -57,7 +57,7 @@ New-Item -ItemType Directory -Force .runs/cgu-pool | Out-Null
 & ./clang/bin/clang++.exe -std=c++17 -O2 `
   -I runtime/vendor/oneTBB/include `
   probes/gates/compiler-industrial/cgu_pool_test.cpp `
-  bootstrap_compiler/src/codegen/cgu_tbb.cpp `
+  bootstrap_compiler/src/codegen/llvm/emit/cgu_tbb.cpp `
   bootstrap_compiler/out/tbb12.lib -o .runs/cgu-pool/check.exe
 Copy-Item bootstrap_compiler/out/tbb12.dll .runs/cgu-pool/
 $check = Start-Process .runs/cgu-pool/check.exe -WindowStyle Hidden -PassThru

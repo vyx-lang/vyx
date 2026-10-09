@@ -1,0 +1,184 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn hir_function_is_codegen_root(self, hir_fn: i32) -> bool {
+        if (hir_fn == hir_id_invalid()) { return false; }
+        if (self.hir_function_has_open_template_types(hir_fn)) { return false; }
+        let fn_flags = hir_unit_function_flags(self.h, hir_fn);
+        if ((fn_flags & hir_function_flag_foreign_cpp_override_method()) != 0) {
+            let owner_type = self.owner_type_text_for_hir_function(hir_fn);
+            let name = self.h.function_name(hir_fn);
+            if (name != "constructor" && name != "drop"
+                && self.hir_type_text_is_dci_stub_class(owner_type)) {
+                // Native DCI stubs call this symbol from C++ and therefore it
+                // has no MIR call edge from `main`. Keep it as an external
+                // codegen root even when project export is partitioned.
+                return true;
+            }
+        }
+        if ((fn_flags & hir_function_flag_codegen_root()) != 0) {
+            return true;
+        }
+        let item_id = self.h.function_item(hir_fn);
+        if (item_id == hir_id_invalid()) { return false; }
+        if (self.h.item_kind(item_id) == hir_item_function()
+            && self.h.item_owner(item_id) == hir_id_invalid()
+            && self.h.function_name(hir_fn) == "main") {
+            return true;
+        }
+        return false;
+    }
+
+    public fn emit_root_name_allowed(self, name: string) -> bool {
+        if (!self.emit_root_names_specified) { return true; }
+        if (name.len == 0) { return false; }
+        return mir_builder_string_contains("|" + self.emit_root_names + "|", "|" + name + "|");
+    }
+
+    public fn emit_root_generic_args_match(self, root_args: string, fn_args: string) -> bool {
+        if (root_args.len == 0 || fn_args.len == 0) { return false; }
+        var idx: i32 = 0;
+        while (idx < 64) {
+            let root_arg = policy_generic_arg_at(root_args, idx);
+            let fn_arg = policy_generic_arg_at(fn_args, idx);
+            if (root_arg.len == 0 || fn_arg.len == 0) {
+                return root_arg.len == 0 && fn_arg.len == 0;
+            }
+            if (root_arg != fn_arg && !policy_type_name_equal(root_arg, fn_arg)) {
+                return false;
+            }
+            idx = idx + 1;
+        }
+        return false;
+    }
+
+    public fn emit_root_generic_instance_allowed(self, hir_fn: i32) -> bool {
+        if (!self.emit_root_names_specified) { return true; }
+        if (hir_fn == hir_id_invalid()) { return false; }
+        let fn_args = hir_unit_function_generic_args(self.h, hir_fn);
+        if (fn_args.len == 0) { return false; }
+        let fn_name = self.h.function_name(hir_fn);
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i <= self.emit_root_names.len) {
+            if (i == self.emit_root_names.len || self.emit_root_names.charAt(i) == 124) {
+                let root_name = self.emit_root_names.substring(start, i);
+                let root_args = policy_generic_call_args(root_name.clone());
+                if (root_args.len > 0 && self.emit_root_generic_args_match(root_args, fn_args)) {
+                    let base = policy_generic_call_base(root_name.clone());
+                    let mangled_base = policy_mangle_part(base);
+                    if (base.len > 0
+                        && (mir_builder_string_contains(fn_name, base)
+                            || mir_builder_string_contains(fn_name, mangled_base))) {
+                        return true;
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn hir_function_is_emit_root(self, hir_fn: i32) -> bool {
+        if (!self.hir_function_is_codegen_root(hir_fn)) { return false; }
+        if (!self.emit_root_names_specified) { return true; }
+        let fn_flags = hir_unit_function_flags(self.h, hir_fn);
+        if ((fn_flags & hir_function_flag_reflection_root()) != 0
+            && (fn_flags & hir_function_flag_reflection_named_root()) == 0
+            && self.emit_partition_owns_reflection_roots()) {
+            return true;
+        }
+        if (self.emit_root_name_allowed(self.h.function_name(hir_fn))) { return true; }
+        return self.emit_root_generic_instance_allowed(hir_fn);
+    }
+
+    public fn reflection_partition_anchor_name(self) -> string {
+        var fallback = "";
+        var hir_fn: i32 = 1;
+        while (hir_fn <= self.h.function_count) {
+            let item_id = self.h.function_item(hir_fn);
+            if (item_id != hir_id_invalid()
+                && self.h.item_kind(item_id) == hir_item_function()
+                && self.h.item_owner(item_id) == hir_id_invalid()
+                && !self.hir_function_has_open_template_types(hir_fn)) {
+                let name = self.h.function_name(hir_fn);
+                if (name == "main") { return name; }
+                if (fallback.len == 0
+                    && (hir_unit_function_flags(self.h, hir_fn)
+                        & hir_function_flag_codegen_root()) != 0) {
+                    fallback = name;
+                }
+            }
+            hir_fn = hir_fn + 1;
+        }
+        return fallback;
+    }
+
+    public fn emit_partition_owns_reflection_roots(self) -> bool {
+        if (!self.emit_root_names_specified) { return true; }
+        let anchor = self.reflection_partition_anchor_name();
+        if (anchor.len == 0) { return false; }
+        return self.emit_root_name_allowed(anchor);
+    }
+
+    public fn mir_function_is_emit_root(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        let hir_fn = self.unit.function_hir_id(function_id);
+        if (hir_fn != hir_id_invalid()) {
+            return self.hir_function_is_emit_root(hir_fn);
+        }
+        if (!self.emit_root_names_specified) { return true; }
+        return self.emit_root_name_allowed(self.unit.function_name(function_id));
+    }
+
+    public fn function_is_partition_external_root(self, function_id: i32) -> bool {
+        if (!self.partition_codegen_roots) { return false; }
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.mir_function_is_emit_root(function_id)) { return false; }
+        let hir_fn = self.unit.function_hir_id(function_id);
+        if (hir_fn == hir_id_invalid()) { return false; }
+        return self.hir_function_is_codegen_root(hir_fn);
+    }
+
+    public fn hir_function_is_partition_declaration_only(self, hir_fn: i32) -> bool {
+        if (!self.partition_codegen_roots) { return false; }
+        if (hir_fn == hir_id_invalid()) { return false; }
+        if (self.hir_function_is_emit_root(hir_fn)) { return false; }
+        let item_id = self.h.function_item(hir_fn);
+        if (item_id != hir_id_invalid()
+            && self.h.item_kind(item_id) == hir_item_extern_function()) {
+            return true;
+        }
+        return (hir_unit_function_flags(self.h, hir_fn) & hir_function_flag_declaration_only()) != 0;
+    }
+
+    public fn function_is_partition_declaration_only(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        return self.hir_function_is_partition_declaration_only(self.unit.function_hir_id(function_id));
+    }
+
+    public fn hir_function_is_interface_method(self, hir_fn: i32) -> bool {
+        if (hir_fn == hir_id_invalid()) { return false; }
+        let item_id = self.h.function_item(hir_fn);
+        if (item_id == hir_id_invalid()) { return false; }
+        let owner_item = self.h.item_owner(item_id);
+        return owner_item != hir_id_invalid()
+            && self.h.item_kind(owner_item) == hir_item_interface();
+    }
+}

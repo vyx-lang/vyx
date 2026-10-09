@@ -8,14 +8,20 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
 $compilerPath = (Resolve-Path -LiteralPath $Compiler).Path
 $runDir = Join-Path $PSScriptRoot ('.runs/' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
-$lowerPath = Join-Path $repo 'bootstrap_compiler/src/codegen/llvm_lower.vyx'
+$lowerPath = Join-Path $repo 'bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx'
 $lower = [IO.File]::ReadAllText($lowerPath)
 if ($SourceRef) {
-    $lower = (& git -C $repo show "${SourceRef}:bootstrap_compiler/src/codegen/llvm_lower.vyx") -join "`n"
+    $historicalPath = $null
+    foreach ($candidate in @('bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx', 'bootstrap_compiler/src/codegen/llvm_lower.vyx')) {
+        & git -C $repo cat-file -e "${SourceRef}:$candidate" 2>$null
+        if ($LASTEXITCODE -eq 0) { $historicalPath = $candidate; break }
+    }
+    if (-not $historicalPath) { throw "Cannot find lowerer at $SourceRef" }
+    $lower = (& git -C $repo show "${SourceRef}:$historicalPath") -join "`n"
     if ($LASTEXITCODE -ne 0) { throw "Cannot read lowerer at $SourceRef" }
 }
 $sourceHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($lower)))
-$ast = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/ast.vyx'))
+$ast = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/syntax/ast.vyx'))
 
 function Get-ProductionFunction([string]$Source, [string]$Name) {
     $match = [regex]::Match($Source, '(?m)^(?:public )?fn ' + [regex]::Escape($Name) + '\(')

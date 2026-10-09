@@ -27,8 +27,8 @@ need docs/高级特性_ZH.md '逐字段' "derive fieldwise (zh)"
 need docs/高级特性_ZH.md 'rawptr' "derive rejects rawptr (zh)"
 
 # Code honesty notes: LSP is Sema-backed; Linux DAP is native ptrace+DWARF.
-need bootstrap_compiler/src/core/lsp_main.vyx 'analyze_unit' "lsp sema"
-need bootstrap_compiler/src/core/dap_main.vyx 'ptrace + DWARF' "dap native"
+need bootstrap_compiler/src/core/tooling/lsp_main.vyx 'analyze_unit' "lsp sema"
+need bootstrap_compiler/src/core/tooling/dap_main.vyx 'ptrace + DWARF' "dap native"
 
 # Android fiber: StartCoroutine is a no-op; async does not need ucontext.
 need docs/ADVANCED_FEATURES.md 'Bionic' "android fiber no-op"

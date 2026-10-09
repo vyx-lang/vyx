@@ -1,0 +1,945 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn record_type_bases_match(self, src_type_id: i32, dst_type_id: i32) -> bool {
+        if (src_type_id == mir_id_invalid() || dst_type_id == mir_id_invalid()) { return false; }
+        let src_text = llvm_mir_type_text(&self.m, src_type_id);
+        let dst_text = llvm_mir_type_text(&self.m, dst_type_id);
+        if (src_text.len == 0 || dst_text.len == 0) { return false; }
+        let src_base = policy_generic_call_base(src_text.clone());
+        let dst_base = policy_generic_call_base(dst_text.clone());
+        return self.last_path_segment(src_base) == self.last_path_segment(dst_base);
+    }
+
+    public fn record_types_structurally_compatible(self, src_type_id: i32, dst_type_id: i32) -> bool {
+        if (src_type_id == dst_type_id) { return true; }
+        if (src_type_id == mir_id_invalid() || dst_type_id == mir_id_invalid()) { return false; }
+        if (llvm_mir_type_kind(&self.m, src_type_id) != ty_CLASS()
+            || llvm_mir_type_kind(&self.m, dst_type_id) != ty_CLASS()) {
+            return false;
+        }
+        if (!self.record_type_bases_match(src_type_id, dst_type_id)) { return false; }
+        let src_count = mir_unit_field_count_for_type(&self.m, src_type_id);
+        let dst_count = mir_unit_field_count_for_type(&self.m, dst_type_id);
+        if (src_count != dst_count) { return false; }
+        var idx: i32 = 0;
+        while (idx < src_count) {
+            let src_field = mir_unit_field_id_for_type_index(&self.m, src_type_id, idx);
+            let dst_field = mir_unit_field_id_for_type_index(&self.m, dst_type_id, idx);
+            if (src_field == mir_id_invalid() || dst_field == mir_id_invalid()) { return false; }
+            if (mir_unit_field_name(&self.m, src_field) != mir_unit_field_name(&self.m, dst_field)) { return false; }
+            if (!self.type_ids_compatible(mir_unit_field_type(&self.m, src_field),
+                                          mir_unit_field_type(&self.m, dst_field))) {
+                return false;
+            }
+            idx = idx + 1;
+        }
+        return true;
+    }
+
+    public fn rebuild_record_value_as(self, value: rawptr, src_type_id: i32, dst_type_id: i32) -> rawptr {
+        if (value == null) { return null; }
+        if (!self.record_types_structurally_compatible(src_type_id, dst_type_id)) { return null; }
+        // Do not extractvalue MIR fields. After the unique C aggregate ABI,
+        // class values may be pointers (method self) or DCI size/align blobs
+        // (`{ i64, [N x i8] }`). extractvalue of field indices aborts in LLVM.
+        // Compatible records share storage; a bitcast-equivalent identity is
+        // enough for both native value structs and foreign DCI layouts.
+        return value;
+    }
+
+    public fn cast_value(self, value: rawptr, src_type_id: i32, dst_type_id: i32) -> rawptr {
+        if (value == null) { return null; }
+        if (src_type_id == dst_type_id || dst_type_id == mir_id_invalid()) { return value; }
+        if (src_type_id == mir_id_invalid()) {
+            self.report_error("cannot cast value with unresolved source type to " + llvm_mir_type_text(&self.m, dst_type_id));
+            return null;
+        }
+        // Same-text types are the same declared type registered twice (e.g.
+        // Result<i32,E> inside a generic method body vs. its instantiated
+        // return type).  Identical text means identical layout: pass the
+        // value through instead of entering the record/DCI adjustment paths,
+        // which return null for this identity shape.  (type_ids_compatible
+        // already treats text equality as compatibility for the same reason;
+        // note DCI derives-from must NOT take this shortcut.)
+        if (llvm_mir_type_text(&self.m, src_type_id) == llvm_mir_type_text(&self.m, dst_type_id)) {
+            return value;
+        }
+        let src_kind0 = llvm_mir_type_kind(&self.m, src_type_id);
+        let dst_kind0 = llvm_mir_type_kind(&self.m, dst_type_id);
+        let src_handle0 = llvm_mir_kind_pointer_handle(src_kind0);
+        let dst_handle0 = llvm_mir_kind_pointer_handle(dst_kind0);
+        if (src_handle0 && dst_handle0) {
+            let src_handle_record = self.class_pointer_abi_record_type(src_type_id);
+            let dst_handle_record = self.class_pointer_abi_record_type(dst_type_id);
+            if (src_handle_record == mir_id_invalid()
+                || dst_handle_record == mir_id_invalid()
+                || src_handle_record == dst_handle_record) {
+                return value;
+            }
+        } else {
+            if (src_handle0 && dst_kind0 == ty_RAWPTR()) {
+                return self.pointer_handle_address(value, "mir.cast.ptr");
+            }
+            if (dst_handle0 && src_kind0 == ty_RAWPTR()) {
+                // An effective-rawptr value can already be a materialized
+                // pointer handle (address_of always builds one).  Re-wrap its
+                // own address + region metadata; feeding the handle struct to
+                // the region-create call fails the runtime argument type
+                // check and silently nulls the whole cast.
+                if (vyx_rt_value_is_struct(value) != 0) {
+                    let wrap_addr = self.pointer_handle_address(value, "mir.cast.ptr");
+                    if (wrap_addr == null) { return null; }
+                    let wrap_meta = self.pointer_handle_metadata(value, "mir.cast.ptr");
+                    return self.build_pointer_handle(wrap_addr, wrap_meta, "mir.cast.ptr");
+                }
+                return self.pointer_handle_from_raw(value,
+                                                    hir_type_table_elem(self.m.types, dst_type_id),
+                                                    0,
+                                                    0,
+                                                    "mir.cast.ptr");
+            }
+        }
+        let src_class_ptr_record = self.class_pointer_abi_record_type(src_type_id);
+        let dst_class_ptr_record = self.class_pointer_abi_record_type(dst_type_id);
+        if (src_class_ptr_record != mir_id_invalid() && dst_class_ptr_record != mir_id_invalid()) {
+            if (src_class_ptr_record == dst_class_ptr_record) { return value; }
+            let src_handle = llvm_mir_kind_pointer_handle(llvm_mir_type_kind(&self.m, src_type_id));
+            let dst_handle = llvm_mir_kind_pointer_handle(llvm_mir_type_kind(&self.m, dst_type_id));
+            var cast_input = value;
+            var cast_metadata: rawptr = null;
+            if (src_handle) {
+                cast_input = self.pointer_handle_address(value, "mir.dci.cast");
+                cast_metadata = self.pointer_handle_metadata(value, "mir.dci.cast");
+                if (cast_input == null || cast_metadata == null) { return null; }
+            }
+            var cast_output: rawptr = null;
+            if (self.type_is_foreign_dci(src_class_ptr_record)
+                && self.type_is_foreign_dci(dst_class_ptr_record)) {
+                if (self.dci_type_derives_from(src_class_ptr_record, dst_class_ptr_record)) {
+                    cast_output = self.adjust_dci_base_pointer(cast_input,
+                                                               src_class_ptr_record,
+                                                               dst_class_ptr_record,
+                                                               "dci.cast.base");
+                } else {
+                    cast_output = self.lower_dci_runtime_pointer_cast(cast_input,
+                                                                      src_type_id,
+                                                                      dst_type_id,
+                                                                      src_class_ptr_record,
+                                                                      dst_class_ptr_record);
+                }
+            } else {
+                cast_output = self.adjust_dci_base_pointer(cast_input,
+                                                           src_class_ptr_record,
+                                                           dst_class_ptr_record,
+                                                           "dci.cast.base");
+            }
+            if (cast_output == null) { return null; }
+            if (src_handle && dst_handle) {
+                return self.build_pointer_handle(cast_output,
+                                                 cast_metadata,
+                                                 "mir.dci.cast");
+            }
+            if (dst_handle) {
+                return self.pointer_handle_from_foreign_raw(cast_output, "mir.dci.cast");
+            }
+            return cast_output;
+        }
+        let src_kind = llvm_mir_type_kind(&self.m, src_type_id);
+        let dst_kind = llvm_mir_type_kind(&self.m, dst_type_id);
+        if (dst_kind == ty_VOID()) { return null; }
+        let src_bits = llvm_mir_int_bits_for_kind(src_kind);
+        let dst_bits = llvm_mir_int_bits_for_kind(dst_kind);
+        let src_float_bits = llvm_mir_float_bits_for_kind(src_kind);
+        let dst_float_bits = llvm_mir_float_bits_for_kind(dst_kind);
+        // Reference view reads: a `&mut T` / `&T` value used where a scalar
+        // or float is expected loads through the reference (C++ reference
+        // semantics).  Raw pointers (`*T`) never auto-deref here — they stay
+        // addresses/handles.
+        if ((src_kind == ty_MUTREF() || src_kind == ty_REF())
+            && (dst_bits > 0 || dst_float_bits > 0)) {
+            let view_elem = hir_type_table_elem(self.m.types, src_type_id);
+            if (view_elem != mir_id_invalid()) {
+                let view_addr = self.pointer_handle_address(value, "mir.ref.view");
+                if (view_addr != null) {
+                    let view_st = self.lower_storage_type(view_elem);
+                    if (view_st != null) {
+                        let view_loaded = vyx_rt_build_load(self.mod, view_st, view_addr, llvm_mir_empty_name(), 0);
+                        if (view_loaded != null) {
+                            return self.cast_value(view_loaded, view_elem, dst_type_id);
+                        }
+                    }
+                }
+            }
+        }
+        if (self.type_is_plain_enum_abi(src_type_id) && dst_bits > 0) {
+            let tag = self.enum_tag_value(value, src_type_id);
+            if (tag == null) {
+                self.report_error("cannot cast enum " + llvm_mir_type_text(&self.m, src_type_id) + " to integer");
+                return null;
+            }
+            if (dst_bits == 32) { return tag; }
+            let dst_ty = self.int_type_for_bits(dst_bits);
+            if (dst_bits < 32) { return vyx_rt_build_trunc(self.mod, tag, dst_ty, llvm_mir_empty_name(), 0); }
+            if (llvm_mir_kind_unsigned(dst_kind)) { return vyx_rt_build_zext(self.mod, tag, dst_ty, llvm_mir_empty_name(), 0); }
+            return vyx_rt_build_sext(self.mod, tag, dst_ty, llvm_mir_empty_name(), 0);
+        }
+        if (src_float_bits > 0 && dst_float_bits > 0) {
+            if (src_float_bits == dst_float_bits) { return value; }
+            let dst_ty = self.lower_type(dst_type_id);
+            if (src_float_bits < dst_float_bits) {
+                return vyx_rt_build_fp_ext(self.mod, value, dst_ty, llvm_mir_empty_name(), 0);
+            }
+            return vyx_rt_build_fp_trunc(self.mod, value, dst_ty, llvm_mir_empty_name(), 0);
+        }
+        if (src_bits > 0 && dst_float_bits > 0) {
+            return vyx_rt_build_si_to_fp(self.mod, value, self.lower_type(dst_type_id), llvm_mir_empty_name(), 0);
+        }
+        if (src_float_bits > 0 && dst_bits > 0) {
+            return vyx_rt_build_fp_to_si(self.mod, value, self.int_type_for_bits(dst_bits), llvm_mir_empty_name(), 0);
+        }
+        if (src_bits > 0 && dst_bits > 0) {
+            if (src_bits == dst_bits) { return value; }
+            let dst_ty = self.int_type_for_bits(dst_bits);
+            if (src_bits > dst_bits) { return vyx_rt_build_trunc(self.mod, value, dst_ty, llvm_mir_empty_name(), 0); }
+            if (llvm_mir_kind_unsigned(src_kind)) { return vyx_rt_build_zext(self.mod, value, dst_ty, llvm_mir_empty_name(), 0); }
+            return vyx_rt_build_sext(self.mod, value, dst_ty, llvm_mir_empty_name(), 0);
+        }
+        let src_handle2 = llvm_mir_kind_pointer_handle(src_kind);
+        let dst_handle2 = llvm_mir_kind_pointer_handle(dst_kind);
+        var pointer_scalar = value;
+        if (src_handle2) {
+            pointer_scalar = self.pointer_handle_address(value, "mir.cast");
+            if (pointer_scalar == null) { return null; }
+        }
+        if (llvm_mir_kind_pointer_like(src_kind) && dst_bits > 0) {
+            return vyx_rt_build_ptr_to_int(self.mod, pointer_scalar, self.int_type_for_bits(dst_bits), llvm_mir_empty_name(), 0);
+        }
+        if (src_bits > 0 && llvm_mir_kind_pointer_like(dst_kind)) {
+            var as_int = value;
+            if (src_bits < 64) { as_int = vyx_rt_build_zext(self.mod, value, self.ty_i64, llvm_mir_empty_name(), 0); }
+            if (src_bits > 64) { as_int = vyx_rt_build_trunc(self.mod, value, self.ty_i64, llvm_mir_empty_name(), 0); }
+            let raw_from_int = vyx_rt_build_int_to_ptr(self.mod, as_int, self.ty_ptr, llvm_mir_empty_name(), 0);
+            if (dst_handle2) {
+                return self.pointer_handle_from_raw(raw_from_int,
+                                                    hir_type_table_elem(self.m.types, dst_type_id),
+                                                    0,
+                                                    0,
+                                                    "mir.cast.int");
+            }
+            return raw_from_int;
+        }
+        if (llvm_mir_kind_pointer_like(src_kind) && llvm_mir_kind_pointer_like(dst_kind)) {
+            if (src_handle2 && dst_handle2) { return value; }
+            if (src_handle2) { return pointer_scalar; }
+            if (dst_handle2) {
+                return self.pointer_handle_from_raw(value,
+                                                    hir_type_table_elem(self.m.types, dst_type_id),
+                                                    0,
+                                                    0,
+                                                    "mir.cast.ptr");
+            }
+            return value;
+        }
+        if (src_kind == ty_CLASS() && dst_kind == ty_CLASS()) {
+            let rebuilt = self.rebuild_record_value_as(value, src_type_id, dst_type_id);
+            if (rebuilt != null) { return rebuilt; }
+        }
+        if (dst_kind == ty_CLASS()) { return value; }
+        return value;
+    }
+
+    public fn truthy_value(self, value: rawptr, type_id: i32) -> rawptr {
+        if (value == null) { return null; }
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        let bits = llvm_mir_int_bits_for_kind(kind);
+        if (bits == 1) { return value; }
+        if (bits > 0) {
+            let v = self.cast_value(value, type_id, type_id);
+            let zero = vyx_rt_const_int(self.mod, self.int_type_for_bits(bits), 0, 0);
+            return vyx_rt_build_icmp(self.mod, llvm_mir_icmp_ne(), v, zero, llvm_mir_empty_name(), 0);
+        }
+        if (llvm_mir_kind_float(kind)) {
+            let zero_f = vyx_rt_const_real(self.mod, self.lower_type(type_id), 0.0);
+            return vyx_rt_build_fcmp(self.mod, llvm_mir_fcmp_one(), value, zero_f, llvm_mir_empty_name(), 0);
+        }
+        if (llvm_mir_kind_pointer_handle(kind)) {
+            return self.pointer_handle_alive(value, "mir.ptr.truthy");
+        }
+        if (llvm_mir_kind_pointer_like(kind)) {
+            return vyx_rt_build_icmp(self.mod,
+                                     llvm_mir_icmp_ne(),
+                                     value,
+                                     vyx_rt_const_ptr_null(self.mod, self.ty_ptr),
+                                     llvm_mir_empty_name(),
+                                     0);
+        }
+        if (self.type_is_class_pointer_abi(type_id)) {
+            return vyx_rt_build_icmp(self.mod,
+                                     llvm_mir_icmp_ne(),
+                                     value,
+                                     vyx_rt_const_ptr_null(self.mod, self.ty_ptr),
+                                     llvm_mir_empty_name(),
+                                     0);
+        }
+        return value;
+    }
+
+    public fn bool_value_i8(self, value_i1: rawptr) -> rawptr {
+        if (value_i1 == null) { return null; }
+        return vyx_rt_build_zext(self.mod, value_i1, self.ty_i8, llvm_mir_empty_name(), 0);
+    }
+
+    public fn int_value_to_bits(self, value: rawptr, src_type_id: i32, dst_bits: i32) -> rawptr {
+        if (value == null) { return null; }
+        let src_kind = llvm_mir_type_kind(&self.m, src_type_id);
+        var src_bits = llvm_mir_int_bits_for_kind(src_kind);
+        if (src_bits <= 0) { src_bits = dst_bits; }
+        if (src_bits == dst_bits) { return value; }
+        let dst_ty = self.int_type_for_bits(dst_bits);
+        if (src_bits > dst_bits) { return vyx_rt_build_trunc(self.mod, value, dst_ty, llvm_mir_empty_name(), 0); }
+        if (llvm_mir_kind_unsigned(src_kind)) { return vyx_rt_build_zext(self.mod, value, dst_ty, llvm_mir_empty_name(), 0); }
+        return vyx_rt_build_sext(self.mod, value, dst_ty, llvm_mir_empty_name(), 0);
+    }
+
+    public fn int_value_to_pointer_index(self, value: rawptr, src_type_id: i32) -> rawptr {
+        if (value == null || self.ty_pointer_index == null || self.pointer_index_bits <= 0) {
+            return null;
+        }
+        let src_kind = llvm_mir_type_kind(&self.m, src_type_id);
+        let src_bits = llvm_mir_int_bits_for_kind(src_kind);
+        if (src_bits <= 0) { return null; }
+        if (src_bits == self.pointer_index_bits) { return value; }
+        if (src_bits > self.pointer_index_bits) {
+            return vyx_rt_build_trunc(self.mod,
+                                      value,
+                                      self.ty_pointer_index,
+                                      llvm_mir_empty_name(),
+                                      0);
+        }
+        if (llvm_mir_kind_unsigned(src_kind)) {
+            return vyx_rt_build_zext(self.mod,
+                                     value,
+                                     self.ty_pointer_index,
+                                     llvm_mir_empty_name(),
+                                     0);
+        }
+        return vyx_rt_build_sext(self.mod,
+                                 value,
+                                 self.ty_pointer_index,
+                                 llvm_mir_empty_name(),
+                                 0);
+    }
+
+    public fn address_arith_operand_i64(self, value_id: i32) -> rawptr {
+        let type_id = self.m.value_type(value_id);
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        let value = self.lower_value(value_id);
+        if (value == null) { return null; }
+        if (llvm_mir_kind_pointer_like(kind)) {
+            var scalar = value;
+            if (llvm_mir_kind_pointer_handle(kind)) {
+                scalar = self.pointer_handle_address(value, "mir.ptr.arith");
+                if (scalar == null) { return null; }
+            }
+            return vyx_rt_build_ptr_to_int(self.mod,
+                                           scalar,
+                                           self.ty_i64,
+                                           llvm_mir_empty_name(),
+                                           0);
+        }
+        if (llvm_mir_int_bits_for_kind(kind) > 0) {
+            return self.int_value_to_bits(value, type_id, 64);
+        }
+        self.report_error("cannot use " + llvm_mir_type_text(&self.m, type_id) + " in pointer arithmetic");
+        return null;
+    }
+
+    public fn lower_pointer_arithmetic_value(self, value_id: i32) -> rawptr {
+        let op = self.m.value_op(value_id);
+        let lhs_id = self.m.value_lhs(value_id);
+        let rhs_id = self.m.value_rhs(value_id);
+        let lhs_kind = llvm_mir_type_kind(&self.m, self.m.value_type(lhs_id));
+        let rhs_kind = llvm_mir_type_kind(&self.m, self.m.value_type(rhs_id));
+        let lhs_ptr = llvm_mir_kind_pointer_like(lhs_kind);
+        let rhs_ptr = llvm_mir_kind_pointer_like(rhs_kind);
+        if (op == llvm_mir_tk_PLUS()) {
+            if (lhs_ptr == rhs_ptr) {
+                self.report_error("pointer addition requires exactly one pointer operand");
+                return null;
+            }
+        } else if (op == llvm_mir_tk_MINUS()) {
+            if (!lhs_ptr || rhs_ptr) {
+                self.report_error("pointer subtraction requires pointer minus integer");
+                return null;
+            }
+        } else {
+            self.report_error("unsupported pointer arithmetic op " + policy_i64_to_string(op as i64));
+            return null;
+        }
+        let lhs_value = self.lower_value(lhs_id);
+        let rhs_value = self.lower_value(rhs_id);
+        if (lhs_value == null || rhs_value == null) {
+            self.report_error("cannot lower pointer arithmetic operands");
+            return null;
+        }
+        var base = lhs_value;
+        var base_kind = lhs_kind;
+        var offset_value = rhs_value;
+        var offset_type = self.m.value_type(rhs_id);
+        var base_type_id = self.m.value_type(lhs_id);
+        if (op == llvm_mir_tk_PLUS()) {
+            if (!lhs_ptr) {
+                base = rhs_value;
+                base_kind = rhs_kind;
+                offset_value = lhs_value;
+                offset_type = self.m.value_type(lhs_id);
+                base_type_id = self.m.value_type(rhs_id);
+            }
+        }
+        let offset_kind = llvm_mir_type_kind(&self.m, offset_type);
+        if (llvm_mir_int_bits_for_kind(offset_kind) <= 0) {
+            self.report_error("cannot lower pointer arithmetic operands");
+            return null;
+        }
+        // Keep both operands lowered in source order, then convert the integer
+        // to the module's address-space-0 GEP index width.
+        var offset = self.int_value_to_pointer_index(offset_value, offset_type);
+        if (offset == null) {
+            self.report_error("cannot lower pointer arithmetic offset");
+            return null;
+        }
+        if (op == llvm_mir_tk_MINUS()) {
+            offset = vyx_rt_build_sub(self.mod,
+                                      vyx_rt_const_int(self.mod, self.ty_pointer_index, 0, 0),
+                                      offset,
+                                      llvm_mir_empty_name(),
+                                      0);
+            if (offset == null) {
+                self.report_error("cannot negate pointer arithmetic offset");
+                return null;
+            }
+        }
+        var base_address = base;
+        var base_metadata: rawptr = null;
+        if (llvm_mir_kind_pointer_handle(base_kind)) {
+            base_address = self.pointer_handle_address(base, "mir.ptr.offset");
+            base_metadata = self.pointer_handle_metadata(base, "mir.ptr.offset");
+            if (base_address == null || base_metadata == null) { return null; }
+        }
+        // Element-scaled stepping: typed pointers (`*T`, `&T`, `&mut T`)
+        // advance by whole elements (Rust raw-pointer semantics); rawptr
+        // stays byte-addressed.
+        var shifted: rawptr = null;
+        if (llvm_mir_kind_pointer_handle(base_kind)
+            && base_type_id != mir_id_invalid()) {
+            let elem_type = hir_type_table_elem(self.m.types, base_type_id);
+            if (elem_type != mir_id_invalid()) {
+                let elem_storage = self.lower_storage_type(elem_type);
+                if (elem_storage != null) {
+                    let elem_size = vyx_rt_type_alloc_size(self.mod, elem_storage);
+                    if (elem_size > 1) {
+                        let scale = vyx_rt_const_int(self.mod,
+                                                     self.ty_pointer_index,
+                                                     elem_size,
+                                                     0);
+                        offset = vyx_rt_build_mul(self.mod,
+                                                  offset,
+                                                  scale,
+                                                  "mir.ptr.elem.scale".c_str(),
+                                                  18);
+                        if (offset == null) { return null; }
+                    }
+                }
+            }
+        }
+        shifted = vyx_rt_build_gep1(self.mod,
+                                    self.ty_i8,
+                                    base_address,
+                                    offset,
+                                    llvm_mir_empty_name(),
+                                    0);
+        if (shifted == null) { return null; }
+        if (llvm_mir_kind_pointer_handle(base_kind)) {
+            return self.build_pointer_handle(shifted, base_metadata, "mir.ptr.offset");
+        }
+        return shifted;
+    }
+
+    public fn lower_pointer_difference_value(self, value_id: i32) -> rawptr {
+        let op = self.m.value_op(value_id);
+        if (op != llvm_mir_tk_MINUS()) {
+            self.report_error("pointer difference requires subtraction");
+            return null;
+        }
+        let lhs_id = self.m.value_lhs(value_id);
+        let rhs_id = self.m.value_rhs(value_id);
+        let lhs_kind = llvm_mir_type_kind(&self.m, self.m.value_type(lhs_id));
+        let rhs_kind = llvm_mir_type_kind(&self.m, self.m.value_type(rhs_id));
+        if (!llvm_mir_kind_pointer_like(lhs_kind) || !llvm_mir_kind_pointer_like(rhs_kind)) {
+            self.report_error("pointer difference requires two pointer operands");
+            return null;
+        }
+        let lhs_i64 = self.address_arith_operand_i64(lhs_id);
+        let rhs_i64 = self.address_arith_operand_i64(rhs_id);
+        if (lhs_i64 == null || rhs_i64 == null) {
+            self.report_error("cannot lower pointer difference operands");
+            return null;
+        }
+        let byte_diff = vyx_rt_build_sub(self.mod, lhs_i64, rhs_i64, llvm_mir_empty_name(), 0);
+        if (byte_diff == null) { return null; }
+        // Typed pointer difference yields the element count (Rust
+        // `offset_from` semantics); rawptr difference stays in bytes.
+        let lhs_type = self.m.value_type(lhs_id);
+        if (llvm_mir_kind_pointer_handle(lhs_kind)
+            && lhs_type != mir_id_invalid()) {
+            let elem_type_d = hir_type_table_elem(self.m.types, lhs_type);
+            if (elem_type_d != mir_id_invalid()) {
+                let elem_storage_d = self.lower_storage_type(elem_type_d);
+                if (elem_storage_d != null) {
+                    let elem_size_d = vyx_rt_type_alloc_size(self.mod, elem_storage_d);
+                    if (elem_size_d > 1) {
+                        return vyx_rt_build_sdiv(self.mod,
+                                                 byte_diff,
+                                                 vyx_rt_const_int(self.mod,
+                                                                  self.ty_i64,
+                                                                  elem_size_d,
+                                                                  0),
+                                                 "mir.ptr.diff.elems".c_str(),
+                                                 18);
+                    }
+                }
+            }
+        }
+        return byte_diff;
+    }
+
+    // Built-in pointer methods (offset/add/sub/byte_*/offset_from family).
+    // Receiver is a typed pointer handle or rawptr; arg is an integer.
+    public fn lower_pointer_method_call(self, value_id: i32, kind: i32) -> rawptr {
+        let receiver_id = self.receiver_for_builtin_call(value_id);
+        if (receiver_id == mir_id_invalid()) {
+            self.report_error("pointer method requires a receiver");
+            return null;
+        }
+        let recv_type = self.m.value_type(receiver_id);
+        let recv_kind = llvm_mir_type_kind(&self.m, recv_type);
+        if (kind == 7 || kind == 8) {
+            // offset_from / byte_offset_from: two pointer operands.
+            let other_id = self.call_arg_at(value_id, 0);
+            if (other_id == mir_id_invalid()) {
+                self.report_error("offset_from requires one argument");
+                return null;
+            }
+            let lhs_i64 = self.address_arith_operand_i64(receiver_id);
+            let rhs_i64 = self.address_arith_operand_i64(other_id);
+            if (lhs_i64 == null || rhs_i64 == null) {
+                self.report_error("cannot lower offset_from operands");
+                return null;
+            }
+            let byte_diff = vyx_rt_build_sub(self.mod, lhs_i64, rhs_i64,
+                                             "mir.pm.diff".c_str(), 11);
+            if (byte_diff == null) { return null; }
+            if (kind == 8) { return byte_diff; }
+            let elem_size = self.pointer_elem_size_for_method(recv_kind, recv_type);
+            if (elem_size <= 1) { return byte_diff; }
+            return vyx_rt_build_sdiv(self.mod,
+                                     byte_diff,
+                                     vyx_rt_const_int(self.mod, self.ty_i64, elem_size, 0),
+                                     "mir.pm.from.elems".c_str(),
+                                     17);
+        }
+        // Stepping methods: ptr ± scaled/unscaled offset.
+        let arg_id = self.call_arg_at(value_id, 0);
+        if (arg_id == mir_id_invalid()) {
+            self.report_error("pointer step method requires one integer argument");
+            return null;
+        }
+        let base = self.lower_value(receiver_id);
+        if (base == null) { return null; }
+        let arg_value = self.lower_value(arg_id);
+        if (arg_value == null) { return null; }
+        let arg_type = self.m.value_type(arg_id);
+        var offset = self.int_value_to_pointer_index(arg_value, arg_type);
+        if (offset == null) {
+            self.report_error("cannot lower pointer method offset");
+            return null;
+        }
+        var elem_size: i64 = 1;
+        if (kind >= 1 && kind <= 3) {
+            // Element-scaled methods.
+            elem_size = self.pointer_elem_size_for_method(recv_kind, recv_type);
+        }
+        if (elem_size > 1) {
+            offset = vyx_rt_build_mul(self.mod,
+                                      offset,
+                                      vyx_rt_const_int(self.mod, self.ty_pointer_index, elem_size, 0),
+                                      "mir.pm.scale".c_str(),
+                                      12);
+            if (offset == null) { return null; }
+        }
+        if (kind == 3 || kind == 6) {
+            offset = vyx_rt_build_sub(self.mod,
+                                      vyx_rt_const_int(self.mod, self.ty_pointer_index, 0, 0),
+                                      offset,
+                                      llvm_mir_empty_name(),
+                                      0);
+            if (offset == null) { return null; }
+        }
+        var base_address = base;
+        var base_metadata: rawptr = null;
+        if (llvm_mir_kind_pointer_handle(recv_kind)) {
+            base_address = self.pointer_handle_address(base, "mir.pm.addr");
+            base_metadata = self.pointer_handle_metadata(base, "mir.pm.meta");
+            if (base_address == null || base_metadata == null) { return null; }
+        }
+        let shifted = self.ptr_offset_bytes(base_address, offset, "mir.pm.step");
+        if (shifted == null) { return null; }
+        if (llvm_mir_kind_pointer_handle(recv_kind)) {
+            return self.build_pointer_handle(shifted, base_metadata, "mir.pm.handle");
+        }
+        return shifted;
+    }
+
+    public fn pointer_elem_size_for_method(self, recv_kind: i32, recv_type: i32) -> i64 {
+        if (!llvm_mir_kind_pointer_handle(recv_kind)) { return 1; }
+        if (recv_type == mir_id_invalid()) { return 1; }
+        let elem_type = hir_type_table_elem(self.m.types, recv_type);
+        if (elem_type == mir_id_invalid()) { return 1; }
+        let elem_storage = self.lower_storage_type(elem_type);
+        if (elem_storage == null) { return 1; }
+        let measured = vyx_rt_type_alloc_size(self.mod, elem_storage);
+        if (measured <= 0) { return 1; }
+        return measured;
+    }
+
+    public fn lower_unary_value(self, value_id: i32) -> rawptr {
+        let op = self.m.value_op(value_id);
+        let inner_id = self.m.value_lhs(value_id);
+        let type_id = self.m.value_type(value_id);
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        let bits = llvm_mir_int_bits_for_kind(kind);
+        if (op == llvm_mir_tk_QUESTION()) {
+            return self.lower_result_try_value(value_id);
+        }
+        let inner = self.lower_value(inner_id);
+        if (self.type_is_result_abi(type_id)
+            && self.m.value_name(value_id).len > 0
+            && self.m.value_text(value_id).len > 0) {
+            return self.lower_result_fail_value(value_id);
+        }
+        if (op == llvm_mir_tk_MINUS()) {
+            if (kind == ty_F32() || kind == ty_F64()) {
+                let zero_f = vyx_rt_const_real(self.mod, self.lower_type(type_id), 0.0);
+                return vyx_rt_build_fsub(self.mod,
+                                         zero_f,
+                                         self.cast_value(inner, self.m.value_type(inner_id), type_id),
+                                         llvm_mir_empty_name(),
+                                         0);
+            }
+            if (bits <= 0) {
+                self.report_error("cannot apply unary minus to " + llvm_mir_type_text(&self.m, type_id));
+                return null;
+            }
+            let zero = vyx_rt_const_int(self.mod, self.int_type_for_bits(bits), 0, 1);
+            return vyx_rt_build_sub(self.mod, zero, self.cast_value(inner, self.m.value_type(inner_id), type_id), llvm_mir_empty_name(), 0);
+        }
+        if (op == llvm_mir_tk_NOT()) {
+            let b = self.truthy_value(inner, self.m.value_type(inner_id));
+            let not_v = vyx_rt_build_icmp(self.mod,
+                                          llvm_mir_icmp_eq(),
+                                          b,
+                                          vyx_rt_const_int(self.mod, self.ty_i1, 0, 0),
+                                          llvm_mir_empty_name(),
+                                          0);
+            return self.bool_value_i8(not_v);
+        }
+        if (op == llvm_mir_tk_TILDE()) {
+            if (bits <= 0) {
+                self.report_error("cannot apply bit-not to " + llvm_mir_type_text(&self.m, type_id));
+                return null;
+            }
+            let all_ones = vyx_rt_const_int(self.mod, self.int_type_for_bits(bits), -1, 1);
+            return vyx_rt_build_xor(self.mod, self.cast_value(inner, self.m.value_type(inner_id), type_id), all_ones, llvm_mir_empty_name(), 0);
+        }
+        return inner;
+    }
+
+    public fn lower_binary_value(self, value_id: i32) -> rawptr {
+        let op = self.m.value_op(value_id);
+        let out_type = self.m.value_type(value_id);
+        let lhs_id = self.m.value_lhs(value_id);
+        let rhs_id = self.m.value_rhs(value_id);
+        let lhs_type = self.m.value_type(lhs_id);
+        let rhs_type = self.m.value_type(rhs_id);
+        // Reference views: when a `&mut T` / `&T` operand participates in a
+        // scalar arithmetic/compare expression, the whole binary acts on the
+        // pointee values (C++ reference semantics).  Without this the
+        // pointer-arithmetic dispatch below would treat the loaded element
+        // as an address.
+        let out_kind0 = llvm_mir_type_kind(&self.m, out_type);
+        let lhs_kind0 = llvm_mir_type_kind(&self.m, lhs_type);
+        let rhs_kind0 = llvm_mir_type_kind(&self.m, rhs_type);
+        if (lhs_kind0 == ty_MUTREF() || lhs_kind0 == ty_REF()
+            || rhs_kind0 == ty_MUTREF() || rhs_kind0 == ty_REF()
+            || out_kind0 == ty_MUTREF() || out_kind0 == ty_REF()) {
+            var lhs_view = lhs_type;
+            var rhs_view = rhs_type;
+            var out_view = out_type;
+            if (lhs_kind0 == ty_MUTREF() || lhs_kind0 == ty_REF()) {
+                let e = hir_type_table_elem(self.m.types, lhs_type);
+                if (e != mir_id_invalid()) { lhs_view = e; }
+            }
+            if (rhs_kind0 == ty_MUTREF() || rhs_kind0 == ty_REF()) {
+                let e = hir_type_table_elem(self.m.types, rhs_type);
+                if (e != mir_id_invalid()) { rhs_view = e; }
+            }
+            if (out_kind0 == ty_MUTREF() || out_kind0 == ty_REF()) {
+                let e = hir_type_table_elem(self.m.types, out_type);
+                if (e != mir_id_invalid()) { out_view = e; }
+            }
+            if (llvm_mir_map_binop_pred_signed(op) >= 0
+                || llvm_mir_map_binop_pred_float(op) >= 0
+                || op == llvm_mir_tk_PLUS() || op == llvm_mir_tk_MINUS()
+                || op == llvm_mir_tk_STAR() || op == llvm_mir_tk_SLASH()
+                || op == llvm_mir_tk_PERCENT()) {
+                return self.lower_scalar_binary_view(op, lhs_id, rhs_id, lhs_view, rhs_view, out_view);
+            }
+        }
+        let lhs_kind = llvm_mir_type_kind(&self.m, lhs_type);
+        let rhs_kind = llvm_mir_type_kind(&self.m, rhs_type);
+        let float_pred = llvm_mir_map_binop_pred_float(op);
+        if (float_pred >= 0 && (llvm_mir_kind_float(lhs_kind) || llvm_mir_kind_float(rhs_kind))) {
+            let cmp_type = self.binary_float_compare_type_id(lhs_id, rhs_id, lhs_type, rhs_type, out_type);
+            let lhs_cmp = self.lower_value_as(lhs_id, cmp_type);
+            let rhs_cmp = self.lower_value_as(rhs_id, cmp_type);
+            if (lhs_cmp == null || rhs_cmp == null) {
+                self.report_error("cannot lower float compare operands");
+                return null;
+            }
+            let cmp = vyx_rt_build_fcmp(self.mod, float_pred, lhs_cmp, rhs_cmp, llvm_mir_empty_name(), 0);
+            if (cmp == null) {
+                self.report_error("cannot emit float compare op "
+                          + policy_i64_to_string(op as i64)
+                          + " lhs=" + llvm_mir_type_text(&self.m, lhs_type)
+                          + " rhs=" + llvm_mir_type_text(&self.m, rhs_type)
+                          + " common=" + llvm_mir_type_text(&self.m, cmp_type)
+                          + " runtime=" + self.runtime_last_error());
+                return null;
+            }
+            return self.bool_value_i8(cmp);
+        }
+        var pred = llvm_mir_map_binop_pred_signed(op);
+        if (pred >= 0) {
+            let cmp_type = lhs_type;
+            let cmp_kind = llvm_mir_type_kind(&self.m, cmp_type);
+            if ((op == llvm_mir_tk_EQEQ() || op == llvm_mir_tk_NEQ())
+                && self.type_is_heap_indirect_deref_type(lhs_type)
+                && self.type_ids_compatible(lhs_type, rhs_type)) {
+                let lhs_data = self.lower_record_field_member_value(lhs_id, "data");
+                let rhs_data = self.lower_record_field_member_value(rhs_id, "data");
+                if (lhs_data == null || rhs_data == null) {
+                    self.report_error("cannot lower heap handle compare operands");
+                    return null;
+                }
+                let cmp = vyx_rt_build_icmp(self.mod,
+                                            pred,
+                                            lhs_data,
+                                            rhs_data,
+                                            llvm_mir_empty_name(),
+                                            0);
+                if (cmp == null) {
+                    self.report_error("cannot emit heap handle compare for "
+                              + llvm_mir_type_text(&self.m, lhs_type)
+                              + " runtime=" + self.runtime_last_error());
+                    return null;
+                }
+                return self.bool_value_i8(cmp);
+            }
+            let cmp_bits = llvm_mir_int_bits_for_kind(cmp_kind);
+            let cmp_pointer_like = llvm_mir_kind_pointer_like(cmp_kind)
+                || self.type_is_class_pointer_abi(cmp_type);
+            if (cmp_bits <= 0 && !cmp_pointer_like) {
+                self.report_error("cannot lower non-scalar compare op "
+                          + policy_i64_to_string(op as i64)
+                          + " lhs=" + llvm_mir_type_text(&self.m, lhs_type)
+                          + " rhs=" + llvm_mir_type_text(&self.m, rhs_type));
+                return null;
+            }
+            if (llvm_mir_kind_unsigned(cmp_kind)) { pred = llvm_mir_map_binop_pred_unsigned(op); }
+            var lhs_cmp = self.lower_value(lhs_id);
+            var rhs_cmp = self.lower_value_as(rhs_id, cmp_type);
+            if (lhs_cmp == null || rhs_cmp == null) {
+                if (self.error_count > 0) { return null; }
+                self.report_error_at_value(value_id, "cannot lower integer compare operands");
+                return null;
+            }
+            if (llvm_mir_kind_pointer_handle(cmp_kind)) {
+                lhs_cmp = self.pointer_handle_address(lhs_cmp, "mir.ptr.cmp.lhs");
+                rhs_cmp = self.pointer_handle_address(rhs_cmp, "mir.ptr.cmp.rhs");
+                if (lhs_cmp == null || rhs_cmp == null) {
+                    self.report_error("cannot extract pointer compare operands");
+                    return null;
+                }
+            }
+            let cmp = vyx_rt_build_icmp(self.mod, pred, lhs_cmp, rhs_cmp, llvm_mir_empty_name(), 0);
+            if (cmp == null) {
+                self.report_error("cannot emit scalar compare op "
+                          + policy_i64_to_string(op as i64)
+                          + " lhs=" + llvm_mir_type_text(&self.m, lhs_type)
+                          + " rhs=" + llvm_mir_type_text(&self.m, rhs_type)
+                          + " runtime=" + self.runtime_last_error());
+                return null;
+            }
+            return self.bool_value_i8(cmp);
+        }
+        if (op == llvm_mir_tk_AND() || op == llvm_mir_tk_OR()) {
+            let lhs_b = self.bool_value_i8(self.truthy_value(self.lower_value(lhs_id), self.m.value_type(lhs_id)));
+            let rhs_b = self.bool_value_i8(self.truthy_value(self.lower_value(rhs_id), self.m.value_type(rhs_id)));
+            if (op == llvm_mir_tk_AND()) { return vyx_rt_build_and(self.mod, lhs_b, rhs_b, llvm_mir_empty_name(), 0); }
+            return vyx_rt_build_or(self.mod, lhs_b, rhs_b, llvm_mir_empty_name(), 0);
+        }
+        let out_kind = llvm_mir_type_kind(&self.m, out_type);
+        let lhs_kind_for_ptr = llvm_mir_type_kind(&self.m, lhs_type);
+        let rhs_kind_for_ptr = llvm_mir_type_kind(&self.m, rhs_type);
+        if (op == llvm_mir_tk_MINUS()
+            && llvm_mir_kind_pointer_like(lhs_kind_for_ptr)
+            && llvm_mir_kind_pointer_like(rhs_kind_for_ptr)) {
+            return self.lower_pointer_difference_value(value_id);
+        }
+        if (llvm_mir_kind_pointer_like(out_kind) && (op == llvm_mir_tk_PLUS() || op == llvm_mir_tk_MINUS())) {
+            return self.lower_pointer_arithmetic_value(value_id);
+        }
+        if (llvm_mir_kind_float(out_kind)) {
+            let lhs_f = self.lower_value_as(lhs_id, out_type);
+            let rhs_f = self.lower_value_as(rhs_id, out_type);
+            if (lhs_f == null || rhs_f == null) {
+                self.report_error("cannot lower float binary operands");
+                return null;
+            }
+            var float_out: rawptr = null;
+            if (op == llvm_mir_tk_PLUS()) { float_out = vyx_rt_build_fadd(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            else if (op == llvm_mir_tk_MINUS()) { float_out = vyx_rt_build_fsub(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            else if (op == llvm_mir_tk_STAR()) { float_out = vyx_rt_build_fmul(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            else if (op == llvm_mir_tk_SLASH()) { float_out = vyx_rt_build_fdiv(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            else if (op == llvm_mir_tk_PERCENT()) { float_out = vyx_rt_build_frem(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            if (float_out != null) { return float_out; }
+            self.report_error("cannot lower float binary op "
+                      + policy_i64_to_string(op as i64)
+                      + " type=" + llvm_mir_type_text(&self.m, out_type)
+                      + " runtime=" + self.runtime_last_error());
+            return null;
+        }
+        let lhs = self.lower_value_as(lhs_id, out_type);
+        let rhs = self.lower_value_as(rhs_id, out_type);
+        if (lhs == null || rhs == null) {
+            self.report_error("cannot lower binary operands");
+            return null;
+        }
+        if (op == llvm_mir_tk_PLUS()) { return vyx_rt_build_add(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_MINUS()) { return vyx_rt_build_sub(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_STAR()) { return vyx_rt_build_mul(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_SLASH()) {
+            if (llvm_mir_kind_unsigned(out_kind)) { return vyx_rt_build_udiv(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+            return vyx_rt_build_sdiv(self.mod, lhs, rhs, llvm_mir_empty_name(), 0);
+        }
+        if (op == llvm_mir_tk_PERCENT()) {
+            if (llvm_mir_kind_unsigned(out_kind)) { return vyx_rt_build_urem(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+            return vyx_rt_build_srem(self.mod, lhs, rhs, llvm_mir_empty_name(), 0);
+        }
+        if (op == llvm_mir_tk_AMP()) { return vyx_rt_build_and(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_PIPE()) { return vyx_rt_build_or(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_CARET()) { return vyx_rt_build_xor(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_LSHIFT()) { return vyx_rt_build_shl(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_RSHIFT()) { return vyx_rt_build_lshr(self.mod, lhs, rhs, llvm_mir_empty_name(), 0); }
+        self.report_error("cannot lower binary op " + policy_i64_to_string(op as i64));
+        return null;
+    }
+
+    /// Scalar binary over reference-view operands: both sides are lowered
+    /// as their pointee types (`&mut T` operands deref through cast_value)
+    /// and the operation is emitted as plain scalar arithmetic/compare.
+    public fn lower_scalar_binary_view(self, op: i32, lhs_id: i32, rhs_id: i32,
+                                       lhs_type: i32, rhs_type: i32, out_type: i32) -> rawptr {
+        let pred = llvm_mir_map_binop_pred_signed(op);
+        if (pred >= 0) {
+            let lhs_c = self.lower_value_as(lhs_id, lhs_type);
+            let rhs_c = self.lower_value_as(rhs_id, lhs_type);
+            if (lhs_c == null || rhs_c == null) { return null; }
+            var use_pred = pred;
+            if (llvm_mir_kind_unsigned(llvm_mir_type_kind(&self.m, lhs_type))) {
+                use_pred = llvm_mir_map_binop_pred_unsigned(op);
+            }
+            let cmp = vyx_rt_build_icmp(self.mod, use_pred, lhs_c, rhs_c, llvm_mir_empty_name(), 0);
+            if (cmp == null) { return null; }
+            return self.bool_value_i8(cmp);
+        }
+        let out_kind = llvm_mir_type_kind(&self.m, out_type);
+        if (llvm_mir_kind_float(out_kind)) {
+            let lhs_f = self.lower_value_as(lhs_id, out_type);
+            let rhs_f = self.lower_value_as(rhs_id, out_type);
+            if (lhs_f == null || rhs_f == null) { return null; }
+            if (op == llvm_mir_tk_PLUS()) { return vyx_rt_build_fadd(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            if (op == llvm_mir_tk_MINUS()) { return vyx_rt_build_fsub(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            if (op == llvm_mir_tk_STAR()) { return vyx_rt_build_fmul(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            if (op == llvm_mir_tk_SLASH()) { return vyx_rt_build_fdiv(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            if (op == llvm_mir_tk_PERCENT()) { return vyx_rt_build_frem(self.mod, lhs_f, rhs_f, llvm_mir_empty_name(), 0); }
+            return null;
+        }
+        let lhs_v = self.lower_value_as(lhs_id, out_type);
+        let rhs_v = self.lower_value_as(rhs_id, out_type);
+        if (lhs_v == null || rhs_v == null) { return null; }
+        if (op == llvm_mir_tk_PLUS()) { return vyx_rt_build_add(self.mod, lhs_v, rhs_v, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_MINUS()) { return vyx_rt_build_sub(self.mod, lhs_v, rhs_v, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_STAR()) { return vyx_rt_build_mul(self.mod, lhs_v, rhs_v, llvm_mir_empty_name(), 0); }
+        if (op == llvm_mir_tk_SLASH()) {
+            if (llvm_mir_kind_unsigned(out_kind)) { return vyx_rt_build_udiv(self.mod, lhs_v, rhs_v, llvm_mir_empty_name(), 0); }
+            return vyx_rt_build_sdiv(self.mod, lhs_v, rhs_v, llvm_mir_empty_name(), 0);
+        }
+        if (op == llvm_mir_tk_PERCENT()) {
+            if (llvm_mir_kind_unsigned(out_kind)) { return vyx_rt_build_urem(self.mod, lhs_v, rhs_v, llvm_mir_empty_name(), 0); }
+            return vyx_rt_build_srem(self.mod, lhs_v, rhs_v, llvm_mir_empty_name(), 0);
+        }
+        return null;
+    }
+
+    public fn lower_control_value(self, value_id: i32) -> rawptr {
+        let cond = self.truthy_value(self.lower_value(self.m.value_lhs(value_id)), self.m.value_type(self.m.value_lhs(value_id)));
+        let then_v = self.lower_value_as(self.m.value_rhs(value_id), self.m.value_type(value_id));
+        let else_v = self.lower_value_as(self.m.value_aux(value_id), self.m.value_type(value_id));
+        if (cond == null || then_v == null || else_v == null) { return null; }
+        return vyx_rt_build_select(self.mod, cond, then_v, else_v, llvm_mir_empty_name(), 0);
+    }
+
+    public fn common_float_type_id(self, lhs_type: i32, rhs_type: i32, preferred_type: i32) -> i32 {
+        let preferred_kind = llvm_mir_type_kind(&self.m, preferred_type);
+        if (llvm_mir_kind_float(preferred_kind)) { return preferred_type; }
+        let lhs_kind = llvm_mir_type_kind(&self.m, lhs_type);
+        let rhs_kind = llvm_mir_type_kind(&self.m, rhs_type);
+        if (lhs_kind == ty_F64() || rhs_kind == ty_F64()) {
+            let f64_id = self.type_id_by_text("f64");
+            if (f64_id != mir_id_invalid()) { return f64_id; }
+            if (lhs_kind == ty_F64()) { return lhs_type; }
+            return rhs_type;
+        }
+        if (lhs_kind == ty_F32() || rhs_kind == ty_F32()) {
+            let f32_id = self.type_id_by_text("f32");
+            if (f32_id != mir_id_invalid()) { return f32_id; }
+            if (lhs_kind == ty_F32()) { return lhs_type; }
+            return rhs_type;
+        }
+        if (preferred_type != mir_id_invalid()) { return preferred_type; }
+        return lhs_type;
+    }
+
+    public fn binary_float_compare_type_id(self, lhs_id: i32, rhs_id: i32, lhs_type: i32, rhs_type: i32, out_type: i32) -> i32 {
+        let lhs_kind = llvm_mir_type_kind(&self.m, lhs_type);
+        let rhs_kind = llvm_mir_type_kind(&self.m, rhs_type);
+        let lhs_is_literal = self.m.value_kind(lhs_id) == mir_value_const_float();
+        let rhs_is_literal = self.m.value_kind(rhs_id) == mir_value_const_float();
+        if (rhs_is_literal && lhs_kind == ty_F32()) { return lhs_type; }
+        if (lhs_is_literal && rhs_kind == ty_F32()) { return rhs_type; }
+        return self.common_float_type_id(lhs_type, rhs_type, out_type);
+    }
+}

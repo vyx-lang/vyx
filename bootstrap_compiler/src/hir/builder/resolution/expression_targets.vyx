@@ -1,0 +1,391 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Expression targets for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn target_kind_for_expr(self, e: rawptr, sem_kind: i32) -> i32 {
+        if (sem_kind == expr_sem_LOCAL()) { return hir_target_local(); }
+        if (sem_kind == expr_sem_CONST()) { return hir_target_item(); }
+        if (sem_kind == expr_sem_GLOBAL()) { return hir_target_item(); }
+        if (sem_kind == expr_sem_DIRECT_FN()) { return hir_target_function(); }
+        if (sem_kind == expr_sem_METHOD()) { return hir_target_function(); }
+        if (sem_kind == expr_sem_FIELD()) {
+            if (e != null && expr_get_semantic_target(e) == null) { return hir_target_builtin(); }
+            return hir_target_field();
+        }
+        if (sem_kind == expr_sem_VARIANT()) { return hir_target_variant(); }
+        if (sem_kind == expr_sem_CLASS()) {
+            if (e != null && expr_get_semantic_target(e) == null) { return hir_target_type(); }
+            return hir_target_item();
+        }
+        if (sem_kind == expr_sem_BUILTIN()) { return hir_target_builtin(); }
+        if (sem_kind == expr_sem_INDIRECT_FN()) {
+            if (e != null && expr_get_semantic_target(e) != null) { return hir_target_local(); }
+            return hir_target_none();
+        }
+        return hir_target_none();
+    }
+
+    fn builtin_name_for_expr(self, e: rawptr) -> string {
+        if (e == null) { return ""; }
+        let k = expr_get_kind(e);
+        if (k == ex_CALL()) {
+            let callee = expr_get_lhs(e);
+            if (callee != null) { return expr_get_name(callee); }
+        }
+        return expr_get_name(e);
+    }
+
+    fn canonical_builtin_name_for_expr(self, e: rawptr) -> string {
+        let raw_name = self.builtin_name_for_expr(e);
+        let base = policy_generic_call_base(raw_name.clone());
+        self.note_reflection_builtin_use(base);
+        if (base != "sizeof" && base != "repr_sizeof" && base != "alignof"
+            && base != "field_count" && base != "field_name"
+            && base != "field_type" && base != "has_field"
+            && base != "type_name" && base != "reflect_name"
+            && base != "construct") {
+            return raw_name;
+        }
+        let args = policy_generic_call_args(raw_name.clone());
+        if (args.len == 0) { return raw_name; }
+        var out_args = "";
+        var i: i32 = 0;
+        while (i < 64) {
+            let raw_arg = policy_generic_arg_at(args, i);
+            if (raw_arg.len == 0) {
+                if (out_args.len == 0) { return raw_name; }
+                return base + "::<" + out_args + ">";
+            }
+            let concrete_arg = self.canonical_type_text_in_current_env(raw_arg);
+            if (concrete_arg.len == 0 || hir_builder_type_name_has_template_atom(concrete_arg)) {
+                return raw_name;
+            }
+            self.ensure_concrete_type_text_ready(concrete_arg);
+            out_args = hir_builder_append_csv(out_args, concrete_arg);
+            i = i + 1;
+        }
+        return raw_name;
+    }
+
+    fn builtin_owner_type_for_expr(self, e: rawptr) -> i32 {
+        if (e == null) { return hir_id_invalid(); }
+        let k = expr_get_kind(e);
+        if (k == ex_MEMBER()) {
+            return self.type_id_from_expr(expr_get_lhs(e));
+        }
+        if (k == ex_CALL()) {
+            let callee = expr_get_lhs(e);
+            if (callee != null && expr_get_kind(callee) == ex_MEMBER()) {
+                return self.type_id_from_expr(expr_get_lhs(callee));
+            }
+        }
+        return hir_id_invalid();
+    }
+
+    fn member_name_for_expr(self, e: rawptr) -> string {
+        if (e == null) { return ""; }
+        if (expr_get_kind(e) == ex_CALL()) {
+            let callee = expr_get_lhs(e);
+            if (callee != null) { return expr_get_name(callee); }
+        }
+        return expr_get_name(e);
+    }
+
+    fn unresolved_trait_builtin_receiver_text(self, e: rawptr) -> string {
+        let receiver = self.receiver_expr_for_call(e);
+        if (receiver == null) { return ""; }
+        return self.type_text_from_expr(receiver);
+    }
+
+    fn type_text_looks_concrete(self, text: string) -> bool {
+        if (text.len == 0) { return false; }
+        if (text.len == 1) {
+            let c = text.charAt(0);
+            if (c >= 65 && c <= 90) { return false; }
+        }
+        return true;
+    }
+
+    fn compare_builtin_receiver_supported(self, text: string) -> bool {
+        let base = policy_generic_call_base(text.clone());
+        if (hir_builder_is_primitive_str_name(base)) { return true; }
+        if (base == "i32") { return true; }
+        if (base == "i64") { return true; }
+        if (base == "f32") { return true; }
+        if (base == "f64") { return true; }
+        if (base == "bool") { return true; }
+        if (base == "char") { return true; }
+        return false;
+    }
+
+    fn semantic_kind_for_expr(self, e: rawptr, sem_kind: i32) -> i32 {
+        if (sem_kind != expr_sem_NONE()) { return sem_kind; }
+        let name = self.member_name_for_expr(e);
+        if (name != "hash" && name != "operator_eq" && name != "operator==" && name != "compare") { return sem_kind; }
+        let recv_text = self.unresolved_trait_builtin_receiver_text(e);
+        if (!self.type_text_looks_concrete(recv_text)) { return sem_kind; }
+        if (name == "compare" && !self.compare_builtin_receiver_supported(recv_text)) { return sem_kind; }
+        return expr_sem_BUILTIN();
+    }
+
+    fn target_id_for_expr(self, e: rawptr, sem_kind: i32, target_kind: i32) -> i32 {
+        if (e == null) { return hir_id_invalid(); }
+        if (target_kind == hir_target_local()) {
+            let local_target = expr_get_semantic_target(e);
+            let existing_local = hir_local_scope_lookup_target(self.locals, local_target);
+            if (existing_local != hir_id_invalid()) { return existing_local; }
+            let captured_local = self.ensure_capture_local(local_target);
+            if (captured_local != hir_id_invalid()) { return captured_local; }
+            let captured_by_name = self.ensure_capture_local_by_name(expr_get_name(e), local_target);
+            if (captured_by_name != hir_id_invalid()) { return captured_by_name; }
+            return hir_local_scope_lookup(self.locals, expr_get_name(e));
+        }
+        if (target_kind == hir_target_builtin()) {
+            return self.unit.add_or_get_builtin(self.canonical_builtin_name_for_expr(e),
+                                               sem_kind,
+                                               self.builtin_owner_type_for_expr(e),
+                                               expr_get_semantic_flags(e));
+        }
+        if (target_kind == hir_target_none()) {
+            return hir_id_invalid();
+        }
+        if (target_kind == hir_target_type()) {
+            return self.type_id_from_expr_semantic(e, sem_kind);
+        }
+        let raw_target = expr_get_semantic_target(e);
+        // Template artifact bodies cannot serialize raw declaration pointers.
+        // Rebind imported constants/globals from the validated value index by
+        // name before giving up.  Keeping this path limited to value
+        // semantics avoids turning arbitrary unresolved identifiers into
+        // permissive rawptr values.
+        if (raw_target == null
+            && (sem_kind == expr_sem_CONST() || sem_kind == expr_sem_GLOBAL())) {
+            let rebound_value = self.value_item_id_for_name(expr_get_name(e));
+            if (rebound_value != hir_id_invalid()) { return rebound_value; }
+            return hir_id_invalid();
+        }
+        if (raw_target == null) { return hir_id_invalid(); }
+        if (target_kind == hir_target_function()) {
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-target-fn] direct-enter name=" + expr_get_name(e)
+                      + " raw=" + decl_get_name(raw_target)
+                      + " exprs=" + self.i32_text(self.unit.expr_count)
+                      + " types=" + self.i32_text(self.unit.types.count));
+            }
+            let direct_closed = self.direct_closed_raw_function_target(raw_target);
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-target-fn] direct-leave name=" + expr_get_name(e)
+                      + " id=" + self.i32_text(direct_closed)
+                      + " exprs=" + self.i32_text(self.unit.expr_count)
+                      + " types=" + self.i32_text(self.unit.types.count));
+            }
+            if (direct_closed != hir_id_invalid()) { return direct_closed; }
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-target-fn] concrete-enter name=" + expr_get_name(e)
+                      + " raw=" + decl_get_name(raw_target)
+                      + " exprs=" + self.i32_text(self.unit.expr_count)
+                      + " types=" + self.i32_text(self.unit.types.count));
+            }
+            let concrete_fn = self.concrete_function_target(e, raw_target);
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-target-fn] concrete-leave name=" + expr_get_name(e)
+                      + " id=" + self.i32_text(concrete_fn)
+                      + " exprs=" + self.i32_text(self.unit.expr_count)
+                      + " types=" + self.i32_text(self.unit.types.count));
+            }
+            if (concrete_fn != hir_id_invalid()) { return concrete_fn; }
+            var fn_id = hir_pointer_map_function(self.decl_map,raw_target);
+            if (fn_id != hir_id_invalid()) {
+                self.ensure_reachable_function_body(raw_target, fn_id, false);
+                return fn_id;
+            }
+            self.register_decl(raw_target, hir_id_invalid());
+            fn_id = hir_pointer_map_function(self.decl_map,raw_target);
+            self.ensure_reachable_function_body(raw_target, fn_id, false);
+            return fn_id;
+        }
+        if (target_kind == hir_target_field()) {
+            let concrete_field = self.concrete_field_target(e, raw_target);
+            if (concrete_field != hir_id_invalid()) { return concrete_field; }
+        }
+        if (target_kind == hir_target_variant()) {
+            let concrete_variant = self.concrete_variant_target(e, raw_target);
+            if (concrete_variant != hir_id_invalid()) { return concrete_variant; }
+        }
+        var item_id = hir_pointer_map_item(self.decl_map,raw_target);
+        if (item_id != hir_id_invalid()) { return item_id; }
+        item_id = self.register_decl(raw_target, hir_id_invalid());
+        return item_id;
+    }
+
+    fn function_id_for_name(self, name: string) -> i32 {
+        if (name.len == 0) { return hir_id_invalid(); }
+        let direct = hir_name_id_map_get(self.free_function_index,name);
+        if (direct != hir_id_invalid()) { return direct; }
+        let base = policy_generic_call_base(name.clone());
+        if (base.len > 0 && base != name) {
+            let base_hit = hir_name_id_map_get(self.free_function_index,base);
+            if (base_hit != hir_id_invalid()) { return base_hit; }
+        }
+        let last = hir_builder_last_path_segment(base);
+        if (last.len > 0 && last != base) {
+            let last_hit = hir_name_id_map_get(self.free_function_index,last);
+            if (last_hit != hir_id_invalid()) { return last_hit; }
+        }
+        return hir_id_invalid();
+    }
+
+    fn resolve_ident_expr_after_create(self, e: rawptr, expr_id: i32) {
+        if (expr_id == hir_id_invalid()) { return; }
+        if (self.unit.expr_target_kind(expr_id) == hir_target_function()) {
+            self.set_expr_type_if_empty(expr_id, self.function_type_id(self.unit.expr_target_id(expr_id)));
+            return;
+        }
+        if (self.unit.expr_target_kind(expr_id) == hir_target_builtin()) {
+            self.set_expr_type_canonical(expr_id, self.builtin_type_id_for_name(self.unit.expr_name(expr_id)));
+            return;
+        }
+        if (self.unit.expr_target_kind(expr_id) == hir_target_item()) {
+            let item_id = self.unit.expr_target_id(expr_id);
+            if (item_id != hir_id_invalid()
+                && (self.unit.item_kind(item_id) == hir_item_class()
+                    || self.unit.item_kind(item_id) == hir_item_enum())) {
+                let item_type_text = self.unit.item_name(item_id);
+                let resolved_item_type = self.resolve_type_text_in_current_env(item_type_text);
+                if (resolved_item_type.len > 0) {
+                    self.set_expr_type_canonical(expr_id, self.type_id_from_text(resolved_item_type));
+                } else {
+                    self.set_expr_type_canonical(expr_id, self.type_id_from_text(item_type_text));
+                }
+                return;
+            }
+        }
+        if (self.unit.expr_target_kind(expr_id) != hir_target_none()) { return; }
+        let name = expr_get_name(e);
+        let local_id = hir_local_scope_lookup(self.locals, name);
+        if (local_id != hir_id_invalid()) {
+            self.unit.set_expr_type(expr_id, self.unit.local_type(local_id));
+            self.unit.set_expr_semantic(expr_id, expr_sem_LOCAL(), hir_target_local(), local_id);
+            return;
+        }
+        let capture_local = self.ensure_capture_local_by_name(name, expr_get_semantic_target(e));
+        if (capture_local != hir_id_invalid()) {
+            self.unit.set_expr_type(expr_id, self.unit.local_type(capture_local));
+            self.unit.set_expr_semantic(expr_id, expr_sem_LOCAL(), hir_target_local(), capture_local);
+            return;
+        }
+        let item_id = self.value_item_id_for_name(name);
+        if (item_id != hir_id_invalid()) {
+            let item_kind = self.unit.item_kind(item_id);
+            var sem_kind = expr_sem_CONST();
+            if (item_kind == hir_item_global()) { sem_kind = expr_sem_GLOBAL(); }
+            self.unit.set_expr_semantic(expr_id, sem_kind, hir_target_item(), item_id);
+            self.set_expr_type_if_empty(expr_id, self.unit.item_type(item_id));
+            return;
+        }
+        let fn_id = self.function_id_for_name(name);
+        if (fn_id != hir_id_invalid()) {
+            self.unit.set_expr_semantic(expr_id, expr_sem_DIRECT_FN(), hir_target_function(), fn_id);
+            let raw_target = hir_pointer_map_raw_for_function(self.decl_map,fn_id);
+            if (raw_target != null) {
+                self.ensure_reachable_function_body(raw_target, fn_id, false);
+            }
+            self.set_expr_type_if_empty(expr_id, self.function_type_id(fn_id));
+            return;
+        }
+        let type_name = self.resolve_type_text_in_current_env(name);
+        if (type_name.len > 0) {
+            self.ensure_concrete_type_text_ready(type_name);
+            var raw_class = self.raw_class_decl_for_type_text(type_name);
+            if (raw_class == null) {
+                raw_class = self.find_class_decl(type_name);
+                if (raw_class == null) {
+                    let type_base = policy_generic_call_base(type_name.clone());
+                    if (type_base.len > 0) {
+                        raw_class = self.find_class_decl(type_base);
+                    }
+                }
+                if (raw_class != null) { self.ensure_concrete_type_text_ready(type_name); }
+            }
+            if (raw_class == null) {
+                let template_class = self.raw_template_class_decl_for_type_text(type_name);
+                if (template_class != null) {
+                    self.ensure_concrete_type_text_ready(type_name);
+                    raw_class = self.raw_class_decl_for_type_text(type_name);
+                }
+            }
+            if (raw_class != null) {
+                let type_item = hir_pointer_map_item(self.decl_map,raw_class);
+                self.unit.set_expr_semantic(expr_id, expr_sem_CLASS(), hir_target_item(), type_item);
+                var canonical_type_name = type_name;
+                if (type_item != hir_id_invalid()
+                    && (self.unit.item_kind(type_item) == hir_item_class()
+                        || self.unit.item_kind(type_item) == hir_item_enum())) {
+                    canonical_type_name = self.unit.item_name(type_item);
+                }
+                self.set_expr_type_canonical(expr_id, self.type_id_from_text(canonical_type_name));
+                return;
+            }
+            if (hir_builder_generic_contains(self.current_generic_params, name)
+                || self.current_generic_binding(name).len > 0
+                || policy_primitive_type_kind(type_name) != 0
+                || hir_builder_is_primitive_str_name(type_name)
+                || type_name == "bool"
+                || type_name == "char"
+                || type_name == "rawptr") {
+                let type_target_id = self.type_id_from_text(type_name);
+                self.unit.set_expr_semantic(expr_id,
+                                           expr_sem_CLASS(),
+                                           hir_target_type(),
+                                           type_target_id);
+                self.set_expr_type_if_empty(expr_id, type_target_id);
+                return;
+            }
+        }
+        if (self.builtin_name_recognized(name)) {
+            let builtin_name = self.canonical_builtin_name_for_expr(e);
+            let builtin_id = self.unit.add_or_get_builtin(builtin_name,
+                                                         expr_sem_BUILTIN(),
+                                                         hir_id_invalid(),
+                                                         expr_get_semantic_flags(e));
+            self.unit.set_expr_semantic(expr_id, expr_sem_BUILTIN(), hir_target_builtin(), builtin_id);
+            if (!self.type_id_is_valid(self.unit.expr_type(expr_id))) {
+                self.unit.set_expr_type(expr_id, self.builtin_type_id_for_name(builtin_name));
+            }
+        }
+    }
+
+    fn expr_base_name(self, expr_id: i32) -> string {
+        if (expr_id == hir_id_invalid()) { return ""; }
+        return policy_generic_call_base(self.unit.expr_name(expr_id).clone());
+    }
+
+    fn unit_has_call_named(self, want_name: string) -> bool {
+        if (want_name.len == 0) { return false; }
+        var expr_id: i32 = 1;
+        while (expr_id <= self.unit.expr_count) {
+            if (self.unit.expr_kind(expr_id) == ex_CALL()) {
+                if (self.expr_base_name(expr_id) == want_name) { return true; }
+                let callee_id = self.unit.expr_lhs(expr_id);
+                if (callee_id != hir_id_invalid()
+                    && self.expr_base_name(callee_id) == want_name) {
+                    return true;
+                }
+            }
+            expr_id = expr_id + 1;
+        }
+        return false;
+    }
+}

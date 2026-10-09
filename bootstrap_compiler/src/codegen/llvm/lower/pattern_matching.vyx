@@ -1,0 +1,692 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn is_default_match_pattern(self, value_id: i32) -> bool {
+        if (value_id == mir_id_invalid()) { return true; }
+        if (self.m.value_kind(value_id) == mir_value_null()
+            && self.m.value_name(value_id) == "__match_default") {
+            return true;
+        }
+        return false;
+    }
+
+    public fn option_pattern_variant_id(self, pattern_id: i32) -> i32 {
+        var variant_id = self.m.value_target_id(pattern_id);
+        if (self.m.value_target_kind(pattern_id) != mir_target_hir_variant()) {
+            let callee_id = self.m.value_lhs(pattern_id);
+            if (callee_id != mir_id_invalid()
+                && self.m.value_target_kind(callee_id) == mir_target_hir_variant()) {
+                variant_id = self.m.value_target_id(callee_id);
+            }
+        }
+        return variant_id;
+    }
+
+    public fn option_pattern_payload_arg(self, pattern_id: i32) -> i32 {
+        if (pattern_id == mir_id_invalid()) { return mir_id_invalid(); }
+        return self.call_arg_payload(self.m.value_first_arg(pattern_id));
+    }
+
+    public fn option_pattern_tag_value(self, pattern_id: i32, option_type: i32) -> rawptr {
+        if (!self.type_is_option_abi(option_type)) {
+            self.report_error("Option match pattern requires Option subject type");
+            return null;
+        }
+        let variant_id = self.option_pattern_variant_id(pattern_id);
+        if (variant_id == mir_id_invalid()) {
+            self.report_error("cannot resolve Option match pattern variant");
+            return null;
+        }
+        return self.option_tag_for_variant(variant_id, mir_unit_variant_name(&self.m, variant_id));
+    }
+
+    public fn match_pattern_arg_is_bind_local(self, arg_id: i32) -> bool {
+        let payload_id = self.call_arg_payload(arg_id);
+        if (payload_id == mir_id_invalid()) { return false; }
+        if (self.m.value_name(payload_id) == "_") { return false; }
+        if (self.m.value_kind(payload_id) != mir_value_read_place()) { return false; }
+        let place_id = self.m.value_place(payload_id);
+        if (place_id == mir_id_invalid()) { return false; }
+        if (self.m.place_kind(place_id) != mir_place_local()) { return false; }
+        let local_id = self.m.place_local(place_id);
+        if (local_id == mir_id_invalid()) { return false; }
+        // Builder temporaries are also read_place values, but only a source
+        // pattern identifier has an originating HIR local to bind.
+        return self.m.local_hir_id(local_id) != hir_id_invalid();
+    }
+
+    public fn match_pattern_is_subject_bind_local(self, subject_type: i32, pattern_id: i32) -> bool {
+        if (!self.match_pattern_arg_is_bind_local(pattern_id)) { return false; }
+        return self.type_ids_compatible(self.m.value_type(pattern_id), subject_type);
+    }
+
+    public fn emit_match_subject_bind(self, subject: rawptr, subject_type: i32, pattern_id: i32) -> bool {
+        if (!self.match_pattern_is_subject_bind_local(subject_type, pattern_id)) { return true; }
+        let place_id = self.m.value_place(pattern_id);
+        let place_type = self.m.place_type(place_id);
+        let cast_subject = self.cast_value(subject, subject_type, place_type);
+        let dst = self.lower_place_addr(place_id);
+        if (subject == null || cast_subject == null || dst == null) {
+            self.report_error("cannot bind match subject");
+            return false;
+        }
+        vyx_rt_build_store(self.mod, cast_subject, dst);
+        return true;
+    }
+
+    public fn option_match_case_needs_payload_bind(self, subject_type: i32, pattern_id: i32) -> bool {
+        if (!self.type_is_option_abi(subject_type)) { return false; }
+        let variant_id = self.option_pattern_variant_id(pattern_id);
+        if (variant_id == mir_id_invalid()) { return false; }
+        if (mir_unit_variant_name(&self.m, variant_id) != "Some") { return false; }
+        return self.match_pattern_arg_is_bind_local(self.option_pattern_payload_arg(pattern_id));
+    }
+
+    public fn lower_option_payload_pattern_condition(self,
+                                                     subject_payload: rawptr,
+                                                     payload_type: i32,
+                                                     pattern_arg_id: i32) -> rawptr {
+        if (pattern_arg_id == mir_id_invalid()) { return null; }
+        if (self.m.value_name(pattern_arg_id) == "_") {
+            return vyx_rt_const_int(self.mod, self.ty_i1, 1, 0);
+        }
+        var pattern_value = self.lower_value_as(pattern_arg_id, payload_type);
+        if (subject_payload == null || pattern_value == null) {
+            self.report_error("cannot lower Option payload match pattern");
+            return null;
+        }
+        let payload_kind = llvm_mir_type_kind(&self.m, payload_type);
+        if (self.type_is_str_abi(payload_type)) {
+            return self.lower_string_equals_raw_condition(subject_payload, pattern_value, false);
+        }
+        if (llvm_mir_int_bits_for_kind(payload_kind) > 0 || llvm_mir_kind_pointer_like(payload_kind)) {
+            var lhs = self.pointer_compare_scalar(subject_payload,
+                                                          payload_type,
+                                                          "mir.option.ptr.lhs");
+            pattern_value = self.pointer_compare_scalar(pattern_value,
+                                                        payload_type,
+                                                        "mir.option.ptr.rhs");
+            return vyx_rt_build_icmp(self.mod,
+                                     llvm_mir_icmp_eq(),
+                                     lhs,
+                                     pattern_value,
+                                     llvm_mir_empty_name(),
+                                     0);
+        }
+        self.report_error("cannot lower Option payload pattern for " + llvm_mir_type_text(&self.m, payload_type));
+        return null;
+    }
+
+    public fn emit_option_pattern_payload_bind(self,
+                                               subject: rawptr,
+                                               subject_type: i32,
+                                               pattern_id: i32) -> bool {
+        if (!self.option_match_case_needs_payload_bind(subject_type, pattern_id)) { return true; }
+        let arg_id = self.option_pattern_payload_arg(pattern_id);
+        let place_id = self.m.value_place(arg_id);
+        let payload_type = self.option_payload_type(subject_type);
+        let payload = self.option_payload_value(subject, subject_type);
+        let place_type = self.m.place_type(place_id);
+        let cast_payload = self.cast_value(payload, payload_type, place_type);
+        let dst = self.lower_place_addr(place_id);
+        if (payload == null || cast_payload == null || dst == null) {
+            self.report_error("cannot bind Option match payload");
+            return false;
+        }
+        vyx_rt_build_store(self.mod, cast_payload, dst);
+        return true;
+    }
+
+    public fn result_pattern_payload_arg(self, pattern_id: i32) -> i32 {
+        return self.call_arg_payload(self.m.value_first_arg(pattern_id));
+    }
+
+    public fn result_pattern_tag_value(self, pattern_id: i32, result_type: i32) -> rawptr {
+        if (!self.type_is_result_abi(result_type)) {
+            self.report_error("Result match pattern requires Result subject type");
+            return null;
+        }
+        let variant_id = self.pattern_variant_id(pattern_id);
+        if (variant_id == mir_id_invalid()) {
+            self.report_error("cannot resolve Result match pattern variant");
+            return null;
+        }
+        return self.result_tag_for_variant_name(mir_unit_variant_name(&self.m, variant_id));
+    }
+
+    public fn result_match_case_needs_payload_bind(self, subject_type: i32, pattern_id: i32) -> bool {
+        if (!self.type_is_result_abi(subject_type)) { return false; }
+        let variant_id = self.pattern_variant_id(pattern_id);
+        if (variant_id == mir_id_invalid()) { return false; }
+        var arg_node_id = self.m.value_first_arg(pattern_id);
+        while (arg_node_id != mir_id_invalid()) {
+            if (self.match_pattern_arg_is_bind_local(arg_node_id)) { return true; }
+            arg_node_id = self.m.value_next_arg(arg_node_id);
+        }
+        return false;
+    }
+
+    public fn result_payload_value_for_variant(self,
+                                               subject: rawptr,
+                                               subject_type: i32,
+                                               variant_id: i32) -> rawptr {
+        let variant_name = mir_unit_variant_name(&self.m, variant_id);
+        if (variant_name == "Ok") { return self.result_ok_value(subject, subject_type); }
+        if (variant_name == "Err") { return self.result_err_value(subject, subject_type); }
+        self.report_error("unknown Result variant " + variant_name);
+        return null;
+    }
+
+    public fn lower_result_payload_pattern_condition(self,
+                                                     subject_payload: rawptr,
+                                                     payload_type: i32,
+                                                     pattern_arg_id: i32) -> rawptr {
+        if (pattern_arg_id == mir_id_invalid()) { return null; }
+        if (self.m.value_name(pattern_arg_id) == "_") {
+            return vyx_rt_const_int(self.mod, self.ty_i1, 1, 0);
+        }
+        var pattern_value = self.lower_value_as(pattern_arg_id, payload_type);
+        if (subject_payload == null || pattern_value == null) {
+            self.report_error("cannot lower Result payload match pattern");
+            return null;
+        }
+        let payload_kind = llvm_mir_type_kind(&self.m, payload_type);
+        if (self.type_is_str_abi(payload_type)) {
+            return self.lower_string_equals_raw_condition(subject_payload, pattern_value, false);
+        }
+        if (llvm_mir_int_bits_for_kind(payload_kind) > 0 || llvm_mir_kind_pointer_like(payload_kind)) {
+            var lhs = self.pointer_compare_scalar(subject_payload,
+                                                          payload_type,
+                                                          "mir.result.ptr.lhs");
+            pattern_value = self.pointer_compare_scalar(pattern_value,
+                                                        payload_type,
+                                                        "mir.result.ptr.rhs");
+            return vyx_rt_build_icmp(self.mod,
+                                     llvm_mir_icmp_eq(),
+                                     lhs,
+                                     pattern_value,
+                                     llvm_mir_empty_name(),
+                                     0);
+        }
+        self.report_error("cannot lower Result payload pattern for " + llvm_mir_type_text(&self.m, payload_type));
+        return null;
+    }
+
+    public fn emit_result_pattern_payload_bind(self,
+                                               subject: rawptr,
+                                               subject_type: i32,
+                                               pattern_id: i32) -> bool {
+        if (!self.result_match_case_needs_payload_bind(subject_type, pattern_id)) { return true; }
+        let variant_id = self.pattern_variant_id(pattern_id);
+        var variant_name: string = "";
+        if (variant_id != mir_id_invalid()) {
+            variant_name = mir_unit_variant_name(&self.m, variant_id);
+        } else {
+            // Generic-instance Result subjects can lack a variant target;
+            // recover from the pattern's own name (`case Ok(..)`/`case Err(..)`).
+            variant_name = self.m.value_name(pattern_id);
+        }
+        var payload_type = mir_id_invalid();
+        var payload: rawptr = null;
+        if (variant_name == "Ok") {
+            payload_type = self.result_ok_type(subject_type);
+            payload = self.result_ok_value(subject, subject_type);
+        } elif (variant_name == "Err") {
+            payload_type = self.result_err_type(subject_type);
+            payload = self.result_err_value(subject, subject_type);
+        } else {
+            self.report_error("cannot resolve Result match pattern variant");
+            return false;
+        }
+        var arg_node_id = self.m.value_first_arg(pattern_id);
+        var arg_index: i32 = 0;
+        while (arg_node_id != mir_id_invalid()) {
+            let arg_id = self.call_arg_payload(arg_node_id);
+            if (arg_index > 0) {
+                self.report_error("Result pattern has more than one payload binding");
+                return false;
+            }
+            if (self.match_pattern_arg_is_bind_local(arg_id)) {
+                let place_id = self.m.value_place(arg_id);
+                let place_type = self.m.place_type(place_id);
+                let cast_payload = self.cast_value(payload, payload_type, place_type);
+                let dst = self.lower_place_addr(place_id);
+                if (payload_type == mir_id_invalid() || payload == null || cast_payload == null || dst == null) {
+                    self.report_error("cannot bind Result match payload");
+                    return false;
+                }
+                vyx_rt_build_store(self.mod, cast_payload, dst);
+            }
+            arg_index = arg_index + 1;
+            arg_node_id = self.m.value_next_arg(arg_node_id);
+        }
+        return true;
+    }
+
+    public fn plain_enum_pattern_tag_value(self, pattern_id: i32, enum_type: i32) -> rawptr {
+        if (!self.type_is_plain_enum_abi(enum_type)) {
+            self.report_error("enum match pattern requires enum subject type (is_plain_enum_abi failed for type "
+                + llvm_mir_type_text(&self.m, enum_type) + ")");
+            return null;
+        }
+        let pattern_kind = self.m.value_kind(pattern_id);
+        if (pattern_kind == mir_value_const_int()
+            || pattern_kind == mir_value_const_char()
+            || pattern_kind == mir_value_const_bool()) {
+            return vyx_rt_const_int(self.mod, self.ty_i32, self.m.value_int(pattern_id), 1);
+        }
+        let variant_id = self.pattern_variant_id(pattern_id);
+        if (variant_id == mir_id_invalid()) {
+            let pat_name = self.m.value_name(pattern_id);
+            let enum_name = llvm_mir_type_text(&self.m, enum_type);
+            var msg = "cannot resolve enum match pattern";
+            if (pat_name.len > 0) {
+                msg = msg + " `" + pat_name + "`";
+            }
+            msg = msg + " for " + enum_name;
+            if (vyx_bootstrap_profile_level() > 0) {
+                let ctx = " [pattern_id=" + policy_i64_to_string(pattern_id as i64)
+                    + " target_kind=" + policy_i64_to_string(self.m.value_target_kind(pattern_id) as i64)
+                    + " target_id=" + policy_i64_to_string(self.m.value_target_id(pattern_id) as i64);
+                if (self.m.value_lhs(pattern_id) != mir_id_invalid()) {
+                    let lhs_id = self.m.value_lhs(pattern_id);
+                    msg = msg + ctx
+                        + " lhs_target_kind=" + policy_i64_to_string(self.m.value_target_kind(lhs_id) as i64)
+                        + " lhs_target_id=" + policy_i64_to_string(self.m.value_target_id(lhs_id) as i64)
+                        + "]";
+                } else {
+                    msg = msg + ctx + "]";
+                }
+            }
+            self.report_error(msg);
+            return null;
+        }
+        return self.lower_variant_tag_value(variant_id);
+    }
+
+    public fn plain_enum_match_case_needs_payload_bind(self, subject_type: i32, pattern_id: i32) -> bool {
+        if (!self.type_is_plain_enum_abi(subject_type)) { return false; }
+        let pattern_kind = self.m.value_kind(pattern_id);
+        if (pattern_kind == mir_value_const_int()
+            || pattern_kind == mir_value_const_char()
+            || pattern_kind == mir_value_const_bool()) {
+            return false;
+        }
+        let variant_id = self.pattern_variant_id(pattern_id);
+        if (variant_id == mir_id_invalid()) { return false; }
+        var arg_node_id = self.m.value_first_arg(pattern_id);
+        while (arg_node_id != mir_id_invalid()) {
+            if (self.match_pattern_arg_is_bind_local(arg_node_id)) { return true; }
+            arg_node_id = self.m.value_next_arg(arg_node_id);
+        }
+        return false;
+    }
+
+    public fn lower_plain_enum_payload_pattern_condition(self,
+                                                         subject_payload: rawptr,
+                                                         payload_type: i32,
+                                                         pattern_arg_id: i32) -> rawptr {
+        if (pattern_arg_id == mir_id_invalid()) { return null; }
+        if (self.m.value_name(pattern_arg_id) == "_") {
+            return vyx_rt_const_int(self.mod, self.ty_i1, 1, 0);
+        }
+        var pattern_value = self.lower_value_as(pattern_arg_id, payload_type);
+        if (subject_payload == null || pattern_value == null) {
+            self.report_error("cannot lower enum payload match pattern");
+            return null;
+        }
+        let payload_kind = llvm_mir_type_kind(&self.m, payload_type);
+        if (self.type_is_str_abi(payload_type)) {
+            return self.lower_string_equals_raw_condition(subject_payload, pattern_value, false);
+        }
+        if (llvm_mir_int_bits_for_kind(payload_kind) > 0 || llvm_mir_kind_pointer_like(payload_kind)) {
+            var lhs = self.pointer_compare_scalar(subject_payload,
+                                                          payload_type,
+                                                          "mir.enum.ptr.lhs");
+            pattern_value = self.pointer_compare_scalar(pattern_value,
+                                                        payload_type,
+                                                        "mir.enum.ptr.rhs");
+            return vyx_rt_build_icmp(self.mod,
+                                     llvm_mir_icmp_eq(),
+                                     lhs,
+                                     pattern_value,
+                                     llvm_mir_empty_name(),
+                                     0);
+        }
+        self.report_error("cannot lower enum payload pattern for " + llvm_mir_type_text(&self.m, payload_type));
+        return null;
+    }
+
+    public fn emit_plain_enum_pattern_payload_bind(self,
+                                                   subject: rawptr,
+                                                   subject_type: i32,
+                                                   pattern_id: i32) -> bool {
+        if (!self.plain_enum_match_case_needs_payload_bind(subject_type, pattern_id)) { return true; }
+        let variant_id = self.pattern_variant_id(pattern_id);
+        if (variant_id == mir_id_invalid()) { return false; }
+        var arg_index: i32 = 0;
+        var arg_node_id = self.m.value_first_arg(pattern_id);
+        while (arg_node_id != mir_id_invalid()) {
+            let arg_id = self.call_arg_payload(arg_node_id);
+            if (self.match_pattern_arg_is_bind_local(arg_id)) {
+                let place_id = self.m.value_place(arg_id);
+                let payload_type = self.enum_variant_payload_type_at(subject_type, variant_id, arg_index);
+                let payload = self.enum_payload_value(subject, subject_type, variant_id, arg_index);
+                let place_type = self.m.place_type(place_id);
+                let cast_payload = self.cast_value(payload, payload_type, place_type);
+                let dst = self.lower_place_addr(place_id);
+                if (payload == null || cast_payload == null || dst == null) {
+                    self.report_error("cannot bind enum match payload");
+                    return false;
+                }
+                vyx_rt_build_store(self.mod, cast_payload, dst);
+            }
+            arg_index = arg_index + 1;
+            arg_node_id = self.m.value_next_arg(arg_node_id);
+        }
+        return true;
+    }
+
+    public fn match_case_needs_payload_bind(self, subject_type: i32, pattern_id: i32) -> bool {
+        if (self.option_match_case_needs_payload_bind(subject_type, pattern_id)) { return true; }
+        if (self.result_match_case_needs_payload_bind(subject_type, pattern_id)) { return true; }
+        return self.plain_enum_match_case_needs_payload_bind(subject_type, pattern_id);
+    }
+
+    public fn emit_match_pattern_payload_bind(self,
+                                              subject: rawptr,
+                                              subject_type: i32,
+                                              pattern_id: i32) -> bool {
+        if (self.type_is_option_abi(subject_type)) {
+            return self.emit_option_pattern_payload_bind(subject, subject_type, pattern_id);
+        }
+        if (self.type_is_result_abi(subject_type)) {
+            return self.emit_result_pattern_payload_bind(subject, subject_type, pattern_id);
+        }
+        if (self.type_is_plain_enum_abi(subject_type)) {
+            return self.emit_plain_enum_pattern_payload_bind(subject, subject_type, pattern_id);
+        }
+        return true;
+    }
+
+    public fn pattern_variant_owner_matches_type(self, pattern_id: i32, candidate_type: i32) -> bool {
+        if (pattern_id == mir_id_invalid() || candidate_type == mir_id_invalid()) { return false; }
+        let variant_id = self.pattern_variant_id(pattern_id);
+        if (variant_id == mir_id_invalid()) { return false; }
+        let owner_type = mir_unit_variant_owner_type(&self.m, variant_id);
+        if (owner_type == mir_id_invalid()) { return false; }
+        if (self.type_ids_compatible(owner_type, self.canonical_record_type_id(candidate_type))) { return true; }
+        // Owner may be a duplicate registration of the same enum; compare
+        // canonical identities as well.
+        return self.type_ids_compatible(self.canonical_record_type_id(owner_type),
+                                        self.canonical_record_type_id(candidate_type));
+    }
+
+    public fn match_pattern_selects_type(self, pattern_id: i32, candidate_type: i32) -> bool {
+        if (pattern_id == mir_id_invalid() || candidate_type == mir_id_invalid()) { return false; }
+        if (self.type_ids_compatible(self.m.value_type(pattern_id), candidate_type)) { return true; }
+        return self.pattern_variant_owner_matches_type(pattern_id, candidate_type);
+    }
+
+    public fn match_effective_subject_type(self, block_id: i32) -> i32 {
+        let subject_id = self.m.block_term_value(block_id);
+        let source_type = self.m.value_type(subject_id);
+        let payload_type = self.heap_indirect_payload_type(source_type);
+        if (payload_type == mir_id_invalid()) { return source_type; }
+        var case_id = self.m.block_term_first_case(block_id);
+        while (case_id != mir_id_invalid()) {
+            let pattern_id = self.m.case_pattern_value(case_id);
+            if (!self.is_default_match_pattern(pattern_id)
+                && self.match_pattern_selects_type(pattern_id, payload_type)) {
+                return payload_type;
+            }
+            case_id = self.m.case_next(case_id);
+        }
+        return source_type;
+    }
+
+    public fn lower_match_case_condition(self, subject_id: i32, subject_type: i32, subject: rawptr, pattern_id: i32) -> rawptr {
+        let pattern_type = self.m.value_type(pattern_id);
+        if (self.match_pattern_is_subject_bind_local(subject_type, pattern_id)) {
+            return vyx_rt_const_int(self.mod, self.ty_i1, 1, 0);
+        }
+        if (self.type_is_str_abi(subject_type) || self.type_is_str_abi(pattern_type)) {
+            let pattern_value = self.lower_value_as(pattern_id, subject_type);
+            if (pattern_value == null) { return null; }
+            return self.lower_string_equals_raw_condition(subject, pattern_value, false);
+        }
+        if (self.type_is_option_abi(subject_type)) {
+            let subject_tag = self.option_tag_value(subject, subject_type);
+            let pattern_tag = self.option_pattern_tag_value(pattern_id, subject_type);
+            if (subject_tag == null || pattern_tag == null) { return null; }
+            var cond = vyx_rt_build_icmp(self.mod,
+                                         llvm_mir_icmp_eq(),
+                                         subject_tag,
+                                         pattern_tag,
+                                         llvm_mir_empty_name(),
+                                         0);
+            let variant_id = self.option_pattern_variant_id(pattern_id);
+            if (variant_id != mir_id_invalid()
+                && mir_unit_variant_name(&self.m, variant_id) == "Some") {
+                let payload_arg = self.option_pattern_payload_arg(pattern_id);
+                if (payload_arg != mir_id_invalid()
+                    && !self.match_pattern_arg_is_bind_local(payload_arg)
+                    && self.m.value_name(payload_arg) != "_") {
+                    let payload_type = self.option_payload_type(subject_type);
+                    let payload = self.option_payload_value(subject, subject_type);
+                    let payload_cond = self.lower_option_payload_pattern_condition(payload, payload_type, payload_arg);
+                    if (payload_cond == null) { return null; }
+                    cond = vyx_rt_build_and(self.mod, cond, payload_cond, llvm_mir_empty_name(), 0);
+                }
+            }
+            return cond;
+        }
+        if (self.type_is_result_abi(subject_type)) {
+            let subject_tag = self.result_tag_value(subject, subject_type);
+            let pattern_tag = self.result_pattern_tag_value(pattern_id, subject_type);
+            if (subject_tag == null || pattern_tag == null) { return null; }
+            var cond_result = vyx_rt_build_icmp(self.mod,
+                                                llvm_mir_icmp_eq(),
+                                                subject_tag,
+                                                pattern_tag,
+                                                llvm_mir_empty_name(),
+                                                0);
+            let variant_id_result = self.pattern_variant_id(pattern_id);
+            if (variant_id_result != mir_id_invalid()) {
+                var arg_index_result: i32 = 0;
+                var payload_arg_node_result = self.m.value_first_arg(pattern_id);
+                while (payload_arg_node_result != mir_id_invalid()) {
+                    let payload_arg_result = self.call_arg_payload(payload_arg_node_result);
+                    if (arg_index_result > 0) {
+                        self.report_error("Result pattern has more than one payload condition");
+                        return null;
+                    }
+                    if (!self.match_pattern_arg_is_bind_local(payload_arg_result)
+                        && self.m.value_name(payload_arg_result) != "_") {
+                        let payload_type_result = self.result_payload_type_for_variant(subject_type, variant_id_result);
+                        let payload_result = self.result_payload_value_for_variant(subject, subject_type, variant_id_result);
+                        let payload_cond_result = self.lower_result_payload_pattern_condition(payload_result,
+                                                                                              payload_type_result,
+                                                                                              payload_arg_result);
+                        if (payload_cond_result == null) { return null; }
+                        cond_result = vyx_rt_build_and(self.mod, cond_result, payload_cond_result, llvm_mir_empty_name(), 0);
+                    }
+                    arg_index_result = arg_index_result + 1;
+                    payload_arg_node_result = self.m.value_next_arg(payload_arg_node_result);
+                }
+            }
+            return cond_result;
+        }
+        if (self.type_is_plain_enum_abi(subject_type)) {
+            let subject_tag = self.enum_tag_value(subject, subject_type);
+            let pattern_tag = self.plain_enum_pattern_tag_value(pattern_id, subject_type);
+            if (subject_tag == null || pattern_tag == null) { return null; }
+            var cond2 = vyx_rt_build_icmp(self.mod,
+                                          llvm_mir_icmp_eq(),
+                                          subject_tag,
+                                          pattern_tag,
+                                          llvm_mir_empty_name(),
+                                          0);
+            let first_payload_arg = self.m.value_first_arg(pattern_id);
+            if (first_payload_arg == mir_id_invalid()) { return cond2; }
+            let variant_id2 = self.pattern_variant_id(pattern_id);
+            if (variant_id2 == mir_id_invalid()) {
+                self.report_error("cannot lower enum payload pattern without a variant target");
+                return null;
+            }
+            var arg_index: i32 = 0;
+            var payload_arg_node = first_payload_arg;
+            while (payload_arg_node != mir_id_invalid()) {
+                let payload_arg = self.call_arg_payload(payload_arg_node);
+                if (!self.match_pattern_arg_is_bind_local(payload_arg)
+                    && self.m.value_name(payload_arg) != "_") {
+                    let payload_type = self.enum_variant_payload_type_at(subject_type, variant_id2, arg_index);
+                    let payload = self.enum_payload_value(subject, subject_type, variant_id2, arg_index);
+                    let payload_cond = self.lower_plain_enum_payload_pattern_condition(payload, payload_type, payload_arg);
+                    if (payload_cond == null) { return null; }
+                    cond2 = vyx_rt_build_and(self.mod, cond2, payload_cond, llvm_mir_empty_name(), 0);
+                }
+                arg_index = arg_index + 1;
+                payload_arg_node = self.m.value_next_arg(payload_arg_node);
+            }
+            return cond2;
+        }
+        let subject_kind = llvm_mir_type_kind(&self.m, subject_type);
+        if (mir_unit_variant_count_for_type(&self.m, subject_type) <= 0
+            && llvm_mir_int_bits_for_kind(subject_kind) <= 0
+            && !llvm_mir_kind_pointer_like(subject_kind)) {
+            self.report_error("cannot lower match equality for " + llvm_mir_type_text(&self.m, subject_type));
+            return null;
+        }
+        var pat_val = self.lower_value_as(pattern_id, subject_type);
+        if (pat_val == null) { return null; }
+        let subject_scalar = self.pointer_compare_scalar(subject, subject_type, "mir.match.ptr.lhs");
+        pat_val = self.pointer_compare_scalar(pat_val, subject_type, "mir.match.ptr.rhs");
+        return vyx_rt_build_icmp(self.mod,
+                                 llvm_mir_icmp_eq(),
+                                 subject_scalar,
+                                 pat_val,
+                                 llvm_mir_empty_name(),
+                                 0);
+    }
+
+    public fn lower_match_terminator(self, block_id: i32) {
+        let subject_id = self.m.block_term_value(block_id);
+        let subject_type = self.match_effective_subject_type(block_id);
+        let subject = self.lower_value_as(subject_id, subject_type);
+        if (subject == null) {
+            self.report_error("cannot lower match subject in block #" + policy_i64_to_string(block_id as i64));
+            return;
+        }
+        var default_target: rawptr = null;
+        var case_id = self.m.block_term_first_case(block_id);
+        while (case_id != mir_id_invalid()) {
+            let pat_id = self.m.case_pattern_value(case_id);
+            if (self.is_default_match_pattern(pat_id)) {
+                default_target = llvm_mir_map_get(self.block_values, self.m.case_target_block(case_id));
+            }
+            case_id = self.m.case_next(case_id);
+        }
+        if (default_target == null) {
+            default_target = llvm_mir_map_get(self.block_values, self.m.block_term_false(block_id));
+        }
+        case_id = self.m.block_term_first_case(block_id);
+        while (case_id != mir_id_invalid()) {
+            let pat_id2 = self.m.case_pattern_value(case_id);
+            if (!self.is_default_match_pattern(pat_id2)) {
+                let target_bb = llvm_mir_map_get(self.block_values, self.m.case_target_block(case_id));
+                var cond = self.lower_match_case_condition(subject_id, subject_type, subject, pat_id2);
+                if (target_bb == null || cond == null) {
+                    self.report_error("cannot lower match case #" + policy_i64_to_string(case_id as i64));
+                    return;
+                }
+                var hit_bb = target_bb;
+                var bind_bb: rawptr = null;
+                let needs_subject_bind = self.match_pattern_is_subject_bind_local(subject_type, pat_id2);
+                let needs_payload_bind = self.match_case_needs_payload_bind(subject_type, pat_id2);
+                let needs_bind = needs_subject_bind || needs_payload_bind;
+                if (needs_bind) {
+                    let bind_name = "mir.match.bind." + policy_i64_to_string(case_id as i64);
+                    bind_bb = vyx_rt_append_block(self.mod,
+                                                  self.current_function_value,
+                                                  bind_name.c_str(),
+                                                  bind_name.len as u64);
+                    if (bind_bb == null) {
+                        self.report_error("cannot create match bind block");
+                        return;
+                    }
+                    hit_bb = bind_bb;
+                }
+                let guard_id = self.m.case_guard_value(case_id);
+                if (guard_id != mir_id_invalid() && !needs_bind) {
+                    let guard = self.truthy_value(self.lower_value(guard_id), self.m.value_type(guard_id));
+                    if (guard == null) {
+                        self.report_error("cannot lower match guard #" + policy_i64_to_string(case_id as i64));
+                        return;
+                    }
+                    cond = vyx_rt_build_and(self.mod, cond, guard, llvm_mir_empty_name(), 0);
+                }
+                var next_case = self.m.case_next(case_id);
+                while (next_case != mir_id_invalid()
+                       && self.is_default_match_pattern(self.m.case_pattern_value(next_case))) {
+                    next_case = self.m.case_next(next_case);
+                }
+                var miss_bb = default_target;
+                var miss_is_unreachable = false;
+                if (next_case != mir_id_invalid()) {
+                    let name = "mir.match.next." + policy_i64_to_string(case_id as i64);
+                    miss_bb = vyx_rt_append_block(self.mod,
+                                                  self.current_function_value,
+                                                  name.c_str(),
+                                                  name.len as u64);
+                } else if (miss_bb == null) {
+                    let miss_name = "mir.match.unreachable." + policy_i64_to_string(case_id as i64);
+                    miss_bb = vyx_rt_append_block(self.mod,
+                                                  self.current_function_value,
+                                                  miss_name.c_str(),
+                                                  miss_name.len as u64);
+                    miss_is_unreachable = true;
+                }
+                if (miss_bb == null) {
+                    self.report_error("cannot resolve match miss target");
+                    return;
+                }
+                vyx_rt_build_cond_br(self.mod, cond, hit_bb, miss_bb);
+                if (bind_bb != null) {
+                    vyx_rt_position_at_end(self.mod, bind_bb);
+                    if (!self.emit_match_subject_bind(subject, subject_type, pat_id2)) {
+                        return;
+                    }
+                    if (!self.emit_match_pattern_payload_bind(subject, subject_type, pat_id2)) {
+                        return;
+                    }
+                    if (guard_id != mir_id_invalid()) {
+                        let guard_after_bind = self.truthy_value(self.lower_value(guard_id), self.m.value_type(guard_id));
+                        if (guard_after_bind == null) {
+                            self.report_error("cannot lower match guard #" + policy_i64_to_string(case_id as i64));
+                            return;
+                        }
+                        vyx_rt_build_cond_br(self.mod, guard_after_bind, target_bb, miss_bb);
+                    } else {
+                        vyx_rt_build_br(self.mod, target_bb);
+                    }
+                }
+                if (next_case == mir_id_invalid()) {
+                    if (miss_is_unreachable) {
+                        vyx_rt_position_at_end(self.mod, miss_bb);
+                        vyx_rt_build_unreachable(self.mod);
+                    }
+                    return;
+                }
+                vyx_rt_position_at_end(self.mod, miss_bb);
+            }
+            case_id = self.m.case_next(case_id);
+        }
+        if (default_target != null) {
+            vyx_rt_build_br(self.mod, default_target);
+        } else {
+            vyx_rt_build_unreachable(self.mod);
+        }
+    }
+}

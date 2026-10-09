@@ -1,0 +1,1131 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Template analysis for the HIR builder. See README.md.
+
+fn hir_builder_type_name_has_template_atom(name: string) -> bool {
+    if (name.len == 0) { return false; }
+    let args = policy_generic_call_args(name.clone());
+    if (args.len > 0) {
+        var i: i32 = 0;
+        while (i < 64) {
+            let a = policy_generic_arg_at(args, i);
+            if (a.len == 0) { return false; }
+            if (hir_builder_type_name_has_template_atom(a)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (name == "Self") { return true; }
+    if (name.len == 1) {
+        let c = name.charAt(0);
+        if (c >= 65 && c <= 90) { return true; }
+    }
+    return false;
+}
+
+fn hir_builder_type_name_contains_template_param(name: string, param: string) -> bool {
+    if (name.len == 0 || param.len == 0) { return false; }
+    if (name == param) { return true; }
+    let args = policy_generic_call_args(name.clone());
+    if (args.len > 0) {
+        var i: i32 = 0;
+        while (i < 64) {
+            let a = policy_generic_arg_at(args, i);
+            if (a.len == 0) { return false; }
+            if (hir_builder_type_name_contains_template_param(a, param)) { return true; }
+            i = i + 1;
+        }
+    }
+    let sep = hir_builder_assoc_separator_index(name);
+    if (sep >= 0) {
+        let sep_len = hir_builder_assoc_separator_len(name, sep);
+        if (sep > 0 && sep + sep_len < name.len) {
+            if (hir_builder_type_name_contains_template_param(name.substring(0, sep), param)) { return true; }
+            if (hir_builder_type_name_contains_template_param(name.substring(sep + sep_len, name.len), param)) { return true; }
+        }
+    }
+    return false;
+}
+
+fn hir_builder_identifier_char(c: i32) -> bool {
+    if (c >= 65 && c <= 90) { return true; }
+    if (c >= 97 && c <= 122) { return true; }
+    if (c >= 48 && c <= 57) { return true; }
+    return c == 95;
+}
+
+fn hir_builder_type_text_contains_template_param(text: string, param: string) -> bool {
+    if (text.len == 0 || param.len == 0) { return false; }
+    var i: i32 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (!hir_builder_identifier_char(c)) {
+            i = i + 1;
+        } else {
+            let start = i;
+            i = i + 1;
+            while (i < text.len && hir_builder_identifier_char(text.charAt(i))) {
+                i = i + 1;
+            }
+            if (i - start == param.len && text.substring(start, i) == param) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn hir_builder_type_ref_has_template_atom(ty: rawptr) -> bool {
+    if (ty == null) { return false; }
+    let k = tref_get_kind(ty);
+    if (k == ty_CLASS()) {
+        return hir_builder_type_name_has_template_atom(tref_get_name(ty));
+    }
+    if (k == ty_PTR() || k == ty_REF() || k == ty_MUTREF()) {
+        return hir_builder_type_ref_has_template_atom(tref_pointee(ty));
+    }
+    if (k == ty_ARRAY()) {
+        return hir_builder_type_ref_has_template_atom(tref_array_elem(ty))
+            || hir_builder_const_expr_has_template_atom(tref_array_size_expr(ty));
+    }
+    if (k == ty_TUPLE()) {
+        var i: i64 = 0;
+        while (i < tref_tuple_count(ty)) {
+            if (hir_builder_type_ref_has_template_atom(tref_tuple_elem_at(ty, i))) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (k == ty_FN() || k == ty_CFN()) {
+        if (hir_builder_type_ref_has_template_atom(tref_fn_ret(ty))) { return true; }
+        var i2: i64 = 0;
+        while (i2 < tref_fn_param_count(ty)) {
+            if (hir_builder_type_ref_has_template_atom(tref_fn_param_at(ty, i2))) { return true; }
+            i2 = i2 + 1;
+        }
+        return false;
+    }
+    return false;
+}
+
+fn hir_builder_type_ref_contains_template_param(ty: rawptr, param: string) -> bool {
+    if (ty == null || param.len == 0) { return false; }
+    let k = tref_get_kind(ty);
+    if (k == ty_CLASS()) {
+        return hir_builder_type_name_contains_template_param(tref_get_name(ty), param);
+    }
+    if (k == ty_PTR() || k == ty_REF() || k == ty_MUTREF()) {
+        return hir_builder_type_ref_contains_template_param(tref_pointee(ty), param);
+    }
+    if (k == ty_ARRAY()) {
+        return hir_builder_type_ref_contains_template_param(tref_array_elem(ty), param)
+            || hir_builder_const_expr_contains_param(tref_array_size_expr(ty), param);
+    }
+    if (k == ty_TUPLE()) {
+        var i: i64 = 0;
+        while (i < tref_tuple_count(ty)) {
+            if (hir_builder_type_ref_contains_template_param(tref_tuple_elem_at(ty, i), param)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (k == ty_FN() || k == ty_CFN()) {
+        if (hir_builder_type_ref_contains_template_param(tref_fn_ret(ty), param)) { return true; }
+        var i2: i64 = 0;
+        while (i2 < tref_fn_param_count(ty)) {
+            if (hir_builder_type_ref_contains_template_param(tref_fn_param_at(ty, i2), param)) { return true; }
+            i2 = i2 + 1;
+        }
+        return false;
+    }
+    return false;
+}
+
+fn hir_builder_append_inferred_template_param(out: string, name: string, excluded: string) -> string {
+    if (name.len == 0 || name == "Self") { return out; }
+    let canon = hir_builder_generic_param_canonical(name);
+    if (canon.len == 0) { return out; }
+    if (hir_builder_generic_contains(out, canon)) { return out; }
+    if (hir_builder_generic_contains(excluded, canon)) { return out; }
+    return hir_builder_append_csv(out, canon);
+}
+
+fn hir_builder_collect_template_params_from_type_name(name: string, out: string, excluded: string) -> string {
+    if (name.len == 0) { return out; }
+    let args = policy_generic_call_args(name.clone());
+    if (args.len > 0) {
+        var out_args = out;
+        var arg_index: i32 = 0;
+        while (arg_index < 64) {
+            let arg = policy_generic_arg_at(args, arg_index);
+            if (arg.len == 0) { return out_args; }
+            out_args = hir_builder_collect_template_params_from_type_name(arg, out_args, excluded);
+            arg_index = arg_index + 1;
+        }
+        return out_args;
+    }
+    let sep = hir_builder_assoc_separator_index(name);
+    if (sep >= 0) {
+        let sep_len = hir_builder_assoc_separator_len(name, sep);
+        var out_assoc = out;
+        if (sep > 0) {
+            out_assoc = hir_builder_collect_template_params_from_type_name(name.substring(0, sep),
+                                                                           out_assoc,
+                                                                           excluded);
+        }
+        if (sep + sep_len < name.len) {
+            out_assoc = hir_builder_collect_template_params_from_type_name(name.substring(sep + sep_len, name.len),
+                                                                           out_assoc,
+                                                                           excluded);
+        }
+        return out_assoc;
+    }
+    if (name.len == 1) {
+        let c = name.charAt(0);
+        if (c >= 65 && c <= 90) {
+            return hir_builder_append_inferred_template_param(out, name, excluded);
+        }
+    }
+    return out;
+}
+
+fn hir_builder_collect_template_params_from_type_ref(ty: rawptr, out: string, excluded: string) -> string {
+    if (ty == null) { return out; }
+    let k = tref_get_kind(ty);
+    if (k == ty_CLASS()) {
+        return hir_builder_collect_template_params_from_type_name(tref_get_name(ty), out, excluded);
+    }
+    if (k == ty_PTR() || k == ty_REF() || k == ty_MUTREF()) {
+        return hir_builder_collect_template_params_from_type_ref(tref_pointee(ty), out, excluded);
+    }
+    if (k == ty_ARRAY()) {
+        var out_arr = hir_builder_collect_template_params_from_type_ref(tref_array_elem(ty), out, excluded);
+        let size_e = tref_array_size_expr(ty);
+        if (size_e != null && expr_get_kind(size_e) == ex_IDENT()) {
+            out_arr = hir_builder_append_inferred_template_param(out_arr, expr_get_name(size_e), excluded);
+        }
+        return out_arr;
+    }
+    if (k == ty_TUPLE()) {
+        var out_tuple = out;
+        var i: i64 = 0;
+        while (i < tref_tuple_count(ty)) {
+            out_tuple = hir_builder_collect_template_params_from_type_ref(tref_tuple_elem_at(ty, i),
+                                                                          out_tuple,
+                                                                          excluded);
+            i = i + 1;
+        }
+        return out_tuple;
+    }
+    if (k == ty_FN() || k == ty_CFN()) {
+        var out_fn = hir_builder_collect_template_params_from_type_ref(tref_fn_ret(ty), out, excluded);
+        var i2: i64 = 0;
+        while (i2 < tref_fn_param_count(ty)) {
+            out_fn = hir_builder_collect_template_params_from_type_ref(tref_fn_param_at(ty, i2),
+                                                                       out_fn,
+                                                                       excluded);
+            i2 = i2 + 1;
+        }
+        return out_fn;
+    }
+    return out;
+}
+
+fn hir_builder_inferred_decl_template_params_except(d: rawptr, excluded: string) -> string {
+    if (d == null) { return ""; }
+    var out = hir_builder_collect_template_params_from_type_ref(decl_get_ty(d), "", excluded);
+    var param = decl_get_params(d);
+    while (param != null) {
+        out = hir_builder_collect_template_params_from_type_ref(decl_get_ty(param), out, excluded);
+        param = decl_get_next(param);
+    }
+    return out;
+}
+
+fn hir_builder_expr_has_template_type(e: rawptr) -> bool {
+    if (e == null) { return false; }
+    if (hir_builder_type_ref_has_template_atom(expr_get_ty(e))) { return true; }
+    if (hir_builder_type_name_has_template_atom(expr_get_name(e))) { return true; }
+    let k = expr_get_kind(e);
+    if (k == ex_BIN() || k == ex_ASSIGN() || k == ex_TERNARY()) {
+        if (hir_builder_expr_has_template_type(expr_get_lhs(e))) { return true; }
+        if (hir_builder_expr_has_template_type(expr_get_rhs(e))) { return true; }
+        return hir_builder_expr_has_template_type(expr_get_args(e));
+    }
+    if (k == ex_UNARY()
+        || k == ex_ADDR_OF()
+        || k == ex_DEREF()
+        || k == ex_CAST()
+        || k == ex_AWAIT()
+        || k == ex_COMPTIME()
+        || k == ex_FAIL()) {
+        return hir_builder_expr_has_template_type(expr_get_lhs(e));
+    }
+    if (k == ex_CALL()) {
+        if (hir_builder_expr_has_template_type(expr_get_lhs(e))) { return true; }
+        return hir_builder_stmt_chain_has_template_type(expr_get_args(e));
+    }
+    if (k == ex_MEMBER()) {
+        return hir_builder_expr_has_template_type(expr_get_lhs(e));
+    }
+    if (k == ex_INDEX()) {
+        if (hir_builder_expr_has_template_type(expr_get_lhs(e))) { return true; }
+        return hir_builder_expr_has_template_type(expr_get_rhs(e));
+    }
+    if (k == ex_STRUCT_INIT()
+        || k == ex_FSTRING()
+        || k == ex_TUPLE_LIT()
+        || k == ex_INLINE_ASM()) {
+        return hir_builder_stmt_chain_has_template_type(expr_get_args(e));
+    }
+    if (k == ex_ARRAY_LIT()) {
+        if (hir_builder_stmt_chain_has_template_type(expr_get_args(e))) { return true; }
+        return hir_builder_expr_has_template_type(expr_get_captures(e));
+    }
+    if (k == ex_CLOSURE()) {
+        if (hir_builder_stmt_chain_has_template_type(expr_get_captures(e))) { return true; }
+        if (hir_builder_stmt_chain_has_template_type(expr_get_lhs(e))) { return true; }
+        return hir_builder_type_ref_has_template_atom(expr_get_rhs(e));
+    }
+    if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+        if (hir_builder_expr_has_template_type(expr_get_lhs(e))) { return true; }
+        if (k == ex_IF_EXPR()) {
+            if (hir_builder_stmt_chain_has_template_type(expr_get_rhs(e))) { return true; }
+            let else_part = expr_get_args(e);
+            if (else_part != null && expr_get_kind(else_part) == ex_IF_EXPR()) {
+                return hir_builder_expr_has_template_type(else_part);
+            }
+            return hir_builder_stmt_chain_has_template_type(else_part);
+        }
+        return hir_builder_stmt_chain_has_template_type(expr_get_args(e));
+    }
+    return false;
+}
+
+fn hir_builder_expr_contains_template_param(e: rawptr, param: string) -> bool {
+    if (e == null || param.len == 0) { return false; }
+    if (hir_builder_type_ref_contains_template_param(expr_get_ty(e), param)) { return true; }
+    if (hir_builder_type_name_contains_template_param(expr_get_name(e), param)) { return true; }
+    let k = expr_get_kind(e);
+    if (k == ex_BIN() || k == ex_ASSIGN() || k == ex_TERNARY()) {
+        if (hir_builder_expr_contains_template_param(expr_get_lhs(e), param)) { return true; }
+        if (hir_builder_expr_contains_template_param(expr_get_rhs(e), param)) { return true; }
+        return hir_builder_expr_contains_template_param(expr_get_args(e), param);
+    }
+    if (k == ex_UNARY()
+        || k == ex_ADDR_OF()
+        || k == ex_DEREF()
+        || k == ex_CAST()
+        || k == ex_AWAIT()
+        || k == ex_COMPTIME()
+        || k == ex_FAIL()) {
+        return hir_builder_expr_contains_template_param(expr_get_lhs(e), param);
+    }
+    if (k == ex_CALL()) {
+        if (hir_builder_expr_contains_template_param(expr_get_lhs(e), param)) { return true; }
+        return hir_builder_stmt_chain_contains_template_param(expr_get_args(e), param);
+    }
+    if (k == ex_MEMBER()) {
+        return hir_builder_expr_contains_template_param(expr_get_lhs(e), param);
+    }
+    if (k == ex_INDEX()) {
+        if (hir_builder_expr_contains_template_param(expr_get_lhs(e), param)) { return true; }
+        return hir_builder_expr_contains_template_param(expr_get_rhs(e), param);
+    }
+    if (k == ex_STRUCT_INIT()
+        || k == ex_FSTRING()
+        || k == ex_TUPLE_LIT()
+        || k == ex_INLINE_ASM()) {
+        return hir_builder_stmt_chain_contains_template_param(expr_get_args(e), param);
+    }
+    if (k == ex_ARRAY_LIT()) {
+        if (hir_builder_stmt_chain_contains_template_param(expr_get_args(e), param)) { return true; }
+        return hir_builder_expr_contains_template_param(expr_get_captures(e), param);
+    }
+    if (k == ex_CLOSURE()) {
+        if (hir_builder_stmt_chain_contains_template_param(expr_get_captures(e), param)) { return true; }
+        if (hir_builder_stmt_chain_contains_template_param(expr_get_lhs(e), param)) { return true; }
+        return hir_builder_type_ref_contains_template_param(expr_get_rhs(e), param);
+    }
+    if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+        if (hir_builder_expr_contains_template_param(expr_get_lhs(e), param)) { return true; }
+        if (k == ex_IF_EXPR()) {
+            if (hir_builder_stmt_chain_contains_template_param(expr_get_rhs(e), param)) { return true; }
+            let else_part = expr_get_args(e);
+            if (else_part != null && expr_get_kind(else_part) == ex_IF_EXPR()) {
+                return hir_builder_expr_contains_template_param(else_part, param);
+            }
+            return hir_builder_stmt_chain_contains_template_param(else_part, param);
+        }
+        return hir_builder_stmt_chain_contains_template_param(expr_get_args(e), param);
+    }
+    return false;
+}
+
+fn hir_builder_stmt_has_template_type(s: rawptr) -> bool {
+    if (s == null) { return false; }
+    if (hir_builder_type_ref_has_template_atom(stmt_get_ty(s))) { return true; }
+    if (hir_builder_expr_has_template_type(stmt_get_init(s))) { return true; }
+    if (hir_builder_expr_has_template_type(stmt_get_cond(s))) { return true; }
+    if (hir_builder_stmt_chain_has_template_type(stmt_get_then_blk(s))) { return true; }
+    if (hir_builder_stmt_chain_has_template_type(stmt_get_else_blk(s))) { return true; }
+    if (hir_builder_stmt_chain_has_template_type(stmt_get_body(s))) { return true; }
+    return false;
+}
+
+fn hir_builder_stmt_contains_template_param(s: rawptr, param: string) -> bool {
+    if (s == null || param.len == 0) { return false; }
+    if (hir_builder_type_ref_contains_template_param(stmt_get_ty(s), param)) { return true; }
+    if (hir_builder_expr_contains_template_param(stmt_get_init(s), param)) { return true; }
+    if (hir_builder_expr_contains_template_param(stmt_get_cond(s), param)) { return true; }
+    if (hir_builder_stmt_chain_contains_template_param(stmt_get_then_blk(s), param)) { return true; }
+    if (hir_builder_stmt_chain_contains_template_param(stmt_get_else_blk(s), param)) { return true; }
+    if (hir_builder_stmt_chain_contains_template_param(stmt_get_body(s), param)) { return true; }
+    return false;
+}
+
+fn hir_builder_stmt_chain_has_template_type(s: rawptr) -> bool {
+    var cur = s;
+    while (cur != null) {
+        if (hir_builder_stmt_has_template_type(cur)) { return true; }
+        cur = stmt_get_next(cur);
+    }
+    return false;
+}
+
+fn hir_builder_stmt_chain_contains_template_param(s: rawptr, param: string) -> bool {
+    var cur = s;
+    while (cur != null) {
+        if (hir_builder_stmt_contains_template_param(cur, param)) { return true; }
+        cur = stmt_get_next(cur);
+    }
+    return false;
+}
+
+fn hir_builder_decl_body_has_template_type(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    if (hir_builder_type_ref_has_template_atom(decl_get_ty(d))) { return true; }
+    var param = decl_get_params(d);
+    while (param != null) {
+        if (hir_builder_type_ref_has_template_atom(decl_get_ty(param))) { return true; }
+        param = decl_get_next(param);
+    }
+    return hir_builder_stmt_chain_has_template_type(decl_get_body(d));
+}
+
+fn hir_builder_decl_contains_template_param(d: rawptr, param: string) -> bool {
+    if (d == null || param.len == 0) { return false; }
+    if (hir_builder_type_ref_contains_template_param(decl_get_ty(d), param)) { return true; }
+    var p = decl_get_params(d);
+    while (p != null) {
+        if (hir_builder_type_ref_contains_template_param(decl_get_ty(p), param)) { return true; }
+        p = decl_get_next(p);
+    }
+    return hir_builder_stmt_chain_contains_template_param(decl_get_body(d), param);
+}
+
+fn hir_builder_expr_is_self_ident(e: rawptr) -> bool {
+    if (e == null || expr_get_kind(e) != ex_IDENT()) { return false; }
+    return expr_get_name(e) == "self";
+}
+
+fn hir_builder_expr_has_self_member_access(e: rawptr) -> bool {
+    if (e == null) { return false; }
+    let k = expr_get_kind(e);
+    if (k == ex_MEMBER()) {
+        if (hir_builder_expr_is_self_ident(expr_get_lhs(e))) { return true; }
+        return hir_builder_expr_has_self_member_access(expr_get_lhs(e));
+    }
+    if (k == ex_CALL()) {
+        if (hir_builder_expr_has_self_member_access(expr_get_lhs(e))) { return true; }
+        return hir_builder_stmt_chain_has_self_member_access(expr_get_args(e));
+    }
+    if (k == ex_UNARY()
+        || k == ex_ADDR_OF()
+        || k == ex_DEREF()
+        || k == ex_AWAIT()
+        || k == ex_COMPTIME()) {
+        return hir_builder_expr_has_self_member_access(expr_get_lhs(e));
+    }
+    if (k == ex_BIN() || k == ex_ASSIGN() || k == ex_INDEX()) {
+        if (hir_builder_expr_has_self_member_access(expr_get_lhs(e))) { return true; }
+        return hir_builder_expr_has_self_member_access(expr_get_rhs(e));
+    }
+    if (k == ex_CLOSURE()) {
+        if (hir_builder_stmt_chain_has_self_member_access(expr_get_captures(e))) { return true; }
+        return hir_builder_stmt_chain_has_self_member_access(expr_get_lhs(e));
+    }
+    if (k == ex_CAST()) {
+        return hir_builder_expr_has_self_member_access(expr_get_lhs(e));
+    }
+    if (k == ex_TERNARY()) {
+        if (hir_builder_expr_has_self_member_access(expr_get_lhs(e))) { return true; }
+        if (hir_builder_expr_has_self_member_access(expr_get_rhs(e))) { return true; }
+        return hir_builder_expr_has_self_member_access(expr_get_args(e));
+    }
+    if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+        if (hir_builder_expr_has_self_member_access(expr_get_lhs(e))) { return true; }
+        if (k == ex_IF_EXPR()) {
+            if (hir_builder_stmt_chain_has_self_member_access(expr_get_rhs(e))) { return true; }
+            let else_part = expr_get_args(e);
+            if (else_part != null && expr_get_kind(else_part) == ex_IF_EXPR()) {
+                return hir_builder_expr_has_self_member_access(else_part);
+            }
+            return hir_builder_stmt_chain_has_self_member_access(else_part);
+        }
+        return hir_builder_stmt_chain_has_self_member_access(expr_get_args(e));
+    }
+    if (k == ex_FSTRING()
+        || k == ex_ARRAY_LIT()
+        || k == ex_TUPLE_LIT()
+        || k == ex_STRUCT_INIT()
+        || k == ex_INLINE_ASM()) {
+        if (hir_builder_stmt_chain_has_self_member_access(expr_get_args(e))) { return true; }
+        if (k == ex_ARRAY_LIT()) {
+            return hir_builder_expr_has_self_member_access(expr_get_captures(e));
+        }
+        return false;
+    }
+    if (k == ex_FAIL()) {
+        return hir_builder_expr_has_self_member_access(expr_get_lhs(e));
+    }
+    return hir_builder_stmt_chain_has_self_member_access(expr_get_args(e));
+}
+
+fn hir_builder_stmt_has_self_member_access(s: rawptr) -> bool {
+    if (s == null) { return false; }
+    if (hir_builder_expr_has_self_member_access(stmt_get_init(s))) { return true; }
+    if (hir_builder_expr_has_self_member_access(stmt_get_cond(s))) { return true; }
+    if (hir_builder_stmt_chain_has_self_member_access(stmt_get_then_blk(s))) { return true; }
+    if (hir_builder_stmt_chain_has_self_member_access(stmt_get_else_blk(s))) { return true; }
+    if (hir_builder_stmt_chain_has_self_member_access(stmt_get_body(s))) { return true; }
+    return false;
+}
+
+fn hir_builder_stmt_chain_has_self_member_access(s: rawptr) -> bool {
+    var cur = s;
+    while (cur != null) {
+        if (hir_builder_stmt_has_self_member_access(cur)) { return true; }
+        cur = stmt_get_next(cur);
+    }
+    return false;
+}
+
+fn hir_builder_decl_body_has_self_member_access(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_stmt_chain_has_self_member_access(decl_get_body(d));
+}
+
+fn hir_builder_expr_has_self_member_call(e: rawptr) -> bool {
+    if (e == null) { return false; }
+    let k = expr_get_kind(e);
+    if (k == ex_CALL()) {
+        let callee = expr_get_lhs(e);
+        if (callee != null
+            && expr_get_kind(callee) == ex_MEMBER()
+            && hir_builder_expr_is_self_ident(expr_get_lhs(callee))) {
+            return true;
+        }
+        if (hir_builder_expr_has_self_member_call(callee)) { return true; }
+        return hir_builder_stmt_chain_has_self_member_call(expr_get_args(e));
+    }
+    if (k == ex_MEMBER()) {
+        return hir_builder_expr_has_self_member_call(expr_get_lhs(e));
+    }
+    if (k == ex_UNARY()
+        || k == ex_ADDR_OF()
+        || k == ex_DEREF()
+        || k == ex_AWAIT()
+        || k == ex_COMPTIME()) {
+        return hir_builder_expr_has_self_member_call(expr_get_lhs(e));
+    }
+    if (k == ex_BIN() || k == ex_ASSIGN() || k == ex_INDEX()) {
+        if (hir_builder_expr_has_self_member_call(expr_get_lhs(e))) { return true; }
+        return hir_builder_expr_has_self_member_call(expr_get_rhs(e));
+    }
+    if (k == ex_CLOSURE()) {
+        if (hir_builder_stmt_chain_has_self_member_call(expr_get_captures(e))) { return true; }
+        return hir_builder_stmt_chain_has_self_member_call(expr_get_lhs(e));
+    }
+    if (k == ex_CAST()) {
+        return hir_builder_expr_has_self_member_call(expr_get_lhs(e));
+    }
+    if (k == ex_TERNARY()) {
+        if (hir_builder_expr_has_self_member_call(expr_get_lhs(e))) { return true; }
+        if (hir_builder_expr_has_self_member_call(expr_get_rhs(e))) { return true; }
+        return hir_builder_expr_has_self_member_call(expr_get_args(e));
+    }
+    if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+        if (hir_builder_expr_has_self_member_call(expr_get_lhs(e))) { return true; }
+        if (k == ex_IF_EXPR()) {
+            if (hir_builder_stmt_chain_has_self_member_call(expr_get_rhs(e))) { return true; }
+            let else_part = expr_get_args(e);
+            if (else_part != null && expr_get_kind(else_part) == ex_IF_EXPR()) {
+                return hir_builder_expr_has_self_member_call(else_part);
+            }
+            return hir_builder_stmt_chain_has_self_member_call(else_part);
+        }
+        return hir_builder_stmt_chain_has_self_member_call(expr_get_args(e));
+    }
+    if (k == ex_FSTRING()
+        || k == ex_ARRAY_LIT()
+        || k == ex_TUPLE_LIT()
+        || k == ex_STRUCT_INIT()
+        || k == ex_INLINE_ASM()) {
+        if (hir_builder_stmt_chain_has_self_member_call(expr_get_args(e))) { return true; }
+        if (k == ex_ARRAY_LIT()) {
+            return hir_builder_expr_has_self_member_call(expr_get_captures(e));
+        }
+        return false;
+    }
+    if (k == ex_FAIL()) {
+        return hir_builder_expr_has_self_member_call(expr_get_lhs(e));
+    }
+    return hir_builder_stmt_chain_has_self_member_call(expr_get_args(e));
+}
+
+fn hir_builder_stmt_has_self_member_call(s: rawptr) -> bool {
+    if (s == null) { return false; }
+    if (hir_builder_expr_has_self_member_call(stmt_get_init(s))) { return true; }
+    if (hir_builder_expr_has_self_member_call(stmt_get_cond(s))) { return true; }
+    if (hir_builder_stmt_chain_has_self_member_call(stmt_get_then_blk(s))) { return true; }
+    if (hir_builder_stmt_chain_has_self_member_call(stmt_get_else_blk(s))) { return true; }
+    if (hir_builder_stmt_chain_has_self_member_call(stmt_get_body(s))) { return true; }
+    return false;
+}
+
+fn hir_builder_stmt_chain_has_self_member_call(s: rawptr) -> bool {
+    var cur = s;
+    while (cur != null) {
+        if (hir_builder_stmt_has_self_member_call(cur)) { return true; }
+        cur = stmt_get_next(cur);
+    }
+    return false;
+}
+
+fn hir_builder_decl_body_has_self_member_call(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_stmt_chain_has_self_member_call(decl_get_body(d));
+}
+
+fn hir_builder_decl_members_have_template_type(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    var member = decl_get_members(d);
+    while (member != null) {
+        if (hir_builder_decl_body_has_template_type(member)) { return true; }
+        member = decl_get_next(member);
+    }
+    return false;
+}
+
+impl HirUnitBuilder {
+    fn type_ref_closes_in_current_env(self, ty: rawptr) -> bool {
+        if (ty == null) { return true; }
+        var key = hir_builder_env_key(self.current_generic_params, self.current_generic_args);
+        if (key.len == 0) { key = "#"; }
+        let cached = hir_decl_instance_map_item(self.type_ref_close_cache,ty, key);
+        if (cached == 1) { return false; }
+        if (cached == 2) { return true; }
+        let concrete_text = self.type_text_from_ref_env(ty, self.current_generic_params, self.current_generic_args);
+        var out = false;
+        if (concrete_text.len > 0) {
+            out = !self.type_text_has_open_template_atom(concrete_text);
+        } else {
+            let concrete = self.concrete_type_ref(ty);
+            out = !hir_builder_type_ref_has_template_atom(concrete);
+        }
+        if (out) {
+            self.type_ref_close_cache = hir_decl_instance_map_put(self.type_ref_close_cache,ty, key, 2, hir_id_invalid());
+        } else {
+            self.type_ref_close_cache = hir_decl_instance_map_put(self.type_ref_close_cache,ty, key, 1, hir_id_invalid());
+        }
+        return out;
+    }
+
+    fn generic_expr_name_closes_in_current_env(self, name: string) -> bool {
+        if (name.len == 0) { return true; }
+        let args = policy_generic_call_args(name.clone());
+        if (args.len == 0) {
+            return !self.type_text_has_open_template_atom(name);
+        }
+        var i: i32 = 0;
+        while (i < 64) {
+            let raw_arg = policy_generic_arg_at(args, i);
+            if (raw_arg.len == 0) { return true; }
+            let resolved_arg = self.resolve_type_text_in_current_env(raw_arg);
+            if (resolved_arg.len == 0 || self.type_text_has_open_template_atom(resolved_arg)) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    fn expr_is_variadic_pack_ident(self, e: rawptr) -> bool {
+        if (e == null || expr_get_kind(e) != ex_IDENT()) { return false; }
+        return expr_get_name(e).len > 0;
+    }
+
+    fn expr_is_variadic_pack_fold(self, e: rawptr) -> bool {
+        if (e == null || expr_get_kind(e) != ex_IDENT()) { return false; }
+        return self.pack_fold_op(expr_get_name(e)) != 0;
+    }
+
+    fn expr_is_variadic_pack_member(self, e: rawptr) -> bool {
+        if (e == null || expr_get_kind(e) != ex_MEMBER()) { return false; }
+        let member = expr_get_name(e);
+        if (member != "len" && member != "length" && member != "size") { return false; }
+        return self.expr_is_variadic_pack_ident(expr_get_lhs(e));
+    }
+
+    fn expr_is_variadic_pack_index(self, e: rawptr) -> bool {
+        if (e == null || expr_get_kind(e) != ex_INDEX()) { return false; }
+        return self.expr_is_variadic_pack_ident(expr_get_lhs(e));
+    }
+
+    fn expr_types_close_in_current_env(self, e: rawptr) -> bool {
+        if (e == null) { return true; }
+        if (self.expr_is_variadic_pack_fold(e)) { return true; }
+        if (self.expr_is_variadic_pack_member(e)) { return true; }
+        if (self.expr_is_variadic_pack_index(e)) { return true; }
+        if (!self.type_ref_closes_in_current_env(expr_get_ty(e))) { return false; }
+        if (!self.generic_expr_name_closes_in_current_env(expr_get_name(e))) { return false; }
+        let k = expr_get_kind(e);
+        if (k == ex_BIN() || k == ex_ASSIGN() || k == ex_TERNARY()) {
+            if (!self.expr_types_close_in_current_env(expr_get_lhs(e))) { return false; }
+            if (!self.expr_types_close_in_current_env(expr_get_rhs(e))) { return false; }
+            return self.expr_types_close_in_current_env(expr_get_args(e));
+        }
+        if (k == ex_UNARY()
+            || k == ex_ADDR_OF()
+            || k == ex_DEREF()
+            || k == ex_CAST()
+            || k == ex_AWAIT()
+            || k == ex_COMPTIME()
+            || k == ex_FAIL()) {
+            return self.expr_types_close_in_current_env(expr_get_lhs(e));
+        }
+        if (k == ex_CALL()) {
+            if (!self.expr_types_close_in_current_env(expr_get_lhs(e))) { return false; }
+            return self.stmt_chain_types_close_in_current_env(expr_get_args(e));
+        }
+        if (k == ex_MEMBER()) {
+            return self.expr_types_close_in_current_env(expr_get_lhs(e));
+        }
+        if (k == ex_INDEX()) {
+            if (!self.expr_types_close_in_current_env(expr_get_lhs(e))) { return false; }
+            return self.expr_types_close_in_current_env(expr_get_rhs(e));
+        }
+        if (k == ex_STRUCT_INIT()
+            || k == ex_FSTRING()
+            || k == ex_TUPLE_LIT()
+            || k == ex_INLINE_ASM()) {
+            return self.stmt_chain_types_close_in_current_env(expr_get_args(e));
+        }
+        if (k == ex_ARRAY_LIT()) {
+            if (!self.stmt_chain_types_close_in_current_env(expr_get_args(e))) { return false; }
+            return self.expr_types_close_in_current_env(expr_get_captures(e));
+        }
+        if (k == ex_CLOSURE()) {
+            if (!self.stmt_chain_types_close_in_current_env(expr_get_captures(e))) { return false; }
+            if (!self.stmt_chain_types_close_in_current_env(expr_get_lhs(e))) { return false; }
+            return self.type_ref_closes_in_current_env(expr_get_rhs(e));
+        }
+        if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+            if (!self.expr_types_close_in_current_env(expr_get_lhs(e))) { return false; }
+            if (k == ex_IF_EXPR()) {
+                if (!self.stmt_chain_types_close_in_current_env(expr_get_rhs(e))) { return false; }
+                let else_part = expr_get_args(e);
+                if (else_part != null && expr_get_kind(else_part) == ex_IF_EXPR()) {
+                    return self.expr_types_close_in_current_env(else_part);
+                }
+                return self.stmt_chain_types_close_in_current_env(else_part);
+            }
+            return self.stmt_chain_types_close_in_current_env(expr_get_args(e));
+        }
+        return true;
+    }
+
+    fn stmt_types_close_in_current_env(self, s: rawptr) -> bool {
+        if (s == null) { return true; }
+        let k = stmt_get_kind(s);
+        if (k == st_EXPR()) {
+            return self.expr_types_close_in_current_env(stmt_get_init(s));
+        }
+        if (k == st_LET() || k == st_VAR()) {
+            if (!self.type_ref_closes_in_current_env(stmt_get_ty(s))) { return false; }
+            return self.expr_types_close_in_current_env(stmt_get_init(s));
+        }
+        if (k == st_RETURN()) {
+            return self.expr_types_close_in_current_env(stmt_get_init(s));
+        }
+        if (k == st_IF()) {
+            if (!self.expr_types_close_in_current_env(stmt_get_cond(s))) { return false; }
+            if (!self.stmt_types_close_in_current_env(stmt_get_then_blk(s))) { return false; }
+            return self.stmt_types_close_in_current_env(stmt_get_else_blk(s));
+        }
+        if (k == st_WHILE()) {
+            if (!self.expr_types_close_in_current_env(stmt_get_cond(s))) { return false; }
+            return self.stmt_types_close_in_current_env(stmt_get_body(s));
+        }
+        if (k == st_BLOCK()) {
+            return self.stmt_chain_types_close_in_current_env(stmt_get_body(s));
+        }
+        if (k == st_FOR()) {
+            if (!self.stmt_types_close_in_current_env(stmt_get_init(s))) { return false; }
+            if (!self.expr_types_close_in_current_env(stmt_get_cond(s))) { return false; }
+            if (!self.stmt_types_close_in_current_env(stmt_get_then_blk(s))) { return false; }
+            return self.stmt_types_close_in_current_env(stmt_get_body(s));
+        }
+        if (k == st_FOREACH()) {
+            if (!self.type_ref_closes_in_current_env(stmt_get_ty(s))) { return false; }
+            if (!self.expr_types_close_in_current_env(stmt_get_cond(s))) { return false; }
+            return self.stmt_types_close_in_current_env(stmt_get_body(s));
+        }
+        if (k == st_MATCH()) {
+            if (!self.expr_types_close_in_current_env(stmt_get_init(s))) { return false; }
+            var arm = stmt_get_body(s);
+            while (arm != null) {
+                if (!self.expr_types_close_in_current_env(stmt_get_init(arm))) { return false; }
+                if (!self.expr_types_close_in_current_env(stmt_get_cond(arm))) { return false; }
+                if (!self.stmt_types_close_in_current_env(stmt_get_body(arm))) { return false; }
+                arm = stmt_get_next(arm);
+            }
+            return true;
+        }
+        if (k == st_DEFER()) {
+            return self.stmt_types_close_in_current_env(stmt_get_init(s));
+        }
+        if (k == st_STATIC_ASSERT()) {
+            return self.expr_types_close_in_current_env(stmt_get_cond(s));
+        }
+        return true;
+    }
+
+    fn stmt_chain_types_close_in_current_env(self, head: rawptr) -> bool {
+        var cur = head;
+        while (cur != null) {
+            if (!self.stmt_types_close_in_current_env(cur)) { return false; }
+            cur = stmt_get_next(cur);
+        }
+        return true;
+    }
+
+    fn decl_body_types_close_in_current_env_uncached(self, d: rawptr) -> bool {
+        if (d == null) { return true; }
+        if (!self.type_ref_closes_in_current_env(decl_get_ty(d))) { return false; }
+        var param = decl_get_params(d);
+        while (param != null) {
+            if (hir_builder_variadic_param(param)) {
+                let pack_name = hir_builder_param_pack_type_name(param);
+                if (self.current_pack_count(pack_name) > 0
+                    && !self.type_ref_closes_in_current_env(decl_get_ty(param))) {
+                    return false;
+                }
+            } else if (!self.type_ref_closes_in_current_env(decl_get_ty(param))) {
+                return false;
+            }
+            param = decl_get_next(param);
+        }
+        return self.stmt_chain_types_close_in_current_env(decl_get_body(d));
+    }
+
+    fn decl_body_types_close_in_current_env(self, d: rawptr) -> bool {
+        if (d == null) { return true; }
+        var key = hir_builder_env_key(self.current_generic_params, self.current_generic_args);
+        if (key.len == 0) { key = "#"; }
+        let cached = hir_decl_instance_map_item(self.decl_body_close_cache,d, key);
+        if (cached == 1) { return false; }
+        if (cached == 2) { return true; }
+        let out = self.decl_body_types_close_in_current_env_uncached(d);
+        if (out) {
+            self.decl_body_close_cache = hir_decl_instance_map_put(self.decl_body_close_cache,d, key, 2, hir_id_invalid());
+        } else {
+            self.decl_body_close_cache = hir_decl_instance_map_put(self.decl_body_close_cache,d, key, 1, hir_id_invalid());
+        }
+        return out;
+    }
+
+    fn decl_body_has_template_type(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        let cached = hir_raw_int_map_get(self.template_body_cache,d);
+        if (cached == 1) { return false; }
+        if (cached == 2) { return true; }
+        let out = hir_builder_decl_body_has_template_type(d);
+        if (out) {
+            self.template_body_cache = hir_raw_int_map_put(self.template_body_cache,d, 2);
+        } else {
+            self.template_body_cache = hir_raw_int_map_put(self.template_body_cache,d, 1);
+        }
+        return out;
+    }
+
+    fn decl_contains_template_param(self, d: rawptr, param: string) -> bool {
+        if (d == null || param.len == 0) { return false; }
+        let cached = hir_decl_instance_map_item(self.template_param_cache,d, param);
+        if (cached == 1) { return false; }
+        if (cached == 2) { return true; }
+        let out = hir_builder_decl_contains_template_param(d, param);
+        if (out) {
+            self.template_param_cache = hir_decl_instance_map_put(self.template_param_cache,d, param, 2, hir_id_invalid());
+        } else {
+            self.template_param_cache = hir_decl_instance_map_put(self.template_param_cache,d, param, 1, hir_id_invalid());
+        }
+        return out;
+    }
+
+    fn decl_signature_has_template_type(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        if (hir_builder_decl_template_head(d)) { return true; }
+        if (hir_builder_type_ref_has_template_atom(decl_get_ty(d))) { return true; }
+        var param = decl_get_params(d);
+        while (param != null) {
+            if (hir_builder_type_ref_has_template_atom(decl_get_ty(param))) { return true; }
+            param = decl_get_next(param);
+        }
+        let k = decl_get_kind(d);
+        if (k == de_CLASS() || k == de_ENUM()) {
+            return self.decl_members_have_template_type(d);
+        }
+        return false;
+    }
+
+    fn decl_members_have_template_type(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        let cached = hir_raw_int_map_get(self.template_members_cache,d);
+        if (cached == 1) { return false; }
+        if (cached == 2) { return true; }
+        var member = decl_get_members(d);
+        while (member != null) {
+            if (self.decl_signature_has_template_type(member)) {
+                self.template_members_cache = hir_raw_int_map_put(self.template_members_cache,d, 2);
+                return true;
+            }
+            member = decl_get_next(member);
+        }
+        self.template_members_cache = hir_raw_int_map_put(self.template_members_cache,d, 1);
+        return false;
+    }
+
+    fn type_atom_is_registered_item(self, name: string) -> bool {
+        if (name.len == 0) { return false; }
+        if (hir_string_set_contains(self.registered_type_atoms,name)) { return true; }
+        return false;
+    }
+
+    fn type_name_is_open_template_atom_in_current_env(self, name: string) -> bool {
+        if (name.len == 0) { return false; }
+        if (name == "Self") {
+            let self_bound = self.current_generic_binding(name);
+            if (self_bound.len == 0 || self_bound == name) { return true; }
+            return self.type_text_has_open_template_atom(self_bound);
+        }
+        let bound = self.current_generic_binding(name);
+        if (bound.len > 0 && bound != name) {
+            return self.type_text_has_open_template_atom(bound);
+        }
+        if (hir_builder_generic_contains(self.current_generic_params, name)) {
+            return true;
+        }
+        if (self.type_atom_is_registered_item(name)) { return false; }
+        if (name.len == 1) {
+            let c = name.charAt(0);
+            if (c >= 65 && c <= 90) { return true; }
+        }
+        return false;
+    }
+
+    fn type_text_open_simple_no_env(self, text: string) -> bool {
+        if (text.len == 0) { return false; }
+        if (text == "Self") { return true; }
+        if (self.type_atom_is_registered_item(text)) { return false; }
+        if (text.len == 1) {
+            let c = text.charAt(0);
+            if (c >= 65 && c <= 90) { return true; }
+        }
+        return false;
+    }
+
+    fn type_text_has_open_template_atom(self, text: string) -> bool {
+        self.profile_type_open_calls = self.profile_type_open_calls + 1;
+        if (text.len == 0) { return false; }
+        let needs_env = self.type_text_needs_current_env(text);
+        if (!needs_env && !hir_builder_type_text_needs_env_resolution(text)) {
+            return self.type_text_open_simple_no_env(text);
+        }
+        var cache_key = text;
+        if (needs_env) {
+            let env_key = hir_builder_env_key(self.current_generic_params, self.current_generic_args);
+            if (env_key.len > 0) { cache_key = env_key + "=>" + text; }
+        }
+        let cached = hir_name_id_map_get(self.type_text_open_cache,cache_key);
+        if (cached != hir_id_invalid()) { return cached == 2; }
+        let open = self.type_text_has_open_template_atom_uncached(text);
+        if (open) {
+            self.type_text_open_cache = hir_name_id_map_put(self.type_text_open_cache,cache_key, 2);
+        } else {
+            self.type_text_open_cache = hir_name_id_map_put(self.type_text_open_cache,cache_key, 1);
+        }
+        return open;
+    }
+
+    fn type_text_has_open_template_atom_uncached(self, text: string) -> bool {
+        if (text.len == 0) { return false; }
+        let resolved_text = self.resolve_type_text_in_current_env(text);
+        if (resolved_text.len == 0) { return false; }
+        if (policy_generic_call_has_args(resolved_text) != 0) {
+            let base = policy_generic_call_base(resolved_text);
+            if (self.type_name_is_open_template_atom_in_current_env(base)) { return true; }
+            let raw_args = policy_generic_call_args(resolved_text);
+            var arg_index: i32 = 0;
+            while (arg_index < 64) {
+                let arg = policy_generic_arg_at(raw_args, arg_index);
+                if (arg.len == 0) { return false; }
+                if (self.type_text_has_open_template_atom(arg)) { return true; }
+                arg_index = arg_index + 1;
+            }
+            return false;
+        }
+        if (self.type_name_is_open_template_atom_in_current_env(resolved_text)) { return true; }
+        let sep = hir_builder_assoc_separator_index(resolved_text);
+        if (sep >= 0) {
+            if (resolved_text.charAt(sep) == 46) { return false; }
+            let sep_len = hir_builder_assoc_separator_len(resolved_text, sep);
+            if (sep > 0 && sep + sep_len < resolved_text.len) {
+                let owner_text = resolved_text.substring(0, sep);
+                let member_text = resolved_text.substring(sep + sep_len, resolved_text.len);
+                if (self.type_text_has_open_template_atom(owner_text)) { return true; }
+                if (self.type_name_is_open_template_atom_in_current_env(member_text)) { return true; }
+            }
+        }
+        return false;
+    }
+
+    fn function_owner_decl_for_open_check(self, fn_id: i32) -> rawptr {
+        if (fn_id == hir_id_invalid()) { return null; }
+        let raw_fn = hir_pointer_map_raw_for_function(self.decl_map,fn_id);
+        if (raw_fn != null) {
+            let raw_owner = hir_raw_owner_map_get(self.decl_owner_map,raw_fn);
+            if (raw_owner != null) { return raw_owner; }
+        }
+        let item_id = self.unit.function_item(fn_id);
+        if (item_id == hir_id_invalid()) { return null; }
+        let owner_item = self.unit.item_owner(item_id);
+        if (owner_item == hir_id_invalid()) { return null; }
+        return hir_pointer_map_raw_for_item(self.decl_map,owner_item);
+    }
+
+    fn function_owner_type_text_for_open_check(self, fn_id: i32) -> string {
+        if (fn_id == hir_id_invalid()) { return ""; }
+        let owner_type = hir_unit_function_owner_type(self.unit, fn_id);
+        if (owner_type.len > 0) { return owner_type; }
+        let item_id = self.unit.function_item(fn_id);
+        if (item_id == hir_id_invalid()) { return ""; }
+        let owner_item = self.unit.item_owner(item_id);
+        if (owner_item == hir_id_invalid()) { return ""; }
+        return self.unit.item_name(owner_item);
+    }
+
+    fn function_owner_type_has_unbound_template_params(self, fn_id: i32) -> bool {
+        let owner_decl = self.function_owner_decl_for_open_check(fn_id);
+        if (owner_decl == null) { return false; }
+        let owner_params = hir_builder_decl_template_params(owner_decl);
+        if (owner_params.len == 0) { return false; }
+        let owner_type = self.function_owner_type_text_for_open_check(fn_id);
+        if (owner_type.len == 0) { return true; }
+        if (self.type_text_has_open_template_atom_without_env(owner_type)) { return true; }
+        if (policy_generic_call_args(owner_type.clone()).len > 0) { return false; }
+        let owner_base = hir_builder_type_base_name(owner_type);
+        let decl_base = hir_builder_type_base_name(decl_get_name(owner_decl));
+        if (owner_base.len == 0 || decl_base.len == 0) { return true; }
+        return hir_builder_type_owner_names_match(owner_base, decl_base);
+    }
+
+    fn type_text_has_open_template_atom_without_env(self, text: string) -> bool {
+        let saved_params = self.current_generic_params;
+        let saved_args = self.current_generic_args;
+        self.current_generic_params = "";
+        self.current_generic_args = "";
+        let out = self.type_text_has_open_template_atom(text);
+        self.current_generic_params = saved_params;
+        self.current_generic_args = saved_args;
+        return out;
+    }
+
+    fn type_id_has_template_atom_without_env(self, type_id: i32) -> bool {
+        if (!self.type_id_is_valid(type_id)) { return false; }
+        let cached = hir_i32_array_map_get(self.type_id_open_no_env_cache,type_id);
+        if (cached >= 0) { return cached != 0; }
+        let open = self.type_text_has_open_template_atom_without_env(hir_type_table_text(self.unit.types, type_id));
+        if (open) {
+            self.type_id_open_no_env_cache = hir_i32_array_map_put(self.type_id_open_no_env_cache,type_id, 1);
+        } else {
+            self.type_id_open_no_env_cache = hir_i32_array_map_put(self.type_id_open_no_env_cache,type_id, 0);
+        }
+        return open;
+    }
+
+    fn function_has_open_template_types(self, fn_id: i32) -> bool {
+        self.profile_function_open_calls = self.profile_function_open_calls + 1;
+        if (fn_id == hir_id_invalid()) { return false; }
+        if (fn_id <= 0 || fn_id > self.unit.function_count) { return true; }
+        let cached = hir_i32_array_map_get(self.function_open_cache,fn_id);
+        if (cached >= 0) { return cached != 0; }
+        var is_open = false;
+        // Closed instances deliberately do not overwrite decl_map: their
+        // concrete FunctionId is keyed in the reverse instance map.  Use that
+        // provenance first so the template's required parameters are checked
+        // against this instance environment rather than treating it as a
+        // parameterless declaration.
+        var raw_decl = self.function_instances.decl_for_function(fn_id);
+        if (raw_decl == null) {
+            raw_decl = hir_pointer_map_raw_for_function(self.decl_map,fn_id);
+        }
+        let raw_params = hir_builder_decl_template_params(raw_decl);
+        if (raw_params.len > 0) {
+            let env_params = hir_unit_function_generic_params(self.unit, fn_id);
+            let env_args = hir_unit_function_generic_args(self.unit, fn_id);
+            if (!self.decl_template_params_closed_in_function_env(raw_decl,
+                                                                 env_params,
+                                                                 env_args)) {
+                is_open = true;
+            }
+        }
+        if (!is_open) {
+            if (self.function_owner_type_has_unbound_template_params(fn_id)) {
+                is_open = true;
+            } else {
+                let ret_type = self.unit.function_return_type(fn_id);
+                if (self.type_id_has_template_atom_without_env(ret_type)) {
+                    is_open = true;
+                } else {
+                    var local_id = self.unit.function_first_local(fn_id);
+                    while (local_id != hir_id_invalid() && !is_open) {
+                        let local_type = self.unit.local_type(local_id);
+                        if (self.type_id_has_template_atom_without_env(local_type)) {
+                            is_open = true;
+                        }
+                        local_id = self.unit.local_next(local_id);
+                    }
+                }
+            }
+        }
+        if (is_open) {
+            self.function_open_cache = hir_i32_array_map_put(self.function_open_cache,fn_id, 1);
+        } else {
+            self.function_open_cache = hir_i32_array_map_put(self.function_open_cache,fn_id, 0);
+        }
+        return is_open;
+    }
+}

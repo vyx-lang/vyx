@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-MODEL="$ROOT/bootstrap_compiler/src/hir/hir_model.vyx"
+MODEL="$ROOT/bootstrap_compiler/src/hir/model/hir_model.vyx"
 fail=0
 
 need() {

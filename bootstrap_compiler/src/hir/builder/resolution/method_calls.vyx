@@ -1,0 +1,506 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Method calls for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn member_call_target_needs_receiver_rebind(self,
+                                                 e: rawptr,
+                                                 callee_expr_id: i32,
+                                                 target_id: i32) -> bool {
+        if (target_id == hir_id_invalid()
+            || callee_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) {
+            return false;
+        }
+        var raw_callee = e;
+        if (raw_callee != null && expr_get_kind(raw_callee) == ex_CALL()) {
+            raw_callee = expr_get_lhs(raw_callee);
+        }
+        if (raw_callee == null
+            || expr_get_kind(raw_callee) != ex_MEMBER()
+            || !hir_builder_expr_is_self_ident(expr_get_lhs(raw_callee))) {
+            return false;
+        }
+        let receiver_type_name = self.member_call_owner_type_name(e, callee_expr_id);
+        if (receiver_type_name.len == 0) { return false; }
+        let target_owner_type = hir_unit_function_owner_type(self.unit, target_id);
+        if (target_owner_type.len == 0) { return false; }
+        return !self.function_candidate_has_exact_owner_type(target_id, receiver_type_name);
+    }
+
+    fn member_call_owner_type_name(self, e: rawptr, callee_expr_id: i32) -> string {
+        if (callee_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) {
+            return "";
+        }
+        let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+        if (owner_expr_id == hir_id_invalid()) { return ""; }
+        if (self.unit.expr_sem_kind(owner_expr_id) == expr_sem_CLASS()) {
+            return self.resolve_type_text_in_current_env(self.unit.expr_name(owner_expr_id));
+        }
+        var raw_callee = e;
+        if (e != null && expr_get_kind(e) == ex_CALL()) {
+            raw_callee = expr_get_lhs(e);
+        }
+        let owner_from_raw = self.member_owner_type_name(raw_callee, owner_expr_id);
+        if (owner_from_raw.len > 0) {
+            return self.resolve_type_text_in_current_env(owner_from_raw);
+        }
+        let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(owner_expr_id));
+        if (!self.type_id_is_valid(owner_type_id)) { return ""; }
+        return self.member_lookup_type_name(owner_type_id);
+    }
+
+    fn method_call_target_cache_key(self,
+                                           method_name: string,
+                                           want_static: bool,
+                                           explicit_method_args: string,
+                                           call_expr_id: i32) -> string {
+        if (method_name.len == 0
+            || call_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(call_expr_id) != ex_CALL()) {
+            return "";
+        }
+        // Building the cache suffix replaces out; preserve the borrowed name.
+        var out = method_name.clone();
+        if (want_static) {
+            out = out + "|static=1";
+        } else {
+            out = out + "|static=0";
+        }
+        let env_key = hir_builder_env_key(self.current_generic_params, self.current_generic_args);
+        if (env_key.len > 0) { out = out + "|env=" + env_key; }
+        if (explicit_method_args.len > 0) {
+            out = out + "|explicit=" + explicit_method_args;
+        }
+        out = out.clone() + "|args=";
+        var arg_expr = self.unit.expr_first_arg(call_expr_id);
+        var arg_count: i32 = 0;
+        while (arg_expr != hir_id_invalid()) {
+            let arg_type_id = self.unit.expr_type(arg_expr);
+            if (!self.type_id_is_valid(arg_type_id)) { return ""; }
+            var arg_text = hir_type_table_text(self.unit.types, arg_type_id);
+            if (arg_text.len == 0) { return ""; }
+            let resolved = self.resolve_type_text_in_current_env(arg_text);
+            if (resolved.len > 0) { arg_text = resolved; }
+            if (self.type_text_has_open_template_atom(arg_text)) { return ""; }
+            if (arg_count > 0) { out = out.clone() + ","; }
+            out = out.clone() + arg_text;
+            arg_count = arg_count + 1;
+            arg_expr = self.unit.expr_next_arg(arg_expr);
+        }
+        if (arg_count == 0) { out = out.clone() + "()"; }
+        return out;
+    }
+
+    fn concrete_method_target_for_call_expr(self,
+                                                   e: rawptr,
+                                                   call_expr_id: i32,
+                                                   callee_expr_id: i32,
+                                                   method_decl: rawptr) -> i32 {
+        if (callee_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) {
+            return hir_id_invalid();
+        }
+        let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+        if (owner_expr_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let owner_type_name = self.member_call_owner_type_name(e, callee_expr_id);
+        if (owner_type_name.len == 0 || self.type_text_has_open_template_atom(owner_type_name)) {
+            return hir_id_invalid();
+        }
+        if (self.dyn_interface_name_from_type_text(owner_type_name).len > 0) {
+            return hir_id_invalid();
+        }
+        let method_name = policy_versioned_generic_call_base(self.unit.expr_name(callee_expr_id).clone());
+        if (method_name.len == 0) { return hir_id_invalid(); }
+        var selected_decl = method_decl;
+        var selected_decl_is_authoritative = selected_decl != null;
+        var selected_decl_from_raw_semantic = false;
+        var raw_callee_ast = e;
+        if (raw_callee_ast != null
+            && expr_get_kind(raw_callee_ast) == ex_CALL()) {
+            raw_callee_ast = expr_get_lhs(raw_callee_ast);
+        }
+        // resolve_call_expr_after_children forwards the member's Sema target
+        // as method_decl. Treat that exact AST target as semantic provenance
+        // too: otherwise the non-null argument bypasses the self-receiver
+        // rebound below and a default interface body keeps calling its
+        // bodyless prototype instead of the concrete implementation.
+        if (selected_decl != null
+            && raw_callee_ast != null
+            && expr_get_kind(raw_callee_ast) == ex_MEMBER()
+            && expr_get_semantic_target(raw_callee_ast) == selected_decl) {
+            selected_decl_from_raw_semantic = true;
+        }
+        if (selected_decl == null
+            && raw_callee_ast != null
+            && expr_get_kind(raw_callee_ast) == ex_MEMBER()) {
+            let semantic_decl = expr_get_semantic_target(raw_callee_ast);
+            if (semantic_decl != null
+                && decl_get_kind(semantic_decl) == de_METHOD()) {
+                selected_decl = semantic_decl;
+                selected_decl_is_authoritative = true;
+                selected_decl_from_raw_semantic = true;
+            }
+        }
+        if (selected_decl == null && call_expr_id != hir_id_invalid()) {
+            selected_decl = self.raw_method_decl_for_call_expr(e,
+                                                               call_expr_id,
+                                                               callee_expr_id);
+            if (policy_module_selector_index(
+                    self.unit.expr_name(callee_expr_id)) >= 0) {
+                selected_decl_is_authoritative = true;
+            }
+        }
+        // Sema is authoritative for member overload selection.  HIR may
+        // still be resolving literal and pointer argument types here, so a
+        // local re-score is only safe after it has explicit, complete type
+        // evidence; preserving the semantic declaration avoids collapsing
+        // distinct virtual overloads onto the first owner/name match.
+        var explicit_method_args = self.resolve_explicit_generic_args_for_call(e);
+        if (explicit_method_args.len == 0) {
+            explicit_method_args = self.resolve_explicit_generic_args_for_hir_call(call_expr_id);
+        }
+        let want_static = self.unit.expr_sem_kind(owner_expr_id) == expr_sem_CLASS();
+        // Sema records the generic-class template declaration, while the
+        // HIR receiver is already closed (Holder::<i32>, etc.).  Prefer the
+        // exact full-specialization body before treating that Sema target as
+        // authoritative. Version selectors remain authoritative by design.
+        if (selected_decl != null
+            && policy_generic_call_args(owner_type_name.clone()).len > 0
+            && policy_module_selector_index(self.unit.expr_name(callee_expr_id)) < 0
+            && !hir_builder_decl_is_foreign_dci_native(selected_decl)) {
+            let specialized_decl = self.canonical_method_decl_for_owner_type(
+                selected_decl,
+                owner_type_name);
+            if (specialized_decl != null
+                && specialized_decl != selected_decl
+                && self.raw_function_body_decl_for(specialized_decl) != null) {
+                selected_decl = specialized_decl;
+                selected_decl_is_authoritative = true;
+            }
+        }
+        // An explicit method generic list always requests a closed template
+        // instance.  Resolve it before name-keyed HIR caches, which contain
+        // erased signature shells and therefore cannot represent `<T>`.
+        if (explicit_method_args.len > 0) {
+            var explicit_template = self.raw_template_method_decl_for_call_type_text(
+                owner_type_name,
+                method_name,
+                want_static,
+                e,
+                call_expr_id);
+            if (hir_builder_decl_template_params(explicit_template).len == 0) {
+                explicit_template = self.raw_template_method_decl_for_type_text(
+                    owner_type_name,
+                    method_name,
+                    want_static);
+            }
+            if (explicit_template != null
+                && hir_builder_decl_template_params(explicit_template).len > 0
+                && !hir_builder_decl_is_foreign_dci_native(explicit_template)) {
+                let explicit_fn = self.closed_method_target_for_type_text(
+                    owner_type_name,
+                    method_name,
+                    e,
+                    call_expr_id,
+                    explicit_template,
+                    want_static);
+                if (explicit_fn != hir_id_invalid()
+                    && !self.function_has_open_template_types(explicit_fn)
+                    && self.function_candidate_matches_method_name(explicit_fn, method_name)) {
+                    return explicit_fn;
+                }
+            }
+        }
+        // Sema records the declaration selected while parsing the original
+        // parent body. Once that body is materialized for a derived receiver,
+        // a bare `self.method()` must restart lookup at the concrete receiver
+        // class so overrides bind to that receiver's instance. Explicit base
+        // calls, version-selected calls, foreign DCI methods, and caller-
+        // supplied declarations remain authoritative.
+        if (selected_decl_from_raw_semantic
+            && !want_static
+            && raw_callee_ast != null
+            && expr_get_kind(raw_callee_ast) == ex_MEMBER()
+            && policy_module_selector_index(expr_get_name(raw_callee_ast)) < 0
+            && !hir_builder_decl_is_foreign_dci_native(selected_decl)) {
+            let raw_receiver = expr_get_lhs(raw_callee_ast);
+            let semantic_owner = hir_raw_owner_map_get(self.decl_owner_map,selected_decl);
+            let receiver_owner = self.raw_class_decl_for_type_text(owner_type_name);
+            if (hir_builder_expr_is_self_ident(raw_receiver)
+                && semantic_owner != null
+                && receiver_owner != null
+                && receiver_owner != semantic_owner
+                && self.owner_decl_accepts_owner_type(semantic_owner, owner_type_name)) {
+                let rebound_decl = self.raw_method_decl_for_call_on_class_tree(
+                    receiver_owner,
+                    method_name,
+                    false,
+                    e,
+                    call_expr_id,
+                    owner_type_name,
+                    0);
+                if (rebound_decl != null
+                    && !hir_builder_decl_is_foreign_dci_native(rebound_decl)) {
+                    selected_decl = rebound_decl;
+                }
+            }
+        }
+        // An explicit method generic list is a materialization request, not a
+        // decoration on a closed declaration. Sema can point at a concrete
+        // signature clone whose generic metadata has already been erased; use
+        // the matching template body when it has the same selected call shape.
+        // This keeps overload selection while carrying method parameters
+        // through nested generic calls such as bind<T> -> self.matches::<T>().
+        if (selected_decl != null
+            && explicit_method_args.len > 0
+            && raw_callee_ast != null
+            && expr_get_kind(raw_callee_ast) == ex_MEMBER()
+            && policy_module_selector_index(expr_get_name(raw_callee_ast)) < 0
+            && !hir_builder_decl_is_foreign_dci_native(selected_decl)) {
+            var template_decl = self.raw_template_method_decl_for_call_type_text(
+                owner_type_name,
+                method_name,
+                want_static,
+                e,
+                call_expr_id);
+            // The call-scored lookup may return Sema's erased signature clone
+            // even though we explicitly need a method-generic body.  In that
+            // case, recover the owner member template before testing the
+            // compatible concrete signature below.
+            if (hir_builder_decl_template_params(template_decl).len == 0) {
+                let owner_template_decl = self.raw_template_method_decl_for_type_text(
+                    owner_type_name,
+                    method_name,
+                    want_static);
+                if (owner_template_decl != null
+                    && hir_builder_decl_template_params(owner_template_decl).len > 0) {
+                    template_decl = owner_template_decl;
+                }
+            }
+            let template_params = hir_builder_decl_template_params(template_decl);
+            if (template_decl != null
+                && template_params.len > 0
+                && !hir_builder_decl_is_foreign_dci_native(template_decl)
+                // Do not require identical generic metadata here: the Sema
+                // clone deliberately erased it.  Name/staticness/value-arity
+                // still bind this back to the selected overload.
+                && hir_builder_decl_specialization_shape_matches(selected_decl, template_decl)
+                && self.decl_signature_matches_in_env(selected_decl,
+                                                       template_decl,
+                                                       template_params,
+                                                       explicit_method_args)) {
+                let template_owner = hir_raw_owner_map_get(self.decl_owner_map,template_decl);
+                if (self.owner_decl_accepts_owner_type(template_owner, owner_type_name)) {
+                    selected_decl = template_decl;
+                    // The explicit generic list and the compatibility checks
+                    // above identify this declaration more precisely than the
+                    // name-keyed HIR score cache. Resolve its closed instance
+                    // before considering that cache.
+                    selected_decl_is_authoritative = true;
+                }
+            }
+        }
+        // Sema owns overload/version selection. Preserve its declaration
+        // before consulting name-keyed caches or HIR rescoring; those indexes
+        // deliberately cannot distinguish two ABI-compatible versions.
+        if (selected_decl != null && selected_decl_is_authoritative) {
+            let semantic_fn = self.closed_method_target_for_type_text(
+                owner_type_name,
+                method_name,
+                e,
+                call_expr_id,
+                selected_decl,
+                want_static);
+            if (semantic_fn != hir_id_invalid()
+                && !self.function_has_open_template_types(semantic_fn)
+                && self.function_candidate_matches_method_name(semantic_fn,
+                                                               method_name)) {
+                return semantic_fn;
+            }
+        }
+        let scored_fn = self.best_hir_method_function_for_call(
+            owner_type_name,
+            method_name,
+            call_expr_id,
+            callee_expr_id);
+        if (scored_fn != hir_id_invalid()
+            && self.function_candidate_matches_method_name(scored_fn,
+                                                           method_name)) {
+            return scored_fn;
+        }
+        let call_cache_key = self.method_call_target_cache_key(method_name,
+                                                               want_static,
+                                                               explicit_method_args,
+                                                               call_expr_id);
+        if (call_cache_key.len > 0) {
+            let cached_target = hir_pair_id_map_get(self.method_call_target_cache,owner_type_name, call_cache_key);
+            if (cached_target != hir_id_invalid()
+                && self.function_candidate_matches_method_name(cached_target, method_name)
+                && !self.function_has_open_template_types(cached_target)) {
+                self.ensure_reachable_function_body_by_id(cached_target);
+                return cached_target;
+            }
+        }
+        if (explicit_method_args.len == 0) {
+            let direct_indexed_fn = self.method_function_target_by_owner_type_and_method(owner_type_name,
+                                                                                         method_name);
+            if (direct_indexed_fn != hir_id_invalid()
+                && self.function_candidate_matches_method_name(direct_indexed_fn, method_name)
+                && self.function_candidate_covers_owner_type(direct_indexed_fn, owner_type_name)
+                && !self.function_has_open_template_types(direct_indexed_fn)) {
+                if (call_cache_key.len > 0) {
+                    self.method_call_target_cache = hir_pair_id_map_put(self.method_call_target_cache,owner_type_name, call_cache_key, direct_indexed_fn);
+                }
+                self.ensure_reachable_function_body_by_id(direct_indexed_fn);
+                return direct_indexed_fn;
+            }
+            let hir_scored_fn = self.best_hir_method_function_for_call(owner_type_name,
+                                                                        method_name,
+                                                                        call_expr_id,
+                                                                        callee_expr_id);
+            if (hir_scored_fn != hir_id_invalid()
+                && self.function_candidate_matches_method_name(hir_scored_fn, method_name)) {
+                if (call_cache_key.len > 0) {
+                    self.method_call_target_cache = hir_pair_id_map_put(self.method_call_target_cache,owner_type_name, call_cache_key, hir_scored_fn);
+                }
+                return hir_scored_fn;
+            }
+        }
+        let out_fn = self.closed_method_target_for_type_text(owner_type_name,
+                                                             method_name,
+                                                             e,
+                                                             call_expr_id,
+                                                             selected_decl,
+                                                             want_static);
+        if (out_fn == hir_id_invalid() || self.function_has_open_template_types(out_fn)) {
+            return hir_id_invalid();
+        }
+        if (!self.function_candidate_matches_method_name(out_fn, method_name)) {
+            return hir_id_invalid();
+        }
+        if (call_cache_key.len > 0) {
+            self.method_call_target_cache = hir_pair_id_map_put(self.method_call_target_cache,owner_type_name, call_cache_key, out_fn);
+        }
+        return out_fn;
+    }
+
+    fn closed_member_call_target_for_receiver(self,
+                                                     e: rawptr,
+                                                     call_expr_id: i32,
+                                                     callee_expr_id: i32,
+                                                     current_fn: i32) -> i32 {
+        if (callee_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) {
+            return current_fn;
+        }
+        let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+        if (owner_expr_id == hir_id_invalid()) { return current_fn; }
+        var owner_type_name = "";
+        if (self.unit.expr_sem_kind(owner_expr_id) == expr_sem_CLASS()) {
+            owner_type_name = self.resolve_type_text_in_current_env(self.unit.expr_name(owner_expr_id));
+        }
+        if (owner_type_name.len == 0) {
+            let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(owner_expr_id));
+            if (!self.type_id_is_valid(owner_type_id)) { return current_fn; }
+            owner_type_name = self.member_lookup_type_name(owner_type_id);
+        }
+        if (owner_type_name.len == 0 || self.type_text_has_open_template_atom(owner_type_name)) {
+            return current_fn;
+        }
+        if (self.dyn_interface_name_from_type_text(owner_type_name).len > 0) {
+            return current_fn;
+        }
+        let method_name = policy_versioned_generic_call_base(self.unit.expr_name(callee_expr_id).clone());
+        if (method_name.len == 0) { return current_fn; }
+        let call_scored_fn = self.concrete_method_target_for_call_expr(e,
+                                                                       call_expr_id,
+                                                                       callee_expr_id,
+                                                                       null);
+        if (call_scored_fn != hir_id_invalid()
+            && !self.function_has_open_template_types(call_scored_fn)) {
+            return call_scored_fn;
+        }
+        if (current_fn != hir_id_invalid() && !self.function_has_open_template_types(current_fn)) {
+            let current_owner_type = hir_unit_function_owner_type(self.unit, current_fn);
+            if ((current_owner_type.len == 0 || current_owner_type == owner_type_name)
+                && self.function_candidate_matches_method_name(current_fn, method_name)) {
+                return current_fn;
+            }
+            if (self.unit.function_body(current_fn) != hir_id_invalid()
+                && self.function_candidate_matches_method_name(current_fn, method_name)) {
+                return current_fn;
+            }
+        }
+        var closed_fn = self.concrete_method_target_for_call_expr(e,
+                                                                  call_expr_id,
+                                                                  callee_expr_id,
+                                                                  null);
+        if (closed_fn == hir_id_invalid()) {
+            closed_fn = self.closed_method_target_for_type_text(owner_type_name,
+                                                                method_name,
+                                                                e,
+                                                                call_expr_id,
+                                                                null,
+                                                                self.unit.expr_sem_kind(owner_expr_id) == expr_sem_CLASS());
+        }
+        if (closed_fn == hir_id_invalid()) { return current_fn; }
+        if (self.function_has_open_template_types(closed_fn)) { return current_fn; }
+        return closed_fn;
+    }
+
+    fn member_owner_type_name(self, e: rawptr, lhs_expr_id: i32) -> string {
+        var member_name = "";
+        if (e != null) { member_name = policy_versioned_generic_call_base(expr_get_name(e).clone()); }
+        if (lhs_expr_id != hir_id_invalid()
+            && self.unit.expr_sem_kind(lhs_expr_id) == expr_sem_CLASS()) {
+            let class_owner = self.resolve_type_text_in_current_env(self.unit.expr_name(lhs_expr_id));
+            if (class_owner.len > 0
+                && !self.type_text_has_open_template_atom(class_owner)
+                && self.raw_class_decl_for_type_text(class_owner) != null) {
+                return class_owner;
+            }
+        }
+        if (e != null) {
+            let lhs = expr_get_lhs(e);
+            if (lhs != null && expr_get_kind(lhs) == ex_IDENT()) {
+                let candidate = self.resolve_type_text_in_current_env(expr_get_name(lhs));
+                if (candidate.len > 0 && self.raw_class_decl_for_type_text(candidate) != null) {
+                    return candidate;
+                }
+            }
+        }
+        let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(lhs_expr_id));
+        if (!self.type_id_is_valid(owner_type_id)) { return ""; }
+        var owner_type = self.member_lookup_type_name(owner_type_id);
+        if (member_name.len > 0) {
+            let want_static_member = self.unit.expr_sem_kind(lhs_expr_id) == expr_sem_CLASS();
+            if (self.raw_member_decl_for_type_text(owner_type, member_name) != null) {
+                return owner_type;
+            }
+            if (self.raw_method_decl_exists_for_type_text(owner_type,
+                                                          member_name,
+                                                          want_static_member)) {
+                return owner_type;
+            }
+            if (self.method_function_target_by_owner_type_and_method(owner_type, member_name) != hir_id_invalid()) {
+                return owner_type;
+            }
+            let payload_owner = self.heap_indirect_member_owner_type_text(owner_type, member_name);
+            if (payload_owner.len > 0) { return payload_owner; }
+        }
+        return owner_type;
+    }
+}

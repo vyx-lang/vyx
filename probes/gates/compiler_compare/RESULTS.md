@@ -176,7 +176,7 @@ free. Dependency stamp timing is a separately measured part of object
 planning, not an additional phase to add to its total.
 
 The remaining repeated dependency work follows this live call chain in
-`bootstrap_compiler/src/core/build_system.vyx`:
+`bootstrap_compiler/src/core/project/build_system.vyx`:
 
 ```text
 build_target

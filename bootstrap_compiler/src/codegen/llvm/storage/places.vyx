@@ -1,0 +1,591 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn place_is_volatile_local(self, place_id: i32) -> bool {
+        var cur = place_id;
+        while (cur != mir_id_invalid()) {
+            let kind = self.m.place_kind(cur);
+            if (kind == mir_place_local()) {
+                let local = self.m.place_local(cur);
+                if (local == mir_id_invalid()) { return false; }
+                return (self.m.local_flags(local) & mir_local_flag_volatile()) != 0;
+            }
+            if (kind == mir_place_field() || kind == mir_place_index()) {
+                cur = self.m.place_base(cur);
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    public fn lower_place_addr(self, place_id: i32) -> rawptr {
+        if (place_id == mir_id_invalid()) { return null; }
+        var timing_place_start: i64 = 0;
+        var timing_place_mark: i64 = 0;
+        var timing_base_ms: i64 = 0;
+        var timing_effective_ms: i64 = 0;
+        var timing_remap1_ms: i64 = 0;
+        var timing_owner_ms: i64 = 0;
+        var timing_canon_ms: i64 = 0;
+        var timing_remap2_ms: i64 = 0;
+        var timing_object_ms: i64 = 0;
+        var timing_type_ms: i64 = 0;
+        var timing_storage_ms: i64 = 0;
+        var timing_gep_ms: i64 = 0;
+        if (llvm_mir_timing_enabled()) {
+            timing_place_start = vyx_bootstrap_now_ms();
+            timing_place_mark = timing_place_start;
+        }
+        let kind = self.m.place_kind(place_id);
+        if (kind == mir_place_local()) {
+            return llvm_mir_map_get(self.local_slots, self.m.place_local(place_id));
+        }
+        if (kind == mir_place_static()) {
+            return self.get_or_create_hir_item_global(self.m.place_local(place_id),
+                                                      self.m.place_type(place_id),
+                                                      self.m.place_name(place_id));
+        }
+        if (kind == mir_place_deref()) {
+            // Same-instruction reuse: `*p += 1` lowers the deref place twice
+            // (read operand + store destination).  Resolving the handle is
+            // expensive when the pointer local is volatile — the reload can
+            // never be CSE'd — so check the per-instruction cache BEFORE
+            // lowering the pointer value below.
+            let cached_deref_early = llvm_mir_map_get(self.instr_deref_addr_cache, place_id);
+            if (cached_deref_early != null) { return cached_deref_early; }
+            let pointer_value_id = self.m.place_index_value(place_id);
+            let pointer_value = self.lower_value(pointer_value_id);
+            let pointer_type = self.m.value_type(pointer_value_id);
+            if (llvm_mir_kind_pointer_handle(llvm_mir_type_kind(&self.m, pointer_type))) {
+                if (!self.place_skips_pointer_region_audit(place_id)) {
+                let payload_type = self.place_effective_type(place_id);
+                let payload_ty = self.lower_storage_type(payload_type);
+                var bytes: i64 = 1;
+                if (payload_ty != null) {
+                    let measured = vyx_rt_type_alloc_size(self.mod, payload_ty);
+                    if (measured > 0) { bytes = measured; }
+                }
+                let pointer_depth = self.pointer_index_shape_depth(pointer_type);
+                let checked = self.pointer_checked_address(pointer_value,
+                                                           vyx_rt_const_int(self.mod, self.ty_i64, 0, 0),
+                                                           bytes,
+                                                           pointer_depth,
+                                                           "mir.deref");
+                return self.pointer_projected_place_addr(pointer_value,
+                                                         checked,
+                                                         payload_type,
+                                                         pointer_depth,
+                                                         "mir.deref.project");
+                }
+                let cached_deref = llvm_mir_map_get(self.instr_deref_addr_cache, place_id);
+                if (cached_deref != null) { return cached_deref; }
+                let raw_addr = self.pointer_handle_address(pointer_value, "mir.dci.deref");
+                if (raw_addr != null) {
+                    llvm_mir_map_put(self.instr_deref_addr_cache, place_id, raw_addr);
+                }
+                return raw_addr;
+            }
+            return pointer_value;
+        }
+        if (kind == mir_place_field()) {
+            let base_place = self.m.place_base(place_id);
+            let base_addr = self.lower_place_addr(base_place);
+            if (llvm_mir_timing_enabled()) {
+                let now_base = vyx_bootstrap_now_ms();
+                timing_base_ms = now_base - timing_place_mark;
+                timing_place_mark = now_base;
+            }
+            var field_id = self.m.place_field(place_id);
+            // Validation of the field index happens AFTER remapping: a
+            // template FieldId may have no layout slot while the concrete
+            // instance field it maps onto does.
+            if (base_addr == null || field_id == mir_id_invalid()) {
+                self.report_error("cannot resolve field place #" + policy_i64_to_string(place_id as i64));
+                return null;
+            }
+            var field_base_addr = base_addr;
+            var field_base_type = self.place_effective_type(base_place);
+            var field_base_is_dereferenced_receiver = false;
+            // `&T` / `&mut T` are receiver views, not distinct field-owning
+            // records.  HIR has already resolved the field against T; peel
+            // the pointer handle here before layout validation so lowering
+            // uses the same object address as an owned T receiver.
+            let field_base_kind = llvm_mir_type_kind(&self.m, field_base_type);
+            if (field_base_kind == ty_PTR()
+                || field_base_kind == ty_REF()
+                || field_base_kind == ty_MUTREF()) {
+                let pointee_type = hir_type_table_elem(self.m.types, field_base_type);
+                if (pointee_type != mir_id_invalid()) {
+                    var handle_ty = self.lower_type(field_base_type);
+                    // Self and DCI/C raw-pointer ABI slots are one machine
+                    // pointer, not `{ptr, ptr}`. Load that width.
+                    if (self.place_slot_holds_raw_pointer(base_place)) {
+                        handle_ty = self.ty_ptr;
+                    }
+                    let handle = vyx_rt_build_load(self.mod,
+                                                   handle_ty,
+                                                   field_base_addr,
+                                                   "mir.field.receiver.handle".c_str(),
+                                                   25);
+                    let deref_addr = self.pointer_handle_address(handle,
+                                                                  "mir.field.receiver");
+                    if (handle == null || deref_addr == null) {
+                        self.report_error("cannot dereference field receiver "
+                                  + llvm_mir_type_text(&self.m, field_base_type));
+                        return null;
+                    }
+                    field_base_addr = deref_addr;
+                    field_base_type = pointee_type;
+                    field_base_is_dereferenced_receiver = true;
+                }
+            }
+            if (llvm_mir_timing_enabled()) {
+                let now_effective = vyx_bootstrap_now_ms();
+                timing_effective_ms = now_effective - timing_place_mark;
+                timing_place_mark = now_effective;
+            }
+            let mapped_field_id = self.remapped_field_for_base(field_base_type, field_id);
+            if (llvm_mir_timing_enabled()) {
+                let now_remap1 = vyx_bootstrap_now_ms();
+                timing_remap1_ms = now_remap1 - timing_place_mark;
+                timing_place_mark = now_remap1;
+            }
+            if (mapped_field_id != mir_id_invalid()) { field_id = mapped_field_id; }
+            let field_owner_type = mir_unit_field_owner_type(&self.m, field_id);
+            if (field_owner_type != mir_id_invalid()
+                && !self.field_owner_accepts_base_type(field_owner_type, field_base_type)) {
+                if (self.heap_indirect_payload_matches(field_base_type, field_owner_type)) {
+                    field_base_addr = self.lower_heap_indirect_payload_address_from_place(base_place, field_owner_type);
+                    field_base_type = field_owner_type;
+                } else {
+                    // Forensics for the multi-CGU "base is i64" corruption:
+                    // print the raw ids so the stale-slot reuse (if any) is
+                    // visible instead of only the resolved type text.
+                    var diag_local: i32 = mir_id_invalid();
+                    if (self.m.place_kind(base_place) == mir_place_local()) {
+                        diag_local = self.m.place_local(base_place);
+                    }
+                    print("[i0100-diag] fn=" + self.m.function_name(self.current_function_id)
+                          + " cgu=" + policy_i64_to_string(self.cgu_emit_index as i64)
+                          + " base_place=" + policy_i64_to_string(base_place as i64)
+                          + " place_kind=" + policy_i64_to_string(self.m.place_kind(base_place) as i64)
+                          + " place_type=" + policy_i64_to_string(self.m.place_type(base_place) as i64)
+                          + " local=" + policy_i64_to_string(diag_local as i64)
+                          + " local_type=" + (diag_local != mir_id_invalid()
+                                              ? policy_i64_to_string(self.m.local_type(diag_local) as i64)
+                                              : "n/a")
+                          + " local_type_text=" + (diag_local != mir_id_invalid()
+                                              ? llvm_mir_type_text(&self.m, self.m.local_type(diag_local))
+                                              : "n/a")
+                          + " base_type_id=" + policy_i64_to_string(field_base_type as i64)
+                          + " owner_type_id=" + policy_i64_to_string(field_owner_type as i64));
+                    self.report_error("field " + mir_unit_field_name(&self.m, field_id)
+                              + " belongs to " + llvm_mir_type_text(&self.m, field_owner_type)
+                              + " but base is " + llvm_mir_type_text(&self.m, field_base_type)
+                              + " [in " + self.m.function_name(self.current_function_id)
+                              + " cgu=" + policy_i64_to_string(self.cgu_emit_index as i64) + "]");
+                    return null;
+                }
+            }
+            if (llvm_mir_timing_enabled()) {
+                let now_owner = vyx_bootstrap_now_ms();
+                timing_owner_ms = now_owner - timing_place_mark;
+                timing_place_mark = now_owner;
+            }
+            field_base_type = self.canonical_record_type_id(field_base_type);
+            if (llvm_mir_timing_enabled()) {
+                let now_canon = vyx_bootstrap_now_ms();
+                timing_canon_ms = now_canon - timing_place_mark;
+                timing_place_mark = now_canon;
+            }
+            field_id = self.remapped_field_for_base(field_base_type, field_id);
+            if (llvm_mir_timing_enabled()) {
+                let now_remap2 = vyx_bootstrap_now_ms();
+                timing_remap2_ms = now_remap2 - timing_place_mark;
+                timing_place_mark = now_remap2;
+            }
+            if (field_id == mir_id_invalid()) {
+                self.report_error("cannot map field place #" + policy_i64_to_string(place_id as i64)
+                          + " onto " + llvm_mir_type_text(&self.m, field_base_type));
+                return null;
+            }
+            if (self.place_is_self_pointer_abi_slot(base_place)) {
+                field_base_addr = self.load_self_pointer_abi_slot(base_place, field_base_addr, field_base_type);
+            } else if (self.type_is_class_pointer_abi(field_base_type)
+                       && !self.place_is_direct_class_object_pointer(base_place)
+                       && !field_base_is_dereferenced_receiver) {
+                field_base_addr = self.class_object_addr_from_place_addr(base_place, field_base_addr, field_base_type);
+            }
+            if (llvm_mir_timing_enabled()) {
+                let now_object = vyx_bootstrap_now_ms();
+                timing_object_ms = now_object - timing_place_mark;
+                timing_place_mark = now_object;
+            }
+            if (self.foreign_dci_field_record_type(field_base_type, field_id) != mir_id_invalid()) {
+                return self.dci_field_addr(field_base_addr, field_base_type, field_id);
+            }
+            if (self.type_is_dci_stub_class(field_base_type)) {
+                return self.dci_stub_state_field_addr(field_base_addr, field_base_type, field_id);
+            }
+            var base_ty = self.lower_type(field_base_type);
+            if (llvm_mir_timing_enabled()) {
+                let now_type = vyx_bootstrap_now_ms();
+                timing_type_ms = now_type - timing_place_mark;
+                timing_place_mark = now_type;
+            }
+            if (self.type_is_class_pointer_abi(field_base_type)
+                || self.place_is_self_pointer_abi_slot(base_place)) {
+                let storage_ty = self.class_record_storage_ty(field_base_type);
+                if (storage_ty != null) { base_ty = storage_ty; }
+            }
+            if (llvm_mir_timing_enabled()) {
+                let now_storage = vyx_bootstrap_now_ms();
+                timing_storage_ms = now_storage - timing_place_mark;
+                timing_place_mark = now_storage;
+            }
+            let field_index2 = mir_unit_field_index(&self.m, field_id);
+            if (field_base_addr == null || base_ty == null || field_index2 < 0) {
+                self.report_error("cannot resolve field base for " + mir_unit_field_name(&self.m, field_id));
+                return null;
+            }
+            let field_count2 = mir_unit_field_count_for_type(&self.m, field_base_type);
+            if (field_index2 >= field_count2) {
+                self.report_error("field index "
+                          + policy_i64_to_string(field_index2 as i64)
+                          + " is outside layout "
+                          + llvm_mir_type_text(&self.m, field_base_type)
+                          + " field_count="
+                          + policy_i64_to_string(field_count2 as i64)
+                          + " for "
+                          + mir_unit_field_name(&self.m, field_id));
+                return null;
+            }
+            let field_addr = vyx_rt_build_gep2(self.mod,
+                                               base_ty,
+                                               field_base_addr,
+                                               vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                               vyx_rt_const_int(self.mod, self.ty_i32, field_index2 as i64, 0),
+                                               mir_unit_field_name(&self.m, field_id).c_str(),
+                                               mir_unit_field_name(&self.m, field_id).len as u64);
+            if (llvm_mir_timing_enabled()) {
+                let now_gep = vyx_bootstrap_now_ms();
+                timing_gep_ms = now_gep - timing_place_mark;
+                timing_place_mark = now_gep;
+            }
+            if (field_addr == null) {
+                self.report_error("cannot build field address for "
+                          + llvm_mir_type_text(&self.m, field_base_type)
+                          + "."
+                          + mir_unit_field_name(&self.m, field_id)
+                          + " index "
+                          + policy_i64_to_string(field_index2 as i64));
+                return null;
+            }
+            if (llvm_mir_timing_enabled()) {
+                let timing_place_elapsed = vyx_bootstrap_now_ms() - timing_place_start;
+                if (timing_place_elapsed >= llvm_mir_slow_instr_threshold_ms()) {
+                    print("[mir-timing] place-field fn #" + policy_i64_to_string(self.current_function_id as i64)
+                          + " " + self.m.function_name(self.current_function_id)
+                          + " place=" + policy_i64_to_string(place_id as i64)
+                          + " field=" + mir_unit_field_name(&self.m, field_id)
+                          + " base_type=" + llvm_mir_type_text(&self.m, field_base_type)
+                          + " base=" + timing_base_ms.toString()
+                          + " effective=" + timing_effective_ms.toString()
+                          + " remap1=" + timing_remap1_ms.toString()
+                          + " owner=" + timing_owner_ms.toString()
+                          + " canon=" + timing_canon_ms.toString()
+                          + " remap2=" + timing_remap2_ms.toString()
+                          + " object=" + timing_object_ms.toString()
+                          + " type=" + timing_type_ms.toString()
+                          + " storage=" + timing_storage_ms.toString()
+                          + " gep=" + timing_gep_ms.toString()
+                          + " total=" + timing_place_elapsed.toString() + " ms");
+                }
+            }
+            return field_addr;
+        }
+        if (kind == mir_place_index()) {
+            return self.lower_index_place_addr(place_id);
+        }
+        self.report_error("cannot lower place #" + policy_i64_to_string(place_id as i64)
+                  + " kind=" + policy_i64_to_string(kind as i64));
+        return null;
+    }
+
+    public fn lower_heap_indirect_payload_address_from_place(self, place_id: i32, dst_type_id: i32) -> rawptr {
+        if (place_id == mir_id_invalid()) { return null; }
+        let src_type_id = self.m.place_type(place_id);
+        let payload_type = self.heap_indirect_payload_type(src_type_id);
+        if (payload_type == mir_id_invalid() || !self.type_ids_compatible(payload_type, dst_type_id)) {
+            self.report_error("cannot resolve heap-indirected payload address from "
+                      + llvm_mir_type_text(&self.m, src_type_id)
+                      + " to "
+                      + llvm_mir_type_text(&self.m, dst_type_id));
+            return null;
+        }
+        let raw_base_addr = self.lower_place_addr(place_id);
+        let base_addr = self.class_object_addr_from_place_addr(place_id, raw_base_addr, src_type_id);
+        let data_addr = self.record_field_addr_for_type(base_addr, src_type_id, "data");
+        if (raw_base_addr == null || base_addr == null || data_addr == null) {
+            self.report_error("cannot address heap-indirected storage for "
+                      + llvm_mir_type_text(&self.m, src_type_id));
+            return null;
+        }
+        let data_ptr = vyx_rt_build_load(self.mod,
+                                         self.ty_ptr,
+                                         data_addr,
+                                         "mir.deref.data".c_str(),
+                                         14);
+        if (data_ptr == null) {
+            self.report_error("cannot load heap-indirected payload address for "
+                      + llvm_mir_type_text(&self.m, src_type_id));
+            return null;
+        }
+        return data_ptr;
+    }
+
+    public fn lower_index_place_addr(self, place_id: i32) -> rawptr {
+        let base_place = self.m.place_base(place_id);
+        let index_id = self.m.place_index_value(place_id);
+        var trace_idx: bool = false;
+        if (llvm_mir_env_enabled("VYX_TRACE_IDXPLACE")) {
+            trace_idx = true;
+            print("[idxplace] enter place=" + policy_i64_to_string(place_id as i64)
+                  + " base=" + policy_i64_to_string(base_place as i64)
+                  + " index=" + policy_i64_to_string(index_id as i64));
+            fflush(null);
+        }
+        if (base_place == mir_id_invalid() || index_id == mir_id_invalid()) {
+            self.report_error("index place is missing base or index for place #" + policy_i64_to_string(place_id as i64));
+            return null;
+        }
+        var index_value = self.int_value_to_bits(self.lower_value(index_id), self.m.value_type(index_id), 64);
+        if (trace_idx) {
+            print("[idxplace] index lowered -> " + (index_value == null ? "null" : "ok"));
+            fflush(null);
+        }
+        if (index_value == null) {
+            self.report_error("cannot lower index operand for place #" + policy_i64_to_string(place_id as i64));
+            return null;
+        }
+        // Refine the base through place_effective_type (template field bases
+        // resolve to the concrete instance layout) and derive the element
+        // type from the refined base when the type table records one.
+        let base_type = self.place_effective_type(base_place);
+        let base_kind = llvm_mir_type_kind(&self.m, base_type);
+        if (trace_idx) {
+            print("[idxplace] base_type=" + llvm_mir_type_text(&self.m, base_type)
+                  + " kind=" + policy_i64_to_string(base_kind as i64));
+            fflush(null);
+        }
+        var result_type = self.m.place_type(place_id);
+        let refined_elem = hir_type_table_elem(self.m.types, base_type);
+        if (!self.type_is_concrete_runtime_type(result_type)
+            && refined_elem != mir_id_invalid()) {
+            result_type = refined_elem;
+        }
+        if (base_kind == ty_ARRAY()) {
+            let base_addr = self.lower_place_addr(base_place);
+            let array_ty = self.lower_type(base_type);
+            let elem_ty = self.lower_type(result_type);
+            if (base_addr == null || array_ty == null || elem_ty == null) {
+                self.report_error("cannot lower array index base for place #" + policy_i64_to_string(place_id as i64));
+                return null;
+            }
+            return vyx_rt_build_gep2(self.mod,
+                                     array_ty,
+                                     base_addr,
+                                     vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                     index_value,
+                                     "mir.index".c_str(),
+                                     9);
+        }
+        if (base_kind == ty_PTR() || base_kind == ty_REF() || base_kind == ty_MUTREF()) {
+            let base_addr2 = self.lower_place_addr(base_place);
+            let base_ptr_ty = self.lower_type(base_type);
+            let elem_ty2 = self.lower_type(result_type);
+            if (base_addr2 == null || base_ptr_ty == null || elem_ty2 == null) {
+                self.report_error("cannot lower pointer index base for place #" + policy_i64_to_string(place_id as i64));
+                return null;
+            }
+            let base_ptr = vyx_rt_build_load(self.mod,
+                                             base_ptr_ty,
+                                             base_addr2,
+                                             llvm_mir_empty_name(),
+                                             0);
+            if (!self.place_skips_pointer_region_audit(place_id)) {
+            var bytes2 = vyx_rt_type_alloc_size(self.mod, elem_ty2);
+            if (bytes2 <= 0) { bytes2 = 1; }
+            let pointer_depth2 = self.pointer_index_shape_depth(base_type);
+            let checked2 = self.pointer_checked_address(base_ptr,
+                                                        index_value,
+                                                        bytes2,
+                                                        pointer_depth2,
+                                                        "mir.index");
+            return self.pointer_projected_place_addr(base_ptr,
+                                                     checked2,
+                                                     result_type,
+                                                     pointer_depth2,
+                                                     "mir.index.project");
+            }
+            // Unchecked (unsafe/DCI) index: peel the raw address out of the
+            // pointer handle first.  DCI/C-ABI slots already hold one machine
+            // pointer (pointer_handle_address passes it through), while Vyx
+            // `*T` slots hold a `{address, metadata}` handle — GEP-ing the
+            // handle struct directly is ill-typed.  Scale by the element
+            // size via a typed GEP so `p[i]` matches the checked-path
+            // semantics instead of advancing `i` bytes.
+            let raw_index_base = self.pointer_handle_address(base_ptr, "mir.unsafe.index");
+            if (raw_index_base == null) {
+                self.report_error("cannot resolve unchecked pointer index base for place #"
+                                  + policy_i64_to_string(place_id as i64));
+                return null;
+            }
+            return self.ptr_offset_elements(elem_ty2,
+                                            raw_index_base,
+                                            index_value,
+                                            "mir.unsafe.index");
+        }
+        if (base_kind == ty_RAWPTR()) {
+            let base_addr3 = self.lower_place_addr(base_place);
+            if (base_addr3 == null) {
+                self.report_error("cannot lower rawptr index base for place #" + policy_i64_to_string(place_id as i64));
+                return null;
+            }
+            let base_ptr3 = vyx_rt_build_load(self.mod,
+                                              self.ty_ptr,
+                                              base_addr3,
+                                              llvm_mir_empty_name(),
+                                              0);
+            return self.ptr_offset_bytes(base_ptr3, index_value, "mir.rawptr.index");
+        }
+        self.report_error("index place base is not indexable: " + llvm_mir_type_text(&self.m, base_type));
+        return null;
+    }
+
+    public fn field_id_for_type_name(self, type_id: i32, field_name: string) -> i32 {
+        if (type_id == mir_id_invalid() || field_name.len == 0) { return mir_id_invalid(); }
+        let exact_base = self.exact_field_id_for_type_name(type_id, field_name);
+        if (exact_base != mir_id_invalid()) { return exact_base; }
+        let canonical_type = self.canonical_record_type_id(type_id);
+        let exact_canonical = self.exact_field_id_for_type_name(canonical_type, field_name);
+        if (exact_canonical != mir_id_invalid()) { return exact_canonical; }
+        var field_id: i32 = 1;
+        while (field_id <= self.m.field_count) {
+            if (mir_unit_field_name(&self.m, field_id) == field_name) {
+                let owner = mir_unit_field_owner_type(&self.m, field_id);
+                if (self.field_owner_accepts_base_type(owner, type_id)
+                    && self.canonical_record_type_id(owner) == canonical_type) {
+                    return field_id;
+                }
+            }
+            field_id = field_id + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn record_field_addr_for_type(self, record_addr: rawptr, type_id: i32, field_name: string) -> rawptr {
+        if (record_addr == null || type_id == mir_id_invalid() || field_name.len == 0) { return null; }
+        let owner_type = self.canonical_record_type_id(type_id);
+        let field_id = self.field_id_for_type_name(owner_type, field_name);
+        if (field_id == mir_id_invalid()) {
+            self.report_error("cannot resolve field `" + field_name + "` for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        var record_ty = self.lower_type(owner_type);
+        if (self.type_is_class_pointer_abi(owner_type)) {
+            record_ty = self.class_record_storage_ty(owner_type);
+        }
+        let field_index = mir_unit_field_index(&self.m, field_id);
+        if (record_ty == null || field_index < 0) {
+            self.report_error("cannot address field `" + field_name + "` for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        let field_count = mir_unit_field_count_for_type(&self.m, owner_type);
+        if (field_index >= field_count) {
+            self.report_error("field `" + field_name + "` index "
+                      + policy_i64_to_string(field_index as i64)
+                      + " is outside layout "
+                      + llvm_mir_type_text(&self.m, owner_type)
+                      + " field_count="
+                      + policy_i64_to_string(field_count as i64));
+            return null;
+        }
+        let out = vyx_rt_build_gep2(self.mod,
+                                    record_ty,
+                                    record_addr,
+                                    vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                    vyx_rt_const_int(self.mod, self.ty_i32, field_index as i64, 0),
+                                    field_name.c_str(),
+                                    field_name.len as u64);
+        if (out == null) {
+            self.report_error("cannot build field address for `" + field_name + "`");
+            return null;
+        }
+        return out;
+    }
+
+    public fn lower_record_field_member_value(self, receiver_id: i32, field_name: string) -> rawptr {
+        if (receiver_id == mir_id_invalid()) { return null; }
+        let receiver_type = self.m.value_type(receiver_id);
+        let field_id = self.field_id_for_type_name(receiver_type, field_name);
+        if (field_id == mir_id_invalid()) {
+            self.report_error("cannot resolve field `" + field_name + "` for " + llvm_mir_type_text(&self.m, receiver_type));
+            return null;
+        }
+        let base_addr = self.lower_self_receiver_address(receiver_id, receiver_type);
+        let field_type = mir_unit_field_type(&self.m, field_id);
+        let field_ty = self.lower_type(field_type);
+        let ptr = self.record_field_addr_for_type(base_addr, receiver_type, field_name);
+        if (base_addr == null || field_ty == null || ptr == null) {
+            self.report_error("cannot address field `" + field_name + "` for " + llvm_mir_type_text(&self.m, receiver_type));
+            return null;
+        }
+        return vyx_rt_build_load(self.mod, field_ty, ptr, field_name.c_str(), field_name.len as u64);
+    }
+
+    public fn lower_tuple_member_value(self, value_id: i32, member_name: string) -> rawptr {
+        let receiver_id = self.m.value_lhs(value_id);
+        if (receiver_id == mir_id_invalid()) {
+            self.report_error("tuple member `" + member_name + "` has no receiver");
+            return null;
+        }
+        let tuple_type = self.m.value_type(receiver_id);
+        if (llvm_mir_type_kind(&self.m, tuple_type) != ty_TUPLE()) {
+            self.report_error("tuple member `" + member_name + "` receiver is not tuple: "
+                      + llvm_mir_type_text(&self.m, tuple_type));
+            return null;
+        }
+        let idx = self.tuple_member_index(member_name);
+        let elem_count = self.tuple_element_count_for_type(tuple_type);
+        if (idx < 0 || idx >= elem_count) {
+            self.report_error("tuple member `" + member_name + "` is outside "
+                      + llvm_mir_type_text(&self.m, tuple_type)
+                      + " element_count="
+                      + policy_i64_to_string(elem_count as i64));
+            return null;
+        }
+        let elem_type = self.tuple_element_type_id(tuple_type, idx);
+        let tuple_ty = self.lower_type(tuple_type);
+        let elem_ty = self.lower_type(elem_type);
+        let base_addr = self.lower_self_receiver_address(receiver_id, tuple_type);
+        if (idx < 0 || elem_type == mir_id_invalid() || tuple_ty == null || elem_ty == null || base_addr == null) {
+            self.report_error("cannot address tuple member `" + member_name + "`");
+            return null;
+        }
+        let elem_ptr = vyx_rt_build_gep2(self.mod,
+                                         tuple_ty,
+                                         base_addr,
+                                         vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                         vyx_rt_const_int(self.mod, self.ty_i32, idx as i64, 0),
+                                         member_name.c_str(),
+                                         member_name.len as u64);
+        if (elem_ptr == null) {
+            self.report_error("cannot build tuple member address `" + member_name + "`");
+            return null;
+        }
+        return vyx_rt_build_load(self.mod, elem_ty, elem_ptr, member_name.c_str(), member_name.len as u64);
+    }
+}

@@ -1,0 +1,753 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+extern "C" {
+    fn getenv(name: rawptr) -> rawptr;
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn strncmp(a: rawptr, b: rawptr, n: i64) -> i32;
+    fn vyx_bootstrap_profile_level() -> i32;
+    fn vyx_bootstrap_now_ms() -> i64;
+    fn vyx_rt_process_private_bytes() -> i64;
+    fn vyx_rt_process_working_set_bytes() -> i64;
+    fn vyx_rt_heap_trim();
+    fn vyx_forget_string_len(s: rawptr);
+    fn cJSON_Parse(value: rawptr) -> rawptr;
+    fn cJSON_Delete(item: rawptr);
+    fn cJSON_GetObjectItemCaseSensitive(object: rawptr, string: rawptr) -> rawptr;
+    fn cJSON_GetArraySize(array: rawptr) -> i32;
+    fn cJSON_GetArrayItem(array: rawptr, index: i32) -> rawptr;
+    fn cJSON_GetStringValue(item: rawptr) -> rawptr;
+    fn cJSON_IsTrue(item: rawptr) -> i32;
+    fn cJSON_IsString(item: rawptr) -> i32;
+    fn cJSON_IsArray(item: rawptr) -> i32;
+    fn cJSON_IsObject(item: rawptr) -> i32;
+}
+// Older bootstrap seeds resolve this as a generic helper. Current compilers
+// reserve the same name as a backend-representation layout builtin.
+fn repr_sizeof<T>() -> i64 {
+    return sizeof::<T>();
+}
+
+// Builder storage, construction and native handle entry points.
+// Implementations are grouped by responsibility in builder/.
+
+class HirStmtChain {
+    public first: i32
+    public last: i32
+    public count: i32
+
+    public static fn empty() -> HirStmtChain {
+        return HirStmtChain { first: hir_id_invalid(), last: hir_id_invalid(), count: 0 };
+    }
+}
+
+public fn hir_bind_dci_lifecycle_contract(h: HirUnit, descriptor_text: string) -> i32 {
+    return dci_binder_bind_contract(h, descriptor_text);
+}
+
+public fn hir_bind_dci_lifecycle_contract_root(h: HirUnit, descriptor_root: rawptr) -> i32 {
+    return dci_binder_bind_root(h, descriptor_root);
+}
+
+public fn hir_bind_dci_lifecycle_contract_root_borrowed(h: HirUnit, descriptor_root: rawptr) -> i32 {
+    return dci_binder_bind_root_borrowed(h, descriptor_root);
+}
+
+public fn hir_bind_dci_lifecycle_paths(h: HirUnit, paths: string) -> i32 {
+    return dci_binder_bind_paths(h, paths);
+}
+
+
+class HirUnitBuilder {
+    public unit: HirUnit
+    public decl_map: HirPointerMap
+    public class_instances: HirDeclInstanceMap
+    public field_instances: HirDeclInstanceMap
+    public variant_instances: HirDeclInstanceMap
+    public member_value_instances: HirDeclInstanceMap
+    public function_instances: HirDeclInstanceMap
+    public type_ref_env_ids: HirDeclInstanceMap
+    public concrete_type_ready: HirStringSet
+    public raw_class_exact: HirRawNameMap
+    public raw_class_template: HirRawNameMap
+    public raw_class_concrete: HirRawNameMap
+    public raw_class_lookup_cache: HirRawNameMap
+    public raw_class_miss_cache: HirNameIdMap
+    /// Env-independent scan results keyed by raw type text. The legacy
+    /// caches above are keyed per generic env, so every new instance env
+    /// repeated the full decl/item linear scans (each pass allocating one
+    /// string copy per item) — quadratic allocation on large units. Scan
+    /// outcomes only depend on the raw text and the registered class set,
+    /// so they are shared here and invalidated via raw_class_index_version.
+    public raw_class_scan_cache: HirRawNameMap
+    public raw_class_scan_stamp: HirNameIdMap
+    public raw_template_scan_cache: HirRawNameMap
+    public raw_template_scan_stamp: HirNameIdMap
+    public raw_class_index_version: i32
+    public registered_type_atoms: HirStringSet
+    public method_function_index: HirPairIdMap
+    public field_index: HirPairIdMap
+    public free_function_index: HirNameIdMap
+    public value_item_index: HirNameIdMap
+    public decl_module_map: HirRawOwnerMap
+    public closed_method_instance_index: HirPairIdMap
+    public owner_method_overload_cache: HirPairIdMap
+    public method_call_target_cache: HirPairIdMap
+    public raw_method_call_decl_cache: HirPairRawMap
+    public raw_method_call_decl_miss_cache: HirPairIdMap
+    public raw_method_overload_count_cache: HirPairIdMap
+    public raw_method_lookup_cache: HirPairRawMap
+    public raw_method_lookup_miss_cache: HirPairIdMap
+    public dyn_trait_impl_materialized_cache: HirPairIdMap
+    public dyn_trait_satisfaction_cache: HirPairIdMap
+    public function_open_cache: rawptr
+    public type_id_open_no_env_cache: rawptr
+    public function_type_cache: HirIntIdMap
+    public zero_arg_function_type_cache: HirIntIdMap
+    public type_text_open_cache: HirNameIdMap
+    public type_text_id_cache: HirNameIdMap
+    public resolved_type_text_cache: HirGenericBindingMap
+    public member_decl_cache: HirPairRawMap
+    public member_decl_miss_cache: HirPairIdMap
+    public concrete_method_decl_cache_static: HirPairRawMap
+    public concrete_method_decl_cache_instance: HirPairRawMap
+    public concrete_method_decl_miss_static: HirPairIdMap
+    public concrete_method_decl_miss_instance: HirPairIdMap
+    public interface_decl_cache: HirRawNameMap
+    public interface_decl_miss_cache: HirNameIdMap
+    public type_alias_decl_cache: HirRawNameMap
+    public type_alias_decl_miss_cache: HirNameIdMap
+    public decl_body_close_cache: HirDeclInstanceMap
+    public type_ref_close_cache: HirDeclInstanceMap
+    public template_body_cache: HirRawIntMap
+    public template_members_cache: HirRawIntMap
+    public template_param_cache: HirDeclInstanceMap
+    public callable_borrow_cache: HirRawIntMap
+    public decl_self_member_call_cache: HirRawIntMap
+    public class_inherits_cache: HirRawPairIntMap
+    public class_parent_cache: HirRawOwnerMap
+    public method_owner_decl_cache: HirRawPairRawMap
+    public direct_method_function_cache: HirRawPairIntMap
+    public param_raw_move_cache: HirDeclInstanceMap
+    public materialized_type_ids: HirIntIdMap
+    public materialized_function_ids: HirIntIdMap
+    public scheduled_function_ids: HirIntIdMap
+    public codegen_body_done_ids: HirIntIdMap
+    public materialized_expr_count: i32
+    public profile_type_open_calls: i64
+    public profile_resolve_type_calls: i64
+    public profile_raw_class_calls: i64
+    public profile_ensure_method_calls: i64
+    public profile_method_target_calls: i64
+    public profile_field_lookup_calls: i64
+    public profile_function_open_calls: i64
+    public profile_type_id_ref_calls: i64
+    public profile_concrete_type_ref_calls: i64
+    public profile_type_id_text_calls: i64
+    public profile_ms_resolve_type: i64
+    public profile_ms_raw_class: i64
+    public profile_ms_raw_method_call: i64
+    public profile_ms_resolve_member: i64
+    public profile_ms_resolve_call: i64
+    public scheduled_body_count: i64
+    public materialized_body_count: i64
+    public export_root_bodies: bool
+    public export_method_roots: bool
+    public export_root_names: string
+    public export_root_names_specified: bool
+    /// `class <closed instance> <TAB> <closed foreign base>` rows, one per
+    /// materialized instance of a *generic* DCI stub class.  A generic stub
+    /// class has no single base at declaration level (`class VyxSink<T> :
+    /// native.SinkG<T>`), so its spec row can only be written once the class
+    /// is closed.  Downstream (`mir_builder`, `llvm_lower`, `mir_cpp_lower`)
+    /// keys every stub-class decision on the spec list, so a class missing
+    /// here is not a stub class at all.
+    public dci_stub_instance_specs: string
+    public materialize_imported_bodies: bool
+    public lazy_codegen: bool
+    public reflection_manifest_required: bool
+    public reflection_name_map_required: bool
+    public decl_owner_map: HirRawOwnerMap
+    public type_ref_ids: HirRawTypeIdMap
+    public locals: HirLocalScope
+    public pack_bindings: HirPackBindings
+    public current_function_id: i32
+    public current_item_id: i32
+    public current_call_callee_ast: rawptr
+    /// Binary exprs whose type was provisionally taken from the rhs because
+    /// the lhs operand was not yet typed (early instance-body builds driven
+    /// from index-operator consumer resolution).  A later typing pass with a
+    /// valid lhs corrects these to the lhs type; see
+    /// resolve_binary_expr_type_after_children.
+    public provisional_binary_rhs_map: rawptr
+    public capture_source_head: rawptr
+    public body_building_head: rawptr
+    public reachable_body_queue_head: rawptr
+    public reachable_body_queue_tail: rawptr
+    public current_generic_params: string
+    public current_generic_args: string
+    public source_unit: rawptr
+
+    public static fn create() -> HirUnitBuilder {
+        return HirUnitBuilder {
+            unit: HirUnit.create(),
+            decl_map: HirPointerMap.create(),
+            class_instances: HirDeclInstanceMap.create(),
+            field_instances: HirDeclInstanceMap.create(),
+            variant_instances: HirDeclInstanceMap.create(),
+            member_value_instances: HirDeclInstanceMap.create(),
+            function_instances: HirDeclInstanceMap.create(),
+            type_ref_env_ids: HirDeclInstanceMap.create(),
+            concrete_type_ready: hir_string_set_create(),
+            raw_class_exact: hir_raw_name_map_create(),
+            raw_class_template: hir_raw_name_map_create(),
+            raw_class_concrete: hir_raw_name_map_create(),
+            raw_class_lookup_cache: hir_raw_name_map_create(),
+            raw_class_miss_cache: hir_name_id_map_create(),
+            raw_class_scan_cache: hir_raw_name_map_create(),
+            raw_class_scan_stamp: hir_name_id_map_create(),
+            raw_template_scan_cache: hir_raw_name_map_create(),
+            raw_template_scan_stamp: hir_name_id_map_create(),
+            raw_class_index_version: 1,
+            registered_type_atoms: hir_string_set_create(),
+            method_function_index: hir_pair_id_map_create(),
+            field_index: hir_pair_id_map_create(),
+            free_function_index: hir_name_id_map_create(),
+            value_item_index: hir_name_id_map_create(),
+            decl_module_map: HirRawOwnerMap.create(),
+            closed_method_instance_index: hir_pair_id_map_create(),
+            owner_method_overload_cache: hir_pair_id_map_create(),
+            method_call_target_cache: hir_pair_id_map_create(),
+            raw_method_call_decl_cache: hir_pair_raw_map_create(),
+            raw_method_call_decl_miss_cache: hir_pair_id_map_create(),
+            raw_method_overload_count_cache: hir_pair_id_map_create(),
+            raw_method_lookup_cache: hir_pair_raw_map_create(),
+            raw_method_lookup_miss_cache: hir_pair_id_map_create(),
+            dyn_trait_impl_materialized_cache: hir_pair_id_map_create(),
+            dyn_trait_satisfaction_cache: hir_pair_id_map_create(),
+            function_open_cache: hir_i32_array_map_create(4096),
+            type_id_open_no_env_cache: hir_i32_array_map_create(4096),
+            function_type_cache: hir_int_id_map_create(),
+            zero_arg_function_type_cache: hir_int_id_map_create(),
+            type_text_open_cache: hir_name_id_map_create(),
+            type_text_id_cache: hir_name_id_map_create(),
+            resolved_type_text_cache: HirGenericBindingMap.create(),
+            member_decl_cache: hir_pair_raw_map_create(),
+            member_decl_miss_cache: hir_pair_id_map_create(),
+            concrete_method_decl_cache_static: hir_pair_raw_map_create(),
+            concrete_method_decl_cache_instance: hir_pair_raw_map_create(),
+            concrete_method_decl_miss_static: hir_pair_id_map_create(),
+            concrete_method_decl_miss_instance: hir_pair_id_map_create(),
+            interface_decl_cache: hir_raw_name_map_create(),
+            interface_decl_miss_cache: hir_name_id_map_create(),
+            type_alias_decl_cache: hir_raw_name_map_create_small(),
+            type_alias_decl_miss_cache: hir_name_id_map_create_small(),
+            decl_body_close_cache: HirDeclInstanceMap.create(),
+            type_ref_close_cache: HirDeclInstanceMap.create(),
+            template_body_cache: HirRawIntMap.create(),
+            template_members_cache: HirRawIntMap.create(),
+            template_param_cache: HirDeclInstanceMap.create(),
+            callable_borrow_cache: HirRawIntMap.create(),
+            decl_self_member_call_cache: HirRawIntMap.create(),
+            class_inherits_cache: HirRawPairIntMap.create(),
+            class_parent_cache: HirRawOwnerMap.create(),
+            method_owner_decl_cache: HirRawPairRawMap.create(),
+            direct_method_function_cache: HirRawPairIntMap.create(),
+            param_raw_move_cache: HirDeclInstanceMap.create(),
+            materialized_type_ids: hir_int_id_map_create(),
+            materialized_function_ids: hir_int_id_map_create(),
+            scheduled_function_ids: hir_int_id_map_create(),
+            codegen_body_done_ids: hir_int_id_map_create(),
+            materialized_expr_count: 0,
+            profile_type_open_calls: 0,
+            profile_resolve_type_calls: 0,
+            profile_raw_class_calls: 0,
+            profile_ensure_method_calls: 0,
+            profile_method_target_calls: 0,
+            profile_field_lookup_calls: 0,
+            profile_function_open_calls: 0,
+            profile_type_id_ref_calls: 0,
+            profile_concrete_type_ref_calls: 0,
+            profile_type_id_text_calls: 0,
+            profile_ms_resolve_type: 0,
+            profile_ms_raw_class: 0,
+            profile_ms_raw_method_call: 0,
+            profile_ms_resolve_member: 0,
+            profile_ms_resolve_call: 0,
+            scheduled_body_count: 0,
+            materialized_body_count: 0,
+            export_root_bodies: false,
+            export_method_roots: false,
+            export_root_names: "",
+            export_root_names_specified: false,
+            dci_stub_instance_specs: "",
+            materialize_imported_bodies: true,
+            lazy_codegen: false,
+            reflection_manifest_required: false,
+            reflection_name_map_required: false,
+            decl_owner_map: HirRawOwnerMap.create(),
+            type_ref_ids: HirRawTypeIdMap.create(),
+            locals: HirLocalScope.create(),
+            pack_bindings: HirPackBindings.create(),
+            current_function_id: hir_id_invalid(),
+            current_item_id: hir_id_invalid(),
+            current_call_callee_ast: null,
+            provisional_binary_rhs_map: null,
+            capture_source_head: null,
+            body_building_head: null,
+            reachable_body_queue_head: null,
+            reachable_body_queue_tail: null,
+            current_generic_params: "",
+            current_generic_args: "",
+            source_unit: null
+        };
+    }
+
+    fn invalidate_materialization_resolution_caches(self) {
+        self.raw_class_miss_cache = hir_name_id_map_dispose(self.raw_class_miss_cache);
+        self.member_decl_miss_cache = hir_pair_id_map_dispose(self.member_decl_miss_cache);
+        self.concrete_method_decl_miss_static = hir_pair_id_map_dispose(self.concrete_method_decl_miss_static);
+        self.concrete_method_decl_miss_instance = hir_pair_id_map_dispose(self.concrete_method_decl_miss_instance);
+        self.interface_decl_cache = hir_raw_name_map_dispose(self.interface_decl_cache);
+        self.interface_decl_miss_cache = hir_name_id_map_dispose(self.interface_decl_miss_cache);
+        self.raw_method_call_decl_cache = hir_pair_raw_map_dispose(self.raw_method_call_decl_cache);
+        self.raw_method_call_decl_miss_cache = hir_pair_id_map_dispose(self.raw_method_call_decl_miss_cache);
+        self.raw_method_overload_count_cache = hir_pair_id_map_dispose(self.raw_method_overload_count_cache);
+        self.owner_method_overload_cache = hir_pair_id_map_dispose(self.owner_method_overload_cache);
+        self.raw_method_lookup_cache = hir_pair_raw_map_dispose(self.raw_method_lookup_cache);
+        self.raw_method_lookup_miss_cache = hir_pair_id_map_dispose(self.raw_method_lookup_miss_cache);
+        self.dyn_trait_impl_materialized_cache = hir_pair_id_map_dispose(self.dyn_trait_impl_materialized_cache);
+        self.dyn_trait_satisfaction_cache = hir_pair_id_map_dispose(self.dyn_trait_satisfaction_cache);
+    }
+
+    public fn reset_materialization_scoped_caches(self) {
+        self.invalidate_materialization_resolution_caches();
+        vyx_rt_heap_trim();
+    }
+
+    public fn release_codegen_state(self) {
+        self.reset_materialization_scoped_caches();
+        self.decl_map = hir_pointer_map_dispose(self.decl_map);
+        self.class_instances = hir_decl_instance_map_dispose(self.class_instances);
+        self.field_instances = hir_decl_instance_map_dispose(self.field_instances);
+        self.variant_instances = hir_decl_instance_map_dispose(self.variant_instances);
+        self.member_value_instances = hir_decl_instance_map_dispose(self.member_value_instances);
+        self.function_instances = hir_decl_instance_map_dispose(self.function_instances);
+        self.type_ref_env_ids = hir_decl_instance_map_dispose(self.type_ref_env_ids);
+        self.concrete_type_ready = hir_string_set_dispose(self.concrete_type_ready);
+        self.raw_class_exact = hir_raw_name_map_dispose(self.raw_class_exact);
+        self.raw_class_template = hir_raw_name_map_dispose(self.raw_class_template);
+        self.raw_class_concrete = hir_raw_name_map_dispose(self.raw_class_concrete);
+        self.raw_class_scan_cache = hir_raw_name_map_dispose(self.raw_class_scan_cache);
+        self.raw_class_scan_stamp = hir_name_id_map_dispose(self.raw_class_scan_stamp);
+        self.raw_template_scan_cache = hir_raw_name_map_dispose(self.raw_template_scan_cache);
+        self.raw_template_scan_stamp = hir_name_id_map_dispose(self.raw_template_scan_stamp);
+        self.registered_type_atoms = hir_string_set_dispose(self.registered_type_atoms);
+        self.method_function_index = hir_pair_id_map_dispose(self.method_function_index);
+        self.field_index = hir_pair_id_map_dispose(self.field_index);
+        self.free_function_index = hir_name_id_map_dispose(self.free_function_index);
+        self.value_item_index = hir_name_id_map_dispose(self.value_item_index);
+        self.decl_module_map = hir_raw_owner_map_dispose(self.decl_module_map);
+        self.closed_method_instance_index = hir_pair_id_map_dispose(self.closed_method_instance_index);
+        self.owner_method_overload_cache = hir_pair_id_map_dispose(self.owner_method_overload_cache);
+        self.raw_method_call_decl_cache = hir_pair_raw_map_dispose(self.raw_method_call_decl_cache);
+        self.raw_method_call_decl_miss_cache = hir_pair_id_map_dispose(self.raw_method_call_decl_miss_cache);
+        self.raw_method_overload_count_cache = hir_pair_id_map_dispose(self.raw_method_overload_count_cache);
+        self.raw_method_lookup_cache = hir_pair_raw_map_dispose(self.raw_method_lookup_cache);
+        self.raw_method_lookup_miss_cache = hir_pair_id_map_dispose(self.raw_method_lookup_miss_cache);
+        self.dyn_trait_impl_materialized_cache = hir_pair_id_map_dispose(self.dyn_trait_impl_materialized_cache);
+        self.dyn_trait_satisfaction_cache = hir_pair_id_map_dispose(self.dyn_trait_satisfaction_cache);
+        self.interface_decl_cache = hir_raw_name_map_dispose(self.interface_decl_cache);
+        self.interface_decl_miss_cache = hir_name_id_map_dispose(self.interface_decl_miss_cache);
+        self.type_alias_decl_cache = hir_raw_name_map_dispose(self.type_alias_decl_cache);
+        self.type_alias_decl_miss_cache = hir_name_id_map_dispose(self.type_alias_decl_miss_cache);
+        self.function_open_cache = hir_i32_array_map_dispose(self.function_open_cache);
+        self.type_id_open_no_env_cache = hir_i32_array_map_dispose(self.type_id_open_no_env_cache);
+        self.function_type_cache = hir_int_id_map_dispose(self.function_type_cache);
+        self.zero_arg_function_type_cache = hir_int_id_map_dispose(self.zero_arg_function_type_cache);
+        self.type_text_id_cache = hir_name_id_map_dispose(self.type_text_id_cache);
+        self.type_ref_close_cache = hir_decl_instance_map_dispose(self.type_ref_close_cache);
+        self.template_body_cache = hir_raw_int_map_dispose(self.template_body_cache);
+        self.template_members_cache = hir_raw_int_map_dispose(self.template_members_cache);
+        self.template_param_cache = hir_decl_instance_map_dispose(self.template_param_cache);
+        self.callable_borrow_cache = hir_raw_int_map_dispose(self.callable_borrow_cache);
+        self.decl_self_member_call_cache = hir_raw_int_map_dispose(self.decl_self_member_call_cache);
+        self.class_inherits_cache = hir_raw_pair_int_map_dispose(self.class_inherits_cache);
+        self.class_parent_cache = hir_raw_owner_map_dispose(self.class_parent_cache);
+        self.method_owner_decl_cache = hir_raw_pair_raw_map_dispose(self.method_owner_decl_cache);
+        self.direct_method_function_cache = hir_raw_pair_int_map_dispose(self.direct_method_function_cache);
+        self.param_raw_move_cache = hir_decl_instance_map_dispose(self.param_raw_move_cache);
+        self.materialized_type_ids = hir_int_id_map_dispose(self.materialized_type_ids);
+        self.materialized_function_ids = hir_int_id_map_dispose(self.materialized_function_ids);
+        self.scheduled_function_ids = hir_int_id_map_dispose(self.scheduled_function_ids);
+        self.codegen_body_done_ids = hir_int_id_map_dispose(self.codegen_body_done_ids);
+        self.decl_owner_map = hir_raw_owner_map_dispose(self.decl_owner_map);
+        self.type_ref_ids = hir_raw_type_id_map_dispose(self.type_ref_ids);
+        self.locals = hir_local_scope_dispose(self.locals);
+        self.pack_bindings = hir_pack_bindings_dispose(self.pack_bindings);
+        self.capture_source_head = null;
+        self.body_building_head = null;
+        self.reachable_body_queue_head = null;
+        self.reachable_body_queue_tail = null;
+        self.current_generic_params = "";
+        self.current_generic_args = "";
+        self.source_unit = null;
+        vyx_rt_heap_trim();
+    }
+
+    public fn build(self, unit_ptr: rawptr) {
+        self.source_unit = unit_ptr;
+        self.profile_build_phase("start");
+        self.preindex_decl_modules(unit_get_decls(unit_ptr), null);
+        self.preindex_raw_type_decls(unit_get_decls(unit_ptr));
+        self.register_decl_chain(unit_get_decls(unit_ptr), hir_id_invalid());
+        self.profile_build_phase("registered");
+        self.build_initializers_for_decl_chain(unit_get_decls(unit_ptr), false);
+        self.profile_build_phase("initializers");
+        self.materialize_function_roots(unit_ptr);
+        self.profile_build_phase("root-functions");
+        if (self.lazy_codegen) {
+            self.materialize_language_lowering_roots();
+            self.profile_build_phase("lazy-language-roots");
+            self.materialize_concrete_type_items();
+            self.profile_build_phase("lazy-concrete-types");
+            self.resolve_deferred_member_exprs();
+            self.profile_build_phase("lazy-deferred-members");
+            self.finalize_foreign_cpp_metadata();
+            self.profile_summary("lazy-build");
+            return self.unit;
+        }
+        self.materialize_reachable_function_bodies();
+        self.profile_build_phase("reachable-1");
+        self.materialize_language_lowering_roots();
+        self.profile_build_phase("language-roots");
+        self.materialize_reachable_function_bodies();
+        self.profile_build_phase("reachable-2");
+        self.materialize_concrete_type_items();
+        self.profile_build_phase("concrete-types");
+        self.resolve_deferred_member_exprs();
+        self.profile_build_phase("deferred-members");
+        self.finalize_foreign_cpp_metadata();
+        self.finalize_reflection_metadata();
+        self.profile_summary("build");
+    }
+}
+
+fn hir_build_unit(unit_ptr: rawptr) -> HirUnit {
+    let builder = HirUnitBuilder.create();
+    builder.build(unit_ptr);
+    return builder.unit;
+}
+
+fn hir_build_unit_for_codegen(unit_ptr: rawptr, export_root_bodies: bool) -> HirUnit {
+    var builder = HirUnitBuilder.create();
+    builder.export_root_bodies = export_root_bodies;
+    builder.materialize_imported_bodies = true;
+    builder.lazy_codegen = true;
+    builder.build(unit_ptr);
+    builder.finalize_codegen_hir();
+    return builder.unit;
+}
+
+fn hir_build_codegen_builder(unit_ptr: rawptr, export_root_bodies: bool) -> HirUnitBuilder {
+    var builder = HirUnitBuilder.create();
+    builder.export_root_bodies = export_root_bodies;
+    builder.materialize_imported_bodies = true;
+    builder.lazy_codegen = true;
+    builder.build(unit_ptr);
+    if (export_root_bodies) {
+        builder.materialize_function_body_for_codegen(hir_id_invalid());
+        builder.discard_function_body_after_codegen(hir_id_invalid(), 0, 0, 0);
+        builder.discard_function_body_records_after_codegen(hir_id_invalid(), 0, 0, 0);
+    }
+    return builder;
+}
+
+fn hir_build_codegen_builder_with_method_roots(unit_ptr: rawptr,
+                                               export_root_bodies: bool,
+                                               export_method_roots: bool) -> HirUnitBuilder {
+    return hir_build_codegen_builder_with_export_roots(unit_ptr,
+                                                       export_root_bodies,
+                                                       export_method_roots,
+                                                       "",
+                                                       false);
+}
+
+fn hir_build_codegen_builder_with_export_roots(unit_ptr: rawptr,
+                                               export_root_bodies: bool,
+                                               export_method_roots: bool,
+                                               export_root_names: string,
+                                               export_root_names_specified: bool) -> HirUnitBuilder {
+    var builder = HirUnitBuilder.create();
+    builder.export_root_bodies = export_root_bodies;
+    builder.export_method_roots = export_method_roots;
+    builder.export_root_names = export_root_names;
+    builder.export_root_names_specified = export_root_names_specified;
+    builder.materialize_imported_bodies = true;
+    builder.lazy_codegen = true;
+    builder.build(unit_ptr);
+    if (export_root_bodies) {
+        builder.materialize_function_body_for_codegen(hir_id_invalid());
+        builder.discard_function_body_after_codegen(hir_id_invalid(), 0, 0, 0);
+        builder.discard_function_body_records_after_codegen(hir_id_invalid(), 0, 0, 0);
+    }
+    return builder;
+}
+
+fn hir_codegen_builder_handle_alloc(builder: HirUnitBuilder) -> rawptr {
+    let handle = malloc(repr_sizeof::<HirUnitBuilder>());
+    if (handle == null) { return null; }
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+    return handle;
+}
+
+fn hir_codegen_builder_handle_load(handle: rawptr) -> HirUnitBuilder {
+    var builder: HirUnitBuilder;
+    if (handle == null) {
+        return HirUnitBuilder.create();
+    }
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    return builder;
+}
+
+fn hir_codegen_builder_handle_store(handle: rawptr, builder: HirUnitBuilder) {
+    if (handle == null) { return; }
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+}
+
+public fn hir_build_codegen_builder_handle_with_export_roots(unit_ptr: rawptr,
+                                                            export_root_bodies: bool,
+                                                            export_method_roots: bool,
+                                                            export_root_names: string,
+                                                            export_root_names_specified: bool) -> rawptr {
+    let builder = hir_build_codegen_builder_with_export_roots(unit_ptr,
+                                                              export_root_bodies,
+                                                              export_method_roots,
+                                                              export_root_names,
+                                                              export_root_names_specified);
+    return hir_codegen_builder_handle_alloc(builder);
+}
+
+public fn hir_codegen_builder_handle_unit(handle: rawptr) -> HirUnit {
+    if (handle == null) { return HirUnit.create(); }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    return builder.unit;
+}
+
+public fn hir_codegen_builder_handle_set_unit(handle: rawptr, unit: HirUnit) {
+    if (handle == null) { return; }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    builder.unit = unit;
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+}
+
+fn hir_build_unit_for_codegen_marked_roots(unit_ptr: rawptr, export_root_bodies: bool) -> HirUnit {
+    var builder = HirUnitBuilder.create();
+    builder.export_root_bodies = export_root_bodies;
+    builder.materialize_imported_bodies = true;
+    builder.lazy_codegen = true;
+    builder.build(unit_ptr);
+    if (export_root_bodies) {
+        builder.materialize_function_body_for_codegen(hir_id_invalid());
+    }
+    builder.materialize_marked_codegen_roots();
+    builder.finalize_reflection_metadata();
+    return builder.unit;
+}
+
+fn hir_codegen_builder_materialize_function_body(builder: HirUnitBuilder, function_id: i32) -> HirUnitBuilder {
+    builder.materialize_function_body_for_codegen(function_id);
+    return builder;
+}
+
+fn hir_codegen_builder_empty() -> HirUnitBuilder {
+    return HirUnitBuilder.create();
+}
+
+fn hir_codegen_builder_reset_materialization_scoped_caches(builder: HirUnitBuilder) -> HirUnitBuilder {
+    builder.reset_materialization_scoped_caches();
+    return builder;
+}
+
+fn hir_codegen_builder_discard_function_body_records_after_codegen(builder: HirUnitBuilder,
+                                                                   function_id: i32,
+                                                                   stmt_mark: i32,
+                                                                   expr_mark: i32,
+                                                                   local_mark: i32) -> HirUnitBuilder {
+    builder.discard_function_body_records_after_codegen(function_id, stmt_mark, expr_mark, local_mark);
+    return builder;
+}
+
+fn hir_codegen_builder_finalize_reflection_metadata(builder: HirUnitBuilder) -> HirUnitBuilder {
+    builder.finalize_reflection_metadata();
+    return builder;
+}
+
+fn hir_codegen_builder_prepare_materialized_facts(builder: HirUnitBuilder, function_id: i32) -> HirUnitBuilder {
+    builder.materialize_concrete_type_items_for_function(function_id);
+    var changed = builder.resolve_deferred_member_exprs_once();
+    var guard: i32 = 0;
+    while (changed && guard < 4) {
+        builder.materialize_concrete_type_items_for_function(function_id);
+        changed = builder.resolve_deferred_member_exprs_once();
+        guard = guard + 1;
+    }
+    return builder;
+}
+
+fn hir_codegen_builder_mark_function_body_codegen_done(builder: HirUnitBuilder, function_id: i32) -> HirUnitBuilder {
+    if (function_id != hir_id_invalid()) {
+        builder.codegen_body_done_ids = hir_int_id_map_put(builder.codegen_body_done_ids,function_id, 1);
+        builder.scheduled_function_ids = hir_int_id_map_put(builder.scheduled_function_ids,function_id, 2);
+    }
+    return builder;
+}
+
+fn hir_codegen_builder_release_codegen_state(builder: HirUnitBuilder) -> HirUnitBuilder {
+    builder.release_codegen_state();
+    return builder;
+}
+
+fn hir_codegen_builder_materialize_function_body_ok(builder: HirUnitBuilder, function_id: i32) -> bool {
+    return builder.materialize_function_body_for_codegen(function_id);
+}
+
+fn hir_codegen_builder_prepare_materialized_facts_inplace(builder: HirUnitBuilder, function_id: i32) {
+    builder.materialize_concrete_type_items_for_function(function_id);
+    var changed = builder.resolve_deferred_member_exprs_once();
+    var guard: i32 = 0;
+    while (changed && guard < 4) {
+        builder.materialize_concrete_type_items_for_function(function_id);
+        changed = builder.resolve_deferred_member_exprs_once();
+        guard = guard + 1;
+    }
+}
+
+public fn hir_codegen_builder_handle_materialize_function_body(handle: rawptr, function_id: i32) -> bool {
+    if (handle == null) { return false; }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    builder.materialize_function_body_for_codegen(function_id);
+    let ok = builder.unit.function_body(function_id) != hir_id_invalid();
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+    return ok;
+}
+
+/// Handled variant of `HirUnitBuilder.function_body_is_recoverable`: the MIR
+/// builder owns the HIR builder only through this handle.
+public fn hir_codegen_builder_handle_function_body_is_recoverable(handle: rawptr, function_id: i32) -> bool {
+    if (handle == null) { return false; }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    return builder.function_body_is_recoverable(function_id);
+}
+
+fn hir_codegen_builder_handle_reset_materialization_scoped_caches(handle: rawptr) {
+    if (handle == null) { return; }
+    var builder = hir_codegen_builder_handle_load(handle);
+    builder.reset_materialization_scoped_caches();
+    hir_codegen_builder_handle_store(handle, builder);
+}
+
+fn hir_codegen_builder_handle_discard_function_body_records_after_codegen(handle: rawptr,
+                                                                         function_id: i32,
+                                                                         stmt_mark: i32,
+                                                                         expr_mark: i32,
+                                                                         local_mark: i32) {
+    if (handle == null) { return; }
+    var builder = hir_codegen_builder_handle_load(handle);
+    builder.discard_function_body_records_after_codegen(function_id, stmt_mark, expr_mark, local_mark);
+    hir_codegen_builder_handle_store(handle, builder);
+}
+
+public fn hir_codegen_builder_handle_finish_function_codegen(handle: rawptr,
+                                                             function_id: i32,
+                                                             stmt_mark: i32,
+                                                             expr_mark: i32,
+                                                             local_mark: i32) {
+    if (handle == null) { return; }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    if (function_id != hir_id_invalid()
+        && builder.unit.function_body(function_id) != hir_id_invalid()) {
+        builder.discard_function_body_records_after_codegen(function_id, stmt_mark, expr_mark, local_mark);
+        builder.codegen_body_done_ids = hir_int_id_map_put(builder.codegen_body_done_ids,function_id, 1);
+        builder.scheduled_function_ids = hir_int_id_map_put(builder.scheduled_function_ids,function_id, 2);
+    } else {
+        builder.invalidate_materialization_resolution_caches();
+    }
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+}
+
+public fn hir_codegen_builder_handle_finalize_reflection_metadata(handle: rawptr) {
+    if (handle == null) { return; }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    builder.finalize_reflection_metadata();
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+}
+
+public fn hir_codegen_builder_handle_prepare_materialized_facts(handle: rawptr, function_id: i32) {
+    if (handle == null) { return; }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    builder.materialize_concrete_type_items_for_function(function_id);
+    var changed = builder.resolve_deferred_member_exprs_once();
+    var guard: i32 = 0;
+    while (changed && guard < 4) {
+        builder.materialize_concrete_type_items_for_function(function_id);
+        changed = builder.resolve_deferred_member_exprs_once();
+        guard = guard + 1;
+    }
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+}
+
+public fn hir_codegen_builder_handle_ensure_concrete_type_text_ready(handle: rawptr, text: string) -> bool {
+    if (handle == null || text.len == 0) { return false; }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    let before_items = builder.unit.item_count;
+    let before_types = builder.unit.types.count;
+    let type_id = builder.ensure_concrete_type_text_ready(text);
+    let changed = builder.unit.item_count != before_items || builder.unit.types.count != before_types;
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+    return type_id != hir_id_invalid() || changed;
+}
+
+fn hir_codegen_builder_handle_mark_function_body_codegen_done(handle: rawptr, function_id: i32) {
+    if (handle == null) { return; }
+    var builder = hir_codegen_builder_handle_load(handle);
+    if (function_id != hir_id_invalid()) {
+        builder.codegen_body_done_ids = hir_int_id_map_put(builder.codegen_body_done_ids,function_id, 1);
+        builder.scheduled_function_ids = hir_int_id_map_put(builder.scheduled_function_ids,function_id, 2);
+    }
+    hir_codegen_builder_handle_store(handle, builder);
+}
+
+public fn hir_codegen_builder_handle_release_codegen_state(handle: rawptr) {
+    if (handle == null) { return; }
+    var builder: HirUnitBuilder;
+    memcpy(to_rawptr(&builder), handle, repr_sizeof::<HirUnitBuilder>());
+    builder.release_codegen_state();
+    memcpy(handle, to_rawptr(&builder), repr_sizeof::<HirUnitBuilder>());
+}
+
+public fn hir_codegen_builder_handle_free(handle: rawptr) {
+    if (handle == null) { return; }
+    free(handle);
+}

@@ -1,0 +1,202 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn build_zeroed_class_object(self, type_id: i32) -> rawptr {
+        let owner_type = self.canonical_record_type_id(type_id);
+        let record_ty = self.class_record_storage_ty(owner_type);
+        if (record_ty == null) {
+            self.report_error("cannot lower zero-init class type " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        var size_bytes = vyx_rt_type_alloc_size(self.mod, record_ty);
+        let dci_size_bytes = self.dci_record_size_bytes_for_type(owner_type);
+        if (dci_size_bytes > 0) {
+            size_bytes = dci_size_bytes;
+        } else if (self.type_is_foreign_dci(owner_type)) {
+            self.report_error("missing DCI record layout for external type "
+                      + llvm_mir_type_text(&self.m, owner_type));
+            return null;
+        }
+        if (size_bytes <= 0) {
+            var measured_fields = mir_unit_field_count_for_type(&self.m, owner_type);
+            if (measured_fields <= 0) { measured_fields = 1; }
+            size_bytes = ((measured_fields as i64) * 8) + 16;
+        }
+        let obj = llvm_lifetime_allocate_class_storage(self.mod, size_bytes, "mir.class.zeroinit",
+                                                        self.builtin_class_alloc_fty, self.builtin_class_alloc_fn,
+                                                        self.builtin_malloc_fty, self.builtin_malloc_fn,
+                                                        self.builtin_free_fn,
+                                                        self.type_is_foreign_dci(owner_type));
+        if (obj == null) { return null; }
+        if (self.builtin_memset_fn == null || self.builtin_memset_fty == null) {
+            self.report_error("memset is not declared before class zero-initialization");
+            return null;
+        }
+        let zeroed = vyx_rt_build_call3(self.mod,
+                                        self.builtin_memset_fty,
+                                        self.builtin_memset_fn,
+                                        obj,
+                                        vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                        vyx_rt_const_int(self.mod, self.ty_i64, size_bytes, 0),
+                                        llvm_mir_empty_name(),
+                                        0);
+        if (zeroed == null) {
+            self.report_error("cannot clear zero-init class object " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        return obj;
+    }
+
+    public fn lower_instr(self, instr_id: i32) {
+        self.current_instr_id = instr_id;
+        // Deref addresses are only shared within a single instruction; the
+        // next instruction must re-resolve (the pointer may have changed).
+        llvm_mir_map_clear_range(self.instr_deref_addr_cache, 0, self.m.place_count + 2);
+        self.current_value_id = self.m.instr_value(instr_id);
+        self.current_place_id = self.m.instr_place(instr_id);
+        let kind = self.m.instr_kind(instr_id);
+        if (kind == mir_instr_eval()) {
+            let value_id = self.m.instr_value(instr_id);
+            if (value_id == mir_id_invalid()) { return; }
+            if (self.m.value_kind(value_id) == mir_value_call()
+                && self.resolved_call_name(value_id) == "assert") {
+                self.lower_assert_call(value_id);
+                return;
+            }
+            self.lower_value(value_id);
+            return;
+        }
+        if (kind == mir_instr_assign()) {
+            let place_id = self.m.instr_place(instr_id);
+            let dst_type = self.place_effective_type(place_id);
+            let addr = self.lower_place_addr(place_id);
+            let value_id = self.m.instr_value(instr_id);
+            if (addr == null) {
+                self.report_error("cannot lower assignment destination for instr #"
+                          + policy_i64_to_string(instr_id as i64)
+                          + " place #" + policy_i64_to_string(place_id as i64)
+                          + " type " + llvm_mir_type_text(&self.m, dst_type));
+                return;
+            }
+            if (self.lower_string_append_assign_into_place(instr_id, place_id, value_id, addr, dst_type)) {
+                return;
+            }
+            if (self.lower_dci_bitfield_store(place_id, addr, value_id, dst_type)) { return; }
+            if (self.place_is_self_pointer_abi_slot(place_id)) {
+                let ptr_val = self.lower_self_receiver_address(value_id, dst_type);
+                if (ptr_val == null) {
+                    self.report_error("cannot lower self pointer assignment value for instr #"
+                              + policy_i64_to_string(instr_id as i64));
+                    return;
+                }
+                vyx_rt_build_store(self.mod, ptr_val, addr);
+                return;
+            }
+            if (self.type_is_class_pointer_abi(dst_type)
+                && self.place_is_direct_class_object_pointer(place_id)) {
+                if (!self.copy_value_storage_to_addr(addr,
+                                                     value_id,
+                                                     dst_type,
+                                                     "assignment instr #"
+                                                     + policy_i64_to_string(instr_id as i64))) {
+                    self.report_error("cannot lower class storage assignment instr #"
+                              + policy_i64_to_string(instr_id as i64));
+                }
+                self.track_shared_unwind_owner(place_id, addr);
+                return;
+            }
+            var val = self.lower_value_as(value_id, dst_type);
+            if (val == null) {
+                self.report_error("cannot lower assignment value for instr #"
+                          + policy_i64_to_string(instr_id as i64)
+                          + " value #" + policy_i64_to_string(value_id as i64)
+                          + " type " + llvm_mir_type_text(&self.m, self.value_effective_type(value_id)));
+                self.report_error("cannot lower assignment instr #" + policy_i64_to_string(instr_id as i64));
+                return;
+            }
+            if (self.assignment_should_retain_ref_handle(place_id, value_id, dst_type)) {
+                val = self.retain_ref_handle_value(val, dst_type);
+                if (val == null) {
+                    self.report_error("cannot retain Ref assignment value for instr #"
+                              + policy_i64_to_string(instr_id as i64));
+                    return;
+                }
+            }
+            if (self.place_is_volatile_local(place_id)) {
+                vyx_rt_build_store_volatile(self.mod, val, addr);
+            } else if (self.m.place_kind(place_id) == mir_place_deref()
+                && self.ptr_alias_domain != null) {
+                vyx_rt_set_alias_scopes_on_store(self.mod, val, addr, self.ptr_alias_domain, 1);
+            } else {
+                let stored = vyx_rt_build_store_instruction(self.mod, val, addr);
+                if (stored != null && self.m.place_kind(place_id) == mir_place_local()) {
+                    self.emit_debug_local_at_assignment(self.m.place_local(place_id), stored);
+                }
+            }
+            self.track_shared_unwind_owner(place_id, addr);
+            return;
+        }
+        if (kind == mir_instr_static_assert()) {
+            self.lower_static_assert_instr(instr_id);
+            return;
+        }
+        if (kind == mir_instr_drop()) {
+            self.lower_drop_instr(instr_id);
+            return;
+        }
+        if (kind == mir_instr_foreach_bind()) {
+            self.lower_foreach_bind_instr(instr_id);
+            return;
+        }
+        // Storage lifetime ends are optimizer metadata. They must not become a
+        // Drop here: ownership destruction remains represented by mir_instr_drop.
+        if (kind == mir_instr_storage_dead()) {
+            if (self.local_lifetime_marker_selected(instr_id)) {
+                let dead_place = self.m.instr_place(instr_id);
+                let dead_addr = self.lower_place_addr(dead_place);
+                if (!self.emit_local_lifetime_marker(instr_id, dead_addr, false)) { return; }
+            }
+            return;
+        }
+        if (kind == mir_instr_storage_live()) {
+            let place_id2 = self.m.instr_place(instr_id);
+            if (place_id2 == mir_id_invalid()) { return; }
+            let addr2 = self.lower_place_addr(place_id2);
+            let live_type = self.place_effective_type(place_id2);
+            if (!self.emit_local_lifetime_marker(instr_id, addr2, true)) { return; }
+            // `var x: SomeClass;` without an initializer: a class-pointer-ABI
+            // local would otherwise hold a null handle and the first direct
+            // field write (e.g. Dict::keys building a Vec field by field)
+            // would dereference null. Materialize a zeroed object instead.
+            // Initialized declarations keep the cheap null default — the
+            // following assign overwrites the handle.
+            if (self.type_is_class_pointer_abi(live_type)
+                && self.m.instr_source_expr(instr_id) == mir_id_invalid()) {
+                let obj2 = self.build_zeroed_class_object(live_type);
+                if (addr2 == null || obj2 == null) {
+                    self.report_error("cannot zero-initialize class storage for instr #" + policy_i64_to_string(instr_id as i64));
+                    return;
+                }
+                let stored_obj = vyx_rt_build_store(self.mod, obj2, addr2);
+                if (stored_obj != null && self.m.place_kind(place_id2) == mir_place_local()) {
+                    self.emit_debug_local_at_assignment(self.m.place_local(place_id2), stored_obj);
+                }
+                return;
+            }
+            let init2 = self.default_value_for_type(live_type);
+            if (addr2 == null || init2 == null) {
+                self.report_error("cannot initialize storage for instr #" + policy_i64_to_string(instr_id as i64));
+                return;
+            }
+            let stored_init = vyx_rt_build_store(self.mod, init2, addr2);
+            if (stored_init != null && self.m.place_kind(place_id2) == mir_place_local()) {
+                self.emit_debug_local_at_assignment(self.m.place_local(place_id2), stored_init);
+            }
+            return;
+        }
+        if (kind == mir_instr_match_arm()) { return; }
+        self.report_error("cannot lower instr #" + policy_i64_to_string(instr_id as i64)
+                  + " kind=" + policy_i64_to_string(kind as i64));
+    }
+}

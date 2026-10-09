@@ -14,6 +14,6 @@ Self-host Vyx editor support. Both plugins talk to `vyxc-lsp` and `vyxc-dap` fro
 
 Installation, tool paths, and debugging: [English](../../docs/TOOLING.md) · [简体中文](../../docs/TOOLING_ZH.md).
 
-See each folder’s README for install and settings. Language-server behavior lives in `../src/core/lsp_main.vyx`; the debug adapter in `../src/core/dap_main.vyx`.
+See each folder’s README for install and settings. Language-server behavior lives in `../src/core/tooling/lsp_main.vyx`; the debug adapter in `../src/core/tooling/dap_main.vyx`.
 
 `use std.` completion lists registered `std.*` (and other) modules with prefix match; further characters and `.` re-query the list.

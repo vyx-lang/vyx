@@ -1,0 +1,143 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn effective_expr_type(self, expr_id: i32, expected_type_id: i32) -> i32 {
+        let actual_type_id = self.h.expr_type(expr_id);
+        if (expected_type_id == hir_id_invalid()) { return actual_type_id; }
+        if (actual_type_id == hir_id_invalid()) { return expected_type_id; }
+        if (actual_type_id == expected_type_id) { return actual_type_id; }
+        let actual_text = self.type_text(actual_type_id);
+        let expected_text = self.type_text(expected_type_id);
+        if (actual_text == expected_text) { return expected_type_id; }
+        if (self.type_dyn_trait_id(expected_type_id) != hir_id_invalid()
+            && self.type_dyn_payload_id(actual_type_id) != hir_id_invalid()) {
+            self.ensure_dyn_trait_methods_reachable(actual_type_id, expected_type_id);
+        }
+        if (self.type_is_dyn_trait(expected_type_id) && !self.type_is_dyn_trait(actual_type_id)) {
+            return expected_type_id;
+        }
+        if (policy_generic_call_has_args(expected_text.clone()) != 0
+            && policy_generic_call_has_args(actual_text.clone()) == 0
+            && self.type_base_text(expected_text) == actual_text) {
+            return expected_type_id;
+        }
+        if (policy_generic_call_has_args(expected_text.clone()) != 0
+            && policy_generic_call_has_args(actual_text.clone()) != 0
+            && self.type_base_text(expected_text) == self.type_base_text(actual_text)
+            && self.type_name_has_open_template_atom(actual_text)
+            && !self.type_name_has_open_template_atom(expected_text)) {
+            return expected_type_id;
+        }
+        return actual_type_id;
+    }
+
+    public fn lower_array_decay_expr_as(self, expr_id: i32, expected_type_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid() || expected_type_id == hir_id_invalid()) {
+            return mir_id_invalid();
+        }
+        let source_type_id = self.h.expr_type(expr_id);
+        if (source_type_id == hir_id_invalid()
+            || hir_type_table_kind(self.h.types, source_type_id) != ty_ARRAY()
+            || hir_type_table_kind(self.h.types, expected_type_id) != ty_PTR()) {
+            return mir_id_invalid();
+        }
+        let source_elem_type = hir_type_table_elem(self.h.types, source_type_id);
+        let pointer_elem_type = hir_type_table_elem(self.h.types, expected_type_id);
+        if (source_elem_type == hir_id_invalid()
+            || pointer_elem_type == hir_id_invalid()
+            || !self.type_ids_equivalent(source_elem_type, pointer_elem_type)) {
+            return mir_id_invalid();
+        }
+        var source_place = self.lower_expr_place(expr_id);
+        if (source_place == mir_id_invalid()) {
+            // Temporary array literal (e.g. a bare `[1, 2, 3]` call
+            // argument, or the `[e1..en]` synthesized for `Vec<i32>{...}`
+            // list initialization): there is no storage to address yet.
+            // Materialize the aggregate into a temp place of the array
+            // type, then decay that place.  The expected type must be
+            // cleared while lowering so the aggregate keeps its real array
+            // type instead of being rebuilt under the pointer type.
+            let saved_expected = self.expected_expr_type_id;
+            self.expected_expr_type_id = hir_id_invalid();
+            let agg = self.lower_expr(expr_id);
+            self.expected_expr_type_id = saved_expected;
+            if (agg == mir_id_invalid()) { return mir_id_invalid(); }
+            let temp_place = self.add_temp_place(source_type_id, expr_id, "array.decay");
+            if (temp_place == mir_id_invalid()) { return mir_id_invalid(); }
+            self.emit_assign(temp_place, agg, hir_id_invalid(), expr_id);
+            source_place = temp_place;
+        }
+        let zero = self.add_const_i64_value(0, expr_id);
+        if (zero == mir_id_invalid()) { return mir_id_invalid(); }
+        let first_elem_place = self.unit.add_place(
+                                                  self.current_function_id,
+                                                  mir_place_index(),
+                                                  source_elem_type,
+                                                  mir_id_invalid(),
+                                                  source_place,
+                                                  mir_id_invalid(),
+                                                  zero,
+                                                  expr_id,
+                                                  "array.decay");
+        return self.unit.add_value(
+                                  self.current_function_id,
+                                  mir_value_address_of(),
+                                  expected_type_id,
+                                  first_elem_place,
+                                  mir_target_none(),
+                                  mir_id_invalid(),
+                                  expr_id,
+                                  hir_unit_expr_flags(self.h, expr_id),
+                                  self.h.expr_op(expr_id),
+                                  hir_unit_expr_int_value(self.h, expr_id),
+                                  "array.decay",
+                                  self.h.expr_value_text(expr_id));
+    }
+
+    public fn lower_expr_as(self, expr_id: i32, expected_type_id: i32) -> i32 {
+        self.ensure_str_to_std_string_support(expr_id, expected_type_id);
+        let array_decay = self.lower_array_decay_expr_as(expr_id, expected_type_id);
+        if (array_decay != mir_id_invalid()) { return array_decay; }
+        let saved = self.expected_expr_type_id;
+        self.expected_expr_type_id = expected_type_id;
+        let out = self.lower_expr(expr_id);
+        self.expected_expr_type_id = saved;
+        if (out != mir_id_invalid()
+            && expected_type_id != hir_id_invalid()
+            && self.unit.value_type(out) != hir_id_invalid()
+            && !self.type_ids_equivalent(self.unit.value_type(out), expected_type_id)) {
+            self.ensure_dyn_trait_methods_reachable(self.unit.value_type(out), expected_type_id);
+            let cast_value = self.unit.add_value(
+                                                self.current_function_id,
+                                                mir_value_cast(),
+                                                expected_type_id,
+                                                mir_id_invalid(),
+                                                mir_target_none(),
+                                                mir_id_invalid(),
+                                                expr_id,
+                                                hir_unit_expr_flags(self.h, expr_id),
+                                                self.h.expr_op(expr_id),
+                                                hir_unit_expr_int_value(self.h, expr_id),
+                                                self.h.expr_name(expr_id),
+                                                self.h.expr_value_text(expr_id));
+            self.unit.set_value_lhs( cast_value, out);
+            return cast_value;
+        }
+        return out;
+    }
+}

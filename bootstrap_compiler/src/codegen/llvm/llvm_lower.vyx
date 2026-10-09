@@ -1,0 +1,3452 @@
+module bootstrap.llvm_mir_lower;
+
+use std.fs;
+use std.string;
+use std.sync;
+use std.threading;
+use bootstrap.ast;
+use bootstrap.llvm_lifetime;
+use bootstrap.llvm_unwind;
+use bootstrap.dci_dcib;
+use bootstrap.dci_requests;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_builder;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.hir_verify;
+use bootstrap.mir_builder;
+use bootstrap.mir_backend;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.mir_verify;
+use bootstrap.policy;
+
+/// Lowerer contract: consume structured `MirUnit` plus DCI facts attached
+/// on that unit, emit a backend artifact. Plugins:
+///   * LLVM — `LlvmMirLowerer` / `mir_lowerer_run_llvm*` (acceptance + fixpoint)
+///   * C++ source — `bootstrap.mir_cpp_lower` (`--emit=cpp` only; not a gate)
+/// There is no second parallel LLVM pipeline and no flag that swaps the
+/// acceptance backend.
+
+extern "C" {
+    fn getenv(name: rawptr) -> rawptr;
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn exit(status: i32);
+    fn fflush(stream: rawptr) -> i32;
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memcmp(a: rawptr, b: rawptr, n: u64) -> i32;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn strtod(s: rawptr, endptr: rawptr) -> f64;
+    fn strstr(haystack: rawptr, needle: rawptr) -> rawptr;
+    fn vyx_string_contains(hay: rawptr, hay_len: u64, needle: rawptr, needle_len: u64) -> i32;
+    fn vyx_bootstrap_platform() -> i32;
+    fn vyx_bootstrap_profile_level() -> i32;
+    fn vyx_bootstrap_now_ms() -> i64;
+    fn vyx_rt_string_arena_checkpoint() -> rawptr;
+    fn vyx_rt_string_arena_release(mark: rawptr);
+    fn vyx_rt_string_arena_reserved_bytes() -> i64;
+    fn vyx_rt_string_arena_active_bytes() -> i64;
+    fn vyx_rt_ast_dup_bytes_total() -> i64;
+    fn vyx_rt_ast_node_bytes_total() -> i64;
+    fn vyx_rt_process_private_bytes() -> i64;
+    fn vyx_rt_process_working_set_bytes() -> i64;
+    fn vyx_rt_process_peak_private_bytes() -> i64;
+    fn vyx_rt_process_peak_working_set_bytes() -> i64;
+    fn vyx_rt_system_available_commit_bytes() -> i64;
+    fn vyx_rt_heap_trim();
+    fn vyx_tbb_cgu_pool_new(units: i32, workers: i32, emit: rawptr) -> rawptr;
+    fn vyx_tbb_cgu_pool_submit(pool: rawptr, unit: i32, mod_h: rawptr,
+                               path: rawptr, path_len: i64, opt: i32) -> i32;
+    fn vyx_tbb_cgu_pool_finish(pool: rawptr);
+    fn vyx_tbb_cgu_pool_unit_ok(pool: rawptr, unit: i32) -> i32;
+    fn vyx_tbb_cgu_pool_free(pool: rawptr);
+    fn cJSON_Parse(value: rawptr) -> rawptr;
+    fn cJSON_Delete(item: rawptr);
+    fn cJSON_GetObjectItemCaseSensitive(object: rawptr, string: rawptr) -> rawptr;
+    fn cJSON_GetArraySize(array: rawptr) -> i32;
+    fn cJSON_GetArrayItem(array: rawptr, index: i32) -> rawptr;
+    fn cJSON_GetStringValue(item: rawptr) -> rawptr;
+    fn cJSON_GetNumberValue(item: rawptr) -> f64;
+    fn cJSON_IsTrue(item: rawptr) -> i32;
+    fn cJSON_IsFalse(item: rawptr) -> i32;
+    fn cJSON_IsString(item: rawptr) -> i32;
+    fn cJSON_IsNumber(item: rawptr) -> i32;
+    fn cJSON_IsArray(item: rawptr) -> i32;
+    fn cJSON_IsObject(item: rawptr) -> i32;
+    fn cJSON_Compare(a: rawptr, b: rawptr, case_sensitive: i32) -> i32;
+    fn cJSON_CreateNull() -> rawptr;
+    fn cJSON_CreateBool(boolean: i32) -> rawptr;
+    fn cJSON_CreateNumber(number: f64) -> rawptr;
+    fn cJSON_CreateString(text: rawptr) -> rawptr;
+    fn cJSON_CreateArray() -> rawptr;
+    fn cJSON_CreateObject() -> rawptr;
+    fn cJSON_AddItemToArray(array: rawptr, item: rawptr) -> i32;
+    fn cJSON_AddItemToObject(object: rawptr, key: rawptr, item: rawptr) -> i32;
+
+    fn vyx_rt_init() -> i32;
+    fn vyx_rt_get_last_error(h: rawptr, buf: rawptr, cap: u64) -> u64;
+    fn vyx_rt_verify(h: rawptr) -> i32;
+    fn vyx_rt_optimize(h: rawptr, opt_level: i32) -> i32;
+    fn vyx_rt_print_to_file(h: rawptr, path: rawptr, len: u64) -> i32;
+    fn vyx_rt_emit_object(h: rawptr, path: rawptr, len: u64, opt_level: i32) -> i32;
+    fn vyx_rt_emit_codegen(h: rawptr, path: rawptr, len: u64,
+                           opt_level: i32, file_type: i32) -> i32;
+    fn vyx_rt_jit_run_main_with_args(h: rawptr,
+                                     opt_level: i32,
+                                     link_args: rawptr,
+                                     link_args_len: u64) -> i32;
+    fn vyx_rt_module_new(name: rawptr,
+                         name_len: u64,
+                         triple: rawptr,
+                         triple_len: u64) -> rawptr;
+    fn vyx_rt_module_free(h: rawptr);
+    fn vyx_rt_set_relocation_model(h: rawptr, model: i32) -> i32;
+    fn vyx_rt_set_target_cpu(h: rawptr, cpu: rawptr, len: u64) -> i32;
+    fn vyx_rt_pointer_index_bits(h: rawptr) -> i32;
+    fn vyx_rt_int_type(h: rawptr, bits: i32) -> rawptr;
+    fn vyx_rt_ptr_ty(h: rawptr) -> rawptr;
+    fn vyx_rt_void_ty(h: rawptr) -> rawptr;
+    fn vyx_rt_float_type(h: rawptr, bits: i32) -> rawptr;
+    fn vyx_rt_array_ty(h: rawptr, elem_ty: rawptr, count: u64) -> rawptr;
+    fn vyx_rt_vector_ty(h: rawptr, elem_ty: rawptr, count: u64) -> rawptr;
+    fn vyx_rt_struct_ty_named(h: rawptr, name: rawptr, name_len: u64) -> rawptr;
+    fn vyx_rt_struct_ty_set_body(h: rawptr, st: rawptr, fields: rawptr, n: u64, packed: i32) -> i32;
+    fn vyx_rt_get_struct_field_ty(h: rawptr, st: rawptr, idx: u64) -> rawptr;
+    fn vyx_rt_type_alloc_size(h: rawptr, ty: rawptr) -> i64;
+    fn vyx_rt_fn_type(h: rawptr,
+                      ret_ty: rawptr,
+                      params: rawptr,
+                      n_params: u64,
+                      is_vararg: i32) -> rawptr;
+    fn vyx_rt_const_int(h: rawptr,
+                        ty: rawptr,
+                        value: i64,
+                        sign_extend: i32) -> rawptr;
+    fn vyx_rt_const_real(h: rawptr, ty: rawptr, value: f64) -> rawptr;
+    fn vyx_rt_const_ptr_null(h: rawptr, ptr_ty: rawptr) -> rawptr;
+    fn vyx_rt_const_null(h: rawptr, ty: rawptr) -> rawptr;
+    fn vyx_rt_const_named_struct(h: rawptr,
+                                 struct_ty: rawptr,
+                                 vals: rawptr,
+                                 n: u64) -> rawptr;
+    fn vyx_rt_const_vyx_string_ptr(h: rawptr,
+                                   s: rawptr,
+                                   len: u64,
+                                   name: rawptr,
+                                   name_len: u64) -> rawptr;
+    fn vyx_rt_add_global(h: rawptr,
+                         ty: rawptr,
+                         name: rawptr,
+                         name_len: u64) -> rawptr;
+    fn vyx_rt_set_initializer(h: rawptr, gv: rawptr, init: rawptr);
+    fn vyx_rt_set_global_constant(h: rawptr, gv: rawptr, is_const: i32);
+    fn vyx_rt_add_function(h: rawptr,
+                           name: rawptr,
+                           name_len: u64,
+                           fty: rawptr) -> rawptr;
+    fn vyx_rt_set_function_attr(h: rawptr,
+                                fn_: rawptr,
+                                attr: rawptr,
+                                attr_len: u64,
+                                value: rawptr,
+                                value_len: u64) -> i32;
+    fn vyx_rt_set_param_abi_attr(h: rawptr,
+                                 fn_: rawptr,
+                                 param_index: u64,
+                                 attr: rawptr,
+                                 attr_len: u64,
+                                 pointee_type: rawptr,
+                                 alignment: u64) -> i32;
+    fn vyx_rt_set_return_attr(h: rawptr,
+                              fn_: rawptr,
+                              attr: rawptr,
+                              attr_len: u64) -> i32;
+    fn vyx_rt_set_calling_convention(h: rawptr,
+                                     fn_or_call: rawptr,
+                                     convention: rawptr,
+                                     convention_len: u64) -> i32;
+    fn vyx_rt_set_alignment(h: rawptr, value: rawptr, bytes: i32);
+    fn vyx_rt_set_alloca_inalloca(h: rawptr, alloca: rawptr) -> i32;
+    fn vyx_rt_alias_scope_domain(h: rawptr) -> rawptr;
+    fn vyx_rt_alias_scope(h: rawptr, domain: rawptr, kind: i32) -> rawptr;
+    fn vyx_rt_set_alias_scopes(h: rawptr, instr: rawptr,
+                               domain: rawptr, scope_kind: i32);
+    fn vyx_rt_set_alias_scopes_on_store(h: rawptr, val: rawptr, ptr: rawptr,
+                                        domain: rawptr, scope_kind: i32);
+    fn vyx_rt_set_linkage(h: rawptr,
+                          fn_or_global: rawptr,
+                          linkage_kind: i32);
+    fn vyx_rt_get_param(h: rawptr, fn_: rawptr, idx: u64) -> rawptr;
+    fn vyx_rt_builder_new(h: rawptr) -> i32;
+    fn vyx_rt_append_block(h: rawptr,
+                           fn_: rawptr,
+                           name: rawptr,
+                           name_len: u64) -> rawptr;
+    fn vyx_rt_position_at_end(h: rawptr, bb: rawptr);
+    fn vyx_rt_position_before(h: rawptr, instruction: rawptr);
+    fn vyx_rt_get_insert_block(h: rawptr) -> rawptr;
+    fn vyx_rt_build_alloca(h: rawptr,
+                           ty: rawptr,
+                           name: rawptr,
+                           len: u64) -> rawptr;
+    fn vyx_rt_build_lifetime_start(h: rawptr, alloca: rawptr) -> rawptr;
+    fn vyx_rt_build_lifetime_end(h: rawptr, alloca: rawptr) -> rawptr;
+    fn vyx_rt_build_load(h: rawptr,
+                         ty: rawptr,
+                         ptr: rawptr,
+                         name: rawptr,
+                         len: u64) -> rawptr;
+    fn vyx_rt_build_store(h: rawptr, val: rawptr, ptr: rawptr) -> rawptr;
+    fn vyx_rt_build_store_instruction(h: rawptr, val: rawptr, ptr: rawptr) -> rawptr;
+    fn vyx_rt_build_load_volatile(h: rawptr,
+                                  ty: rawptr,
+                                  ptr: rawptr,
+                                  name: rawptr,
+                                  len: u64) -> rawptr;
+    fn vyx_rt_build_store_volatile(h: rawptr, val: rawptr, ptr: rawptr);
+    fn vyx_rt_build_load_aligned(h: rawptr,
+                                 ty: rawptr,
+                                 ptr: rawptr,
+                                 alignment: i32,
+                                 name: rawptr,
+                                 len: u64) -> rawptr;
+    fn vyx_rt_build_store_aligned(h: rawptr,
+                                  val: rawptr,
+                                  ptr: rawptr,
+                                  alignment: i32) -> rawptr;
+    fn vyx_rt_build_gep1(h: rawptr,
+                         ty: rawptr,
+                         ptr: rawptr,
+                         i0: rawptr,
+                         name: rawptr,
+                         len: u64) -> rawptr;
+    fn vyx_rt_build_gep2(h: rawptr,
+                         ty: rawptr,
+                         ptr: rawptr,
+                         i0: rawptr,
+                         i1: rawptr,
+                         name: rawptr,
+                         len: u64) -> rawptr;
+    fn vyx_rt_build_add(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_atomicrmw_add(h: rawptr, ptr: rawptr, value: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_atomic_load(h: rawptr, ty: rawptr, ptr: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_atomic_cmpxchg(h: rawptr,
+                                   ptr: rawptr,
+                                   expected: rawptr,
+                                   desired: rawptr,
+                                   name: rawptr,
+                                   len: u64) -> rawptr;
+    fn vyx_rt_build_sub(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_mul(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_sdiv(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_srem(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_udiv(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_urem(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_fadd(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_fsub(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_fmul(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_fdiv(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_frem(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_and(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_or(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_xor(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_shl(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_lshr(h: rawptr, lhs: rawptr, rhs: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_icmp(h: rawptr,
+                         pred: i32,
+                         lhs: rawptr,
+                         rhs: rawptr,
+                         name: rawptr,
+                         len: u64) -> rawptr;
+    fn vyx_rt_build_fcmp(h: rawptr,
+                         pred: i32,
+                         lhs: rawptr,
+                         rhs: rawptr,
+                         name: rawptr,
+                         len: u64) -> rawptr;
+    fn vyx_rt_build_br(h: rawptr, dest_bb: rawptr);
+    fn vyx_rt_build_cond_br(h: rawptr,
+                            cond: rawptr,
+                            then_bb: rawptr,
+                            else_bb: rawptr);
+    fn vyx_rt_build_ret(h: rawptr, val: rawptr);
+    fn vyx_rt_build_ret_void(h: rawptr);
+    fn vyx_rt_build_call(h: rawptr,
+                         fty: rawptr,
+                         callee: rawptr,
+                         args: rawptr,
+                         n: u64,
+                         name: rawptr,
+                         len: u64) -> rawptr;
+    fn vyx_rt_build_invoke(h: rawptr,
+                           fty: rawptr,
+                           callee: rawptr,
+                           args: rawptr,
+                           n: u64,
+                           name: rawptr,
+                           len: u64) -> rawptr;
+    fn vyx_rt_build_call1(h: rawptr,
+                          fty: rawptr,
+                          callee: rawptr,
+                          a0: rawptr,
+                          name: rawptr,
+                          len: u64) -> rawptr;
+    fn vyx_rt_build_call2(h: rawptr,
+                          fty: rawptr,
+                          callee: rawptr,
+                          a0: rawptr,
+                          a1: rawptr,
+                          name: rawptr,
+                          len: u64) -> rawptr;
+    fn vyx_rt_build_call3(h: rawptr,
+                          fty: rawptr,
+                          callee: rawptr,
+                          a0: rawptr,
+                          a1: rawptr,
+                          a2: rawptr,
+                          name: rawptr,
+                          len: u64) -> rawptr;
+    fn vyx_rt_build_call4(h: rawptr,
+                          fty: rawptr,
+                          callee: rawptr,
+                          a0: rawptr,
+                          a1: rawptr,
+                          a2: rawptr,
+                          a3: rawptr,
+                          name: rawptr,
+                          len: u64) -> rawptr;
+    fn vyx_rt_build_sext(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_zext(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_trunc(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_fp_to_si(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_si_to_fp(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_fp_ext(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_fp_trunc(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_ptr_to_int(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_int_to_ptr(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_bitcast(h: rawptr, val: rawptr, dst_ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_build_select(h: rawptr,
+                           cond: rawptr,
+                           true_val: rawptr,
+                           false_val: rawptr,
+                           name: rawptr,
+                           len: u64) -> rawptr;
+    fn vyx_rt_build_extract_value(h: rawptr,
+                                  agg_val: rawptr,
+                                  idx: i32,
+                                  name: rawptr,
+                                  len: u64) -> rawptr;
+    fn vyx_rt_value_is_struct(val: rawptr) -> i32;
+    fn vyx_rt_build_insert_value(h: rawptr,
+                                 agg_val: rawptr,
+                                 elt: rawptr,
+                                 idx: i32,
+                                 name: rawptr,
+                                 len: u64) -> rawptr;
+    fn vyx_rt_build_unreachable(h: rawptr) -> rawptr;
+    fn vyx_rt_build_phi(h: rawptr, ty: rawptr, name: rawptr, len: u64) -> rawptr;
+    fn vyx_rt_add_incoming(h: rawptr, phi: rawptr, val: rawptr, bb: rawptr);
+    fn vyx_rt_enable_debug(h: rawptr, filename: rawptr, len: u64) -> i32;
+    fn vyx_rt_debug_set_function(h: rawptr,
+                                 fn_handle: rawptr,
+                                 name: rawptr,
+                                 len: u64,
+                                 line: i32) -> i32;
+    fn vyx_rt_debug_declare_local(h: rawptr,
+                                  fn_handle: rawptr,
+                                  storage: rawptr,
+                                  llvm_ty: rawptr,
+                                  name: rawptr,
+                                  name_len: u64,
+                                  type_name: rawptr,
+                                  type_name_len: u64,
+                                   field_names: rawptr,
+                                   field_names_len: u64,
+                                  line: i32,
+                                  arg_index: i32) -> i32;
+    fn vyx_rt_debug_location(h: rawptr, line: i32, col: i32);
+    fn vyx_rt_debug_finalize(h: rawptr);
+}
+
+fn llvm_mir_env_value(name: string) -> string {
+    let raw = getenv(name.c_str());
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}
+
+fn llvm_mir_env_enabled(name: string) -> bool {
+    let value = llvm_mir_env_value(name).trim();
+    if (value.len == 0) { return false; }
+    if (value == "0" || value == "false" || value == "FALSE"
+        || value == "no" || value == "NO" || value == "off" || value == "OFF") {
+        return false;
+    }
+    return true;
+}
+
+fn llvm_mir_parse_positive_i32(text: string) -> i32 {
+    if (text.len == 0) { return 0; }
+    var n: i32 = 0;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let ch = text.charAt(i);
+        if (ch < 48 || ch > 57) { return 0; }
+        n = n * 10 + (ch - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn llvm_mir_cli_emit_kind() -> i32 {
+    var mode: i32 = 2;
+    let argc = argCount();
+    var i: i32 = 1;
+    while (i < argc) {
+        let a = getArg(i);
+        if (a == "--") { break; }
+        if (a.startsWith("--emit=") && a.len > 7) {
+            let kind = a.substring(7, a.len);
+            if (kind == "ir") { mode = 0; }
+            if (kind == "obj") { mode = 1; }
+            if (kind == "exe") { mode = 2; }
+            if (kind == "dll") { mode = 4; }
+            if (kind == "lib") { mode = 5; }
+            if (kind == "vyi") { mode = 6; }
+            if (kind == "cpp") { mode = 8; }
+            if (kind == "dci-stubs") { mode = 9; }
+        }
+        if (a.startsWith("--run=") && a.len > 6) {
+            let run_kind = a.substring(6, a.len);
+            if (run_kind == "aot") { mode = 3; }
+            if (run_kind == "jit") { mode = 7; }
+        }
+        i = i + 1;
+    }
+    return mode;
+}
+
+// The CGU split writes one object per unit next to the `-o` path and records
+// them in `<obj>.cgu.list`, which the caller links (`emit_object_to_file`
+// turns into a no-op once that list exists).  Drivers that own the output path
+// themselves -- running a project, or `--emit=obj`/`--emit=exe` without `-o` --
+// publish it here so the split still has somewhere to land.  Without it the
+// extra units are lowered and thrown away and only the final unit reaches the
+// object file, which then links with missing `main` / missing monomorphised
+// bodies.
+var g_llvm_cgu_primary_path: string = "";
+
+// Open-generic DCI instances closed by this compile unit.  One line per
+// instance: `open <symbol> <base> <ret_text> <args_csv>`.  The build system
+// merges the per-object sidecars and hands them to the external DCI stub
+// backend, whose Active Adapter materializes each native entrypoint.
+var g_dci_open_requests: string = "";
+
+// Consumer-declared records an open-generic instance is closed over.  A record
+// the producer's artifact never mentioned has no descriptor entry, so no
+// adapter ever measured it -- yet the producer must *define* it (rustc has to
+// monomorphize `swap::<TestS, i32>`) and the consumer's layout for it is
+// derived rather than measured.  One line per record,
+// `record <name> <size> <align> <field:type:offset,...>`, prepended to the
+// requests sidecar so the producer can materialize the record and check the
+// derived numbers against its own.
+var g_dci_local_record_lines: string = "";
+
+// Closed trait instances this compile unit *inherits from* (reverse override).
+// One line per instance, `instance <consumer-type-text of the base>`.
+//
+// Why this needs its own request kind: an open generic *function* can be closed
+// at link time (`U vyx_pair2_i32_vec2_get_first`), but a base class cannot --
+// the producer's vtable shape for `SinkG<i32>` has to be in the contract
+// *before* lowering reads it, because there is no cross-language rule to derive
+// another ABI's `dyn` layout from.  So the only alternative to a human typing
+// `--export-instance` for every instance is for the consumer to report the ones
+// it needs right here, and let whoever re-runs the adapter feed them back in.
+
+/// Declare that this unit needs the closed instance `instance_text` (the base's
+/// consumer-side type text, e.g. `native.SinkG<i32>`).  Called both on the
+/// success path and at the point where the missing vtable is diagnosed, so a
+/// pass run purely to discover instances still yields its requests.
+public fn llvm_dci_open_note_instance(instance_text: string) {
+    dci_request_instance(instance_text);
+}
+
+public fn llvm_lower_take_dci_open_requests() -> string {
+    let out = dci_requests_take() + g_dci_local_record_lines + g_dci_open_requests;
+    g_dci_local_record_lines = "";
+    g_dci_open_requests = "";
+    return out;
+}
+
+public fn llvm_mir_publish_primary_object_path(path: string) {
+    g_llvm_cgu_primary_path = path;
+}
+
+fn llvm_mir_cli_output_path() -> string {
+    if (g_llvm_cgu_primary_path.len > 0) { return g_llvm_cgu_primary_path; }
+    let argc = argCount();
+    var i: i32 = 1;
+    while (i + 1 < argc) {
+        let a = getArg(i);
+        if (a == "--") { break; }
+        if (a == "-o") { return getArg(i + 1); }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn llvm_mir_cli_opt_level() -> i32 {
+    var out: i32 = 2;
+    let argc = argCount();
+    var i: i32 = 1;
+    while (i < argc) {
+        let a = getArg(i);
+        if (a == "--") { break; }
+        if (a == "-O0") { out = 0; }
+        if (a == "-O1") { out = 1; }
+        if (a == "-O2") { out = 2; }
+        if (a == "-O3") { out = 3; }
+        if (a == "-Os") { out = 4; }
+        if (a == "-Oz") { out = 5; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn llvm_mir_target_is_nvptx() -> bool {
+    return policy_cli_target_triple().contains("nvptx");
+}
+
+fn llvm_mir_cli_target_cpu() -> string {
+    let argc = argCount();
+    var out: string = "";
+    var i: i32 = 1;
+    while (i < argc) {
+        let a = getArg(i);
+        if (a == "--") { break; }
+        if ((a == "--target-cpu" || a == "--mcpu") && i + 1 < argc) {
+            out = getArg(i + 1).trim();
+            i = i + 2;
+            continue;
+        }
+        if (a.startsWith("--target-cpu=")) {
+            out = a.substring(13, a.len).trim();
+        } elif (a.startsWith("--mcpu=")) {
+            out = a.substring(7, a.len).trim();
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn llvm_mir_apply_target_cpu(mod_h: rawptr) -> i32 {
+    if (mod_h == null) { return 1; }
+    let cpu = llvm_mir_cli_target_cpu();
+    if (cpu.len == 0) { return 0; }
+    return vyx_rt_set_target_cpu(mod_h, cpu.c_str(), cpu.len as u64);
+}
+
+fn llvm_mir_emit_module_file(mod_h: rawptr, path_p: rawptr, path_len: u64, opt: i32) -> i32 {
+    var file_type: i32 = 0;
+    if (llvm_mir_target_is_nvptx()) { file_type = 1; }
+    let cpu_rc = llvm_mir_apply_target_cpu(mod_h);
+    if (cpu_rc != 0) { return cpu_rc; }
+    return vyx_rt_emit_codegen(mod_h, path_p, path_len, opt, file_type);
+}
+
+fn llvm_mir_codegen_unit_limit() -> i32 {
+    var n = llvm_mir_parse_positive_i32(llvm_mir_env_value("VYX_CODEGEN_UNITS").trim());
+    let argc = argCount();
+    var i: i32 = 1;
+    while (i < argc) {
+        let a = getArg(i);
+        if (a == "--") { break; }
+        if (a == "--codegen-units" && i + 1 < argc) {
+            n = llvm_mir_parse_positive_i32(getArg(i + 1).trim());
+            i = i + 1;
+        } elif (a.startsWith("--codegen-units=") && a.len > 16) {
+            n = llvm_mir_parse_positive_i32(a.substring(16, a.len).trim());
+        } elif (a == "-C" && i + 1 < argc) {
+            let spec = getArg(i + 1);
+            if (spec.startsWith("codegen-units=") && spec.len > 14) {
+                n = llvm_mir_parse_positive_i32(spec.substring(14, spec.len).trim());
+            }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    if (n < 1) { n = 16; }
+    return n;
+}
+
+fn llvm_mir_cli_cgu_wanted() -> bool {
+    let mode = llvm_mir_cli_emit_kind();
+    if (mode == 0 || mode == 6 || mode == 7 || mode == 8 || mode == 9) { return false; }
+    return llvm_mir_codegen_unit_limit() > 1;
+}
+
+fn llvm_mir_ptr_map_zero(map: rawptr) {
+    llvm_mir_id_map_zero(map);
+}
+
+fn llvm_mir_i32_map_zero(map: rawptr) {
+    llvm_mir_id_map_zero(map);
+}
+
+// ── CGU emit pipeline ────────────────────────────────────────────────
+//
+// `emit_cgu_objects_from_builder` builds one LLVM module per codegen unit.
+// Optimizing and object-writing a finished module touches neither the shared
+// streaming state nor the mutable HIR view -- the module owns its own
+// LLVMContext (see vyx_rt_module_new) -- so it is handed to a background
+// thread while the main thread keeps lowering the next unit.  This is the
+// rustc shape: serial lowering, parallel per-CGU codegen.
+//
+// The handoff is bounded to `g_cgu_pipe_depth` outstanding modules so peak
+// memory stays close to the serial path.  Object bytes and the `.cgu.list`
+// order do not depend on thread timing, so output stays byte-identical.
+
+let CGU_PIPE_SLOT_BYTES: i32 = 48;
+let CGU_PIPE_DEFAULT_THREADS: i32 = 2;
+// Auto sizing never goes above this: every queued unit owns a live module and
+// its own LLVMContext, so the pool's memory footprint grows with it.
+let CGU_PIPE_AUTO_MAX_THREADS: i32 = 8;
+// Hard ceiling for an explicit `--threads=N` / `VYX_CGU_THREADS=N` request.
+let CGU_PIPE_MAX_THREADS: i32 = 32;
+// Measured private commit a single emit worker adds on a large unit: a
+// 20-core host reached 44 GB across 8 workers, i.e. roughly 5.5 GiB each, and
+// then failed inside LLVM with `pooled string malloc failed`.  The auto sizing
+// below spends at most three quarters of the machine's remaining commit on
+// workers so the MIR arena and LLVM's own allocator keep the rest.
+let CGU_PIPE_WORKER_MEMORY_BYTES: i64 = 6442450944;
+
+// One handoff record per queued codegen unit.  The layout is named rather
+// than open-coded at each site so later phases can carry extra per-CGU state
+// (a lowerer handle, a frozen MIR slice) without re-deriving every offset.
+let CGU_WS_MOD: i32 = 0;        // rawptr: finished LLVM module
+let CGU_WS_PATH: i32 = 8;       // rawptr: object path bytes
+let CGU_WS_PATH_LEN: i32 = 16;  // i64: object path length
+let CGU_WS_OPT: i32 = 24;       // i32: optimization level (0 = skip)
+let CGU_WS_PRESENT: i32 = 32;   // i32: slot occupied
+let CGU_WS_KIND: i32 = 36;      // i32: CGU_WS_KIND_*
+let CGU_WS_UNIT: i32 = 40;      // i32: 1-based codegen unit
+
+// What a worker should do with a queued unit.  The worker dispatches on this
+// instead of assuming emit, so a later phase can queue a unit whose lowering
+// still has to run on the worker without adding a second queue.
+let CGU_WS_KIND_EMIT: i32 = 1;
+
+// `VYX_CGU_PARALLEL` selects how much of the per-CGU pipeline leaves the main
+// thread.  `lazy` is the historical behaviour: lowering stays serial and the
+// finished modules are optimized plus written on the pool.  `off` pins
+// everything to the main thread, which yields a reference build to diff
+// object bytes against.  `full` is reserved for per-CGU parallel lowering and
+// currently falls back to `lazy`.
+let CGU_PAR_MODE_OFF: i32 = 0;
+let CGU_PAR_MODE_LAZY: i32 = 1;
+let CGU_PAR_MODE_FULL: i32 = 2;
+
+// ── Per-function MIR slice ───────────────────────────────────────────
+//
+// The per-function codegen path used to be one fused body: build the HIR
+// body, run the MIR pass and emit LLVM, with a handful of locals holding the
+// arena marks.  Everything the lowerer needed was valid only inside that one
+// call, so lowering could never move off the materialisation thread.
+//
+// This record is what crosses the seam.  It freezes the region of the shared
+// MIR arena that one function occupies -- including the value/instr *end*
+// marks -- so the lowering stage can be driven from a frame, or a thread, in
+// which those locals no longer exist.  Materialisation and the MIR pass still
+// mutate the arena and stay serial; lowering only reads it and writes the
+// lowerer's own module, which owns its own LLVMContext (see
+// `vyx_rt_module_new`) and is therefore the stage that can go per-CGU.
+let MIR_SLICE_FN_ID: i32 = 0;        // i32: MIR function id
+let MIR_SLICE_HIR_FN: i32 = 4;       // i32: HIR function id
+let MIR_SLICE_FUNC_MARK: i32 = 8;    // i32: arena function_count before build
+let MIR_SLICE_BLOCK_MARK: i32 = 12;  // i32: arena block_count before build
+let MIR_SLICE_LOCAL_MARK: i32 = 16;  // i32: arena local_count before build
+let MIR_SLICE_PLACE_MARK: i32 = 20;  // i32: arena place_count before build
+let MIR_SLICE_VALUE_MARK: i32 = 24;  // i32: arena value_count before build
+let MIR_SLICE_INSTR_MARK: i32 = 28;  // i32: arena instr_count before build
+let MIR_SLICE_CASE_MARK: i32 = 32;   // i32: arena case_count before build
+let MIR_SLICE_VALUE_END: i32 = 36;   // i32: arena value_count after build
+let MIR_SLICE_INSTR_END: i32 = 40;   // i32: arena instr_count after build
+let MIR_SLICE_MIR_ERRORS: i32 = 44;  // i32: MIR pass diagnostics
+let MIR_SLICE_STATE: i32 = 48;       // i32: MIR_SLICE_ST_*
+let MIR_SLICE_EMITTED: i32 = 52;     // i32: body definition was emitted
+let MIR_SLICE_T_TOTAL: i32 = 56;     // i64: phase 1 start
+let MIR_SLICE_T_MARK: i32 = 64;      // i64: rolling phase boundary
+let MIR_SLICE_T_BODY: i32 = 72;      // i64: HIR body build
+let MIR_SLICE_T_OPTIMIZE: i32 = 80;  // i64: MIR pass pipeline
+let MIR_SLICE_T_DEPS: i32 = 88;      // i64: nested dependency drain window
+let MIR_SLICE_T_ADAPTERS: i32 = 96;  // i64: adapter declaration
+let MIR_SLICE_T_SIGNATURE: i32 = 104; // i64: signature declaration
+let MIR_SLICE_T_BLOCKS: i32 = 112;   // i64: basic block declaration
+let MIR_SLICE_T_LOWER: i32 = 120;    // i64: instruction lowering
+let MIR_SLICE_T_DISCARD: i32 = 128;  // i64: body release
+let MIR_SLICE_RETAINED: i32 = 136;   // i32: body reused from the collect walk
+let MIR_SLICE_BYTES: i32 = 144;
+
+// Retained-body record: one per collected function, holding the frozen marks
+// the emit walk needs when it reuses the body the collect walk left in the
+// arena instead of materialising the function a second time.
+let CGU_RETAIN_STRIDE: i32 = 10;     // i32s per record
+let CGU_RETAIN_BLOCK: i32 = 0;
+let CGU_RETAIN_LOCAL: i32 = 1;
+let CGU_RETAIN_PLACE: i32 = 2;
+let CGU_RETAIN_VALUE: i32 = 3;
+let CGU_RETAIN_INSTR: i32 = 4;
+let CGU_RETAIN_CASE: i32 = 5;
+let CGU_RETAIN_VALUE_END: i32 = 6;
+let CGU_RETAIN_INSTR_END: i32 = 7;
+let CGU_RETAIN_FUNC_MARK: i32 = 8;
+let CGU_RETAIN_EMITTED: i32 = 9;
+
+// Lifecycle of one slice.  The states exist so a later phase can assert that
+// its predecessor actually ran instead of silently reading a zeroed record.
+let MIR_SLICE_ST_EMPTY: i32 = 0;
+let MIR_SLICE_ST_MATERIALIZING: i32 = 1;
+let MIR_SLICE_ST_MATERIALIZED: i32 = 2;
+let MIR_SLICE_ST_LOWERED: i32 = 3;
+let MIR_SLICE_ST_RELEASED: i32 = 4;
+
+fn mir_slice_alloc() -> rawptr {
+    let p = malloc(MIR_SLICE_BYTES as u64);
+    if (p == null) { return null; }
+    memset(p, 0, MIR_SLICE_BYTES as u64);
+    return p;
+}
+
+fn mir_slice_free(p: rawptr) {
+    if (p != null) { free(p); }
+}
+
+// Aggregate per-phase wall time for `VYX_CGU_PHASES`.  These are the numbers
+// that decide whether moving the lowering stage off the materialisation
+// thread is worth it, so they must be attributable per phase rather than
+// folded into one "codegen" bucket.  `materialize` is the HIR body build and
+// `lower` the LLVM emission; the dependency drain that materialisation runs
+// recursively is attributed to the nested functions themselves, so the
+// buckets stay non-overlapping.
+var g_cgu_phase_fns: i64 = 0;
+var g_cgu_phase_materialize_ms: i64 = 0;
+var g_cgu_phase_optimize_ms: i64 = 0;
+var g_cgu_phase_deps_ms: i64 = 0;
+var g_cgu_phase_lower_ms: i64 = 0;
+var g_cgu_phase_release_ms: i64 = 0;
+
+fn llvm_cgu_phases_note(materialize_ms: i64, optimize_ms: i64, deps_ms: i64,
+                        lower_ms: i64, release_ms: i64) {
+    if (!policy_cgu_phases_enabled()) { return; }
+    g_cgu_phase_fns = g_cgu_phase_fns + 1;
+    g_cgu_phase_materialize_ms = g_cgu_phase_materialize_ms + materialize_ms;
+    g_cgu_phase_optimize_ms = g_cgu_phase_optimize_ms + optimize_ms;
+    g_cgu_phase_deps_ms = g_cgu_phase_deps_ms + deps_ms;
+    g_cgu_phase_lower_ms = g_cgu_phase_lower_ms + lower_ms;
+    g_cgu_phase_release_ms = g_cgu_phase_release_ms + release_ms;
+}
+
+fn llvm_cgu_phases_reset() {
+    g_cgu_phase_fns = 0;
+    g_cgu_phase_materialize_ms = 0;
+    g_cgu_phase_optimize_ms = 0;
+    g_cgu_phase_deps_ms = 0;
+    g_cgu_phase_lower_ms = 0;
+    g_cgu_phase_release_ms = 0;
+}
+
+fn llvm_cgu_phases_report() {
+    if (!policy_cgu_phases_enabled()) { return; }
+    print("[llvm-cgu] phases fns=" + policy_i64_to_string(g_cgu_phase_fns)
+          + " materialize=" + g_cgu_phase_materialize_ms.toString() + "ms"
+          + " optimize=" + g_cgu_phase_optimize_ms.toString() + "ms"
+          + " deps=" + g_cgu_phase_deps_ms.toString() + "ms"
+          + " lower=" + g_cgu_phase_lower_ms.toString() + "ms"
+          + " release=" + g_cgu_phase_release_ms.toString() + "ms");
+}
+
+fn cgu_ws_set(slot: rawptr, mod_h: rawptr, path_p: rawptr, path_len: i64,
+              opt: i32, unit: i32, kind: i32) {
+    ast_write_rawptr(ptr_offset(slot, CGU_WS_MOD), mod_h);
+    ast_write_rawptr(ptr_offset(slot, CGU_WS_PATH), path_p);
+    ast_write_i64(ptr_offset(slot, CGU_WS_PATH_LEN), path_len);
+    ast_write_i32(ptr_offset(slot, CGU_WS_OPT), opt);
+    ast_write_i32(ptr_offset(slot, CGU_WS_PRESENT), 1);
+    ast_write_i32(ptr_offset(slot, CGU_WS_KIND), kind);
+    ast_write_i32(ptr_offset(slot, CGU_WS_UNIT), unit);
+}
+
+fn cgu_ws_clear(slot: rawptr) {
+    ast_write_i32(ptr_offset(slot, CGU_WS_PRESENT), 0);
+    ast_write_rawptr(ptr_offset(slot, CGU_WS_MOD), null);
+    ast_write_rawptr(ptr_offset(slot, CGU_WS_PATH), null);
+}
+
+// Run one queued emit job.  Emitting touches neither the shared streaming
+// state nor the mutable HIR view -- the module owns its own LLVMContext -- so
+// a worker can run it while the main thread keeps lowering the next unit.
+fn cgu_ws_run_emit(mod_h: rawptr, path_p: rawptr, path_len: i64, opt: i32) -> i32 {
+    var rc: i32 = 0;
+    if (opt > 0) { rc = vyx_rt_optimize(mod_h, opt); }
+    if (rc == 0) {
+        rc = llvm_mir_emit_module_file(mod_h, path_p, path_len as u64, opt);
+    }
+    vyx_rt_module_free(mod_h);
+    return rc;
+}
+
+var g_cgu_pipe_slots: rawptr = null;
+var g_cgu_pipe_paths: rawptr = null;
+var g_cgu_pipe_rcs: rawptr = null;
+var g_cgu_pipe_depth: i32 = 0;
+var g_cgu_pipe_units: i32 = 0;
+var g_cgu_pipe_head: i32 = 0;
+var g_cgu_pipe_tail: i32 = 0;
+var g_cgu_pipe_stop: i32 = 0;
+var g_cgu_pipe_mu: rawptr = null;
+var g_cgu_pipe_cv_free: rawptr = null;
+var g_cgu_pipe_cv_work: rawptr = null;
+var g_cgu_pipe_workers: rawptr = null;
+var g_cgu_pipe_workers_n: i32 = 0;
+var g_cgu_tbb_pool: rawptr = null;
+
+/// Parse `text` as a non-negative integer, or -1 when it is not one.  `0` is a
+/// meaningful value here ("keep every unit on the main thread"), so it must be
+/// distinguishable from "unset", which is what `llvm_mir_parse_positive_i32`
+/// cannot express.
+fn llvm_mir_parse_nonneg_i32(text: string) -> i32 {
+    var n: i32 = 0;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c < 48 || c > 57) { return -1; }
+        n = n * 10 + (c - 48);
+        i = i + 1;
+    }
+    return n;
+}
+
+fn llvm_cgu_clamp_threads(n: i32) -> i32 {
+    if (n < 0) { return 0; }
+    if (n > CGU_PIPE_MAX_THREADS) { return CGU_PIPE_MAX_THREADS; }
+    return n;
+}
+
+/// How much of the machine's remaining commit the emit pool may spend.
+///
+/// Returns `CGU_PIPE_AUTO_MAX_THREADS` when the runtime cannot report the
+/// budget, so an unknown platform keeps the previous core-count behaviour
+/// instead of collapsing to a single worker.
+fn llvm_cgu_memory_max_threads() -> i32 {
+    let available = vyx_rt_system_available_commit_bytes();
+    if (available <= 0) { return CGU_PIPE_AUTO_MAX_THREADS; }
+    let budget = (available / 4) * 3;
+    var n: i64 = budget / CGU_PIPE_WORKER_MEMORY_BYTES;
+    let ceiling: i64 = CGU_PIPE_AUTO_MAX_THREADS as i64;
+    if (n > ceiling) { n = ceiling; }
+    if (n < 1) { return 1; }
+    return n as i32;
+}
+
+/// What the machine can actually run, capped so a 128-thread box does not
+/// spawn 128 LLVMContexts at once -- and capped again by memory, because on a
+/// large unit each of those contexts plus its module costs gigabytes.
+fn llvm_cgu_default_threads() -> i32 {
+    let cores = thread_available_parallelism();
+    if (cores < 1) { return CGU_PIPE_DEFAULT_THREADS; }
+    var n = cores;
+    if (n > CGU_PIPE_AUTO_MAX_THREADS) { n = CGU_PIPE_AUTO_MAX_THREADS; }
+    let memory_cap = llvm_cgu_memory_max_threads();
+    if (n > memory_cap) { n = memory_cap; }
+    return n;
+}
+
+/// rustc spells this `-Z threads=N` and otherwise inherits the jobserver's
+/// parallelism; the Vyx driver passes its own `-j N` down, so that is accepted
+/// too.  Returns -1 when no thread flag was given, so `--threads=0` (explicitly
+/// serial) stays distinguishable from "not asked".
+fn llvm_cgu_cli_threads() -> i32 {
+    var out: i32 = -1;
+    let argc = argCount();
+    var i: i32 = 1;
+    while (i < argc) {
+        let a = getArg(i);
+        if (a == "--") { break; }
+        if ((a == "--threads" || a == "--jobs" || a == "-j") && i + 1 < argc) {
+            out = llvm_mir_parse_nonneg_i32(getArg(i + 1).trim());
+            i = i + 1;
+        } elif (a.startsWith("--threads=") && a.len > 10) {
+            out = llvm_mir_parse_nonneg_i32(a.substring(10, a.len).trim());
+        } elif (a.startsWith("--jobs=") && a.len > 7) {
+            out = llvm_mir_parse_nonneg_i32(a.substring(7, a.len).trim());
+        } elif (a.startsWith("-j") && a.len > 2) {
+            out = llvm_mir_parse_nonneg_i32(a.substring(2, a.len).trim());
+        } elif ((a == "-Z" || a == "-C") && i + 1 < argc) {
+            let spec = getArg(i + 1);
+            if (spec.startsWith("threads=") && spec.len > 8) {
+                out = llvm_mir_parse_nonneg_i32(spec.substring(8, spec.len).trim());
+            }
+            i = i + 1;
+        }
+        if (out < 0) { out = -1; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn llvm_cgu_env_emit_threads() -> i32 {
+    let raw = llvm_mir_env_value("VYX_CGU_EMIT_THREADS").trim();
+    if (raw.len > 0) {
+        let n = llvm_mir_parse_nonneg_i32(raw);
+        if (n >= 0) { return llvm_cgu_clamp_threads(n); }
+    }
+    let alt = llvm_mir_env_value("VYX_CGU_THREADS").trim();
+    if (alt.len > 0) {
+        let n2 = llvm_mir_parse_nonneg_i32(alt);
+        if (n2 >= 0) { return llvm_cgu_clamp_threads(n2); }
+    }
+    let cli = llvm_cgu_cli_threads();
+    if (cli >= 0) { return llvm_cgu_clamp_threads(cli); }
+    return llvm_cgu_default_threads();
+}
+
+fn llvm_cgu_parallel_mode() -> i32 {
+    let raw = llvm_mir_env_value("VYX_CGU_PARALLEL").trim();
+    if (raw.len == 0) { return CGU_PAR_MODE_LAZY; }
+    if (raw == "off" || raw == "none" || raw == "0" || raw == "serial") {
+        return CGU_PAR_MODE_OFF;
+    }
+    if (raw == "full") { return CGU_PAR_MODE_FULL; }
+    return CGU_PAR_MODE_LAZY;
+}
+
+fn llvm_cgu_parallel_mode_name(mode: i32) -> string {
+    if (mode == CGU_PAR_MODE_OFF) { return "off"; }
+    if (mode == CGU_PAR_MODE_FULL) { return "full"; }
+    return "lazy";
+}
+
+fn llvm_cgu_object_path(primary: string, cgu: i32) -> string {
+    if (cgu <= 1) { return primary.clone(); }
+    return primary + ".cgu." + policy_i64_to_string((cgu - 1) as i64);
+}
+
+fn llvm_mir_dup_cstr(s: string) -> rawptr {
+    let n = s.len;
+    if (n <= 0) { return null; }
+    let p = malloc((n + 1) as u64);
+    if (p == null) { return null; }
+    memcpy(p, s.c_str(), n as u64);
+    memset(ptr_offset(p, n), 0, 1);
+    return p;
+}
+
+fn cgu_pipe_slot(ring: i32) -> rawptr {
+    return ptr_offset(g_cgu_pipe_slots, ring * CGU_PIPE_SLOT_BYTES);
+}
+
+fn cgu_pipe_worker_main(_arg: rawptr) -> i64 {
+    var mod_h: rawptr = null;
+    var path_p: rawptr = null;
+    var path_len: i64 = 0;
+    var opt: i32 = 0;
+    var unit: i32 = 0;
+    var running: i32 = 1;
+    while (running != 0) {
+        mutex_lock(g_cgu_pipe_mu);
+        while (g_cgu_pipe_head == g_cgu_pipe_tail && g_cgu_pipe_stop == 0) {
+            condvar_wait(g_cgu_pipe_cv_work, g_cgu_pipe_mu);
+        }
+        var got: i32 = 0;
+        var kind: i32 = 0;
+        if (g_cgu_pipe_head == g_cgu_pipe_tail) {
+            running = 0;
+        } else {
+            let slot = cgu_pipe_slot(g_cgu_pipe_head % g_cgu_pipe_depth);
+            mod_h = ast_read_rawptr(ptr_offset(slot, CGU_WS_MOD));
+            path_p = ast_read_rawptr(ptr_offset(slot, CGU_WS_PATH));
+            path_len = ast_read_i64(ptr_offset(slot, CGU_WS_PATH_LEN));
+            opt = ast_read_i32(ptr_offset(slot, CGU_WS_OPT));
+            kind = ast_read_i32(ptr_offset(slot, CGU_WS_KIND));
+            unit = ast_read_i32(ptr_offset(slot, CGU_WS_UNIT));
+            cgu_ws_clear(slot);
+            g_cgu_pipe_head = g_cgu_pipe_head + 1;
+            got = 1;
+            condvar_broadcast(g_cgu_pipe_cv_free);
+        }
+        mutex_unlock(g_cgu_pipe_mu);
+        if (got != 0) {
+            var rc: i32 = 0;
+            if (kind == CGU_WS_KIND_EMIT) {
+                rc = cgu_ws_run_emit(mod_h, path_p, path_len, opt);
+            } else {
+                // Unknown kind: fail the unit rather than leak its module.
+                vyx_rt_module_free(mod_h);
+                rc = 1;
+            }
+            mutex_lock(g_cgu_pipe_mu);
+            if (unit > 0 && unit < g_cgu_pipe_units) {
+                ast_write_i32(ptr_offset(g_cgu_pipe_rcs, unit * 4), rc);
+            }
+            condvar_broadcast(g_cgu_pipe_cv_free);
+            mutex_unlock(g_cgu_pipe_mu);
+        }
+    }
+    return 0;
+}
+
+/// Join every emit worker and release the handle array.
+fn cgu_pipe_join_workers() {
+    if (g_cgu_pipe_workers == null) { return; }
+    var i: i32 = 0;
+    while (i < g_cgu_pipe_workers_n) {
+        let h = ast_read_rawptr(ptr_offset(g_cgu_pipe_workers, i * 8));
+        if (h != null) { thread_join(h); }
+        i = i + 1;
+    }
+    g_cgu_pipe_workers_n = 0;
+    free(g_cgu_pipe_workers);
+    g_cgu_pipe_workers = null;
+}
+
+fn cgu_pipe_dispose() {
+    if (g_cgu_tbb_pool != null) {
+        vyx_tbb_cgu_pool_free(g_cgu_tbb_pool);
+        g_cgu_tbb_pool = null;
+        return;
+    }
+    if (g_cgu_pipe_mu != null) {
+        mutex_lock(g_cgu_pipe_mu);
+        g_cgu_pipe_stop = 1;
+        condvar_broadcast(g_cgu_pipe_cv_work);
+        mutex_unlock(g_cgu_pipe_mu);
+    }
+    cgu_pipe_join_workers();
+    if (g_cgu_pipe_mu != null) { mutex_destroy(g_cgu_pipe_mu); g_cgu_pipe_mu = null; }
+    if (g_cgu_pipe_cv_free != null) { condvar_destroy(g_cgu_pipe_cv_free); g_cgu_pipe_cv_free = null; }
+    if (g_cgu_pipe_cv_work != null) { condvar_destroy(g_cgu_pipe_cv_work); g_cgu_pipe_cv_work = null; }
+    if (g_cgu_pipe_paths != null) {
+        var i: i32 = 0;
+        while (i < g_cgu_pipe_units) {
+            let p = ast_read_rawptr(ptr_offset(g_cgu_pipe_paths, i * 8));
+            if (p != null) { free(p); }
+            i = i + 1;
+        }
+        free(g_cgu_pipe_paths);
+        g_cgu_pipe_paths = null;
+    }
+    if (g_cgu_pipe_slots != null) { free(g_cgu_pipe_slots); g_cgu_pipe_slots = null; }
+    if (g_cgu_pipe_rcs != null) { free(g_cgu_pipe_rcs); g_cgu_pipe_rcs = null; }
+    g_cgu_pipe_depth = 0;
+    g_cgu_pipe_units = 0;
+    g_cgu_pipe_head = 0;
+    g_cgu_pipe_tail = 0;
+    g_cgu_pipe_stop = 0;
+}
+
+fn cgu_pipe_start(units: i32, threads: i32) -> bool {
+    if (g_cgu_tbb_pool != null) { return false; }
+    var tbb_threads = threads;
+    if (tbb_threads < 1) { tbb_threads = 1; }
+    if (tbb_threads > CGU_PIPE_MAX_THREADS) { tbb_threads = CGU_PIPE_MAX_THREADS; }
+    if (units < 2) { return false; }
+    g_cgu_tbb_pool = vyx_tbb_cgu_pool_new(units, tbb_threads,
+                                          cgu_ws_run_emit as rawptr);
+    if (g_cgu_tbb_pool != null) { return true; }
+    // Keep the established thread pool as a fallback if TBB cannot allocate.
+    if (g_cgu_pipe_slots != null) { return false; }
+    var d = threads;
+    if (d < 1) { d = 1; }
+    if (d > CGU_PIPE_MAX_THREADS) { d = CGU_PIPE_MAX_THREADS; }
+    if (units < 2) { return false; }
+    g_cgu_pipe_depth = d;
+    g_cgu_pipe_units = units;
+    g_cgu_pipe_slots = malloc((CGU_PIPE_SLOT_BYTES * d) as u64);
+    g_cgu_pipe_paths = malloc((8 * units) as u64);
+    g_cgu_pipe_rcs = malloc((4 * units) as u64);
+    if (g_cgu_pipe_slots == null || g_cgu_pipe_paths == null || g_cgu_pipe_rcs == null) {
+        cgu_pipe_dispose();
+        return false;
+    }
+    memset(g_cgu_pipe_slots, 0, (CGU_PIPE_SLOT_BYTES * d) as u64);
+    memset(g_cgu_pipe_paths, 0, (8 * units) as u64);
+    memset(g_cgu_pipe_rcs, 0, (4 * units) as u64);
+    var i: i32 = 0;
+    while (i < units) {
+        ast_write_i32(ptr_offset(g_cgu_pipe_rcs, i * 4), -1);
+        i = i + 1;
+    }
+    g_cgu_pipe_head = 0;
+    g_cgu_pipe_tail = 0;
+    g_cgu_pipe_stop = 0;
+    g_cgu_pipe_mu = mutex_new();
+    g_cgu_pipe_cv_free = condvar_new();
+    g_cgu_pipe_cv_work = condvar_new();
+    if (g_cgu_pipe_mu == null || g_cgu_pipe_cv_free == null || g_cgu_pipe_cv_work == null) {
+        cgu_pipe_dispose();
+        return false;
+    }
+    g_cgu_pipe_workers = malloc((8 * d) as u64);
+    if (g_cgu_pipe_workers == null) {
+        cgu_pipe_dispose();
+        return false;
+    }
+    memset(g_cgu_pipe_workers, 0, (8 * d) as u64);
+    g_cgu_pipe_workers_n = d;
+    var w: i32 = 0;
+    while (w < d) {
+        let h = thread_spawn(cgu_pipe_worker_main as rawptr, null);
+        if (h == null) {
+            g_cgu_pipe_workers_n = w;
+            cgu_pipe_dispose();
+            return false;
+        }
+        ast_write_rawptr(ptr_offset(g_cgu_pipe_workers, w * 8), h);
+        w = w + 1;
+    }
+    return true;
+}
+
+/// Queue one finished module.  Blocks while `g_cgu_pipe_depth` modules are
+/// already outstanding, which bounds how many LLVM modules are live.
+fn cgu_pipe_submit(unit: i32, mod_h: rawptr, path_p: rawptr,
+                   path_len: i64, opt: i32) -> bool {
+    if (g_cgu_tbb_pool != null) {
+        return vyx_tbb_cgu_pool_submit(g_cgu_tbb_pool, unit, mod_h,
+                                       path_p, path_len, opt) == 0;
+    }
+    if (g_cgu_pipe_slots == null || g_cgu_pipe_mu == null) { return false; }
+    mutex_lock(g_cgu_pipe_mu);
+    while ((g_cgu_pipe_tail - g_cgu_pipe_head) >= g_cgu_pipe_depth) {
+        condvar_wait(g_cgu_pipe_cv_free, g_cgu_pipe_mu);
+    }
+    let ring = g_cgu_pipe_tail % g_cgu_pipe_depth;
+    let slot = cgu_pipe_slot(ring);
+    cgu_ws_set(slot, mod_h, path_p, path_len, opt, unit, CGU_WS_KIND_EMIT);
+    if (unit > 0 && unit < g_cgu_pipe_units) {
+        ast_write_rawptr(ptr_offset(g_cgu_pipe_paths, unit * 8), path_p);
+    }
+    g_cgu_pipe_tail = g_cgu_pipe_tail + 1;
+    condvar_broadcast(g_cgu_pipe_cv_work);
+    mutex_unlock(g_cgu_pipe_mu);
+    return true;
+}
+
+fn cgu_pipe_finish() {
+    if (g_cgu_tbb_pool != null) {
+        vyx_tbb_cgu_pool_finish(g_cgu_tbb_pool);
+        return;
+    }
+    if (g_cgu_pipe_mu == null) { return; }
+    mutex_lock(g_cgu_pipe_mu);
+    while ((g_cgu_pipe_tail - g_cgu_pipe_head) > 0) {
+        condvar_wait(g_cgu_pipe_cv_free, g_cgu_pipe_mu);
+    }
+    g_cgu_pipe_stop = 1;
+    condvar_broadcast(g_cgu_pipe_cv_work);
+    mutex_unlock(g_cgu_pipe_mu);
+    cgu_pipe_join_workers();
+}
+
+fn cgu_pipe_unit_ok(unit: i32) -> bool {
+    if (g_cgu_tbb_pool != null) {
+        return vyx_tbb_cgu_pool_unit_ok(g_cgu_tbb_pool, unit) != 0;
+    }
+    if (g_cgu_pipe_rcs == null || unit < 0 || unit >= g_cgu_pipe_units) { return false; }
+    return ast_read_i32(ptr_offset(g_cgu_pipe_rcs, unit * 4)) == 0;
+}
+
+fn llvm_cgu_find_root(parent: rawptr, x: i32) -> i32 {
+    if (parent == null || x <= 0) { return x; }
+    var r = x;
+    var guard: i32 = 0;
+    while (guard < 65536) {
+        let p = ast_read_i32(ptr_offset(parent, r * 4));
+        if (p == r || p <= 0) { break; }
+        r = p;
+        guard = guard + 1;
+    }
+    var y = x;
+    guard = 0;
+    while (y != r && guard < 65536) {
+        let p = ast_read_i32(ptr_offset(parent, y * 4));
+        ast_write_i32(ptr_offset(parent, y * 4), r);
+        if (p <= 0) { break; }
+        y = p;
+        guard = guard + 1;
+    }
+    return r;
+}
+
+fn llvm_mir_cli_debug_enabled() -> bool {
+    var i: i32 = 1;
+    while (i < argCount()) {
+        let arg = getArg(i);
+        if (arg == "-g" || arg == "--debug") { return true; }
+        if (arg == "--") { break; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn llvm_mir_cli_source_path(mod_name: string) -> string {
+    var i: i32 = 1;
+    while (i + 1 < argCount()) {
+        let arg = getArg(i);
+        if (arg == "--src=file") { return getArg(i + 1); }
+        if (arg == "--") { break; }
+        i = i + 1;
+    }
+    return mod_name + ".vyx";
+}
+
+fn llvm_mir_string_contains(hay: string, needle: string) -> bool {
+    if (needle.len == 0) { return true; }
+    if (hay.len < needle.len) { return false; }
+    return vyx_string_contains(hay.c_str(), hay.len as u64, needle.c_str(), needle.len as u64) != 0;
+}
+
+fn dci_trace_verdict(ok: bool) -> string {
+    if (ok) { return "1"; }
+    return "0";
+}
+
+fn llvm_mir_parse_i64(text: string) -> i64 {
+    let s = text.trim();
+    if (s.len == 0) { return 0; }
+    var i: i32 = 0;
+    var sign: i64 = 1;
+    var out: i64 = 0;
+    if (s.charAt(0) == 45) {
+        sign = -1;
+        i = 1;
+    } else if (s.charAt(0) == 43) {
+        i = 1;
+    }
+    while (i < s.len) {
+        let c = s.charAt(i);
+        if (c < 48 || c > 57) { return out * sign; }
+        out = out * 10 + (c - 48);
+        i = i + 1;
+    }
+    return out * sign;
+}
+
+fn llvm_mir_timing_enabled() -> bool {
+    return llvm_mir_env_enabled("VYX_MIR_TIMING");
+}
+
+// The slice phases stamp the same marks whether the caller wants the
+// per-function slow-path log (`VYX_MIR_TIMING`) or the per-phase breakdown
+// (`VYX_CGU_PHASES`).  One set of marks, two consumers, so the instrumentation
+// cannot drift apart.
+//
+// Resolution is cached: the phases consult this gate a dozen times per
+// function, and `llvm_mir_env_enabled` reads the environment (and allocates a
+// string) on every call.
+var g_llvm_slice_timing_on: i32 = -1;
+
+fn llvm_mir_slice_timing_enabled() -> bool {
+    if (g_llvm_slice_timing_on < 0) {
+        var on: i32 = 0;
+        if (llvm_mir_timing_enabled()) { on = 1; }
+        if (policy_cgu_phases_enabled()) { on = 1; }
+        g_llvm_slice_timing_on = on;
+    }
+    return g_llvm_slice_timing_on == 1;
+}
+
+// Streaming-phase accumulators (VYX_MIR_TIMING=1 only).  The per-function
+// [mir-timing] records nest (a drain frame contains its callees' frames), so
+// summing them over-counts; these counters measure disjoint wall time.
+var g_llvm_stream_pipeline_ms: i64 = 0;
+var g_llvm_stream_lower_ms: i64 = 0;
+var g_llvm_stream_body_ms: i64 = 0;
+var g_llvm_stream_drain_ms: i64 = 0;
+var g_llvm_stream_drain_depth: i32 = 0;
+var g_llvm_stream_shell_base: i64 = 0;
+
+// Typed-pointer accesses expand the region/liveness/bounds audit as visible
+// IR by default so LLVM can inline, hoist and CSE the individual checks.
+// Setting VYX_INLINE_PTR_CHECK=0 falls back to the opaque runtime call so the
+// two lowerings can be A/B measured against each other.
+fn llvm_mir_inline_pointer_checks_disabled() -> bool {
+    let value = llvm_mir_env_value("VYX_INLINE_PTR_CHECK").trim();
+    if (value.len == 0) { return false; }
+    return value == "0" || value == "false" || value == "FALSE"
+        || value == "no" || value == "NO" || value == "off" || value == "OFF";
+}
+
+fn llvm_mir_slow_fn_threshold_ms() -> i64 {
+    let raw = llvm_mir_env_value("VYX_MIR_SLOW_MS");
+    let parsed = llvm_mir_parse_i64(raw);
+    if (parsed > 0) { return parsed; }
+    return 1000;
+}
+
+fn llvm_mir_slow_instr_threshold_ms() -> i64 {
+    let raw = llvm_mir_env_value("VYX_MIR_SLOW_INSTR_MS");
+    let parsed = llvm_mir_parse_i64(raw);
+    if (parsed > 0) { return parsed; }
+    return 1000;
+}
+
+fn llvm_mir_timing_mark(label: string, start_ms: i64) -> i64 {
+    if (!llvm_mir_timing_enabled()) { return start_ms; }
+    let now = vyx_bootstrap_now_ms();
+    print("[mir-timing] " + label + ": " + (now - start_ms).toString() + " ms");
+    return now;
+}
+
+fn llvm_mir_empty_name() -> rawptr {
+    return "".c_str();
+}
+
+fn llvm_mir_entry_at(buf: rawptr, idx: i32) -> rawptr {
+    return buf + (idx * 32);
+}
+
+fn llvm_mir_entry_write(slot: rawptr, name: string, value: rawptr, extra: rawptr) {
+    policy_entry_write(slot, name.c_str(), name.len, value, extra);
+}
+
+fn llvm_mir_entry_lookup_value(buf: rawptr, count: i32, name: string) -> rawptr {
+    if (buf == null) { return null; }
+    return policy_entry_lookup_value(buf, count, name.c_str(), name.len, 0);
+}
+
+fn llvm_mir_is_primitive_str_name(name: string) -> bool {
+    return name == "str" || name == "string" || name == "__String";
+}
+
+fn llvm_mir_generic_param_canonical(raw: string) -> string {
+    if (raw.len == 0) { return ""; }
+    var i: i32 = 0;
+    while (i < raw.len) {
+        if (raw.charAt(i) == 94) {
+            return raw.substring(0, i);
+        }
+        i = i + 1;
+    }
+    return raw;
+}
+
+fn llvm_mir_generic_param_name_is_template(name: string) -> bool {
+    if (name == "Self") { return true; }
+    if (name.len == 0) { return false; }
+    let first = name.charAt(0);
+    if (first < 65 || first > 90) { return false; }
+    var i: i32 = 0;
+    while (i < name.len) {
+        let c = name.charAt(i);
+        if (c == 46 || c == 58 || c == 60 || c == 62 || c == 91 || c == 93 || c == 40 || c == 41) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn llvm_mir_generic_params_contains(params: string, name: string) -> bool {
+    if (params.len == 0 || name.len == 0) { return false; }
+    var i: i32 = 0;
+    while (i < 64) {
+        let p = llvm_mir_generic_param_canonical(policy_generic_param_at(params, i));
+        if (p.len == 0) { return false; }
+        if (p == name && llvm_mir_generic_param_name_is_template(p)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn llvm_mir_assoc_separator_index(name: string) -> i32 {
+    var angle_depth: i32 = 0;
+    var paren_depth: i32 = 0;
+    var i: i32 = 0;
+    while (i < name.len) {
+        let ch = name.charAt(i);
+        if (ch == 60) {
+            angle_depth = angle_depth + 1;
+        } else if (ch == 62 && !(i > 0 && name.charAt(i - 1) == 45)) {
+            if (angle_depth > 0) { angle_depth = angle_depth - 1; }
+        } else if (ch == 40) {
+            paren_depth = paren_depth + 1;
+        } else if (ch == 41) {
+            if (paren_depth > 0) { paren_depth = paren_depth - 1; }
+        } else if (angle_depth == 0 && paren_depth == 0) {
+            if (ch == 46) { return i; }
+            if (ch == 58 && i + 1 < name.len && name.charAt(i + 1) == 58) { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn llvm_mir_assoc_separator_len(name: string, index: i32) -> i32 {
+    if (index < 0 || index >= name.len) { return 0; }
+    if (name.charAt(index) == 58
+        && index + 1 < name.len
+        && name.charAt(index + 1) == 58) {
+        return 2;
+    }
+    return 1;
+}
+
+fn llvm_mir_atom_is_open_template_without_env(atom: string, array_len_atom: bool) -> bool {
+    if (atom.len == 0) { return false; }
+    if (atom == "Self") { return true; }
+    let first = atom.charAt(0);
+    if (first >= 48 && first <= 57) { return false; }
+    if (atom.len == 1 && first >= 65 && first <= 90) { return true; }
+    return array_len_atom && first >= 65 && first <= 90;
+}
+
+fn llvm_mir_structural_type_text_has_open_template_atom(text: string) -> bool {
+    if (text.len == 0) { return false; }
+    var start: i32 = -1;
+    var in_array_len = false;
+    var token_is_array_len = false;
+    var i: i32 = 0;
+    while (i <= text.len) {
+        var c: i32 = 0;
+        if (i < text.len) { c = text.charAt(i); }
+        let is_ident = i < text.len
+            && ((c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122)
+                || (c >= 48 && c <= 57)
+                || c == 95
+                || c == 46);
+        if (is_ident) {
+            if (start < 0) {
+                start = i;
+                token_is_array_len = in_array_len;
+            }
+        } else {
+            if (start >= 0) {
+                let atom = text.substring(start, i);
+                if (llvm_mir_atom_is_open_template_without_env(atom, token_is_array_len)) { return true; }
+                start = -1;
+                token_is_array_len = false;
+            }
+            if (i < text.len) {
+                if (c == 59) {
+                    in_array_len = true;
+                } else if (c == 93 || c == 44 || c == 41 || c == 62) {
+                    in_array_len = false;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn llvm_mir_type_name_has_open_template_atom(name: string) -> bool {
+    if (name.len == 0) { return false; }
+    let args = policy_generic_call_args(name.clone());
+    if (args.len > 0) {
+        var i: i32 = 0;
+        while (i < 64) {
+            let a = policy_generic_arg_at(args, i);
+            if (a.len == 0) { return false; }
+            if (llvm_mir_type_name_has_open_template_atom(a)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    let sep = llvm_mir_assoc_separator_index(name);
+    if (sep >= 0) {
+        let sep_len = llvm_mir_assoc_separator_len(name, sep);
+        if (sep > 0 && sep + sep_len < name.len) {
+            let owner_text = name.substring(0, sep);
+            let member_text = name.substring(sep + sep_len, name.len);
+            if (llvm_mir_type_name_has_open_template_atom(owner_text)) { return true; }
+            if (llvm_mir_type_name_has_open_template_atom(member_text)) { return true; }
+        }
+    }
+    if (llvm_mir_structural_type_text_has_open_template_atom(name)) { return true; }
+    return false;
+}
+
+fn llvm_mir_icmp_eq() -> i32 { return 32; }
+fn llvm_mir_icmp_ne() -> i32 { return 33; }
+fn llvm_mir_icmp_ugt() -> i32 { return 34; }
+fn llvm_mir_icmp_uge() -> i32 { return 35; }
+fn llvm_mir_icmp_ult() -> i32 { return 36; }
+fn llvm_mir_icmp_ule() -> i32 { return 37; }
+fn llvm_mir_icmp_sgt() -> i32 { return 38; }
+fn llvm_mir_icmp_sge() -> i32 { return 39; }
+fn llvm_mir_icmp_slt() -> i32 { return 40; }
+fn llvm_mir_icmp_sle() -> i32 { return 41; }
+fn llvm_mir_fcmp_oeq() -> i32 { return 1; }
+fn llvm_mir_fcmp_ogt() -> i32 { return 2; }
+fn llvm_mir_fcmp_oge() -> i32 { return 3; }
+fn llvm_mir_fcmp_olt() -> i32 { return 4; }
+fn llvm_mir_fcmp_ole() -> i32 { return 5; }
+fn llvm_mir_fcmp_one() -> i32 { return 6; }
+fn llvm_mir_fcmp_une() -> i32 { return 14; }
+
+fn llvm_mir_string_contains_text(hay: string, needle: string) -> bool {
+    return llvm_mir_string_find(hay, needle, 0) >= 0;
+}
+
+fn llvm_mir_effective_target_is_windows() -> bool {
+    let requested = policy_cli_requested_target();
+    if (requested.len > 0) {
+        return policy_target_platform_name(requested) == "windows";
+    }
+    return vyx_bootstrap_platform() == 1;
+}
+
+fn llvm_mir_string_find(hay: string, needle: string, start: i32) -> i32 {
+    if (needle.len == 0) { return start; }
+    if (hay.len == 0 || needle.len > hay.len) { return -1; }
+    var i = start;
+    if (i < 0) { i = 0; }
+    while (i + needle.len <= hay.len) {
+        var j: i32 = 0;
+        var same = true;
+        while (j < needle.len && same) {
+            if (hay.charAt(i + j) != needle.charAt(j)) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn llvm_mir_last_path_segment(name: string) -> string {
+    if (name.len == 0) { return ""; }
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i < name.len) {
+        if (name.charAt(i) == 46) { start = i + 1; }
+        i = i + 1;
+    }
+    return name.substring(start, name.len);
+}
+
+fn llvm_mir_demangle_part(name: string) -> string {
+    var out = "";
+    var i: i32 = 0;
+    while (i < name.len) {
+        if (name.charAt(i) == 95 && i + 2 < name.len) {
+            let esc = name.substring(i, i + 3);
+            if (esc == "_5F") {
+                out = out + "_";
+                i = i + 3;
+                continue;
+            }
+            if (esc == "_2E") {
+                out = out + ".";
+                i = i + 3;
+                continue;
+            }
+            if (esc == "_3A") {
+                out = out + ":";
+                i = i + 3;
+                continue;
+            }
+            if (esc == "_3C") {
+                out = out + "<";
+                i = i + 3;
+                continue;
+            }
+            if (esc == "_3E") {
+                out = out + ">";
+                i = i + 3;
+                continue;
+            }
+            if (esc == "_2C") {
+                out = out + ",";
+                i = i + 3;
+                continue;
+            }
+        }
+        out = out + name.substring(i, i + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn llvm_mir_reflect_symbol_id(symbol_name: string) -> i64 {
+    var h: i64 = 1125899907;
+    var i: i32 = 0;
+    while (i < symbol_name.len) {
+        h = ((h * 131) + (symbol_name.charAt(i) as i64)) % 2147483647;
+        if (h < 0) { h = -h; }
+        i = i + 1;
+    }
+    if (h == 0) { return 1; }
+    return h;
+}
+
+fn llvm_mir_specialized_symbol_from_args(base: string, args: string) -> string {
+    var out = base + "__";
+    var idx: i32 = 0;
+    while (idx < 64) {
+        let arg = policy_generic_arg_at(args, idx);
+        if (arg.len == 0) { return out; }
+        if (idx > 0) { out = out + "_"; }
+        out = out + policy_mangle_part(arg);
+        idx = idx + 1;
+    }
+    return out;
+}
+
+fn llvm_mir_method_symbol_segment(method_name: string) -> string {
+    var i: i32 = 0;
+    while (i < method_name.len) {
+        let c = method_name.charAt(i);
+        let is_digit = c >= 48 && c <= 57;
+        let is_upper = c >= 65 && c <= 90;
+        let is_lower = c >= 97 && c <= 122;
+        if (!(is_digit || is_upper || is_lower || c == 95)) {
+            return policy_mangle_part(method_name);
+        }
+        i = i + 1;
+    }
+    return method_name;
+}
+
+fn llvm_mir_primitive_method_symbol_base(class_base: string, method_name: string) -> string {
+    var prim = class_base;
+    let last = llvm_mir_last_path_segment(class_base);
+    let method_segment = llvm_mir_method_symbol_segment(method_name);
+    if (policy_primitive_type_kind(prim) == 0 && policy_primitive_type_kind(last) != 0) {
+        prim = last;
+    }
+    if (policy_primitive_type_kind(prim) != 0) {
+        return "__vyx_prim_" + policy_mangle_part(prim) + "_" + method_segment;
+    }
+    return class_base + "_" + method_segment;
+}
+
+fn llvm_mir_class_method_symbol_name(class_name: string, method_name: string) -> string {
+    var base = class_name;
+    var args: string = "";
+    if (policy_generic_call_has_args(class_name) != 0) {
+        base = policy_generic_call_base(class_name);
+        args = policy_generic_call_args(class_name);
+    }
+    let flat = llvm_mir_primitive_method_symbol_base(base, method_name);
+    if (args.len == 0) { return flat; }
+    return llvm_mir_specialized_symbol_from_args(flat, args);
+}
+
+fn llvm_mir_symbol_index_slot_size() -> i32 { return 24; }
+
+fn llvm_mir_symbol_index_hash(symbol: string) -> i64 {
+    var h: i64 = -3750763034362895579;
+    var i: i32 = 0;
+    while (i < symbol.len) {
+        h = h ^ (symbol.charAt(i) as i64);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    if (h < 0) { h = 0 - h; }
+    return h;
+}
+
+fn llvm_mir_symbol_index_new(cap: i32) -> rawptr {
+    var n = cap;
+    if (n < 65536) { n = 65536; }
+    let bytes = (n as i64) * (llvm_mir_symbol_index_slot_size() as i64);
+    let buf = malloc(bytes as u64);
+    if (buf != null) { memset(buf, 0, bytes as u64); }
+    return buf;
+}
+
+fn llvm_mir_symbol_index_slot(buf: rawptr, idx: i32) -> rawptr {
+    return ptr_offset(buf, (idx as i64) * (llvm_mir_symbol_index_slot_size() as i64));
+}
+
+fn llvm_mir_symbol_index_key_matches(ptr: rawptr, len: i64, symbol: string) -> bool {
+    if (ptr == null || len != symbol.len) { return false; }
+    if (len == 0) { return symbol.len == 0; }
+    return memcmp(ptr, symbol.c_str(), len as u64) == 0;
+}
+
+fn llvm_mir_symbol_index_get(buf: rawptr, cap: i32, symbol: string) -> i32 {
+    if (buf == null || cap <= 0 || symbol.len == 0) { return mir_id_invalid(); }
+    var idx = (llvm_mir_symbol_index_hash(symbol.clone()) % (cap as i64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = llvm_mir_symbol_index_slot(buf, idx);
+        let ptr = ast_read_rawptr(slot);
+        if (ptr == null) { return mir_id_invalid(); }
+        if (llvm_mir_symbol_index_key_matches(ptr, ast_read_i64(ptr_offset(slot, 8)), symbol)) {
+            return ast_read_i32(ptr_offset(slot, 16));
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return mir_id_invalid();
+}
+
+fn llvm_mir_symbol_index_put_first(buf: rawptr, cap: i32, symbol: string, function_id: i32) {
+    if (buf == null || cap <= 0 || symbol.len == 0 || function_id == mir_id_invalid()) { return; }
+    var idx = (llvm_mir_symbol_index_hash(symbol.clone()) % (cap as i64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = llvm_mir_symbol_index_slot(buf, idx);
+        let ptr = ast_read_rawptr(slot);
+        if (ptr == null) {
+            ast_write_rawptr(slot, ast_dup_c_string(symbol.clone()));
+            ast_write_i64(ptr_offset(slot, 8), symbol.len);
+            ast_write_i32(ptr_offset(slot, 16), function_id);
+            return;
+        }
+        if (llvm_mir_symbol_index_key_matches(ptr, ast_read_i64(ptr_offset(slot, 8)), symbol)) {
+            return;
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+}
+
+fn llvm_mir_method_candidate_index_new(cap: i32) -> rawptr {
+    return llvm_mir_symbol_index_new(cap);
+}
+
+fn llvm_mir_method_candidate_index_lookup(buf: rawptr, cap: i32, method_name: string) -> rawptr {
+    if (buf == null || cap <= 0 || method_name.len == 0) { return null; }
+    var idx = (llvm_mir_symbol_index_hash(method_name.clone()) % (cap as i64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = llvm_mir_symbol_index_slot(buf, idx);
+        let ptr = ast_read_rawptr(slot);
+        if (ptr == null) { return null; }
+        if (llvm_mir_symbol_index_key_matches(ptr, ast_read_i64(ptr_offset(slot, 8)), method_name)) {
+            return ast_read_rawptr(ptr_offset(slot, 16));
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn llvm_mir_method_candidate_index_put(buf: rawptr, cap: i32, method_name: string, function_id: i32) {
+    if (buf == null || cap <= 0 || method_name.len == 0 || function_id == mir_id_invalid()) { return; }
+    var idx = (llvm_mir_symbol_index_hash(method_name.clone()) % (cap as i64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = llvm_mir_symbol_index_slot(buf, idx);
+        var ptr = ast_read_rawptr(slot);
+        if (ptr == null) {
+            ast_write_rawptr(slot, ast_dup_c_string(method_name.clone()));
+            ast_write_i64(ptr_offset(slot, 8), method_name.len);
+            ast_write_rawptr(ptr_offset(slot, 16), null);
+            ptr = ast_read_rawptr(slot);
+        }
+        if (llvm_mir_symbol_index_key_matches(ptr, ast_read_i64(ptr_offset(slot, 8)), method_name)) {
+            var existing = ast_read_rawptr(ptr_offset(slot, 16));
+            while (existing != null) {
+                if (ast_read_i32(existing) == function_id) { return; }
+                existing = ast_read_rawptr(ptr_offset(existing, 8));
+            }
+            let node = malloc(16);
+            if (node == null) { return; }
+            ast_write_i32(node, function_id);
+            ast_write_rawptr(ptr_offset(node, 8), ast_read_rawptr(ptr_offset(slot, 16)));
+            ast_write_rawptr(ptr_offset(slot, 16), node);
+            return;
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+}
+
+// Stable descriptor: data pointer at 0, slot capacity (including id 0) at 8,
+// written high-water id at 16, element byte width at 24. All counters are i64.
+// MIR tables grow while bodies and instances are materialized, so creation
+// counts are sizing hints, never bounds on later ids. No caller borrows a slot
+// address; only the descriptor and the stored values remain stable on growth.
+fn llvm_mir_id_map_fail() {
+    diag_emit_codegen("LLVM MIR ID map allocation failed");
+    // Losing a declaration/value write is not a recoverable cache miss. Stop
+    // before a partial LLVM module can be reported as successful output.
+    exit(1);
+}
+
+fn llvm_mir_id_map_new(count: i32, element_bytes: i64) -> rawptr {
+    var n = count as i64;
+    if (n < 1) { n = 1; }
+    let capacity = n + 1;
+    let bytes = capacity * element_bytes;
+    let map = malloc(32);
+    if (map == null) {
+        llvm_mir_id_map_fail();
+        return null;
+    }
+    let data = malloc(bytes as u64);
+    if (data == null) {
+        free(map);
+        llvm_mir_id_map_fail();
+        return null;
+    }
+    memset(data, 0, bytes as u64);
+    ast_write_rawptr(map, data);
+    ast_write_i64(ptr_offset(map, 8), capacity);
+    ast_write_i64(ptr_offset(map, 16), 0);
+    ast_write_i64(ptr_offset(map, 24), element_bytes);
+    return map;
+}
+
+fn llvm_mir_id_map_slot(map: rawptr, id: i32) -> rawptr {
+    let data = ast_read_rawptr(map);
+    let element_bytes = ast_read_i64(ptr_offset(map, 24));
+    return data + ((id as i64) * element_bytes);
+}
+
+fn llvm_mir_id_map_reserve(map: rawptr, id: i32) {
+    let required = (id as i64) + 1;
+    let capacity = ast_read_i64(ptr_offset(map, 8));
+    if (required <= capacity) { return; }
+    var next_capacity = capacity * 2;
+    if (next_capacity < required) { next_capacity = required; }
+    let element_bytes = ast_read_i64(ptr_offset(map, 24));
+    let bytes = next_capacity * element_bytes;
+    let data = malloc(bytes as u64);
+    if (data == null) {
+        llvm_mir_id_map_fail();
+        return;
+    }
+    memset(data, 0, bytes as u64);
+    let old_data = ast_read_rawptr(map);
+    let written = ast_read_i64(ptr_offset(map, 16));
+    memcpy(data, old_data, ((written + 1) * element_bytes) as u64);
+    ast_write_rawptr(map, data);
+    ast_write_i64(ptr_offset(map, 8), next_capacity);
+    free(old_data);
+}
+
+fn llvm_mir_id_map_note_write(map: rawptr, id: i32) {
+    let written = ast_read_i64(ptr_offset(map, 16));
+    if ((id as i64) > written) {
+        ast_write_i64(ptr_offset(map, 16), id as i64);
+    }
+}
+
+fn llvm_mir_id_map_zero(map: rawptr) {
+    if (map == null) { return; }
+    let written = ast_read_i64(ptr_offset(map, 16));
+    if (written <= 0) { return; }
+    let element_bytes = ast_read_i64(ptr_offset(map, 24));
+    memset(ast_read_rawptr(map), 0, ((written + 1) * element_bytes) as u64);
+    ast_write_i64(ptr_offset(map, 16), 0);
+}
+
+fn llvm_mir_id_map_clear_range(map: rawptr, first_id: i32, last_id: i32) {
+    if (map == null || last_id < first_id) { return; }
+    var first = first_id as i64;
+    if (first < 1) { first = 1; }
+    var last = last_id as i64;
+    let written = ast_read_i64(ptr_offset(map, 16));
+    if (last > written) { last = written; }
+    if (last < first) { return; }
+    let element_bytes = ast_read_i64(ptr_offset(map, 24));
+    let data = ast_read_rawptr(map);
+    memset(data + first * element_bytes, 0, ((last - first + 1) * element_bytes) as u64);
+    if (last == written) { ast_write_i64(ptr_offset(map, 16), first - 1); }
+}
+
+fn llvm_mir_id_map_dispose(map: rawptr) {
+    if (map == null) { return; }
+    free(ast_read_rawptr(map));
+    free(map);
+}
+
+fn llvm_mir_alloc_ptr_map(count: i32) -> rawptr {
+    return llvm_mir_id_map_new(count, 8);
+}
+
+fn llvm_mir_alloc_i32_map(count: i32) -> rawptr {
+    return llvm_mir_id_map_new(count, 4);
+}
+
+fn llvm_mir_free_raw_chain(head: rawptr, next_offset: i32) {
+    var cur = head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, next_offset));
+        free(cur);
+        cur = next;
+    }
+}
+
+fn llvm_mir_free_map_value_chains(map: rawptr, count: i32, next_offset: i32) {
+    if (map == null || count <= 0) { return; }
+    var id: i32 = 1;
+    while (id <= count) {
+        llvm_mir_free_raw_chain(llvm_mir_map_get(map, id), next_offset);
+        id = id + 1;
+    }
+}
+
+fn llvm_mir_free_map_owned_values(map: rawptr, count: i32) {
+    if (map == null || count <= 0) { return; }
+    var id: i32 = 1;
+    while (id <= count) {
+        let value = llvm_mir_map_get(map, id);
+        if (value != null) { free(value); }
+        id = id + 1;
+    }
+}
+
+fn llvm_mir_dispose_symbol_index(buf: rawptr, cap: i32, has_candidate_chains: bool) {
+    if (buf == null) { return; }
+    var i: i32 = 0;
+    while (i < cap) {
+        let slot = llvm_mir_symbol_index_slot(buf, i);
+        let key = ast_read_rawptr(slot);
+        if (key != null) { free(key); }
+        if (has_candidate_chains) {
+            llvm_mir_free_raw_chain(ast_read_rawptr(ptr_offset(slot, 16)), 8);
+        }
+        i = i + 1;
+    }
+    free(buf);
+}
+
+fn llvm_mir_dci_obj_index_lookup(buf: rawptr, cap: i32, key: string) -> rawptr {
+    if (buf == null || cap <= 0 || key.len == 0) { return null; }
+    var idx = (llvm_mir_symbol_index_hash(key.clone()) % (cap as i64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = llvm_mir_symbol_index_slot(buf, idx);
+        let ptr = ast_read_rawptr(slot);
+        if (ptr == null) { return null; }
+        if (llvm_mir_symbol_index_key_matches(ptr, ast_read_i64(ptr_offset(slot, 8)), key)) {
+            return ast_read_rawptr(ptr_offset(slot, 16));
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return null;
+}
+
+fn llvm_mir_dci_obj_index_first(buf: rawptr, cap: i32, key: string) -> rawptr {
+    let chain = llvm_mir_dci_obj_index_lookup(buf, cap, key);
+    if (chain == null) { return null; }
+    return ast_read_rawptr(chain);
+}
+
+fn llvm_mir_dci_obj_index_put(buf: rawptr, cap: i32, key: string, obj: rawptr) {
+    if (buf == null || cap <= 0 || key.len == 0 || obj == null) { return; }
+    var idx = (llvm_mir_symbol_index_hash(key.clone()) % (cap as i64)) as i32;
+    var probes: i32 = 0;
+    while (probes < cap) {
+        let slot = llvm_mir_symbol_index_slot(buf, idx);
+        var ptr = ast_read_rawptr(slot);
+        if (ptr == null) {
+            ast_write_rawptr(slot, ast_dup_c_string(key.clone()));
+            ast_write_i64(ptr_offset(slot, 8), key.len);
+            ast_write_rawptr(ptr_offset(slot, 16), null);
+            ptr = ast_read_rawptr(slot);
+        }
+        if (llvm_mir_symbol_index_key_matches(ptr, ast_read_i64(ptr_offset(slot, 8)), key)) {
+            var existing = ast_read_rawptr(ptr_offset(slot, 16));
+            var last: rawptr = null;
+            while (existing != null) {
+                if (ast_read_rawptr(existing) == obj) { return; }
+                last = existing;
+                existing = ast_read_rawptr(ptr_offset(existing, 8));
+            }
+            let node = malloc(16);
+            if (node == null) { return; }
+            ast_write_rawptr(node, obj);
+            ast_write_rawptr(ptr_offset(node, 8), null);
+            if (last == null) {
+                ast_write_rawptr(ptr_offset(slot, 16), node);
+            } else {
+                ast_write_rawptr(ptr_offset(last, 8), node);
+            }
+            return;
+        }
+        idx = idx + 1;
+        if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
+    }
+}
+
+fn llvm_mir_dci_type_name_is_plain(raw: string) -> bool {
+    if (raw.len == 0) { return false; }
+    var i: i32 = 0;
+    while (i < raw.len) {
+        let ch = raw.charAt(i);
+        if (ch == 9 || ch == 32 || ch == 58) { return false; }
+        if (ch == 46 && (i + 1) < raw.len && raw.charAt(i + 1) == 60) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn llvm_mir_map_get(map: rawptr, id: i32) -> rawptr {
+    if (map == null || id <= 0) { return null; }
+    if ((id as i64) >= ast_read_i64(ptr_offset(map, 8))) { return null; }
+    return ast_read_rawptr(llvm_mir_id_map_slot(map, id));
+}
+
+fn llvm_mir_map_put(map: rawptr, id: i32, value: rawptr) {
+    if (map == null || id <= 0) { return; }
+    llvm_mir_id_map_reserve(map, id);
+    ast_write_rawptr(llvm_mir_id_map_slot(map, id), value);
+    llvm_mir_id_map_note_write(map, id);
+}
+
+fn llvm_mir_map_clear_range(map: rawptr, first_id: i32, last_id: i32) {
+    llvm_mir_id_map_clear_range(map, first_id, last_id);
+}
+
+fn llvm_mir_i32_map_get(map: rawptr, id: i32) -> i32 {
+    if (map == null || id <= 0) { return 0; }
+    if ((id as i64) >= ast_read_i64(ptr_offset(map, 8))) { return 0; }
+    return ast_read_i32(llvm_mir_id_map_slot(map, id));
+}
+
+fn llvm_mir_i32_map_put(map: rawptr, id: i32, value: i32) {
+    if (map == null || id <= 0) { return; }
+    llvm_mir_id_map_reserve(map, id);
+    ast_write_i32(llvm_mir_id_map_slot(map, id), value);
+    llvm_mir_id_map_note_write(map, id);
+}
+
+fn llvm_mir_i32_map_clear_range(map: rawptr, first_id: i32, last_id: i32) {
+    llvm_mir_id_map_clear_range(map, first_id, last_id);
+}
+
+fn llvm_mir_max_static_item_target(m: MirUnit) -> i32 {
+    var out: i32 = 0;
+    var value_id: i32 = 1;
+    while (value_id <= m.value_count) {
+        if (m.value_target_kind(value_id) == mir_target_hir_item()
+            && m.value_target_id(value_id) > out) {
+            out = m.value_target_id(value_id);
+        }
+        value_id = value_id + 1;
+    }
+    var place_id: i32 = 1;
+    while (place_id <= m.place_count) {
+        if (m.place_kind(place_id) == mir_place_static()
+            && m.place_local(place_id) > out) {
+            out = m.place_local(place_id);
+        }
+        place_id = place_id + 1;
+    }
+    if (m.static_count > out) { out = m.static_count; }
+    return out;
+}
+
+fn llvm_mir_type_kind(m: &MirUnit, type_id: i32) -> i32 {
+    return mir_backend_type_kind(m, type_id);
+}
+
+fn llvm_mir_type_text(m: &MirUnit, type_id: i32) -> string {
+    return mir_backend_type_text(m, type_id);
+}
+
+fn llvm_mir_int_bits_for_kind(kind: i32) -> i32 {
+    return mir_backend_int_bits_for_kind(kind);
+}
+
+fn llvm_mir_kind_unsigned(kind: i32) -> bool {
+    return mir_backend_kind_unsigned(kind);
+}
+
+// Bool and char have their own textual forms. All remaining unsigned integer
+// kinds must use the uint64_t runtime ABI so a high-bit u64 is not rendered
+// as a negative int64_t value.
+fn llvm_mir_kind_decimal_unsigned(kind: i32) -> bool {
+    return mir_backend_kind_decimal_unsigned(kind);
+}
+
+fn llvm_mir_kind_float(kind: i32) -> bool {
+    return mir_backend_kind_float(kind);
+}
+
+fn llvm_mir_float_bits_for_kind(kind: i32) -> i32 {
+    return mir_backend_float_bits_for_kind(kind);
+}
+
+fn llvm_mir_kind_pointer_like(kind: i32) -> bool {
+    return mir_backend_kind_pointer_like(kind);
+}
+
+fn llvm_mir_kind_pointer_handle(kind: i32) -> bool {
+    return mir_backend_kind_pointer_handle(kind);
+}
+
+fn llvm_mir_tk_PLUS() -> i32 { return 81; }
+fn llvm_mir_tk_MINUS() -> i32 { return 82; }
+fn llvm_mir_tk_STAR() -> i32 { return 83; }
+fn llvm_mir_tk_SLASH() -> i32 { return 84; }
+fn llvm_mir_tk_PERCENT() -> i32 { return 85; }
+fn llvm_mir_tk_EQEQ() -> i32 { return 86; }
+fn llvm_mir_tk_NEQ() -> i32 { return 87; }
+fn llvm_mir_tk_LT() -> i32 { return 88; }
+fn llvm_mir_tk_LE() -> i32 { return 89; }
+fn llvm_mir_tk_GT() -> i32 { return 90; }
+fn llvm_mir_tk_GE() -> i32 { return 91; }
+fn llvm_mir_tk_AND() -> i32 { return 92; }
+fn llvm_mir_tk_OR() -> i32 { return 93; }
+fn llvm_mir_tk_NOT() -> i32 { return 94; }
+fn llvm_mir_tk_AMP() -> i32 { return 95; }
+fn llvm_mir_tk_PIPE() -> i32 { return 96; }
+fn llvm_mir_tk_CARET() -> i32 { return 97; }
+fn llvm_mir_tk_TILDE() -> i32 { return 98; }
+fn llvm_mir_tk_LSHIFT() -> i32 { return 99; }
+fn llvm_mir_tk_RSHIFT() -> i32 { return 100; }
+fn llvm_mir_tk_QUESTION() -> i32 { return 118; }
+
+fn llvm_mir_map_binop_pred_float(op: i32) -> i32 {
+    if (op == llvm_mir_tk_EQEQ()) { return llvm_mir_fcmp_oeq(); }
+    if (op == llvm_mir_tk_NEQ()) { return llvm_mir_fcmp_one(); }
+    if (op == llvm_mir_tk_LT()) { return llvm_mir_fcmp_olt(); }
+    if (op == llvm_mir_tk_LE()) { return llvm_mir_fcmp_ole(); }
+    if (op == llvm_mir_tk_GT()) { return llvm_mir_fcmp_ogt(); }
+    if (op == llvm_mir_tk_GE()) { return llvm_mir_fcmp_oge(); }
+    return -1;
+}
+
+fn llvm_mir_map_binop_pred_signed(op: i32) -> i32 {
+    if (op == llvm_mir_tk_EQEQ()) { return llvm_mir_icmp_eq(); }
+    if (op == llvm_mir_tk_NEQ()) { return llvm_mir_icmp_ne(); }
+    if (op == llvm_mir_tk_LT()) { return llvm_mir_icmp_slt(); }
+    if (op == llvm_mir_tk_LE()) { return llvm_mir_icmp_sle(); }
+    if (op == llvm_mir_tk_GT()) { return llvm_mir_icmp_sgt(); }
+    if (op == llvm_mir_tk_GE()) { return llvm_mir_icmp_sge(); }
+    return -1;
+}
+
+fn llvm_mir_map_binop_pred_unsigned(op: i32) -> i32 {
+    if (op == llvm_mir_tk_EQEQ()) { return llvm_mir_icmp_eq(); }
+    if (op == llvm_mir_tk_NEQ()) { return llvm_mir_icmp_ne(); }
+    if (op == llvm_mir_tk_LT()) { return llvm_mir_icmp_ult(); }
+    if (op == llvm_mir_tk_LE()) { return llvm_mir_icmp_ule(); }
+    if (op == llvm_mir_tk_GT()) { return llvm_mir_icmp_ugt(); }
+    if (op == llvm_mir_tk_GE()) { return llvm_mir_icmp_uge(); }
+    return -1;
+}
+
+// P4 remains a bounded proof slice. Exceeding these limits only disables
+// lifetime metadata/slot reuse for that function; it never changes codegen
+// semantics or attempts a partial interval proof.
+fn llvm_mir_lifetime_marker_max_function_locals() -> i32 { return 128; }
+fn llvm_mir_lifetime_marker_max_block_instrs() -> i32 { return 4096; }
+fn llvm_mir_lifetime_marker_max_value_visits() -> i32 { return 8192; }
+
+fn llvm_mir_pic_from_argv() -> bool {
+    var i: i32 = 1;
+    while (i < argCount()) {
+        let arg = getArg(i);
+        if (arg == "-fPIC" || arg == "-fpic") { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Acceptance Lowerer plugin: structured `MirUnit` + attached DCI facts → LLVM.
+/// The C++ source backend is a separate optional plugin (`mir_cpp_lower.vyx`)
+/// and is not on the hello/fixpoint/DCI gate path.
+public fn llvm_mir_lowerer_plugin_name() -> string { return "llvm"; }
+public fn llvm_mir_lowerer_is_acceptance_backend() -> bool { return true; }
+
+public class LlvmMirLowerer {
+    public m: MirUnit
+    public module_symbol_name: string
+    public target_triple: string
+    public export_root_linkage_mode: bool
+    public partition_codegen_roots: bool
+    public mir_opt_level: i32
+    public mir_verify_strict: bool
+    public debug_enabled: bool
+    public debug_source_path: string
+    public mod: rawptr
+    public ty_i1: rawptr
+    public ty_i8: rawptr
+    public ty_i16: rawptr
+    public ty_i32: rawptr
+    public ty_i64: rawptr
+    public pointer_index_bits: i32
+    public ty_pointer_index: rawptr
+    public ty_ptr: rawptr
+    public ty_void: rawptr
+    public string_ty: rawptr
+    public closure_fat_ty: rawptr
+    public pointer_handle_ty: rawptr
+    public function_values: rawptr
+    public function_types: rawptr
+    public function_definition_emitted_map: rawptr
+    public function_closure_adapter_values: rawptr
+    public function_raw_callback_adapter_values: rawptr
+    public reflected_method_adapter_head: rawptr
+    public dyn_method_adapter_head: rawptr
+    public dyn_vtable_head: rawptr
+    public dyn_trait_impl_cache_head: rawptr
+    public function_env_types: rawptr
+    public async_context_types: rawptr
+    public async_worker_values: rawptr
+    public async_worker_types: rawptr
+    public async_ctx_temp_specs: rawptr
+    // Arena `local_count` as it stood just before the body currently being
+    // lowered was built (the slice's local mark).  A streamed body can be
+    // materialised more than once -- the CGU collect walk builds every body
+    // once and the unit that owns a function builds it again -- and a released
+    // body deliberately leaves its locals in the function's `local_next` chain
+    // ("later declarations still need their parameter types and flags", see
+    // `discard_recent_body_records`).  Locals with an id at or below this mark
+    // therefore belong to an *earlier* build of the same body: dead weight for
+    // the walk in progress.  0 means "no body in flight", which is also what
+    // the spawn-side queries run with -- they need the whole chain, because the
+    // callee's body (and so its frame layout) may have been built by another
+    // unit or an earlier round.
+    // The duplicate locals that survive are exactly the builder's temporaries:
+    // requested HIR locals are re-used across builds through the builder's
+    // local map, so parameters and captures stay single-copy, while
+    // `add_temp_place*` allocates a fresh MIR local for every build.
+    public current_body_local_first: i32
+    public type_struct_values: rawptr
+    public type_struct_body_field_counts: rawptr
+    public dyn_vtable_type_values: rawptr
+    public dyn_trait_method_counts: rawptr
+    public dyn_trait_method_lists: rawptr
+    public hir_item_globals: rawptr
+    public block_values: rawptr
+    public local_slots: rawptr
+    public local_debug_pending: rawptr
+    public local_lifetime_marker_candidates: rawptr
+    public local_lifetime_marker_live_orders: rawptr
+    public local_lifetime_marker_dead_orders: rawptr
+    public local_lifetime_marker_value_visit_budget: i32
+    public local_lifetime_marker_value_query_failed: bool
+    public local_slot_reuse_candidates: rawptr
+    // 0 = owns an alloca that has not been lent; positive = reuses that
+    // earlier local's slot; negative = owns an alloca already lent once.
+    // The bounded P4 slice deliberately limits each physical slot to one
+    // proven sequential pair.
+    public local_slot_reuse_sources: rawptr
+    public foreach_iterator_slots: rawptr
+    public value_cache: rawptr
+    // Per-instruction deref-place address cache: within one MIR instruction,
+    // the same deref place (e.g. `*p` read and written by `*p += 1`) must
+    // resolve to one handle load even when the pointer local is volatile
+    // (volatile loads are not CSE-able by LLVM).  Cleared per instruction.
+    public instr_deref_addr_cache: rawptr
+    // Handles for borrow regions that were hoisted to the frame entry, keyed
+    // by the MIR value id of the `&place` expression.  Cleared over the
+    // function's own value range, like value_cache, because the streaming
+    // pipeline recycles value ids across functions.
+    public hoisted_borrow_handles: rawptr
+    // Value id of the function currently being lowered, as a half-open range
+    // [pending_value_first, pending_value_last] supplied by the pipeline that
+    // built the MIR body.  Zero means "unknown", which disables hoisting.
+    public pending_value_first: i32
+    public pending_value_last: i32
+    // Lazily built (first_value, last_value) pair per function, for the
+    // whole-unit pipeline that has no per-function mark to hand over.
+    public function_value_ranges: rawptr
+    public direct_call_callee_value_map: rawptr
+    public function_value_adapter_need_map: rawptr
+    public raw_callback_adapter_use_map: rawptr
+    public adapter_need_cache_ready: bool
+    public function_open_template_cache: rawptr
+    public function_open_template_cache_ready: bool
+    public function_self_call_cache: rawptr
+    public function_self_call_cache_ready: bool
+    public canonical_type_cache: rawptr
+    public type_compat_cache: rawptr
+    public field_owner_accept_cache: rawptr
+    public class_pointer_abi_cache: rawptr
+    public value_struct_abi_cache: rawptr
+    public c_sysv_classify_cache: rawptr
+    public value_struct_base_name_index: rawptr
+    public value_struct_base_name_index_cap: i32
+    public value_struct_base_name_index_ready: bool
+    public type_text_index: rawptr
+    public type_text_index_cap: i32
+    public type_text_index_ready: bool
+    public type_text_index_types: i32
+    public interned_rawptr_type_id: i32
+    public interned_str_type_id: i32
+    public interned_f32_type_id: i32
+    public interned_f64_type_id: i32
+    public option_abi_cache: rawptr
+    public result_abi_cache: rawptr
+    public interface_trait_type_cache: rawptr
+    public interface_owner_name_index: rawptr
+    public interface_owner_name_index_cap: i32
+    public interface_owner_name_index_ready: bool
+    public interface_owner_name_index_functions: i32
+    public foreign_dci_type_presence_cache: i32
+    public foreign_dci_field_record_cache: rawptr
+    public field_remap_cache: rawptr
+    public dci_stub_factory_values: rawptr
+    public dci_stub_destroy_values: rawptr
+    public dci_json_root: rawptr
+    public dci_json_bundle: rawptr
+    public dci_json_text_cache: string
+    public dci_layout_by_type_cache: rawptr
+    public dci_record_name_cache: rawptr
+    public dci_local_reported_names: string
+    public dci_local_layout_slots: rawptr
+    public dci_local_layout_count: i32
+    public dci_symbol_name_cache: rawptr
+    public dci_symbol_object_cache: rawptr
+    public dci_lookup_miss: rawptr
+    public dci_index_ready: bool
+    public dci_layout_index: rawptr
+    public dci_layout_index_cap: i32
+    public dci_symbol_index: rawptr
+    public dci_symbol_index_cap: i32
+    public dci_alias_index: rawptr
+    public dci_alias_index_cap: i32
+    public dci_consumer_bind_depth: i32
+    public function_mangled_name_cache: rawptr
+    public dci_runtime_operation_cache_head: rawptr
+    public current_function_id: i32
+    public current_block_id: i32
+    public current_instr_id: i32
+    public current_value_id: i32
+    public current_place_id: i32
+    public current_function_value: rawptr
+    public current_entry_block: rawptr
+    public builtin_print_fn: rawptr
+    public builtin_print_fty: rawptr
+    public builtin_println_fn: rawptr
+    public builtin_println_fty: rawptr
+    public builtin_printf_fn: rawptr
+    public builtin_printf_fty: rawptr
+    public builtin_snprintf_fn: rawptr
+    public builtin_snprintf_fty: rawptr
+    public builtin_int_to_string_fn: rawptr
+    public builtin_int_to_string_fty: rawptr
+    public builtin_int_to_string_len_fn: rawptr
+    public builtin_int_to_string_len_fty: rawptr
+    public builtin_int_decimal_len_fn: rawptr
+    public builtin_int_decimal_len_fty: rawptr
+    public builtin_int_to_string_into_fn: rawptr
+    public builtin_int_to_string_into_fty: rawptr
+    public builtin_uint_to_string_fn: rawptr
+    public builtin_uint_to_string_fty: rawptr
+    public builtin_uint_to_string_len_fn: rawptr
+    public builtin_uint_to_string_len_fty: rawptr
+    public builtin_uint_decimal_len_fn: rawptr
+    public builtin_uint_decimal_len_fty: rawptr
+    public builtin_uint_to_string_into_fn: rawptr
+    public builtin_uint_to_string_into_fty: rawptr
+    public builtin_string_builder_create_fn: rawptr
+    public builtin_string_builder_create_fty: rawptr
+    public builtin_string_builder_append_i64_fn: rawptr
+    public builtin_string_builder_append_i64_fty: rawptr
+    public builtin_string_builder_append_u64_fn: rawptr
+    public builtin_string_builder_append_u64_fty: rawptr
+    public builtin_string_clone_fn: rawptr
+    public builtin_string_clone_fty: rawptr
+    public builtin_class_alloc_fn: rawptr
+    public builtin_class_alloc_fty: rawptr
+    public builtin_bool_to_string_fn: rawptr
+    public builtin_bool_to_string_fty: rawptr
+    public builtin_strlen_fn: rawptr
+    public builtin_strlen_fty: rawptr
+    public builtin_arg_count_fn: rawptr
+    public builtin_arg_count_fty: rawptr
+    public builtin_get_arg_fn: rawptr
+    public builtin_get_arg_fty: rawptr
+    public runtime_arg_count_fn: rawptr
+    public runtime_arg_count_fty: rawptr
+    public runtime_get_arg_cstr_fn: rawptr
+    public runtime_get_arg_cstr_fty: rawptr
+    public runtime_set_args_fn: rawptr
+    public runtime_set_args_fty: rawptr
+    public builtin_malloc_fn: rawptr
+    public builtin_malloc_fty: rawptr
+    public builtin_pooled_string_alloc_fn: rawptr
+    public builtin_pooled_string_alloc_fty: rawptr
+    public builtin_free_fn: rawptr
+    public builtin_free_fty: rawptr
+    public pointer_region_create_fn: rawptr
+    public pointer_region_create_fty: rawptr
+    public pointer_region_retag_fn: rawptr
+    public pointer_region_retag_fty: rawptr
+    public pointer_region_set_dimension_fn: rawptr
+    public pointer_region_set_dimension_fty: rawptr
+    public pointer_region_rank_fn: rawptr
+    public pointer_region_rank_fty: rawptr
+    public pointer_handle_alive_fn: rawptr
+    public pointer_handle_alive_fty: rawptr
+    public pointer_checked_address_fn: rawptr
+    public pointer_checked_address_fty: rawptr
+    public pointer_checked_address_typed_fn: rawptr
+    public pointer_checked_address_typed_fty: rawptr
+    public pointer_region_delete_fn: rawptr
+    public pointer_region_delete_fty: rawptr
+    public builtin_pooled_string_free_fn: rawptr
+    public builtin_pooled_string_free_fty: rawptr
+    public builtin_forget_string_len_fn: rawptr
+    public builtin_forget_string_len_fty: rawptr
+    public builtin_runtime_string_free_fn: rawptr
+    public builtin_runtime_string_free_fty: rawptr
+    public builtin_realloc_fn: rawptr
+    public builtin_realloc_fty: rawptr
+    public builtin_memcpy_fn: rawptr
+    public builtin_memcpy_fty: rawptr
+    public builtin_memmove_fn: rawptr
+    public builtin_memmove_fty: rawptr
+    public builtin_memset_fn: rawptr
+    public builtin_memset_fty: rawptr
+    public builtin_abort_fn: rawptr
+    public builtin_abort_fty: rawptr
+    // Alias-scope domain for typed-pointer audit/payload disjointness (lazy).
+    public ptr_alias_domain: rawptr
+    public builtin_exit_fn: rawptr
+    public builtin_exit_fty: rawptr
+    public builtin_concat_fn: rawptr
+    public builtin_concat_fty: rawptr
+    public builtin_string_trim_fn: rawptr
+    public builtin_string_trim_fty: rawptr
+    public builtin_string_replace_fn: rawptr
+    public builtin_string_replace_fty: rawptr
+    public builtin_string_to_upper_len_fn: rawptr
+    public builtin_string_to_upper_len_fty: rawptr
+    public builtin_string_to_lower_len_fn: rawptr
+    public builtin_string_to_lower_len_fty: rawptr
+    public builtin_strncmp_fn: rawptr
+    public builtin_strncmp_fty: rawptr
+    public builtin_strcmp_fn: rawptr
+    public builtin_strcmp_fty: rawptr
+    public builtin_memcmp_fn: rawptr
+    public builtin_memcmp_fty: rawptr
+    public builtin_strstr_fn: rawptr
+    public builtin_strstr_fty: rawptr
+    public builtin_string_contains_fn: rawptr
+    public builtin_string_contains_fty: rawptr
+    public builtin_string_index_of_fn: rawptr
+    public builtin_string_index_of_fty: rawptr
+    public builtin_get_file_attrs_fn: rawptr
+    public builtin_get_file_attrs_fty: rawptr
+    public builtin_calloc_fn: rawptr
+    public builtin_calloc_fty: rawptr
+    public builtin_fopen_fn: rawptr
+    public builtin_fopen_fty: rawptr
+    public builtin_fclose_fn: rawptr
+    public builtin_fclose_fty: rawptr
+    public builtin_fread_fn: rawptr
+    public builtin_fread_fty: rawptr
+    public builtin_fwrite_fn: rawptr
+    public builtin_fwrite_fty: rawptr
+    public builtin_fgetc_fn: rawptr
+    public builtin_fgetc_fty: rawptr
+    public builtin_fputc_fn: rawptr
+    public builtin_fputc_fty: rawptr
+    public builtin_feof_fn: rawptr
+    public builtin_feof_fty: rawptr
+    public builtin_fseek_fn: rawptr
+    public builtin_fseek_fty: rawptr
+    public builtin_ftell_fn: rawptr
+    public builtin_ftell_fty: rawptr
+    public builtin_remove_fn: rawptr
+    public builtin_remove_fty: rawptr
+    public builtin_rename_fn: rawptr
+    public builtin_rename_fty: rawptr
+    public runtime_argc_global: rawptr
+    public runtime_argv_global: rawptr
+    public runtime_args_defined: bool
+    public last_print_call: rawptr
+    public error_count: i32
+    public str_lit_buf: rawptr
+    public string_lit_count: i32
+    public declared_function_scan_next: i32
+    public function_symbol_index: rawptr
+    public function_symbol_index_cap: i32
+    public method_candidate_index: rawptr
+    public method_candidate_index_cap: i32
+    public method_candidate_index_ready: bool
+    // Method-name index over the codegen partition.  `method_candidate_index`
+    // cannot serve the `dyn` path in a split build (a sibling unit's function
+    // has no body *here*), but it must stay byte-for-byte identical for
+    // ordinary method resolution, so the partition gets its own index,
+    // populated once from inside `cgu_record_function`.
+    public dyn_partition_index: rawptr
+    public dyn_partition_index_cap: i32
+    // Number of partition slots already folded into `dyn_partition_index`.  The
+    // index grows lazily, so a lookup only ever indexes slots it has not seen;
+    // that also keeps it correct when the partition gains slots after the first
+    // `dyn` query.
+    public dyn_partition_index_n: i32
+    // Per-slot signature snapshots for the partition.  A body is released right
+    // after `cgu_record_function` accepts it, and the released local chain may
+    // still be walked but must not be trusted (it can even be cyclic -- see the
+    // `local_guard` in `discard_recent_body_records`), so the arity and the
+    // parameter type ids are captured while the body is still live, into a flat
+    // i32 buffer addressed by `dyn_sig_off[slot]` (-1 = none).
+    public dyn_sig_off: rawptr
+    public dyn_sig_buf: rawptr
+    public dyn_sig_n: i32
+    public dyn_sig_cap: i32
+    // A snapshot needs a LIVE body: it walks the function's `local_next` chain.
+    // `cgu_collect_from_shells` tops the partition up after the collect-only
+    // walk has released every body, and a released chain is not merely stale --
+    // `discard_recent_body_records` may leave it cyclic, so walking it hangs or
+    // faults.  The sweep therefore records the function but leaves its slot at
+    // -1 ("no signature"), which is also the honest answer: a function with no
+    // body present cannot be a `dyn` vtable candidate.
+    public cgu_shell_sweep: bool
+    public cgu_collect_only: bool
+    public cgu_emit_index: i32
+    public cgu_unit_count: i32
+    public cgu_member_map: rawptr
+    public cgu_static_defined_map: rawptr
+    public cgu_collected_ids: rawptr
+    public cgu_collected_sizes: rawptr
+    public cgu_collected_keys: rawptr
+    public cgu_collected_n: i32
+    public cgu_collected_cap: i32
+    // Frozen marks of every body the collect walk left in the arena, indexed
+    // by collected slot, plus a function-id -> slot map so the emit walk can
+    // find them without rescanning.
+    public cgu_retain_marks: rawptr
+    public cgu_retain_slot: rawptr
+    public cgu_retain_bodies: bool
+    // Number of successful `cgu_retain_record` calls.  A body is materialised
+    // as a *stack* -- a nested function's region sits above the region of the
+    // body whose build pulled it in -- so releasing an enclosing body rewinds
+    // the arena straight through every retained region below the top.  The
+    // collect walk therefore asks, for each body it is about to release,
+    // whether this counter moved while that body was being built: if it did, a
+    // retained body lives inside, and the enclosing body has to be retained
+    // too.  See `cgu_must_retain_enclosing_body`.
+    public cgu_retain_count: i32
+    public cgu_key_table: string
+    public cgu_emitted_objects: bool
+    public cgu_object_list: string
+
+    public static fn create(m: MirUnit,
+                            mod_name: string,
+                            export_root_linkage_mode: bool) -> LlvmMirLowerer {
+        vyx_rt_init();
+        let triple = policy_cli_target_triple();
+        let mod_h = vyx_rt_module_new(mod_name.c_str(),
+                                      mod_name.len as u64,
+                                      triple.c_str(),
+                                      triple.len as u64);
+        if (mod_h != null && llvm_mir_pic_from_argv()) {
+            vyx_rt_set_relocation_model(mod_h, 2);
+        }
+        var initial_target_errors: i32 = 0;
+        if (mod_h != null && triple.len > 0) {
+            let err_buf = malloc(4096);
+            let err_len = vyx_rt_get_last_error(mod_h, err_buf, 4095);
+            if (err_len > 0) {
+                var copy_len = err_len;
+                if (copy_len > 4095) { copy_len = 4095; }
+                var detail = "LLVM target lookup failed";
+                if (err_buf != null) { detail = from_cstr_len(err_buf, copy_len as i64); }
+                diag_emit_codegen("unsupported LLVM target triple `" + triple + "`: " + detail);
+                initial_target_errors = 1;
+            }
+            if (err_buf != null) { free(err_buf); }
+        }
+        if (mod_h != null) { vyx_rt_builder_new(mod_h); }
+        let debug_enabled = llvm_mir_cli_debug_enabled();
+        let debug_source_path = llvm_mir_cli_source_path(mod_name);
+        if (mod_h != null && debug_enabled) {
+            vyx_rt_enable_debug(mod_h,
+                                debug_source_path.c_str(),
+                                debug_source_path.len as u64);
+        }
+        var type_struct_map_cap: i32 = m.types.count;
+        type_struct_map_cap = type_struct_map_cap + 1;
+        let str_slots = malloc((8192 * 32) as u64);
+        if (str_slots != null) { memset(str_slots, 0, (8192 * 32) as u64); }
+        let symbol_index_cap: i32 = 65536;
+        let method_index_cap: i32 = 65536;
+        let pointer_index_bits = vyx_rt_pointer_index_bits(mod_h);
+        var pointer_index_ty: rawptr = null;
+        if (pointer_index_bits > 0) {
+            pointer_index_ty = vyx_rt_int_type(mod_h, pointer_index_bits);
+        }
+        let max_static = llvm_mir_max_static_item_target(m);
+        return LlvmMirLowerer {
+            m: m,
+            module_symbol_name: mod_name,
+            target_triple: triple,
+            export_root_linkage_mode: export_root_linkage_mode,
+            partition_codegen_roots: false,
+            mir_opt_level: 0,
+            mir_verify_strict: false,
+            debug_enabled: debug_enabled,
+            debug_source_path: debug_source_path,
+            mod: mod_h,
+            ty_i1: vyx_rt_int_type(mod_h, 1),
+            ty_i8: vyx_rt_int_type(mod_h, 8),
+            ty_i16: vyx_rt_int_type(mod_h, 16),
+            ty_i32: vyx_rt_int_type(mod_h, 32),
+            ty_i64: vyx_rt_int_type(mod_h, 64),
+            pointer_index_bits: pointer_index_bits,
+            ty_pointer_index: pointer_index_ty,
+            ty_ptr: vyx_rt_ptr_ty(mod_h),
+            ty_void: vyx_rt_void_ty(mod_h),
+            string_ty: null,
+            closure_fat_ty: null,
+            pointer_handle_ty: null,
+            function_values: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            function_types: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            function_definition_emitted_map: llvm_mir_alloc_i32_map(m.function_count + 1),
+            function_closure_adapter_values: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            function_raw_callback_adapter_values: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            reflected_method_adapter_head: null,
+            dyn_method_adapter_head: null,
+            dyn_vtable_head: null,
+            dyn_trait_impl_cache_head: null,
+            function_env_types: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            async_context_types: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            async_worker_values: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            async_worker_types: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            async_ctx_temp_specs: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            current_body_local_first: 0,
+            type_struct_values: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            type_struct_body_field_counts: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            dyn_vtable_type_values: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            dyn_trait_method_counts: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            dyn_trait_method_lists: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            hir_item_globals: llvm_mir_alloc_ptr_map(max_static + 1),
+            block_values: llvm_mir_alloc_ptr_map(m.block_count + 1),
+            local_slots: llvm_mir_alloc_ptr_map(m.local_count + 1),
+            local_debug_pending: llvm_mir_alloc_i32_map(m.local_count + 1),
+            local_lifetime_marker_candidates: llvm_mir_alloc_i32_map(m.local_count + 1),
+            local_lifetime_marker_live_orders: llvm_mir_alloc_i32_map(m.local_count + 1),
+            local_lifetime_marker_dead_orders: llvm_mir_alloc_i32_map(m.local_count + 1),
+            local_lifetime_marker_value_visit_budget: 0,
+            local_lifetime_marker_value_query_failed: false,
+            local_slot_reuse_candidates: llvm_mir_alloc_i32_map(m.local_count + 1),
+            local_slot_reuse_sources: llvm_mir_alloc_i32_map(m.local_count + 1),
+            foreach_iterator_slots: llvm_mir_alloc_ptr_map(m.value_count + 1),
+            value_cache: llvm_mir_alloc_ptr_map(m.value_count + 1),
+            instr_deref_addr_cache: llvm_mir_alloc_ptr_map(m.place_count + 2),
+            hoisted_borrow_handles: llvm_mir_alloc_ptr_map(m.value_count + 1),
+            pending_value_first: 0,
+            pending_value_last: 0,
+            function_value_ranges: null,
+            direct_call_callee_value_map: llvm_mir_alloc_i32_map(m.value_count + 1),
+            function_value_adapter_need_map: llvm_mir_alloc_i32_map(m.function_count + 1),
+            raw_callback_adapter_use_map: llvm_mir_alloc_i32_map(m.function_count + 1),
+            adapter_need_cache_ready: false,
+            function_open_template_cache: llvm_mir_alloc_i32_map(m.function_count + 1),
+            function_open_template_cache_ready: false,
+            function_self_call_cache: llvm_mir_alloc_i32_map(m.function_count + 1),
+            function_self_call_cache_ready: false,
+            canonical_type_cache: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            type_compat_cache: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            field_owner_accept_cache: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            class_pointer_abi_cache: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            value_struct_abi_cache: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            c_sysv_classify_cache: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            value_struct_base_name_index: null,
+            value_struct_base_name_index_cap: 0,
+            value_struct_base_name_index_ready: false,
+            type_text_index: null,
+            type_text_index_cap: 0,
+            type_text_index_ready: false,
+            type_text_index_types: 0,
+            interned_rawptr_type_id: 0,
+            interned_str_type_id: 0,
+            interned_f32_type_id: 0,
+            interned_f64_type_id: 0,
+            option_abi_cache: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            result_abi_cache: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            interface_trait_type_cache: llvm_mir_alloc_i32_map(type_struct_map_cap),
+            interface_owner_name_index: null,
+            interface_owner_name_index_cap: 0,
+            interface_owner_name_index_ready: false,
+            interface_owner_name_index_functions: 0,
+            foreign_dci_type_presence_cache: 0,
+            foreign_dci_field_record_cache: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            field_remap_cache: llvm_mir_alloc_ptr_map(m.field_count + 1),
+            dci_stub_factory_values: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            dci_stub_destroy_values: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            dci_json_root: null,
+            dci_json_bundle: null,
+            dci_json_text_cache: "",
+            dci_layout_by_type_cache: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            dci_record_name_cache: llvm_mir_alloc_ptr_map(type_struct_map_cap),
+            dci_local_reported_names: "",
+            dci_local_layout_slots: null,
+            dci_local_layout_count: 0,
+            dci_symbol_name_cache: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            dci_symbol_object_cache: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            dci_lookup_miss: malloc(8),
+            dci_index_ready: false,
+            dci_layout_index: null,
+            dci_layout_index_cap: 0,
+            dci_symbol_index: null,
+            dci_symbol_index_cap: 0,
+            dci_alias_index: null,
+            dci_alias_index_cap: 0,
+            dci_consumer_bind_depth: 0,
+            function_mangled_name_cache: llvm_mir_alloc_ptr_map(m.function_count + 1),
+            dci_runtime_operation_cache_head: null,
+            current_function_id: mir_id_invalid(),
+            current_block_id: mir_id_invalid(),
+            current_instr_id: mir_id_invalid(),
+            current_value_id: mir_id_invalid(),
+            current_place_id: mir_id_invalid(),
+            current_function_value: null,
+            current_entry_block: null,
+            builtin_print_fn: null,
+            builtin_print_fty: null,
+            builtin_println_fn: null,
+            builtin_println_fty: null,
+            builtin_printf_fn: null,
+            builtin_printf_fty: null,
+            builtin_snprintf_fn: null,
+            builtin_snprintf_fty: null,
+            builtin_int_to_string_fn: null,
+            builtin_int_to_string_fty: null,
+            builtin_int_to_string_len_fn: null,
+            builtin_int_to_string_len_fty: null,
+            builtin_int_decimal_len_fn: null,
+            builtin_int_decimal_len_fty: null,
+            builtin_int_to_string_into_fn: null,
+            builtin_int_to_string_into_fty: null,
+            builtin_uint_to_string_fn: null,
+            builtin_uint_to_string_fty: null,
+            builtin_uint_to_string_len_fn: null,
+            builtin_uint_to_string_len_fty: null,
+            builtin_uint_decimal_len_fn: null,
+            builtin_uint_decimal_len_fty: null,
+            builtin_uint_to_string_into_fn: null,
+            builtin_uint_to_string_into_fty: null,
+            builtin_string_builder_create_fn: null,
+            builtin_string_builder_create_fty: null,
+            builtin_string_builder_append_i64_fn: null,
+            builtin_string_builder_append_i64_fty: null,
+            builtin_string_builder_append_u64_fn: null,
+            builtin_string_builder_append_u64_fty: null,
+            builtin_string_clone_fn: null,
+            builtin_string_clone_fty: null,
+            builtin_class_alloc_fn: null,
+            builtin_class_alloc_fty: null,
+            builtin_bool_to_string_fn: null,
+            builtin_bool_to_string_fty: null,
+            builtin_strlen_fn: null,
+            builtin_strlen_fty: null,
+            builtin_arg_count_fn: null,
+            builtin_arg_count_fty: null,
+            builtin_get_arg_fn: null,
+            builtin_get_arg_fty: null,
+            runtime_arg_count_fn: null,
+            runtime_arg_count_fty: null,
+            runtime_get_arg_cstr_fn: null,
+            runtime_get_arg_cstr_fty: null,
+            runtime_set_args_fn: null,
+            runtime_set_args_fty: null,
+            builtin_malloc_fn: null,
+            builtin_malloc_fty: null,
+            builtin_pooled_string_alloc_fn: null,
+            builtin_pooled_string_alloc_fty: null,
+            builtin_free_fn: null,
+            builtin_free_fty: null,
+            pointer_region_create_fn: null,
+            pointer_region_create_fty: null,
+            pointer_region_retag_fn: null,
+            pointer_region_retag_fty: null,
+            pointer_region_set_dimension_fn: null,
+            pointer_region_set_dimension_fty: null,
+            pointer_region_rank_fn: null,
+            pointer_region_rank_fty: null,
+            pointer_handle_alive_fn: null,
+            pointer_handle_alive_fty: null,
+            pointer_checked_address_fn: null,
+            pointer_checked_address_fty: null,
+            pointer_checked_address_typed_fn: null,
+            pointer_checked_address_typed_fty: null,
+            pointer_region_delete_fn: null,
+            pointer_region_delete_fty: null,
+            builtin_pooled_string_free_fn: null,
+            builtin_pooled_string_free_fty: null,
+            builtin_forget_string_len_fn: null,
+            builtin_forget_string_len_fty: null,
+            builtin_runtime_string_free_fn: null,
+            builtin_runtime_string_free_fty: null,
+            builtin_realloc_fn: null,
+            builtin_realloc_fty: null,
+            builtin_memcpy_fn: null,
+            builtin_memcpy_fty: null,
+            builtin_memmove_fn: null,
+            builtin_memmove_fty: null,
+            builtin_memset_fn: null,
+            builtin_memset_fty: null,
+            builtin_abort_fn: null,
+            builtin_abort_fty: null,
+            ptr_alias_domain: null,
+            builtin_exit_fn: null,
+            builtin_exit_fty: null,
+            builtin_concat_fn: null,
+            builtin_concat_fty: null,
+            builtin_string_trim_fn: null,
+            builtin_string_trim_fty: null,
+            builtin_string_replace_fn: null,
+            builtin_string_replace_fty: null,
+            builtin_string_to_upper_len_fn: null,
+            builtin_string_to_upper_len_fty: null,
+            builtin_string_to_lower_len_fn: null,
+            builtin_string_to_lower_len_fty: null,
+            builtin_strncmp_fn: null,
+            builtin_strncmp_fty: null,
+            builtin_strcmp_fn: null,
+            builtin_strcmp_fty: null,
+            builtin_memcmp_fn: null,
+            builtin_memcmp_fty: null,
+            builtin_strstr_fn: null,
+            builtin_strstr_fty: null,
+            builtin_string_contains_fn: null,
+            builtin_string_contains_fty: null,
+            builtin_string_index_of_fn: null,
+            builtin_string_index_of_fty: null,
+            builtin_get_file_attrs_fn: null,
+            builtin_get_file_attrs_fty: null,
+            builtin_calloc_fn: null,
+            builtin_calloc_fty: null,
+            builtin_fopen_fn: null,
+            builtin_fopen_fty: null,
+            builtin_fclose_fn: null,
+            builtin_fclose_fty: null,
+            builtin_fread_fn: null,
+            builtin_fread_fty: null,
+            builtin_fwrite_fn: null,
+            builtin_fwrite_fty: null,
+            builtin_fgetc_fn: null,
+            builtin_fgetc_fty: null,
+            builtin_fputc_fn: null,
+            builtin_fputc_fty: null,
+            builtin_feof_fn: null,
+            builtin_feof_fty: null,
+            builtin_fseek_fn: null,
+            builtin_fseek_fty: null,
+            builtin_ftell_fn: null,
+            builtin_ftell_fty: null,
+            builtin_remove_fn: null,
+            builtin_remove_fty: null,
+            builtin_rename_fn: null,
+            builtin_rename_fty: null,
+            runtime_argc_global: null,
+            runtime_argv_global: null,
+            runtime_args_defined: false,
+            last_print_call: null,
+            error_count: initial_target_errors,
+            str_lit_buf: str_slots,
+            string_lit_count: 0,
+            declared_function_scan_next: 1,
+            function_symbol_index: llvm_mir_symbol_index_new(symbol_index_cap),
+            function_symbol_index_cap: symbol_index_cap,
+            method_candidate_index: llvm_mir_method_candidate_index_new(method_index_cap),
+            method_candidate_index_cap: method_index_cap,
+            method_candidate_index_ready: false,
+            dyn_partition_index: llvm_mir_method_candidate_index_new(method_index_cap),
+            dyn_partition_index_cap: method_index_cap,
+            dyn_partition_index_n: 0,
+            dyn_sig_off: null,
+            dyn_sig_buf: null,
+            dyn_sig_n: 0,
+            dyn_sig_cap: 0,
+            cgu_shell_sweep: false,
+            cgu_collect_only: false,
+            cgu_emit_index: 0,
+            cgu_unit_count: 0,
+            cgu_member_map: null,
+            cgu_static_defined_map: null,
+            cgu_collected_ids: null,
+            cgu_collected_sizes: null,
+            cgu_collected_keys: null,
+            cgu_retain_marks: null,
+            cgu_retain_slot: null,
+            cgu_retain_bodies: false,
+            cgu_retain_count: 0,
+            cgu_collected_n: 0,
+            cgu_collected_cap: 0,
+            cgu_key_table: "",
+            cgu_emitted_objects: false,
+            cgu_object_list: ""
+        };
+    }
+
+    public fn release_aux_storage(self) {
+        if (self.str_lit_buf != null) {
+            var n = self.string_lit_count;
+            if (n > 8192) { n = 8192; }
+            var i: i32 = 0;
+            while (i < n) {
+                policy_entry_clear(llvm_mir_entry_at(self.str_lit_buf, i));
+                i = i + 1;
+            }
+            free(self.str_lit_buf);
+            self.str_lit_buf = null;
+            self.string_lit_count = 0;
+        }
+
+        llvm_mir_dispose_symbol_index(self.function_symbol_index,
+                                      self.function_symbol_index_cap,
+                                      false);
+        self.function_symbol_index = null;
+        self.function_symbol_index_cap = 0;
+        llvm_mir_dispose_symbol_index(self.method_candidate_index,
+                                      self.method_candidate_index_cap,
+                                      true);
+        self.method_candidate_index = null;
+        self.method_candidate_index_cap = 0;
+        llvm_mir_dispose_symbol_index(self.dyn_partition_index,
+                                      self.dyn_partition_index_cap,
+                                      true);
+        self.dyn_partition_index = null;
+        self.dyn_partition_index_cap = 0;
+        self.dyn_partition_index_n = 0;
+        if (self.dyn_sig_off != null) { free(self.dyn_sig_off); self.dyn_sig_off = null; }
+        if (self.dyn_sig_buf != null) { free(self.dyn_sig_buf); self.dyn_sig_buf = null; }
+        self.dyn_sig_n = 0;
+        self.dyn_sig_cap = 0;
+        if (self.cgu_member_map != null) { llvm_mir_id_map_dispose(self.cgu_member_map); self.cgu_member_map = null; }
+        if (self.cgu_static_defined_map != null) { llvm_mir_id_map_dispose(self.cgu_static_defined_map); self.cgu_static_defined_map = null; }
+        if (self.cgu_collected_ids != null) { free(self.cgu_collected_ids); self.cgu_collected_ids = null; }
+        if (self.cgu_collected_sizes != null) { free(self.cgu_collected_sizes); self.cgu_collected_sizes = null; }
+        if (self.cgu_collected_keys != null) { free(self.cgu_collected_keys); self.cgu_collected_keys = null; }
+        if (self.cgu_retain_marks != null) { free(self.cgu_retain_marks); self.cgu_retain_marks = null; }
+        if (self.cgu_retain_slot != null) { llvm_mir_id_map_dispose(self.cgu_retain_slot); self.cgu_retain_slot = null; }
+        self.cgu_retain_bodies = false;
+        self.cgu_retain_count = 0;
+        self.cgu_collected_n = 0;
+        self.cgu_collected_cap = 0;
+
+        llvm_mir_free_map_owned_values(self.dyn_trait_method_lists, self.m.types.count);
+        llvm_mir_free_map_value_chains(self.type_compat_cache, self.m.types.count, 8);
+        llvm_mir_free_map_value_chains(self.field_owner_accept_cache, self.m.types.count, 8);
+        llvm_mir_free_map_value_chains(self.foreign_dci_field_record_cache, self.m.types.count, 8);
+        llvm_mir_free_map_value_chains(self.field_remap_cache, self.m.field_count, 8);
+        llvm_mir_free_map_owned_values(self.dci_record_name_cache, self.m.types.count);
+        llvm_mir_free_map_owned_values(self.dci_symbol_name_cache, self.m.function_count);
+        llvm_mir_free_map_owned_values(self.function_mangled_name_cache, self.m.function_count);
+        self.dci_dispose_indexes();
+        if (self.dci_symbol_object_cache != null) { llvm_mir_id_map_dispose(self.dci_symbol_object_cache); self.dci_symbol_object_cache = null; }
+        if (self.dci_lookup_miss != null) { free(self.dci_lookup_miss); self.dci_lookup_miss = null; }
+
+        llvm_mir_free_raw_chain(self.dyn_method_adapter_head, 16);
+        self.dyn_method_adapter_head = null;
+        llvm_mir_free_raw_chain(self.reflected_method_adapter_head, 24);
+        self.reflected_method_adapter_head = null;
+        llvm_mir_free_raw_chain(self.dyn_vtable_head, 16);
+        self.dyn_vtable_head = null;
+        llvm_mir_free_raw_chain(self.dyn_trait_impl_cache_head, 16);
+        self.dyn_trait_impl_cache_head = null;
+        var runtime_op = self.dci_runtime_operation_cache_head;
+        while (runtime_op != null) {
+            let next_runtime_op = ast_read_rawptr(ptr_offset(runtime_op, 32));
+            let runtime_name = ast_read_rawptr(runtime_op);
+            if (runtime_name != null) { free(runtime_name); }
+            free(runtime_op);
+            runtime_op = next_runtime_op;
+        }
+        self.dci_runtime_operation_cache_head = null;
+        if (self.dci_json_bundle != null) {
+            cJSON_Delete(self.dci_json_bundle);
+            self.dci_json_bundle = null;
+            self.dci_json_root = null;
+        } else if (self.dci_json_root != null) {
+            cJSON_Delete(self.dci_json_root);
+            self.dci_json_root = null;
+        }
+        str_drop(self.dci_json_text_cache);
+        self.dci_json_text_cache = "";
+
+        if (self.function_values != null) { llvm_mir_id_map_dispose(self.function_values); self.function_values = null; }
+        if (self.function_types != null) { llvm_mir_id_map_dispose(self.function_types); self.function_types = null; }
+        if (self.function_definition_emitted_map != null) { llvm_mir_id_map_dispose(self.function_definition_emitted_map); self.function_definition_emitted_map = null; }
+        if (self.function_closure_adapter_values != null) { llvm_mir_id_map_dispose(self.function_closure_adapter_values); self.function_closure_adapter_values = null; }
+        if (self.function_raw_callback_adapter_values != null) { llvm_mir_id_map_dispose(self.function_raw_callback_adapter_values); self.function_raw_callback_adapter_values = null; }
+        if (self.function_env_types != null) { llvm_mir_id_map_dispose(self.function_env_types); self.function_env_types = null; }
+        if (self.async_context_types != null) { llvm_mir_id_map_dispose(self.async_context_types); self.async_context_types = null; }
+        if (self.async_worker_values != null) { llvm_mir_id_map_dispose(self.async_worker_values); self.async_worker_values = null; }
+        if (self.async_worker_types != null) { llvm_mir_id_map_dispose(self.async_worker_types); self.async_worker_types = null; }
+        if (self.async_ctx_temp_specs != null) { llvm_mir_id_map_dispose(self.async_ctx_temp_specs); self.async_ctx_temp_specs = null; }
+        if (self.type_struct_values != null) { llvm_mir_id_map_dispose(self.type_struct_values); self.type_struct_values = null; }
+        if (self.type_struct_body_field_counts != null) { llvm_mir_id_map_dispose(self.type_struct_body_field_counts); self.type_struct_body_field_counts = null; }
+        if (self.dyn_vtable_type_values != null) { llvm_mir_id_map_dispose(self.dyn_vtable_type_values); self.dyn_vtable_type_values = null; }
+        if (self.dyn_trait_method_counts != null) { llvm_mir_id_map_dispose(self.dyn_trait_method_counts); self.dyn_trait_method_counts = null; }
+        if (self.dyn_trait_method_lists != null) { llvm_mir_id_map_dispose(self.dyn_trait_method_lists); self.dyn_trait_method_lists = null; }
+        if (self.hir_item_globals != null) { llvm_mir_id_map_dispose(self.hir_item_globals); self.hir_item_globals = null; }
+        if (self.block_values != null) { llvm_mir_id_map_dispose(self.block_values); self.block_values = null; }
+        if (self.local_slots != null) { llvm_mir_id_map_dispose(self.local_slots); self.local_slots = null; }
+        if (self.local_debug_pending != null) { llvm_mir_id_map_dispose(self.local_debug_pending); self.local_debug_pending = null; }
+        if (self.local_lifetime_marker_candidates != null) { llvm_mir_id_map_dispose(self.local_lifetime_marker_candidates); self.local_lifetime_marker_candidates = null; }
+        if (self.local_lifetime_marker_live_orders != null) { llvm_mir_id_map_dispose(self.local_lifetime_marker_live_orders); self.local_lifetime_marker_live_orders = null; }
+        if (self.local_lifetime_marker_dead_orders != null) { llvm_mir_id_map_dispose(self.local_lifetime_marker_dead_orders); self.local_lifetime_marker_dead_orders = null; }
+        if (self.local_slot_reuse_candidates != null) { llvm_mir_id_map_dispose(self.local_slot_reuse_candidates); self.local_slot_reuse_candidates = null; }
+        if (self.local_slot_reuse_sources != null) { llvm_mir_id_map_dispose(self.local_slot_reuse_sources); self.local_slot_reuse_sources = null; }
+        if (self.foreach_iterator_slots != null) { llvm_mir_id_map_dispose(self.foreach_iterator_slots); self.foreach_iterator_slots = null; }
+        if (self.value_cache != null) { llvm_mir_id_map_dispose(self.value_cache); self.value_cache = null; }
+        if (self.instr_deref_addr_cache != null) { llvm_mir_id_map_dispose(self.instr_deref_addr_cache); self.instr_deref_addr_cache = null; }
+        if (self.hoisted_borrow_handles != null) { llvm_mir_id_map_dispose(self.hoisted_borrow_handles); self.hoisted_borrow_handles = null; }
+        if (self.function_value_ranges != null) { free(self.function_value_ranges); self.function_value_ranges = null; }
+        if (self.direct_call_callee_value_map != null) { llvm_mir_id_map_dispose(self.direct_call_callee_value_map); self.direct_call_callee_value_map = null; }
+        if (self.function_value_adapter_need_map != null) { llvm_mir_id_map_dispose(self.function_value_adapter_need_map); self.function_value_adapter_need_map = null; }
+        if (self.raw_callback_adapter_use_map != null) { llvm_mir_id_map_dispose(self.raw_callback_adapter_use_map); self.raw_callback_adapter_use_map = null; }
+        if (self.function_open_template_cache != null) { llvm_mir_id_map_dispose(self.function_open_template_cache); self.function_open_template_cache = null; }
+        if (self.function_self_call_cache != null) { llvm_mir_id_map_dispose(self.function_self_call_cache); self.function_self_call_cache = null; }
+        if (self.canonical_type_cache != null) { llvm_mir_id_map_dispose(self.canonical_type_cache); self.canonical_type_cache = null; }
+        if (self.type_compat_cache != null) { llvm_mir_id_map_dispose(self.type_compat_cache); self.type_compat_cache = null; }
+        if (self.field_owner_accept_cache != null) { llvm_mir_id_map_dispose(self.field_owner_accept_cache); self.field_owner_accept_cache = null; }
+        if (self.class_pointer_abi_cache != null) { llvm_mir_id_map_dispose(self.class_pointer_abi_cache); self.class_pointer_abi_cache = null; }
+        if (self.value_struct_abi_cache != null) { llvm_mir_id_map_dispose(self.value_struct_abi_cache); self.value_struct_abi_cache = null; }
+        if (self.c_sysv_classify_cache != null) { llvm_mir_id_map_dispose(self.c_sysv_classify_cache); self.c_sysv_classify_cache = null; }
+        if (self.value_struct_base_name_index != null) {
+            llvm_mir_dispose_symbol_index(self.value_struct_base_name_index, self.value_struct_base_name_index_cap, false);
+            self.value_struct_base_name_index = null;
+        }
+        if (self.type_text_index != null) {
+            llvm_mir_dispose_symbol_index(self.type_text_index, self.type_text_index_cap, false);
+            self.type_text_index = null;
+        }
+        if (self.option_abi_cache != null) { llvm_mir_id_map_dispose(self.option_abi_cache); self.option_abi_cache = null; }
+        if (self.result_abi_cache != null) { llvm_mir_id_map_dispose(self.result_abi_cache); self.result_abi_cache = null; }
+        if (self.interface_trait_type_cache != null) { llvm_mir_id_map_dispose(self.interface_trait_type_cache); self.interface_trait_type_cache = null; }
+        if (self.interface_owner_name_index != null) {
+            llvm_mir_dispose_symbol_index(self.interface_owner_name_index, self.interface_owner_name_index_cap, false);
+            self.interface_owner_name_index = null;
+        }
+        if (self.foreign_dci_field_record_cache != null) { llvm_mir_id_map_dispose(self.foreign_dci_field_record_cache); self.foreign_dci_field_record_cache = null; }
+        if (self.field_remap_cache != null) { llvm_mir_id_map_dispose(self.field_remap_cache); self.field_remap_cache = null; }
+        if (self.dci_stub_factory_values != null) { llvm_mir_id_map_dispose(self.dci_stub_factory_values); self.dci_stub_factory_values = null; }
+        if (self.dci_stub_destroy_values != null) { llvm_mir_id_map_dispose(self.dci_stub_destroy_values); self.dci_stub_destroy_values = null; }
+        if (self.dci_layout_by_type_cache != null) { llvm_mir_id_map_dispose(self.dci_layout_by_type_cache); self.dci_layout_by_type_cache = null; }
+        if (self.dci_record_name_cache != null) { llvm_mir_id_map_dispose(self.dci_record_name_cache); self.dci_record_name_cache = null; }
+        // The slot array only holds borrowed cJSON object pointers; the objects
+        // themselves belong to the derived-layout cache.
+        if (self.dci_local_layout_slots != null) { free(self.dci_local_layout_slots); self.dci_local_layout_slots = null; }
+        self.dci_local_layout_count = 0;
+        if (self.dci_symbol_name_cache != null) { llvm_mir_id_map_dispose(self.dci_symbol_name_cache); self.dci_symbol_name_cache = null; }
+        if (self.function_mangled_name_cache != null) { llvm_mir_id_map_dispose(self.function_mangled_name_cache); self.function_mangled_name_cache = null; }
+    }
+
+    public fn run(self) -> rawptr {
+        if (self.mod == null) {
+            self.report_error("cannot create LLVM module");
+            self.release_aux_storage();
+            return null;
+        }
+        let mir_pass_errors = mir_run_unit_pass_pipeline(&mut self.m,
+                                                          self.mir_opt_level,
+                                                          self.mir_verify_strict);
+        if (mir_pass_errors > 0) {
+            self.error_count = self.error_count + mir_pass_errors;
+            return self.finish_module_handle();
+        }
+        self.profile_phase("start");
+        self.declare_runtime_builtins();
+        self.profile_phase("runtime-builtins");
+        self.define_main_arg_runtime_helpers();
+        self.profile_phase("runtime-helpers");
+        self.declare_functions();
+        self.profile_phase("functions-declared");
+        self.emit_static_storage_roots();
+        self.dci_synthesize_stub_wrappers();
+        self.profile_phase("dci-stub-wrappers");
+        self.declare_function_value_adapters();
+        self.profile_phase("fn-value-adapters");
+        self.declare_raw_callback_adapters();
+        self.profile_phase("raw-callback-adapters");
+        var fn_id: i32 = 1;
+        while (fn_id <= self.m.function_count) {
+            let temp_string_mark = vyx_rt_string_arena_checkpoint();
+            self.declare_blocks_for_function(fn_id);
+            self.release_temp_strings(temp_string_mark);
+            fn_id = fn_id + 1;
+        }
+        self.profile_phase("blocks-declared");
+        fn_id = 1;
+        while (fn_id <= self.m.function_count) {
+            let temp_string_mark = vyx_rt_string_arena_checkpoint();
+            if (vyx_bootstrap_profile_level() > 0 && fn_id >= 850) {
+                self.profile_phase("before-lower-" + policy_i64_to_string(fn_id as i64)
+                                   + "-" + self.m.function_name(fn_id));
+            }
+            self.prepare_function_value_range(fn_id);
+            self.lower_function(fn_id);
+            if (vyx_bootstrap_profile_level() > 0 && fn_id >= 850) {
+                self.profile_phase("after-lower-" + policy_i64_to_string(fn_id as i64));
+            }
+            if (vyx_bootstrap_profile_level() > 0 && (fn_id % 100) == 0) {
+                self.profile_phase("lowered-" + policy_i64_to_string(fn_id as i64));
+            }
+            self.release_temp_strings(temp_string_mark);
+            fn_id = fn_id + 1;
+        }
+        self.profile_phase("functions-lowered");
+        if (self.error_count > 0) {
+            return self.finish_module_handle();
+        }
+        return self.finish_module_handle();
+    }
+}
+
+public fn emit_mir_unit(m: MirUnit, mod_name: string) -> rawptr {
+    return mir_lowerer_run_llvm(m, mod_name, 0);
+}
+
+/// LLVM plugin entry (whole-unit MIR already built). This is the
+/// acceptance lowerer; MIR→C++ lives in mir_cpp_lower.vyx as a plugin.
+public fn mir_llvm_plugin_is_acceptance_backend() -> bool {
+    return true;
+}
+
+public fn mir_lowerer_run_llvm(m: MirUnit, mod_name: string, opt_level: i32) -> rawptr {
+    return emit_mir_unit_with_opt_level(m, mod_name, opt_level);
+}
+
+public fn emit_mir_unit_with_opt_level(m: MirUnit,
+                                       mod_name: string,
+                                       opt_level: i32) -> rawptr {
+    let lowerer = LlvmMirLowerer.create(m, mod_name, false);
+    lowerer.mir_opt_level = opt_level;
+    return lowerer.run();
+}
+
+public fn emit_mir_unit_with_linkage_mode(m: MirUnit,
+                                          mod_name: string,
+                                          export_root_linkage_mode: bool) -> rawptr {
+    let lowerer = LlvmMirLowerer.create(m, mod_name, export_root_linkage_mode);
+    return lowerer.run();
+}
+
+public fn emit_mir_unit_lazy_from_ast_with_method_roots(unit_ptr: rawptr,
+                                                       mod_name: string,
+                                                       export_all: bool,
+                                                       export_method_roots: bool) -> rawptr {
+    return emit_mir_unit_lazy_from_ast_with_export_roots(unit_ptr,
+                                                        mod_name,
+                                                        export_all,
+                                                        export_method_roots,
+                                                        "",
+                                                        false,
+                                                        "",
+                                                        false,
+                                                        "",
+                                                        "",
+                                                        false);
+}
+
+public fn emit_mir_unit_lazy_from_ast_with_export_roots(unit_ptr: rawptr,
+                                                       mod_name: string,
+                                                       export_all: bool,
+                                                       export_method_roots: bool,
+                                                       export_root_names: string,
+                                                       export_root_names_specified: bool,
+                                                       emit_root_names: string,
+                                                       emit_root_names_specified: bool,
+                                                       dci_abi_text: string,
+                                                       dci_abi_path: string,
+                                                       dci_abi_is_binary: bool) -> rawptr {
+    var timing_total: i64 = 0;
+    var timing_mark: i64 = 0;
+    if (llvm_mir_timing_enabled()) {
+        timing_total = vyx_bootstrap_now_ms();
+        timing_mark = timing_total;
+    }
+    let hbuilder = hir_build_codegen_builder_handle_with_export_roots(unit_ptr,
+                                                                      export_all,
+                                                                      export_method_roots,
+                                                                      export_root_names,
+                                                                      export_root_names_specified);
+    if (hbuilder == null) {
+        diag_emit_codegen("code generation failed: failed to allocate HIR codegen builder");
+        return null;
+    }
+    timing_mark = llvm_mir_timing_mark("lazy hir-build", timing_mark);
+    var hunit = hir_codegen_builder_handle_unit(hbuilder);
+    if (vyx_bootstrap_profile_level() > 0) {
+        print("[llvm-mir-pipe] after-hir-build");
+    }
+    let resolve_left = hir_semantic_resolve_unit_silent(hunit);
+    hir_codegen_builder_handle_set_unit(hbuilder, hunit);
+    timing_mark = llvm_mir_timing_mark("lazy resolve", timing_mark);
+    if (resolve_left > 0) {
+        diag_emit_codegen("code generation failed: HIR semantic resolution left "
+                          + policy_i64_to_string(resolve_left as i64)
+                          + " unresolved target(s)");
+        hir_codegen_builder_handle_release_codegen_state(hbuilder);
+        hir_codegen_builder_handle_free(hbuilder);
+        return null;
+    }
+    var lifecycle_errors: i32 = 0;
+    if (dci_path_list_count(dci_abi_path.clone()) > 0) {
+        lifecycle_errors = hir_bind_dci_lifecycle_paths(hunit, dci_abi_path.clone());
+    } else if (dci_abi_text.len > 0) {
+        lifecycle_errors = hir_bind_dci_lifecycle_contract(hunit, dci_abi_text.clone());
+    }
+    hir_codegen_builder_handle_set_unit(hbuilder, hunit);
+    if (lifecycle_errors > 0) {
+        diag_emit_codegen("code generation failed: DCI lifecycle binding produced "
+                          + policy_i64_to_string(lifecycle_errors as i64)
+                          + " error(s)");
+        hir_codegen_builder_handle_release_codegen_state(hbuilder);
+        hir_codegen_builder_handle_free(hbuilder);
+        return null;
+    }
+    let ownership_errors = hir_ownership_resolve_unit_silent(hunit);
+    hir_codegen_builder_handle_set_unit(hbuilder, hunit);
+    timing_mark = llvm_mir_timing_mark("lazy ownership", timing_mark);
+    if (ownership_errors > 0) {
+        diag_emit_codegen("code generation failed: HIR ownership resolution produced "
+                          + policy_i64_to_string(ownership_errors as i64)
+                          + " error(s)");
+        hir_codegen_builder_handle_release_codegen_state(hbuilder);
+        hir_codegen_builder_handle_free(hbuilder);
+        return null;
+    }
+    let hir_errors = hir_verify_unit_silent(hunit);
+    hir_codegen_builder_handle_set_unit(hbuilder, hunit);
+    timing_mark = llvm_mir_timing_mark("lazy hir-verify", timing_mark);
+    if (hir_errors > 0) {
+        diag_emit_codegen("code generation failed: refusing invalid HIR unit before MIR build");
+        hir_codegen_builder_handle_release_codegen_state(hbuilder);
+        hir_codegen_builder_handle_free(hbuilder);
+        return null;
+    }
+    let out = emit_mir_unit_from_hir_codegen_builder_handle_with_emit_roots(hbuilder,
+                                                                            mod_name,
+                                                                            export_all,
+                                                                            emit_root_names,
+                                                                            emit_root_names_specified,
+                                                                            dci_abi_text.clone(),
+                                                                            dci_abi_path.clone(),
+                                                                            dci_abi_is_binary);
+    timing_mark = llvm_mir_timing_mark("lazy stream-run", timing_mark);
+    hir_codegen_builder_handle_release_codegen_state(hbuilder);
+    hir_codegen_builder_handle_free(hbuilder);
+    timing_mark = llvm_mir_timing_mark("lazy free-builder", timing_mark);
+    if (vyx_bootstrap_profile_level() > 0) {
+        print("[llvm-mir-pipe] after-llvm-emit");
+    }
+    llvm_mir_timing_mark("lazy total", timing_total);
+    return out;
+}
+
+public fn emit_mir_unit_from_hir_codegen_builder_handle_with_emit_roots(hbuilder: rawptr,
+                                                                       mod_name: string,
+                                                                       export_all: bool,
+                                                                       emit_root_names: string,
+                                                                       emit_root_names_specified: bool,
+                                                                       dci_abi_text: string,
+                                                                       dci_abi_path: string,
+                                                                       dci_abi_is_binary: bool) -> rawptr {
+    return emit_mir_unit_from_hir_codegen_builder_handle_with_emit_roots_and_opt_level(
+        hbuilder,
+        mod_name,
+        export_all,
+        emit_root_names,
+        emit_root_names_specified,
+        dci_abi_text,
+        dci_abi_path,
+        dci_abi_is_binary,
+        0,
+        false);
+}
+
+public fn emit_mir_unit_from_hir_codegen_builder_handle_with_emit_roots_and_opt_level(
+        hbuilder: rawptr,
+        mod_name: string,
+        export_all: bool,
+        emit_root_names: string,
+        emit_root_names_specified: bool,
+        dci_abi_text: string,
+        dci_abi_path: string,
+        dci_abi_is_binary: bool,
+        opt_level: i32,
+        verify_strict: bool) -> rawptr {
+    if (hbuilder == null) { return null; }
+    var mbuilder = MirUnitBuilder.create_for_codegen(hbuilder);
+    mbuilder.partition_codegen_roots = emit_root_names_specified;
+    mbuilder.emit_root_names = emit_root_names;
+    mbuilder.emit_root_names_specified = emit_root_names_specified;
+    if (dci_abi_text.len > 0 || dci_abi_path.len > 0) {
+        // Mutate the builder field in place. Passing `mbuilder.unit` into a
+        // by-value `mir_unit_set_dci_abi_source` copies the large MirUnit
+        // (sret/byval) and the DCI path write strands on the copy; streaming
+        // then does `self.m = builder.unit` and lowering sees an empty ABI.
+        mbuilder.unit.set_dci_abi_source(dci_abi_text.clone(),
+                                         dci_abi_path.clone(),
+                                         dci_abi_is_binary);
+    }
+    if (vyx_bootstrap_profile_level() > 0) {
+        print("[llvm-mir] codegen-create-lowerer");
+    }
+    var lowerer = LlvmMirLowerer.create(mbuilder.unit, mod_name, export_all);
+    if (vyx_bootstrap_profile_level() > 0) {
+        print("[llvm-mir] codegen-run-streaming");
+    }
+    lowerer.partition_codegen_roots = emit_root_names_specified;
+    lowerer.mir_opt_level = opt_level;
+    lowerer.mir_verify_strict = verify_strict;
+    return lowerer.run_streaming_from_builder(&mut mbuilder);
+}
+
+/// LLVM plugin entry (HIR builder → streaming MIR → LLVM). Acceptance path
+/// for `--emit=ir|obj|exe|dll|lib`. Not used by `--emit=cpp`.
+public fn mir_lowerer_run_llvm_streaming_from_hir(
+        hbuilder: rawptr,
+        mod_name: string,
+        export_all: bool,
+        emit_root_names: string,
+        emit_root_names_specified: bool,
+        dci_abi_text: string,
+        dci_abi_path: string,
+        dci_abi_is_binary: bool,
+        opt_level: i32,
+        verify_strict: bool) -> rawptr {
+    return emit_mir_unit_from_hir_codegen_builder_handle_with_emit_roots_and_opt_level(
+        hbuilder,
+        mod_name,
+        export_all,
+        emit_root_names,
+        emit_root_names_specified,
+        dci_abi_text,
+        dci_abi_path,
+        dci_abi_is_binary,
+        opt_level,
+        verify_strict);
+}
+
+public fn emit_mir_unit_lazy_from_ast(unit_ptr: rawptr, mod_name: string, export_all: bool) -> rawptr {
+    return emit_mir_unit_lazy_from_ast_with_method_roots(unit_ptr,
+                                                        mod_name,
+                                                        export_all,
+                                                        export_all);
+}
+
+fn llvm_mir_module_last_error(mod_h: rawptr) -> string {
+    if (mod_h == null) { return ""; }
+    let err_buf = malloc(4096);
+    if (err_buf == null) { return ""; }
+    let nerr = vyx_rt_get_last_error(mod_h, err_buf, 4095);
+    var detail = "";
+    if (nerr > 0) {
+        var copy_len = nerr;
+        if (copy_len > 4095) { copy_len = 4095; }
+        detail = from_cstr_len(err_buf, copy_len as i64);
+    }
+    free(err_buf);
+    return detail;
+}
+
+fn llvm_mir_report_stage_error(stage: string, rc: i32, detail: string) {
+    var message = "LLVM MIR " + stage + " failed with code "
+        + policy_i64_to_string(rc as i64);
+    if (detail.len > 0) { message = message + ": " + detail; }
+    diag_emit_codegen(message);
+}
+
+public fn emit_to_file(cg_handle: rawptr, path: string) -> i32 {
+    if (cg_handle == null) {
+        llvm_mir_report_stage_error("IR emission", 1, "missing codegen handle");
+        return 1;
+    }
+    var mod_h: rawptr = null;
+    memcpy(to_rawptr(&mod_h), cg_handle, 8);
+    if (mod_h == null) {
+        llvm_mir_report_stage_error("IR emission", 1, "missing LLVM module");
+        return 1;
+    }
+
+    let pr = vyx_rt_print_to_file(mod_h, path.c_str(), path.len as u64);
+    let v = vyx_rt_verify(mod_h);
+    if (v != 0) {
+        llvm_mir_report_stage_error("module verification", v,
+                                    llvm_mir_module_last_error(mod_h));
+    }
+    if (pr != 0) {
+        llvm_mir_report_stage_error("IR file emission", pr,
+                                    llvm_mir_module_last_error(mod_h));
+        return pr;
+    }
+    if (v != 0) { return 2; }
+    return 0;
+}
+
+public fn optimize_unit(cg_handle: rawptr, opt_level: i32) -> i32 {
+    if (cg_handle == null) {
+        llvm_mir_report_stage_error("optimization", 1, "missing codegen handle");
+        return 1;
+    }
+    var mod_h: rawptr = null;
+    memcpy(to_rawptr(&mod_h), cg_handle, 8);
+    if (mod_h == null) {
+        llvm_mir_report_stage_error("optimization", 1, "missing LLVM module");
+        return 1;
+    }
+    var level = opt_level;
+    if (level < 0) { level = 0; }
+    if (level > 5) { level = 5; }
+    let rc = vyx_rt_optimize(mod_h, level);
+    if (rc != 0) {
+        llvm_mir_report_stage_error("optimization", rc,
+                                    llvm_mir_module_last_error(mod_h));
+    }
+    return rc;
+}
+
+public fn emit_object_to_file(cg_handle: rawptr, path: string, opt_level: i32) -> i32 {
+    if (fileExists(path + ".cgu.list")) { return 0; }
+    if (cg_handle == null) {
+        llvm_mir_report_stage_error("object emission", 1, "missing codegen handle");
+        return 1;
+    }
+    var mod_h: rawptr = null;
+    memcpy(to_rawptr(&mod_h), cg_handle, 8);
+    if (mod_h == null) {
+        llvm_mir_report_stage_error("object emission", 1, "missing LLVM module");
+        return 1;
+    }
+    let rc = llvm_mir_emit_module_file(mod_h, path.c_str(), path.len as u64, opt_level);
+    if (rc != 0) {
+        llvm_mir_report_stage_error("object emission", rc,
+                                    llvm_mir_module_last_error(mod_h));
+    }
+    return rc;
+}
+
+public fn jit_run_main(cg_handle: rawptr, opt_level: i32, link_args: string) -> i32 {
+    if (cg_handle == null) {
+        llvm_mir_report_stage_error("JIT execution", -1, "missing codegen handle");
+        return -1;
+    }
+    var mod_h: rawptr = null;
+    memcpy(to_rawptr(&mod_h), cg_handle, 8);
+    if (mod_h == null) {
+        llvm_mir_report_stage_error("JIT execution", -1, "missing LLVM module");
+        return -1;
+    }
+    let rc = vyx_rt_jit_run_main_with_args(mod_h,
+                                           opt_level,
+                                           link_args.c_str(),
+                                           link_args.len as u64);
+    if (rc < 0) {
+        llvm_mir_report_stage_error("JIT execution", rc,
+                                    llvm_mir_module_last_error(mod_h));
+    }
+    return rc;
+}
+
+public fn codegen_dispose(cg: rawptr) -> i32 {
+    if (cg == null) { return 0; }
+    var mod_h: rawptr = null;
+    memcpy(to_rawptr(&mod_h), cg, 8);
+    if (mod_h != null) { vyx_rt_module_free(mod_h); }
+    free(cg);
+    return 0;
+}

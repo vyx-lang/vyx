@@ -1,0 +1,116 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    // A constructor instance keeps its constructor identity on the HIR
+    // function flag: the closed instance is filed under the mangled
+    // `mir2$…` name, so the source-name test alone misses it.
+    public fn hir_function_is_constructor_abi(self, hir_function_id: i32) -> bool {
+        if (hir_function_id == hir_id_invalid()) { return false; }
+        if ((hir_unit_function_flags(self.h, hir_function_id) & hir_function_flag_constructor()) != 0) { return true; }
+        return self.h.function_name(hir_function_id) == "constructor";
+    }
+
+    // Check if a function should implicitly return the hidden constructor self.
+    public fn return_type_is_constructor(self, hir_function_id: i32, return_type_id: i32) -> bool {
+        if (!self.hir_function_is_constructor_abi(hir_function_id)) { return false; }
+        let ret_text = self.type_text(return_type_id);
+        if (ret_text == "void" || ret_text == "") { return false; }
+        if (policy_primitive_type_kind(ret_text) != 0) { return false; }
+        let local_id = self.h.function_first_local(hir_function_id);
+        if (local_id == hir_id_invalid()) { return false; }
+        return (self.h.local_flags(local_id) & hir_local_flag_self_receiver()) != 0;
+    }
+
+    // Create a read value (use site copy) for the self parameter, to return from a constructor.
+    public fn implicit_self_return_value(self, hir_function_id: i32) -> i32 {
+        let self_hir_local = self.h.function_first_local(hir_function_id);
+        if (self_hir_local == hir_id_invalid()) { return mir_id_invalid(); }
+        let mir_self_local = mir_i32_map_get(self.local_map, self_hir_local);
+        if (mir_self_local == mir_id_invalid()) { return mir_id_invalid(); }
+        let place_id = self.unit.local_place(mir_self_local);
+        return self.add_read_value(place_id, hir_id_invalid());
+    }
+
+    public fn lower_stmt_chain(self, first_stmt_id: i32) {
+        var cur = first_stmt_id;
+        while (cur != hir_id_invalid()) {
+            if (self.current_block_terminated()) { return; }
+            self.lower_stmt(cur);
+            cur = self.h.stmt_next(cur);
+        }
+    }
+
+    public fn last_stmt_in_chain(self, first_stmt_id: i32) -> i32 {
+        var cur = first_stmt_id;
+        var last = hir_id_invalid();
+        while (cur != hir_id_invalid()) {
+            last = cur;
+            cur = self.h.stmt_next(cur);
+        }
+        return last;
+    }
+
+    public fn implicit_return_stmt_for_body(self, body_stmt_id: i32) -> i32 {
+        if (body_stmt_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let k = self.h.stmt_kind(body_stmt_id);
+        if (k == hir_stmt_expr()) { return body_stmt_id; }
+        if (k == hir_stmt_block()) {
+            let last = self.last_stmt_in_chain(self.h.stmt_child(body_stmt_id));
+            if (last != hir_id_invalid() && self.h.stmt_kind(last) == hir_stmt_expr()) { return last; }
+        }
+        return hir_id_invalid();
+    }
+
+    public fn lower_body_before_implicit_return(self, body_stmt_id: i32, return_stmt_id: i32) -> bool {
+        if (return_stmt_id == hir_id_invalid()) { return false; }
+        if (body_stmt_id == return_stmt_id) { return true; }
+        if (self.h.stmt_kind(body_stmt_id) != hir_stmt_block()) { return false; }
+        var cur = self.h.stmt_child(body_stmt_id);
+        while (cur != hir_id_invalid() && cur != return_stmt_id) {
+            if (self.current_block_terminated()) { return true; }
+            self.lower_stmt(cur);
+            cur = self.h.stmt_next(cur);
+        }
+        return cur == return_stmt_id;
+    }
+
+    public fn try_lower_implicit_function_return(self, body_stmt_id: i32, return_type: i32) -> bool {
+        if (self.type_text(return_type) == "void") { return false; }
+        if (self.return_type_is_constructor(self.current_hir_function_id, return_type)) {
+            return false;
+        }
+        let return_stmt = self.implicit_return_stmt_for_body(body_stmt_id);
+        if (return_stmt == hir_id_invalid()) { return false; }
+        let return_expr = self.h.stmt_expr(return_stmt);
+        if (return_expr == hir_id_invalid()) { return false; }
+        if (self.type_text(self.h.expr_type(return_expr)) == "void") { return false; }
+        if (!self.lower_body_before_implicit_return(body_stmt_id, return_stmt)) { return false; }
+        if (self.current_block_terminated()) { return true; }
+        var ret_value = mir_id_invalid();
+        if (self.return_expr_needs_awaitable_ready(return_type, return_expr)) {
+            ret_value = self.lower_awaitable_ready_return(return_expr, return_type);
+        } else {
+            ret_value = self.lower_expr_as(return_expr, return_type);
+        }
+        self.deactivate_moved_source_expr_except(return_expr, hir_id_invalid());
+        ret_value = self.materialize_return_value(ret_value, return_type, return_stmt, return_expr);
+        self.emit_function_exit(return_stmt);
+        self.terminate_current(mir_term_return(), ret_value, mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), return_stmt);
+        return true;
+    }
+}

@@ -1,0 +1,590 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn function_capture_count(self, function_id: i32) -> i32 {
+        var out: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_capture(local)) { out = out + 1; }
+            local = self.m.local_next(local);
+        }
+        return out;
+    }
+
+    public fn local_is_source_param(self, local_id: i32) -> bool {
+        if (local_id == mir_id_invalid()) { return false; }
+        return (self.m.local_flags(local_id) & mir_local_flag_param()) != 0;
+    }
+
+    public fn local_is_capture(self, local_id: i32) -> bool {
+        if (local_id == mir_id_invalid()) { return false; }
+        return (self.m.local_flags(local_id) & mir_local_flag_capture()) != 0;
+    }
+
+    public fn local_is_reference_capture(self, local_id: i32) -> bool {
+        if (local_id == mir_id_invalid()) { return false; }
+        return (self.m.local_flags(local_id) & mir_local_flag_reference_capture()) != 0;
+    }
+
+    public fn local_is_self_receiver_param(self, local_id: i32) -> bool {
+        if (!self.local_is_source_param(local_id)) { return false; }
+        return (self.m.local_flags(local_id) & mir_local_flag_self_receiver()) != 0;
+    }
+
+    // This first lifetime-intrinsic slice deliberately accepts only plain
+    // non-pointer scalar source locals. A raw pointer may carry an address of
+    // local, foreign, or aliasing storage even when no MIR address_of node is
+    // visible, so it is not positive evidence for an early lifetime end or a
+    // reusable alloca. Aggregate, owning, DCI, and derived-place storage stay
+    // outside the proof until escape/liveness are first-class analyses.
+    public fn local_lifetime_marker_type_supported(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        return llvm_mir_int_bits_for_kind(kind) > 0 || llvm_mir_kind_float(kind);
+    }
+
+    public fn storage_instr_direct_local(self, instr_id: i32) -> i32 {
+        if (instr_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let place_id = self.m.instr_place(instr_id);
+        if (place_id == mir_id_invalid() || self.m.place_kind(place_id) != mir_place_local()) {
+            return mir_id_invalid();
+        }
+        return self.m.place_local(place_id);
+    }
+
+    public fn local_lifetime_marker_has_address_or_capture(self, local_id: i32) -> bool {
+        var value_id: i32 = 1;
+        while (value_id <= self.m.value_count) {
+            if (self.m.value_kind(value_id) == mir_value_address_of()) {
+                let place_id = self.m.value_place(value_id);
+                if (place_id != mir_id_invalid()
+                    && self.m.place_kind(place_id) == mir_place_local()
+                    && self.m.place_local(place_id) == local_id) {
+                    return true;
+                }
+            }
+            value_id = value_id + 1;
+        }
+        var other_local: i32 = 1;
+        while (other_local <= self.m.local_count) {
+            if (self.m.local_capture_source(other_local) == local_id) { return true; }
+            other_local = other_local + 1;
+        }
+        return false;
+    }
+
+    // A non-direct place is intentionally a barrier here. This bounded proof
+    // does not attempt alias analysis for fields, dereferences, indexes, or
+    // malformed/cyclic value graphs.
+    public fn local_lifetime_marker_value_uses_local(self,
+                                                     value_id: i32,
+                                                     local_id: i32) -> bool {
+        if (value_id == mir_id_invalid()) { return false; }
+        if (value_id <= 0 || value_id > self.m.value_count
+            || self.local_lifetime_marker_value_visit_budget <= 0) {
+            self.local_lifetime_marker_value_query_failed = true;
+            return true;
+        }
+        self.local_lifetime_marker_value_visit_budget = self.local_lifetime_marker_value_visit_budget - 1;
+        let place_id = self.m.value_place(value_id);
+        if (place_id != mir_id_invalid()) {
+            if (place_id <= 0 || place_id > self.m.place_count
+                || self.m.place_kind(place_id) != mir_place_local()) {
+                return true;
+            }
+            if (self.m.place_local(place_id) == local_id) { return true; }
+        }
+        if (self.m.value_target_kind(value_id) == mir_target_local()
+            && self.m.value_target_id(value_id) == local_id) {
+            return true;
+        }
+        if (self.local_lifetime_marker_value_uses_local(self.m.value_lhs(value_id),
+                                                         local_id)) { return true; }
+        if (self.local_lifetime_marker_value_uses_local(self.m.value_rhs(value_id),
+                                                         local_id)) { return true; }
+        if (self.local_lifetime_marker_value_uses_local(self.m.value_aux(value_id),
+                                                         local_id)) { return true; }
+        var arg_id = self.m.value_first_arg(value_id);
+        var guard: i32 = 0;
+        while (arg_id != mir_id_invalid()) {
+            if (guard > self.m.value_count) {
+                self.local_lifetime_marker_value_query_failed = true;
+                return true;
+            }
+            if (self.local_lifetime_marker_value_uses_local(arg_id, local_id)) {
+                return true;
+            }
+            arg_id = self.m.value_next_arg(arg_id);
+            guard = guard + 1;
+        }
+        return false;
+    }
+
+    public fn local_lifetime_marker_instr_mentions_local(self,
+                                                         instr_id: i32,
+                                                         local_id: i32) -> bool {
+        let place_id = self.m.instr_place(instr_id);
+        if (place_id != mir_id_invalid()) {
+            if (place_id <= 0 || place_id > self.m.place_count
+                || self.m.place_kind(place_id) != mir_place_local()) {
+                return true;
+            }
+            if (self.m.place_local(place_id) == local_id) { return true; }
+        }
+        if (self.m.instr_target_kind(instr_id) == mir_target_local()
+            && self.m.instr_target_id(instr_id) == local_id) {
+            return true;
+        }
+        return self.local_lifetime_marker_value_uses_local(self.m.instr_value(instr_id), local_id)
+            || self.local_lifetime_marker_value_uses_local(self.m.instr_lhs(instr_id), local_id)
+            || self.local_lifetime_marker_value_uses_local(self.m.instr_rhs(instr_id), local_id);
+    }
+
+    public fn local_lifetime_marker_candidate(self,
+                                              function_id: i32,
+                                              local_id: i32) -> bool {
+        if (local_id == mir_id_invalid() || self.m.local_function(local_id) != function_id) {
+            return false;
+        }
+        // Cross-block intervals need dominance/post-dominance and C++ scope
+        // proofs. Do not infer either from lexical StorageDead records.
+        if (self.m.function_block_count(function_id) != 1
+            || self.m.function_local_count(function_id) > llvm_mir_lifetime_marker_max_function_locals()) {
+            return false;
+        }
+        let block_id = self.m.function_first_block(function_id);
+        if (block_id == mir_id_invalid() || self.m.block_term_kind(block_id) != mir_term_return()
+            || self.m.block_instr_count(block_id) > llvm_mir_lifetime_marker_max_block_instrs()) {
+            return false;
+        }
+        let flags = self.m.local_flags(local_id);
+        let rejected_flags = mir_local_flag_param()
+            | mir_local_flag_capture()
+            | mir_local_flag_auto_drop()
+            | mir_local_flag_move_arg()
+            | mir_local_flag_self_receiver()
+            | mir_local_flag_reference_capture()
+            | mir_local_flag_if_expr_result();
+        if ((flags & rejected_flags) != 0
+            || !self.local_lifetime_marker_type_supported(self.local_effective_type(local_id))
+            || self.local_is_self_pointer_abi_slot(function_id, local_id)) {
+            return false;
+        }
+        let local_place = self.m.local_place(local_id);
+        if (local_place == mir_id_invalid()
+            || self.m.place_kind(local_place) != mir_place_local()
+            || self.m.place_local(local_place) != local_id
+            || self.local_lifetime_marker_has_address_or_capture(local_id)) {
+            return false;
+        }
+
+        // A StorageDead marker is only legal metadata when no later MIR
+        // instruction or terminator reads/writes the local. The old paired
+        // marker check did not establish this, which would let LLVM optimize
+        // a post-dead use as undefined behavior.
+        self.local_lifetime_marker_value_visit_budget = llvm_mir_lifetime_marker_max_value_visits();
+        self.local_lifetime_marker_value_query_failed = false;
+        var phase: i32 = 0;
+        var live_order: i32 = 0;
+        var dead_order: i32 = 0;
+        var instr_id = self.m.block_first_instr(block_id);
+        var guard: i32 = 0;
+        while (instr_id != mir_id_invalid()) {
+            let instr_order = guard + 1;
+            let instr_kind = self.m.instr_kind(instr_id);
+            let direct_local = self.storage_instr_direct_local(instr_id);
+            if (direct_local == local_id) {
+                if (instr_kind == mir_instr_storage_live()) {
+                    if (phase != 0) { return false; }
+                    phase = 1;
+                    live_order = instr_order;
+                } else if (instr_kind == mir_instr_storage_dead()) {
+                    if (phase != 1) { return false; }
+                    phase = 2;
+                    dead_order = instr_order;
+                } else if (instr_kind == mir_instr_drop()) {
+                    return false;
+                } else if (phase != 1) {
+                    return false;
+                }
+            } else {
+                let mentions = self.local_lifetime_marker_instr_mentions_local(instr_id, local_id);
+                if (self.local_lifetime_marker_value_query_failed
+                    || (mentions && phase != 1)) {
+                    return false;
+                }
+            }
+            instr_id = self.m.instr_next(instr_id);
+            guard = guard + 1;
+            if (guard > self.m.instr_count + 1) { return false; }
+        }
+        let term_uses_local = self.local_lifetime_marker_value_uses_local(self.m.block_term_value(block_id), local_id);
+        if (phase != 2 || self.local_lifetime_marker_value_query_failed || term_uses_local) {
+            return false;
+        }
+        if (live_order <= 0 || dead_order <= live_order) { return false; }
+        llvm_mir_i32_map_put(self.local_lifetime_marker_live_orders, local_id, live_order);
+        llvm_mir_i32_map_put(self.local_lifetime_marker_dead_orders, local_id, dead_order);
+        return true;
+    }
+
+    // Orders are recorded while walking the block instruction chain, rather
+    // than inferred from InstrId. That makes pair selection O(1) per prior
+    // local and keeps record-id allocation out of the lifetime proof.
+    public fn local_lifetime_marker_interval_precedes(self,
+                                                      function_id: i32,
+                                                      earlier_local: i32,
+                                                      later_local: i32) -> bool {
+        if (earlier_local == mir_id_invalid() || later_local == mir_id_invalid()
+            || earlier_local == later_local
+            || llvm_mir_i32_map_get(self.local_lifetime_marker_candidates, earlier_local) != 1
+            || llvm_mir_i32_map_get(self.local_lifetime_marker_candidates, later_local) != 1) {
+            return false;
+        }
+        if (self.m.function_block_count(function_id) != 1) {
+            return false;
+        }
+        let earlier_dead = llvm_mir_i32_map_get(self.local_lifetime_marker_dead_orders, earlier_local);
+        let later_live = llvm_mir_i32_map_get(self.local_lifetime_marker_live_orders, later_local);
+        return earlier_dead > 0 && later_live > 0 && earlier_dead < later_live;
+    }
+
+    // Reuse is stricter than lifetime metadata: it accepts only primitive
+    // direct-place arithmetic/dataflow. Calls, DCI, aggregates, address/borrow
+    // operations and hidden control-flow values all fail this whitelist.
+    public fn local_slot_reuse_value_is_simple(self,
+                                               value_id: i32,
+                                               depth: i32) -> bool {
+        if (value_id == mir_id_invalid()) { return true; }
+        if (value_id <= 0 || value_id > self.m.value_count || depth > 16
+            || self.local_lifetime_marker_value_visit_budget <= 0
+            || !self.local_lifetime_marker_type_supported(self.m.value_type(value_id))) {
+            return false;
+        }
+        self.local_lifetime_marker_value_visit_budget = self.local_lifetime_marker_value_visit_budget - 1;
+        if (self.m.value_first_arg(value_id) != mir_id_invalid()
+            || self.m.value_next_arg(value_id) != mir_id_invalid()) {
+            return false;
+        }
+        let kind = self.m.value_kind(value_id);
+        if (kind == mir_value_const_int() || kind == mir_value_const_bool()
+            || kind == mir_value_const_char() || kind == mir_value_null()
+            || kind == mir_value_const_float()) {
+            return true;
+        }
+        if (kind == mir_value_read_place()) {
+            let place_id = self.m.value_place(value_id);
+            return place_id != mir_id_invalid()
+                && place_id > 0
+                && place_id <= self.m.place_count
+                && self.m.place_kind(place_id) == mir_place_local()
+                && self.local_lifetime_marker_type_supported(self.m.place_type(place_id));
+        }
+        if (kind == mir_value_unary() || kind == mir_value_cast() || kind == mir_value_arg()) {
+            return self.local_slot_reuse_value_is_simple(self.m.value_lhs(value_id), depth + 1)
+                && self.m.value_rhs(value_id) == mir_id_invalid()
+                && self.m.value_aux(value_id) == mir_id_invalid();
+        }
+        if (kind == mir_value_binary()) {
+            return self.local_slot_reuse_value_is_simple(self.m.value_lhs(value_id), depth + 1)
+                && self.local_slot_reuse_value_is_simple(self.m.value_rhs(value_id), depth + 1)
+                && self.m.value_aux(value_id) == mir_id_invalid();
+        }
+        return false;
+    }
+
+    public fn local_slot_reuse_instr_is_supported(self, instr_id: i32) -> bool {
+        let kind = self.m.instr_kind(instr_id);
+        if (kind == mir_instr_eval()) {
+            return self.local_slot_reuse_value_is_simple(self.m.instr_value(instr_id), 0)
+                && self.local_slot_reuse_value_is_simple(self.m.instr_lhs(instr_id), 0)
+                && self.local_slot_reuse_value_is_simple(self.m.instr_rhs(instr_id), 0);
+        }
+        if (kind != mir_instr_assign()
+            || self.m.instr_target_kind(instr_id) != mir_target_none()
+            || self.m.instr_target_id(instr_id) != mir_id_invalid()) {
+            return false;
+        }
+        let place_id = self.m.instr_place(instr_id);
+        if (place_id == mir_id_invalid() || place_id <= 0 || place_id > self.m.place_count
+            || self.m.place_kind(place_id) != mir_place_local()
+            || !self.local_lifetime_marker_type_supported(self.m.place_type(place_id))) {
+            return false;
+        }
+        return self.local_slot_reuse_value_is_simple(self.m.instr_value(instr_id), 0)
+            && self.local_slot_reuse_value_is_simple(self.m.instr_lhs(instr_id), 0)
+            && self.local_slot_reuse_value_is_simple(self.m.instr_rhs(instr_id), 0);
+    }
+
+    public fn local_slot_reuse_candidate(self,
+                                         function_id: i32,
+                                         local_id: i32) -> bool {
+        if (llvm_mir_i32_map_get(self.local_lifetime_marker_candidates, local_id) != 1
+            || self.m.local_hir_id(local_id) == hir_id_invalid()) {
+            return false;
+        }
+        let block_id = self.m.function_first_block(function_id);
+        if (block_id == mir_id_invalid() || self.m.function_block_count(function_id) != 1) {
+            return false;
+        }
+        self.local_lifetime_marker_value_visit_budget = llvm_mir_lifetime_marker_max_value_visits();
+        var phase: i32 = 0;
+        var instr_id = self.m.block_first_instr(block_id);
+        var guard: i32 = 0;
+        while (instr_id != mir_id_invalid()) {
+            let kind = self.m.instr_kind(instr_id);
+            let direct_local = self.storage_instr_direct_local(instr_id);
+            if (direct_local == local_id) {
+                if (kind == mir_instr_storage_live()) {
+                    if (phase != 0) { return false; }
+                    phase = 1;
+                } else if (kind == mir_instr_storage_dead()) {
+                    if (phase != 1) { return false; }
+                    phase = 2;
+                } else if (phase != 1 || !self.local_slot_reuse_instr_is_supported(instr_id)) {
+                    return false;
+                }
+            } else if (phase == 1 && !self.local_slot_reuse_instr_is_supported(instr_id)) {
+                return false;
+            }
+            instr_id = self.m.instr_next(instr_id);
+            guard = guard + 1;
+            if (guard > self.m.instr_count + 1) { return false; }
+        }
+        return phase == 2;
+    }
+
+    public fn local_slot_reuse_type_compatible(self,
+                                               earlier_local: i32,
+                                               later_local: i32) -> bool {
+        let earlier_type = self.local_effective_type(earlier_local);
+        let later_type = self.local_effective_type(later_local);
+        // Exact TypeId equality keeps LLVM storage type, ABI alignment, and
+        // raw-pointer address space identical. Do not generalize this to a
+        // size-based rule until alignment/alias proofs are first-class.
+        return earlier_type != mir_id_invalid() && earlier_type == later_type;
+    }
+
+    public fn local_slot_reuse_source_for(self,
+                                          function_id: i32,
+                                          local_id: i32) -> i32 {
+        if (llvm_mir_i32_map_get(self.local_slot_reuse_candidates, local_id) != 1
+            || llvm_mir_i32_map_get(self.local_slot_reuse_sources, local_id) != 0) {
+            return mir_id_invalid();
+        }
+        var best = mir_id_invalid();
+        var prior = self.m.function_first_local(function_id);
+        var guard: i32 = 0;
+        while (prior != mir_id_invalid() && prior != local_id) {
+            if (llvm_mir_i32_map_get(self.local_slot_reuse_candidates, prior) == 1
+                // A root alloca is deliberately lent at most once. This
+                // prevents a later lexical declaration from overlapping an
+                // earlier pair through transitive aliasing.
+                && llvm_mir_i32_map_get(self.local_slot_reuse_sources, prior) == 0
+                && self.local_slot_reuse_type_compatible(prior, local_id)
+                && llvm_mir_map_get(self.local_slots, prior) != null
+                && self.local_lifetime_marker_interval_precedes(function_id, prior, local_id)) {
+                best = prior;
+            }
+            prior = self.m.local_next(prior);
+            guard = guard + 1;
+            if (guard > self.m.local_count + 1) {
+                self.report_error("cyclic local chain while selecting slot reuse source");
+                return mir_id_invalid();
+            }
+        }
+        return best;
+    }
+
+    public fn prepare_local_lifetime_marker_candidates(self, function_id: i32) {
+        var local_id = self.m.function_first_local(function_id);
+        var guard: i32 = 0;
+        while (local_id != mir_id_invalid()) {
+            llvm_mir_i32_map_put(self.local_lifetime_marker_live_orders, local_id, 0);
+            llvm_mir_i32_map_put(self.local_lifetime_marker_dead_orders, local_id, 0);
+            var state: i32 = 0;
+            if (self.local_lifetime_marker_candidate(function_id, local_id)) { state = 1; }
+            llvm_mir_i32_map_put(self.local_lifetime_marker_candidates, local_id, state);
+            var reuse_state: i32 = 0;
+            if (state == 1 && self.local_slot_reuse_candidate(function_id, local_id)) {
+                reuse_state = 1;
+            }
+            llvm_mir_i32_map_put(self.local_slot_reuse_candidates, local_id, reuse_state);
+            llvm_mir_i32_map_put(self.local_slot_reuse_sources, local_id, 0);
+            local_id = self.m.local_next(local_id);
+            guard = guard + 1;
+            if (guard > self.m.local_count + 1) {
+                self.report_error("cyclic local chain while preparing lifetime markers");
+                return;
+            }
+        }
+    }
+
+    public fn local_lifetime_marker_selected(self, instr_id: i32) -> bool {
+        let local_id = self.storage_instr_direct_local(instr_id);
+        return local_id != mir_id_invalid()
+            && llvm_mir_i32_map_get(self.local_lifetime_marker_candidates, local_id) == 1;
+    }
+
+    public fn emit_local_lifetime_marker(self,
+                                         instr_id: i32,
+                                         addr: rawptr,
+                                         is_start: bool) -> bool {
+        if (!self.local_lifetime_marker_selected(instr_id)) { return true; }
+        if (addr == null) {
+            self.report_error("missing direct alloca for lifetime marker on instr #"
+                              + policy_i64_to_string(instr_id as i64));
+            return false;
+        }
+        var marker: rawptr = null;
+        if (is_start) { marker = vyx_rt_build_lifetime_start(self.mod, addr); }
+        else { marker = vyx_rt_build_lifetime_end(self.mod, addr); }
+        if (marker == null) {
+            self.report_error("cannot emit LLVM lifetime marker for instr #"
+                              + policy_i64_to_string(instr_id as i64));
+            return false;
+        }
+        return true;
+    }
+
+    public fn place_address_is_frame_invariant(self, place_id: i32) -> bool {
+        if (place_id == mir_id_invalid()) { return false; }
+        var cursor = place_id;
+        var depth: i32 = 0;
+        while (depth < 64) {
+            let kind = self.m.place_kind(cursor);
+            if (kind == mir_place_local()) { return true; }
+            if (kind == mir_place_field()) {
+                cursor = self.m.place_base(cursor);
+                depth = depth + 1;
+                continue;
+            }
+            if (kind == mir_place_index()) {
+                let index_value = self.m.place_index_value(cursor);
+                if (index_value == mir_id_invalid()) { return false; }
+                if (self.m.value_kind(index_value) != mir_value_const_int()) { return false; }
+                cursor = self.m.place_base(cursor);
+                depth = depth + 1;
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // Emits the region create for every frame-invariant `&place` in the
+    // function's value range.  Runs while the frame entry block is still
+    // unterminated, so the calls land there and dominate every use.
+    public fn hoist_frame_invariant_borrow_regions(self, function_id: i32) {
+        // OFF BY DEFAULT -- opt in with VYX_REGION_HOIST=1.
+        //
+        // This hoist contradicts the borrow-site region invariant documented
+        // at the lowering that consumes these handles ("Each evaluation of a
+        // borrow site must create a FRESH region"): vyx_pointer_region_create
+        // returns refcount 1 and the compiler pairs it with exactly one
+        // frame-end vyx_pointer_region_delete.  Handing every evaluation of a
+        // site the same hoisted handle keeps a region alive on paper while the
+        // runtime may already have released it -- a stack borrow reuses the
+        // same address on every iteration, so the stale handle is
+        // indistinguishable from a fresh one.  The result is UAF and heap
+        // corruption.
+        //
+        // Measured: zyn_counter_app --gpu crashed 3/3 with 0xC0000374 right
+        // after D3D12 root-signature creation; with the hoist disabled it
+        // exits 0 3/3 with byte-identical output (frames=2 rendered=2
+        // nodes=10 draws=160).  The crash site was
+        // GlyphCache::cacheGlyphIndex -> Vec<CachedGlyph>::ensure_capacity,
+        // reached with a corrupted frame.
+        //
+        // The runtime region dedup cache from the same change stays enabled:
+        // it is sound (it only ever returns a descriptor that is still live)
+        // and carried most of the win (ptrBench 606ms -> 34.5ms).  Only the
+        // hoist, which took it to 17.5ms, is gated off.  Reviving it requires
+        // the hoisted handle to acquire and release the region in lockstep
+        // with create/delete instead of caching a bare pointer.
+        if (!llvm_mir_env_enabled("VYX_REGION_HOIST")) { return; }
+        if (self.hoisted_borrow_handles == null || self.current_entry_block == null) { return; }
+        let first_value = self.pending_value_first;
+        let last_value = self.pending_value_last;
+        if (first_value <= 0 || last_value < first_value) { return; }
+        llvm_mir_map_clear_range(self.hoisted_borrow_handles, first_value, last_value);
+        var value_id = first_value;
+        while (value_id <= last_value) {
+            if (self.m.value_kind(value_id) == mir_value_address_of()
+                && self.m.value_function(value_id) == function_id) {
+                let place_id = self.m.value_place(value_id);
+                if (place_id != mir_id_invalid()
+                    && self.dci_bitfield_for_place(place_id) == null
+                    && self.m.place_kind(place_id) != mir_place_deref()
+                    && self.place_address_is_frame_invariant(place_id)) {
+                    let place_type = self.place_effective_type(place_id);
+                    if (place_type != mir_id_invalid()
+                        && !self.type_is_class_pointer_abi(place_type)) {
+                        var capability: i32 = 1;
+                        if (self.m.value_op(value_id) == 1) { capability = 2; }
+                        var region_payload_type = place_type;
+                        if (self.m.place_kind(place_id) == mir_place_index()) {
+                            let array_base = self.m.place_base(place_id);
+                            let array_type = self.place_effective_type(array_base);
+                            if (llvm_mir_type_kind(&self.m, array_type) == ty_ARRAY()) {
+                                region_payload_type = array_type;
+                            }
+                        }
+                        let address = self.lower_place_addr(place_id);
+                        if (address != null) {
+                            let handle = self.pointer_handle_from_raw(address,
+                                                                      region_payload_type,
+                                                                      0,
+                                                                      capability,
+                                                                      "mir.addr.hoist");
+                            if (handle != null) {
+                                llvm_mir_map_put(self.hoisted_borrow_handles, value_id, handle);
+                            }
+                        }
+                    }
+                }
+            }
+            value_id = value_id + 1;
+        }
+    }
+
+    // (first_value, last_value) per function for the whole-unit pipeline,
+    // which lowers a complete unit and has no per-function value mark.
+    public fn build_function_value_ranges(self) {
+        if (self.function_value_ranges != null) { return; }
+        let count = self.m.function_count;
+        if (count <= 0) { return; }
+        let bytes = ((count as i64) + 1) * 16;
+        let buffer = malloc(bytes as u64);
+        if (buffer == null) { return; }
+        memset(buffer, 0, bytes as u64);
+        self.function_value_ranges = buffer;
+        let total = self.m.value_count;
+        var value_id: i32 = 1;
+        while (value_id <= total) {
+            let owner = self.m.value_function(value_id);
+            if (owner > 0 && owner <= count) {
+                let slot = ptr_offset(buffer, owner * 16);
+                if (ast_read_i64(slot) == 0) { ast_write_i64(slot, value_id as i64); }
+                ast_write_i64(ptr_offset(slot, 8), value_id as i64);
+            }
+            value_id = value_id + 1;
+        }
+    }
+
+    fn function_range_value(self, function_id: i32, offset: i32) -> i32 {
+        if (self.function_value_ranges == null || function_id <= 0
+            || function_id > self.m.function_count) {
+            return 0;
+        }
+        return ast_read_i64(ptr_offset(self.function_value_ranges,
+                                        function_id * 16 + offset)) as i32;
+    }
+
+    public fn prepare_function_value_range(self, function_id: i32) {
+        self.build_function_value_ranges();
+        self.pending_value_first = self.function_range_value(function_id, 0);
+        self.pending_value_last = self.function_range_value(function_id, 8);
+    }
+}

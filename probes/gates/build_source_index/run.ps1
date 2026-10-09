@@ -38,12 +38,13 @@ function Get-ProductionFunction([string]$Text, [string]$Name) {
     throw "Unterminated production function $Name"
 }
 
-$system = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/build_system.vyx'))
-$model = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/build_source_index.vyx')).Replace('module bootstrap.build_source_index;', 'module source_index_probe;')
-$sets = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/build_sets.vyx'))
+$system = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_system.vyx'))
+$model = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_source_index.vyx')).Replace('module bootstrap.build_source_index;', 'module source_index_probe;')
+$sets = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_sets.vyx'))
+# This fixed revision predates the source-tree migration.
 $old = (& git -C $repo show e52de175:bootstrap_compiler/src/core/build_system.vyx) -join "`n"
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read reference source' }
-$source = $system + "`n" + $sets + "`n" + [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/policy.vyx')) + "`n" + $old
+$source = $system + "`n" + $sets + "`n" + [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/sema/policy.vyx')) + "`n" + $old
 $queue = [Collections.Generic.Queue[string]]::new()
 @('build_make_source_index', 'build_partition_dependency_stamp', 'build_auto_vyx_import_sources_mode', 'build_module_files_from_registry', 'build_write_peer_vyi_units', 'build_emit_peer_vyi_files') | ForEach-Object { $queue.Enqueue($_) }
 $seen = [Collections.Generic.HashSet[string]]::new()

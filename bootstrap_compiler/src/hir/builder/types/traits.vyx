@@ -1,0 +1,384 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Traits for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn raw_interface_decl_for_trait_name(self, trait_name: string) -> rawptr {
+        if (trait_name.len == 0) { return null; }
+        let cached = hir_raw_name_map_get(self.interface_decl_cache,trait_name);
+        if (cached != null) { return cached; }
+        if (hir_name_id_map_get(self.interface_decl_miss_cache,trait_name) != hir_id_invalid()) { return null; }
+        let direct = self.find_class_decl(trait_name);
+        if (direct != null
+            && (((decl_get_generic_flags(direct) & 2) != 0)
+                || hir_builder_string_contains(decl_get_generic_params(direct), "|kind:interface"))) {
+            self.interface_decl_cache = hir_raw_name_map_put(self.interface_decl_cache,trait_name, direct);
+            return direct;
+        }
+        var cur = self.decl_map.head;
+        while (cur != null) {
+            let candidate = ast_read_rawptr(cur);
+            if (candidate != null
+                && decl_get_kind(candidate) == de_CLASS()
+                && (((decl_get_generic_flags(candidate) & 2) != 0)
+                    || hir_builder_string_contains(decl_get_generic_params(candidate), "|kind:interface"))
+                && hir_builder_trait_names_match(decl_get_name(candidate), trait_name)) {
+                self.interface_decl_cache = hir_raw_name_map_put(self.interface_decl_cache,trait_name, candidate);
+                return candidate;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        self.interface_decl_miss_cache = hir_name_id_map_put(self.interface_decl_miss_cache,trait_name, 1);
+        return null;
+    }
+
+    fn raw_interface_default_method_decl_on_trait(self,
+                                                        trait_decl: rawptr,
+                                                        method_name: string,
+                                                        depth: i32) -> rawptr {
+        if (trait_decl == null || method_name.len == 0 || depth > 8) { return null; }
+        if ((decl_get_generic_flags(trait_decl) & 2) == 0) { return null; }
+        var member = decl_get_members(trait_decl);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(decl_get_name(member), method_name)
+                && !decl_get_is_static(member)
+                && self.raw_function_body_decl_for(member) != null) {
+                return member;
+            }
+            member = decl_get_next(member);
+        }
+        let gp = decl_get_generic_params(trait_decl);
+        var idx: i32 = 0;
+        while (idx < 64) {
+            let super_name = hir_builder_impl_trait_at(gp, idx);
+            if (super_name.len == 0) { break; }
+            let super_decl = self.raw_interface_decl_for_trait_name(super_name);
+            if (super_decl != null && super_decl != trait_decl) {
+                let inherited = self.raw_interface_default_method_decl_on_trait(super_decl,
+                                                                                method_name,
+                                                                                depth + 1);
+                if (inherited != null) { return inherited; }
+            }
+            idx = idx + 1;
+        }
+        return null;
+    }
+
+    fn raw_interface_default_method_decl_for_type_text(self,
+                                                              type_text: string,
+                                                              method_name: string) -> rawptr {
+        if (type_text.len == 0 || method_name.len == 0) { return null; }
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null || ((decl_get_generic_flags(cd) & 64) == 0)) { return null; }
+        let gp = decl_get_generic_params(cd);
+        var idx: i32 = 0;
+        while (idx < 64) {
+            let trait_name = hir_builder_impl_trait_at(gp, idx);
+            if (trait_name.len == 0) { break; }
+            let trait_decl = self.raw_interface_decl_for_trait_name(trait_name);
+            if (trait_decl != null) {
+                let method_decl = self.raw_interface_default_method_decl_on_trait(trait_decl,
+                                                                                  method_name,
+                                                                                  0);
+                if (method_decl != null) { return method_decl; }
+            }
+            idx = idx + 1;
+        }
+        return null;
+    }
+
+    fn interface_decl_extends_trait_name(self, interface_decl: rawptr, trait_name: string, depth: i32) -> bool {
+        if (interface_decl == null || trait_name.len == 0 || depth > 16) { return false; }
+        if ((decl_get_generic_flags(interface_decl) & 2) == 0) { return false; }
+        if (hir_builder_trait_names_match(decl_get_name(interface_decl), trait_name)) { return true; }
+        let gp = decl_get_generic_params(interface_decl);
+        var idx: i32 = 0;
+        while (idx < 64) {
+            let super_name = hir_builder_impl_trait_at(gp, idx);
+            if (super_name.len == 0) { break; }
+            if (hir_builder_trait_names_match(super_name, trait_name)) { return true; }
+            let super_decl = self.raw_interface_decl_for_trait_name(super_name);
+            if (super_decl != null && super_decl != interface_decl) {
+                if (self.interface_decl_extends_trait_name(super_decl, trait_name, depth + 1)) {
+                    return true;
+                }
+            }
+            idx = idx + 1;
+        }
+        return false;
+    }
+
+    fn class_decl_implements_trait_name(self, class_decl: rawptr, trait_name: string, depth: i32) -> bool {
+        if (class_decl == null || trait_name.len == 0 || depth > 32) { return false; }
+        let gp = decl_get_generic_params(class_decl);
+        var idx: i32 = 0;
+        while (idx < 64) {
+            let item = hir_builder_impl_trait_at(gp, idx);
+            if (item.len == 0) { break; }
+            let interface_decl = self.raw_interface_decl_for_trait_name(item);
+            if (interface_decl != null) {
+                if (hir_builder_trait_names_match(item, trait_name)
+                    || self.interface_decl_extends_trait_name(interface_decl, trait_name, 0)) {
+                    return true;
+                }
+            }
+            idx = idx + 1;
+        }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { return false; }
+            if (self.class_decl_implements_trait_name(parent_decl, trait_name, depth + 1)) {
+                return true;
+            }
+            parent_i = parent_i + 1;
+        }
+        return false;
+    }
+
+    fn type_text_satisfies_dyn_trait(self, actual_type: string, trait_name: string) -> bool {
+        if (actual_type.len == 0 || trait_name.len == 0) { return false; }
+        let cached = hir_pair_id_map_get(self.dyn_trait_satisfaction_cache,actual_type, trait_name);
+        if (cached == 2) { return true; }
+        if (cached == 1) { return false; }
+        var out = false;
+        if (hir_builder_trait_names_match(actual_type, trait_name)) {
+            out = true;
+            self.dyn_trait_satisfaction_cache = hir_pair_id_map_put(self.dyn_trait_satisfaction_cache,actual_type, trait_name, 2);
+            return out;
+        }
+        let actual_dyn_trait = self.dyn_interface_name_from_type_text(actual_type);
+        if (actual_dyn_trait.len > 0) {
+            if (hir_builder_trait_names_match(actual_dyn_trait, trait_name)) {
+                self.dyn_trait_satisfaction_cache = hir_pair_id_map_put(self.dyn_trait_satisfaction_cache,actual_type, trait_name, 2);
+                return true;
+            }
+            let actual_iface = self.raw_interface_decl_for_trait_name(actual_dyn_trait);
+            if (actual_iface != null) {
+                out = self.interface_decl_extends_trait_name(actual_iface, trait_name, 0);
+                if (out) {
+                    self.dyn_trait_satisfaction_cache = hir_pair_id_map_put(self.dyn_trait_satisfaction_cache,actual_type, trait_name, 2);
+                } else {
+                    self.dyn_trait_satisfaction_cache = hir_pair_id_map_put(self.dyn_trait_satisfaction_cache,actual_type, trait_name, 1);
+                }
+                return out;
+            }
+            self.dyn_trait_satisfaction_cache = hir_pair_id_map_put(self.dyn_trait_satisfaction_cache,actual_type, trait_name, 1);
+            return false;
+        }
+        let class_decl = self.raw_class_decl_for_type_text(actual_type);
+        if (class_decl == null) {
+            self.dyn_trait_satisfaction_cache = hir_pair_id_map_put(self.dyn_trait_satisfaction_cache,actual_type, trait_name, 1);
+            return false;
+        }
+        if ((decl_get_generic_flags(class_decl) & 2) != 0) {
+            out = self.interface_decl_extends_trait_name(class_decl, trait_name, 0);
+        } else {
+            out = self.class_decl_implements_trait_name(class_decl, trait_name, 0);
+        }
+        if (out) {
+            self.dyn_trait_satisfaction_cache = hir_pair_id_map_put(self.dyn_trait_satisfaction_cache,actual_type, trait_name, 2);
+        } else {
+            self.dyn_trait_satisfaction_cache = hir_pair_id_map_put(self.dyn_trait_satisfaction_cache,actual_type, trait_name, 1);
+        }
+        return out;
+    }
+
+    fn hir_type_id_peel_handle(self, type_id: i32) -> i32 {
+        var cur = type_id;
+        var depth: i32 = 0;
+        while (depth < 4 && self.type_id_is_valid(cur)) {
+            let kind = hir_type_table_kind(self.unit.types, cur);
+            if (kind != ty_PTR() && kind != ty_REF() && kind != ty_MUTREF()) {
+                return cur;
+            }
+            let elem = hir_type_table_elem(self.unit.types, cur);
+            if (!self.type_id_is_valid(elem)) { return cur; }
+            cur = elem;
+            depth = depth + 1;
+        }
+        return cur;
+    }
+
+    fn dyn_interface_name_from_type_text(self, type_text: string) -> string {
+        let peeled = hir_builder_peel_handle_type_text(type_text);
+        if (peeled.len <= 3) { return ""; }
+        let base = policy_generic_call_base(peeled.clone());
+        if (base.len <= 3 || !base.startsWith("dyn")) { return ""; }
+        let iface_base = base.substring(3, base.len);
+        if (iface_base.len == 0) { return ""; }
+        let args = policy_generic_call_args(peeled.clone());
+        if (args.len > 0) { return iface_base + "::<" + args + ">"; }
+        return iface_base;
+    }
+
+    fn dyn_interface_method_target_for_callee_member(self, callee_expr_id: i32) -> i32 {
+        if (callee_expr_id == hir_id_invalid()) { return hir_id_invalid(); }
+        if (self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) { return hir_id_invalid(); }
+        let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+        if (owner_expr_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(owner_expr_id));
+        if (!self.type_id_is_valid(owner_type_id)) { return hir_id_invalid(); }
+        let owner_type_name = self.member_lookup_type_name(owner_type_id);
+        let dyn_iface_name = self.dyn_interface_name_from_type_text(owner_type_name);
+        if (dyn_iface_name.len == 0) { return hir_id_invalid(); }
+        let member_name = policy_versioned_generic_call_base(self.unit.expr_name(callee_expr_id).clone());
+        return self.method_function_target_by_owner_type_and_method(dyn_iface_name, member_name);
+    }
+
+    fn materialize_dyn_trait_impl_methods_on_trait(self,
+                                                          actual_type_name: string,
+                                                          trait_decl: rawptr,
+                                                          depth: i32) {
+        if (actual_type_name.len == 0 || trait_decl == null || depth > 16) { return; }
+        if ((decl_get_generic_flags(trait_decl) & 2) == 0) { return; }
+        var member = decl_get_members(trait_decl);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && !decl_get_is_static(member)) {
+                var method_start: i64 = 0;
+                let method_timing = hir_builder_env_enabled("VYX_HIR_DYN_MATERIALIZE_TIMING");
+                if (method_timing) { method_start = vyx_bootstrap_now_ms(); }
+                self.ensure_method_instance_for_type_text(actual_type_name, decl_get_name(member));
+                if (method_timing) {
+                    let method_elapsed = vyx_bootstrap_now_ms() - method_start;
+                    if (method_elapsed >= hir_builder_slow_expr_threshold_ms()) {
+                        print("[hir-dyn-method] type=" + actual_type_name
+                              + " trait=" + decl_get_name(trait_decl)
+                              + " method=" + decl_get_name(member)
+                              + " elapsed=" + policy_i64_to_string(method_elapsed)
+                              + " depth=" + self.i32_text(depth));
+                    }
+                }
+            }
+            member = decl_get_next(member);
+        }
+        let gp = decl_get_generic_params(trait_decl);
+        var idx: i32 = 0;
+        while (idx < 64) {
+            let super_name = hir_builder_impl_trait_at(gp, idx);
+            if (super_name.len == 0) { break; }
+            let super_decl = self.raw_interface_decl_for_trait_name(super_name);
+            if (super_decl != null && super_decl != trait_decl) {
+                self.materialize_dyn_trait_impl_methods_on_trait(actual_type_name,
+                                                                 super_decl,
+                                                                 depth + 1);
+            }
+            idx = idx + 1;
+        }
+    }
+
+    fn materialize_dyn_trait_impl_methods(self, actual_type_name: string, trait_name: string) {
+        if (actual_type_name.len == 0 || trait_name.len == 0) { return; }
+        if (hir_pair_id_map_get(self.dyn_trait_impl_materialized_cache,actual_type_name, trait_name) != hir_id_invalid()) {
+            return;
+        }
+        let timing_enabled = hir_builder_env_enabled("VYX_HIR_DYN_MATERIALIZE_TIMING");
+        var timing_start: i64 = 0;
+        var timing_satisfy_ms: i64 = 0;
+        var timing_decl_ms: i64 = 0;
+        var timing_methods_ms: i64 = 0;
+        if (timing_enabled) { timing_start = vyx_bootstrap_now_ms(); }
+        if (!self.type_text_satisfies_dyn_trait(actual_type_name, trait_name)) { return; }
+        var timing_mark: i64 = 0;
+        if (timing_enabled) {
+            timing_mark = vyx_bootstrap_now_ms();
+            timing_satisfy_ms = timing_mark - timing_start;
+        }
+        let trait_decl = self.raw_interface_decl_for_trait_name(trait_name);
+        if (trait_decl == null) { return; }
+        if (timing_enabled) {
+            let now_decl = vyx_bootstrap_now_ms();
+            timing_decl_ms = now_decl - timing_mark;
+            timing_mark = now_decl;
+        }
+        self.materialize_dyn_trait_impl_methods_on_trait(actual_type_name, trait_decl, 0);
+        if (timing_enabled) {
+            timing_methods_ms = vyx_bootstrap_now_ms() - timing_mark;
+        }
+        self.dyn_trait_impl_materialized_cache = hir_pair_id_map_put(self.dyn_trait_impl_materialized_cache,actual_type_name, trait_name, 1);
+        if (timing_enabled) {
+            let total = vyx_bootstrap_now_ms() - timing_start;
+            if (total >= hir_builder_slow_expr_threshold_ms()) {
+                print("[hir-dyn-materialize] type=" + actual_type_name
+                      + " trait=" + trait_name
+                      + " total=" + policy_i64_to_string(total)
+                      + " satisfy=" + policy_i64_to_string(timing_satisfy_ms)
+                      + " decl=" + policy_i64_to_string(timing_decl_ms)
+                      + " methods=" + policy_i64_to_string(timing_methods_ms));
+            }
+        }
+    }
+
+    fn expr_dyn_payload_type_text(self, expr_id: i32) -> string {
+        var cur = expr_id;
+        var depth: i32 = 0;
+        var last = "";
+        while (depth < 6 && cur != hir_id_invalid()) {
+            let type_id = self.unit.expr_type(cur);
+            if (self.type_id_is_valid(type_id)) {
+                let peeled = hir_builder_peel_handle_type_text(
+                    hir_type_table_text(self.unit.types, type_id));
+                if (peeled.len > 0) { last = peeled; }
+                if (self.dyn_interface_name_from_type_text(peeled).len == 0) {
+                    let base = policy_generic_call_base(peeled.clone());
+                    if (base.len > 0
+                        && base != "ref"
+                        && base != "mutref"
+                        && base != "ptr"
+                        && base != "rawptr") {
+                        return peeled;
+                    }
+                }
+            }
+            let kind = self.unit.expr_kind(cur);
+            if (kind != ex_ADDR_OF()
+                && kind != ex_CAST()
+                && kind != ex_DEREF()
+                && kind != ex_UNARY()) {
+                break;
+            }
+            cur = self.unit.expr_lhs(cur);
+            depth = depth + 1;
+        }
+        return last;
+    }
+
+    fn materialize_dyn_type_coercion(self, actual_type_id: i32, expected_type_id: i32) {
+        if (!self.type_id_is_valid(actual_type_id) || !self.type_id_is_valid(expected_type_id)) { return; }
+        let expected_core = self.hir_type_id_peel_handle(expected_type_id);
+        let trait_name = self.dyn_interface_name_from_type_text(
+            hir_type_table_text(self.unit.types, expected_core));
+        if (trait_name.len == 0) { return; }
+        let actual_core = self.hir_type_id_peel_handle(actual_type_id);
+        if (!self.type_id_is_valid(actual_core)) { return; }
+        let actual_name = hir_type_table_text(self.unit.types, actual_core);
+        if (actual_name.len == 0) { return; }
+        if (self.dyn_interface_name_from_type_text(actual_name).len > 0) { return; }
+        self.materialize_dyn_trait_impl_methods(actual_name, trait_name);
+    }
+
+    fn materialize_dyn_expected_arg_impl(self, arg_expr_id: i32, expected_type_id: i32) {
+        if (arg_expr_id == hir_id_invalid() || !self.type_id_is_valid(expected_type_id)) { return; }
+        let expected_type_name = hir_type_table_text(self.unit.types, expected_type_id);
+        let trait_name = self.dyn_interface_name_from_type_text(expected_type_name);
+        if (trait_name.len == 0) { return; }
+        self.materialize_dyn_type_coercion(self.unit.expr_type(arg_expr_id), expected_type_id);
+        let walked = self.expr_dyn_payload_type_text(arg_expr_id);
+        if (walked.len > 0 && self.dyn_interface_name_from_type_text(walked).len == 0) {
+            self.materialize_dyn_trait_impl_methods(walked, trait_name);
+        }
+    }
+}

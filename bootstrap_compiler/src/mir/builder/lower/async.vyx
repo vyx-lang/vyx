@@ -1,0 +1,379 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn current_function_is_async_task(self) -> bool {
+        if (self.current_function_id == mir_id_invalid()) { return false; }
+        return (self.unit.function_flags(self.current_function_id) & hir_function_flag_async_task()) != 0;
+    }
+
+    public fn add_receiver_method_call(self,
+                                         receiver_value: i32,
+                                         target_fn: i32,
+                                         result_type: i32,
+                                         source_expr_id: i32,
+                                         name: string) -> i32 {
+        if (receiver_value == mir_id_invalid() || target_fn == mir_id_invalid()) {
+            return mir_id_invalid();
+        }
+        let callee_ref = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_target_ref(),
+                                           self.unit.value_type(receiver_value),
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           target_fn,
+                                           source_expr_id,
+                                           0,
+                                           0,
+                                           0,
+                                           name,
+                                           "");
+        self.unit.set_value_lhs( callee_ref, receiver_value);
+        let call_value = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_call(),
+                                           result_type,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           target_fn,
+                                           source_expr_id,
+                                           0,
+                                           0,
+                                           0,
+                                           name,
+                                           "");
+        self.unit.set_value_lhs( call_value, callee_ref);
+        return call_value;
+    }
+
+    public fn async_resume_block_for_index(self, index: i32) -> i32 {
+        if (self.current_function_id == mir_id_invalid() || index <= 0) {
+            return mir_id_invalid();
+        }
+        var block_id = self.unit.function_first_block(self.current_function_id);
+        while (block_id != mir_id_invalid()) {
+            if (self.unit.block_term_kind(block_id) == mir_term_yield()
+                && self.unit.block_term_aux(block_id) == index) {
+                return self.unit.block_term_target(block_id);
+            }
+            block_id = self.unit.block_next(block_id);
+        }
+        return mir_id_invalid();
+    }
+
+    public fn finish_async_dispatch(self, dispatch_block: i32, body_entry: i32) {
+        if (dispatch_block == mir_id_invalid() || body_entry == mir_id_invalid()) { return; }
+        if (self.unit.block_term_kind(dispatch_block) != mir_id_invalid()
+            && self.unit.block_term_kind(dispatch_block) != 0) {
+            return;
+        }
+        self.set_current_block(dispatch_block);
+        if (self.async_pc_place_id == mir_id_invalid() || self.async_await_index <= 0) {
+            if (!self.current_block_terminated()) {
+                self.terminate_current_goto(body_entry);
+            }
+            return;
+        }
+        let pc_val = self.add_read_value(self.async_pc_place_id, hir_id_invalid());
+        let zero = self.add_const_i32_value(0, hir_id_invalid());
+        let eq0 = self.add_binary_value(self.bool_type_id(),
+                                          tk_EQEQ(),
+                                          pc_val,
+                                          zero,
+                                          hir_id_invalid(),
+                                          "async.pc.eq0");
+        var next_block = self.add_block(hir_id_invalid());
+        self.terminate_current(mir_term_branch(),
+                               eq0,
+                               body_entry,
+                               next_block,
+                               mir_id_invalid(),
+                               hir_id_invalid());
+        var idx: i32 = 1;
+        while (idx <= self.async_await_index) {
+            self.set_current_block(next_block);
+            let resume = self.async_resume_block_for_index(idx);
+            let expected = self.add_const_i32_value(idx as i64, hir_id_invalid());
+            let pc_again = self.add_read_value(self.async_pc_place_id, hir_id_invalid());
+            let eq = self.add_binary_value(self.bool_type_id(),
+                                            tk_EQEQ(),
+                                            pc_again,
+                                            expected,
+                                            hir_id_invalid(),
+                                            "async.pc.eq");
+            var dest = resume;
+            if (dest == mir_id_invalid()) { dest = body_entry; }
+            if (idx == self.async_await_index) {
+                let miss_block = self.add_block(hir_id_invalid());
+                self.terminate_current(mir_term_branch(),
+                                       eq,
+                                       dest,
+                                       miss_block,
+                                       mir_id_invalid(),
+                                       hir_id_invalid());
+                self.set_current_block(miss_block);
+                self.terminate_current(mir_term_unreachable(),
+                                       mir_id_invalid(),
+                                       mir_id_invalid(),
+                                       mir_id_invalid(),
+                                       mir_id_invalid(),
+                                       hir_id_invalid());
+            } else {
+                next_block = self.add_block(hir_id_invalid());
+                self.terminate_current(mir_term_branch(),
+                                       eq,
+                                       dest,
+                                       next_block,
+                                       mir_id_invalid(),
+                                       hir_id_invalid());
+            }
+            idx = idx + 1;
+        }
+    }
+
+    public fn lower_await_expr(self, expr_id: i32, type_id: i32) -> i32 {
+        let receiver_expr = self.h.expr_lhs(expr_id);
+        let receiver_value = self.lower_expr(receiver_expr);
+        let target_fn = self.target_id_from_hir_expr(expr_id);
+        if (self.current_function_is_async_task() && receiver_value != mir_id_invalid()) {
+            let receiver_type = self.h.expr_type(receiver_expr);
+            let poll_fn = self.function_target_by_owner_type_and_method(self.type_text(receiver_type), "poll");
+            var take_fn = target_fn;
+            if (take_fn == mir_id_invalid()) {
+                take_fn = self.function_target_by_owner_type_and_method(self.type_text(receiver_type), "await_value");
+            }
+            if (poll_fn != mir_id_invalid() && take_fn != mir_id_invalid()) {
+                self.async_await_index = self.async_await_index + 1;
+                let await_index = self.async_await_index;
+                let fut_place = self.add_temp_place(receiver_type, expr_id, "await.fut");
+                self.emit_assign(fut_place, receiver_value, hir_id_invalid(), expr_id);
+                let poll_block = self.add_block(hir_id_invalid());
+                let yield_block = self.add_block(hir_id_invalid());
+                let ready_block = self.add_block(hir_id_invalid());
+                if (!self.current_block_terminated()) {
+                    self.terminate_current_goto(poll_block);
+                }
+                self.set_current_block(poll_block);
+                let fut_ref = self.add_read_value(fut_place, expr_id);
+                let poll_call = self.add_receiver_method_call(fut_ref,
+                                                                poll_fn,
+                                                                self.bool_type_id(),
+                                                                expr_id,
+                                                                "poll");
+                self.terminate_current(mir_term_branch(),
+                                       poll_call,
+                                       ready_block,
+                                       yield_block,
+                                       mir_id_invalid(),
+                                       expr_id);
+                self.set_current_block(yield_block);
+                self.terminate_current(mir_term_yield(),
+                                       fut_ref,
+                                       poll_block,
+                                       mir_id_invalid(),
+                                       mir_id_invalid(),
+                                       await_index);
+                self.set_current_block(ready_block);
+                let ready_fut = self.add_read_value(fut_place, expr_id);
+                return self.add_receiver_method_call(ready_fut,
+                                                     take_fn,
+                                                     type_id,
+                                                     expr_id,
+                                                     "await_value");
+            }
+        }
+        if (target_fn == mir_id_invalid()) {
+            if (self.type_text(type_id) == "void") {
+                if (receiver_value != mir_id_invalid()) { return receiver_value; }
+                let yield_fn = self.function_target_by_name("__vio_await_yield");
+                if (yield_fn != mir_id_invalid()) {
+                    return self.add_direct_empty_arg_call(expr_id, type_id, yield_fn, "__vio_await_yield");
+                }
+            }
+            let unresolved = self.unit.add_value(
+                                               self.current_function_id,
+                                               mir_value_intrinsic(),
+                                               type_id,
+                                               mir_id_invalid(),
+                                               mir_target_none(),
+                                               mir_id_invalid(),
+                                               expr_id,
+                                               hir_unit_expr_flags(self.h, expr_id),
+                                               self.h.expr_op(expr_id),
+                                               hir_unit_expr_int_value(self.h, expr_id),
+                                               "await",
+                                               self.type_text(self.h.expr_type(receiver_expr)));
+            self.unit.set_value_lhs( unresolved, receiver_value);
+            return unresolved;
+        }
+        let callee_ref = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_target_ref(),
+                                           self.h.expr_type(receiver_expr),
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           target_fn,
+                                           expr_id,
+                                           hir_unit_expr_flags(self.h, expr_id),
+                                           self.h.expr_op(expr_id),
+                                           hir_unit_expr_int_value(self.h, expr_id),
+                                           "await_value",
+                                           self.h.expr_name(expr_id));
+        self.unit.set_value_lhs( callee_ref, receiver_value);
+        let call_value = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_call(),
+                                           type_id,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           target_fn,
+                                           expr_id,
+                                           hir_unit_expr_flags(self.h, expr_id),
+                                           self.h.expr_op(expr_id),
+                                           hir_unit_expr_int_value(self.h, expr_id),
+                                           "await_value",
+                                           self.h.expr_value_text(expr_id));
+        self.unit.set_value_lhs( call_value, callee_ref);
+        return call_value;
+    }
+
+    public fn type_text_is_awaitable(self, text: string) -> bool {
+        let base = self.type_base_text(text);
+        let last = mir_builder_last_path_segment(base);
+        return last == "Task" || last == "Promise";
+    }
+
+    public fn awaitable_payload_type_id(self, type_id: i32) -> i32 {
+        let text = self.type_text(type_id);
+        if (!self.type_text_is_awaitable(text)) { return mir_id_invalid(); }
+        let args = policy_generic_call_args(text.clone());
+        var payload = policy_generic_arg_at(args, 0);
+        if (payload.len == 0 || payload == "void") { payload = "i32"; }
+        return self.type_id_by_text(payload);
+    }
+
+    public fn mark_async_call_support_reachable(self, target_fn: i32) {
+        if (target_fn == mir_id_invalid()) { return; }
+        self.mark_function_reachable(target_fn);
+        self.function_target_by_name("vio_promise_state_new");
+        self.function_target_by_name("vio_sched_spawn");
+        self.function_target_by_name("vio_promise_state_reject");
+        self.function_target_by_name("malloc");
+        self.function_target_by_name("free");
+        let return_type_id = self.unit.function_return_type(target_fn);
+        let return_text = self.type_text(return_type_id);
+        if (return_text.len > 0 && self.type_text_is_awaitable(return_text)) {
+            self.function_target_by_owner_type_and_method(return_text, "await_value");
+            self.function_target_by_owner_type_and_method(return_text, "poll");
+            self.function_target_by_owner_type_and_method(return_text, "resolve");
+            self.function_target_by_owner_type_and_method(return_text, "drop");
+        }
+        self.function_target_by_name("vio_async_frame_set");
+        self.function_target_by_name("vio_async_frame_get");
+        self.function_target_by_name("vio_async_pending_set");
+        self.function_target_by_name("vio_async_take_pending");
+    }
+
+    public fn return_expr_needs_awaitable_ready(self, return_type_id: i32, expr_id: i32) -> bool {
+        if (return_type_id == mir_id_invalid() || expr_id == hir_id_invalid()) { return false; }
+        let return_text = self.type_text(return_type_id);
+        if (!self.type_text_is_awaitable(return_text)) { return false; }
+        let expr_type = self.h.expr_type(expr_id);
+        if (expr_type == return_type_id) { return false; }
+        if (self.type_text(expr_type) == return_text) { return false; }
+        if (self.type_text_is_awaitable(self.type_text(expr_type))) { return false; }
+        return self.awaitable_payload_type_id(return_type_id) != mir_id_invalid();
+    }
+
+    public fn lower_awaitable_ready_return(self, expr_id: i32, return_type_id: i32) -> i32 {
+        let payload_type_id = self.awaitable_payload_type_id(return_type_id);
+        if (payload_type_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let return_text = self.type_text(return_type_id);
+        let ready_fn = self.function_target_by_owner_type_and_method(return_text, "ready");
+        if (ready_fn == mir_id_invalid()) { return mir_id_invalid(); }
+        let payload_value = self.lower_expr_as(expr_id, payload_type_id);
+        let callee_ref = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_target_ref(),
+                                           return_type_id,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           ready_fn,
+                                           expr_id,
+                                           hir_unit_expr_flags(self.h, expr_id),
+                                           self.h.expr_op(expr_id),
+                                           hir_unit_expr_int_value(self.h, expr_id),
+                                           "ready",
+                                           return_text);
+        let call_value = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_call(),
+                                           return_type_id,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           ready_fn,
+                                           expr_id,
+                                           hir_unit_expr_flags(self.h, expr_id),
+                                           self.h.expr_op(expr_id),
+                                           hir_unit_expr_int_value(self.h, expr_id),
+                                           "ready",
+                                           return_text);
+        self.unit.set_value_lhs( call_value, callee_ref);
+        self.append_value_arg(call_value, mir_id_invalid(), mir_id_invalid(), payload_value);
+        return call_value;
+    }
+
+    public fn lower_awaitable_ready_default_return(self, return_type_id: i32, source_expr_id: i32) -> i32 {
+        let payload_type_id = self.awaitable_payload_type_id(return_type_id);
+        if (payload_type_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let return_text = self.type_text(return_type_id);
+        let ready_fn = self.function_target_by_owner_type_and_method(return_text, "ready");
+        if (ready_fn == mir_id_invalid()) { return mir_id_invalid(); }
+        let payload_value = self.add_default_value_for_type(payload_type_id, source_expr_id);
+        if (payload_value == mir_id_invalid()) { return mir_id_invalid(); }
+        let callee_ref = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_target_ref(),
+                                           return_type_id,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           ready_fn,
+                                           source_expr_id,
+                                           0,
+                                           0,
+                                           0,
+                                           "ready",
+                                           return_text);
+        let call_value = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_call(),
+                                           return_type_id,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           ready_fn,
+                                           source_expr_id,
+                                           0,
+                                           0,
+                                           0,
+                                           "ready",
+                                           return_text);
+        self.unit.set_value_lhs( call_value, callee_ref);
+        self.append_value_arg(call_value, mir_id_invalid(), mir_id_invalid(), payload_value);
+        return call_value;
+    }
+}

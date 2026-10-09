@@ -1,0 +1,523 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Reflection for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn reflection_member_name_recognized(self, member_name: string) -> bool {
+        if (member_name == "name" || member_name == "kind") { return true; }
+        if (member_name == "fields" || member_name == "methods") { return true; }
+        return false;
+    }
+
+    fn reflection_member_result_type_id(self, member_name: string) -> i32 {
+        if (member_name == "name" || member_name == "kind") { return self.builtin_str_type_id(); }
+        if (member_name == "fields" || member_name == "methods") { return self.type_id_from_text("rawptr"); }
+        return hir_id_invalid();
+    }
+
+    fn reflection_lhs_is_type_operand(self, source_member: rawptr, lhs_expr_id: i32) -> bool {
+        if (lhs_expr_id == hir_id_invalid()) { return false; }
+        if (self.unit.expr_sem_kind(lhs_expr_id) == expr_sem_CLASS()) { return true; }
+        if (source_member == null || expr_get_kind(source_member) != ex_MEMBER()) { return false; }
+        let raw_lhs = expr_get_lhs(source_member);
+        if (raw_lhs == null || expr_get_kind(raw_lhs) != ex_IDENT()) { return false; }
+        let raw_name = expr_get_name(raw_lhs);
+        if (raw_name.len == 0) { return false; }
+        if (hir_builder_generic_contains(self.current_generic_params, raw_name)) { return true; }
+        if (self.current_generic_binding(raw_name).len > 0) { return true; }
+        let resolved = self.resolve_type_text_in_current_env(raw_name);
+        if (resolved.len == 0) { return false; }
+        if (self.raw_class_decl_for_type_text(resolved) != null) { return true; }
+        return policy_primitive_type_kind(resolved) != 0 || hir_builder_is_primitive_str_name(resolved) || resolved == "bool" || resolved == "char" || resolved == "rawptr";
+    }
+
+    fn reflection_lhs_type_id(self, source_member: rawptr, lhs_expr_id: i32) -> i32 {
+        if (lhs_expr_id != hir_id_invalid()) {
+            let direct_type = self.unit.expr_type(lhs_expr_id);
+            if (self.type_id_is_valid(direct_type)) { return direct_type; }
+        }
+        if (source_member == null || expr_get_kind(source_member) != ex_MEMBER()) { return hir_id_invalid(); }
+        let raw_lhs = expr_get_lhs(source_member);
+        if (raw_lhs == null || expr_get_kind(raw_lhs) != ex_IDENT()) { return hir_id_invalid(); }
+        let resolved = self.resolve_type_text_in_current_env(expr_get_name(raw_lhs));
+        if (resolved.len == 0) { return hir_id_invalid(); }
+        return self.type_id_from_text(resolved);
+    }
+
+    fn resolve_reflection_member_expr(self, e: rawptr, expr_id: i32, lhs_expr_id: i32) -> bool {
+        if (expr_id == hir_id_invalid() || lhs_expr_id == hir_id_invalid()) { return false; }
+        if (e == null || expr_get_kind(e) != ex_MEMBER()) { return false; }
+        let member_name = policy_versioned_generic_call_base(expr_get_name(e).clone());
+        if (!self.reflection_member_name_recognized(member_name)) { return false; }
+        if (!self.reflection_lhs_is_type_operand(e, lhs_expr_id)) { return false; }
+        let owner_type_id = self.reflection_lhs_type_id(e, lhs_expr_id);
+        if (!self.type_id_is_valid(owner_type_id)) { return false; }
+        let result_type_id = self.reflection_member_result_type_id(member_name);
+        if (!self.type_id_is_valid(result_type_id)) { return false; }
+        let builtin_id = self.unit.add_or_get_builtin(member_name,
+                                                     expr_sem_BUILTIN(),
+                                                     owner_type_id,
+                                                     expr_get_semantic_flags(e));
+        if (builtin_id == hir_id_invalid()) { return false; }
+        self.unit.set_expr_type(expr_id, result_type_id);
+        self.unit.set_expr_semantic(expr_id,
+                                   expr_sem_BUILTIN(),
+                                   hir_target_builtin(),
+                                   builtin_id);
+        return true;
+    }
+
+    fn reflect_type_visible(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        if (!hir_builder_decl_has_reflect_attr(d)) { return false; }
+        if (hir_builder_decl_has_hidden_attr(d)) { return false; }
+        if (!hir_builder_decl_exports_world(d)) { return false; }
+        let vis = hir_builder_reflect_attr_visibility(d);
+        if (vis == "private" || vis == "internal" || vis == "protected") { return false; }
+        let k = decl_get_kind(d);
+        if (k == de_ENUM()) { return true; }
+        if (k != de_CLASS()) { return false; }
+        return true;
+    }
+
+    fn reflect_member_visible(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        if (!hir_builder_decl_exports_world(d)) { return false; }
+        if (hir_builder_decl_has_hidden_attr(d)) { return false; }
+        if (hir_builder_decl_visibility_is_none(d)) { return false; }
+        return true;
+    }
+
+    fn count_class_fields(self, class_decl: rawptr) -> i32 {
+        if (class_decl == null) { return 0; }
+        var n: i32 = 0;
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { break; }
+            n = n + self.count_class_fields(parent_decl);
+            parent_i = parent_i + 1;
+        }
+        var mp = decl_get_members(class_decl);
+        while (mp != null) {
+            if (hir_builder_decl_is_layout_field(mp)) { n = n + 1; }
+            mp = decl_get_next(mp);
+        }
+        return n;
+    }
+
+    fn class_layout_field_at(self, class_decl: rawptr, want_idx: i32) -> rawptr {
+        if (class_decl == null || want_idx < 0) { return null; }
+        var local_idx = want_idx;
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { break; }
+            let parent_count = self.count_class_fields(parent_decl);
+            if (local_idx < parent_count) { return self.class_layout_field_at(parent_decl, local_idx); }
+            local_idx = local_idx - parent_count;
+            parent_i = parent_i + 1;
+        }
+        var idx: i32 = 0;
+        var mp = decl_get_members(class_decl);
+        while (mp != null) {
+            if (hir_builder_decl_is_layout_field(mp)) {
+                if (idx == local_idx) { return mp; }
+                idx = idx + 1;
+            }
+            mp = decl_get_next(mp);
+        }
+        return null;
+    }
+
+    fn reflected_field_count(self, class_decl: rawptr) -> i32 {
+        if (class_decl == null) { return 0; }
+        var n: i32 = 0;
+        let total = self.count_class_fields(class_decl);
+        var idx: i32 = 0;
+        while (idx < total) {
+            let f = self.class_layout_field_at(class_decl, idx);
+            if (f != null && self.reflect_member_visible(f)) { n = n + 1; }
+            idx = idx + 1;
+        }
+        return n;
+    }
+
+    fn reflected_method_count(self, class_decl: rawptr) -> i32 {
+        if (class_decl == null) { return 0; }
+        var n: i32 = 0;
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { break; }
+            n = n + self.reflected_method_count(parent_decl);
+            parent_i = parent_i + 1;
+        }
+        var m = decl_get_members(class_decl);
+        while (m != null) {
+            if (decl_get_kind(m) == de_METHOD() && self.reflect_member_visible(m)) { n = n + 1; }
+            m = decl_get_next(m);
+        }
+        return n;
+    }
+
+    fn type_name_for_ref(self, ty: rawptr) -> string {
+        if (ty == null) { return "void"; }
+        let sty = self.concrete_type_ref(ty);
+        if (sty == null) { return "void"; }
+        let k = tref_get_kind(sty);
+        if (k == ty_I32()) { return "i32"; }
+        if (k == ty_I64()) { return "i64"; }
+        if (k == ty_I8()) { return "i8"; }
+        if (k == ty_I16()) { return "i16"; }
+        if (k == ty_U8()) { return "u8"; }
+        if (k == ty_U16()) { return "u16"; }
+        if (k == ty_U32()) { return "u32"; }
+        if (k == ty_U64()) { return "u64"; }
+        if (k == ty_ISIZE()) { return "isize"; }
+        if (k == ty_USIZE()) { return "usize"; }
+        if (k == ty_F32()) { return "f32"; }
+        if (k == ty_F64()) { return "f64"; }
+        if (k == ty_BOOL()) { return "bool"; }
+        if (k == ty_CHAR()) { return "char"; }
+        if (k == ty_STRING()) { return "string"; }
+        if (k == ty_RAWPTR()) { return "rawptr"; }
+        if (k == ty_PTR() || k == ty_REF() || k == ty_MUTREF()) {
+            var prefix = "ptr";
+            if (k == ty_REF()) { prefix = "ref"; }
+            if (k == ty_MUTREF()) { prefix = "mutref"; }
+            return prefix + "<" + self.type_name_for_ref(tref_pointee(sty)) + ">";
+        }
+        if (k == ty_VOID()) { return "void"; }
+        if (k == ty_RANGE()) { return "Range"; }
+        if (k == ty_ARRAY()) {
+            return "[" + self.type_name_for_ref(tref_array_elem(sty))
+                + ";"
+                + policy_i64_to_string(tref_array_size(sty))
+                + "]";
+        }
+        if (k == ty_TUPLE()) {
+            var out = "(";
+            var i: i64 = 0;
+            while (i < tref_tuple_count(sty)) {
+                if (i > 0) { out = out + ","; }
+                out = out + self.type_name_for_ref(tref_tuple_elem_at(sty, i));
+                i = i + 1;
+            }
+            return out + ")";
+        }
+        if (k == ty_FN() || k == ty_CFN()) {
+            var out2 = "fn(";
+            if (k == ty_CFN()) { out2 = "cfn("; }
+            var p: i64 = 0;
+            while (p < tref_fn_param_count(sty)) {
+                if (p > 0) { out2 = out2 + ","; }
+                out2 = out2 + self.type_name_for_ref(tref_fn_param_at(sty, p));
+                p = p + 1;
+            }
+            out2 = out2 + ")->" + self.type_name_for_ref(tref_fn_ret(sty));
+            return out2;
+        }
+        if (k == ty_CLASS()) {
+            let n = tref_get_name(sty);
+            if (hir_builder_is_primitive_str_name(n)) { return "string"; }
+            if (n.len > 0) { return n; }
+        }
+        return "rawptr";
+    }
+
+    fn reflected_field_offset(self, class_decl: rawptr, layout_idx: i32) -> i64 {
+        if (class_decl == null || layout_idx < 0) { return -1; }
+        let packed = hir_builder_decl_is_packed(class_decl);
+        var off: i64 = 0;
+        var i: i32 = 0;
+        while (i < layout_idx) {
+            let f = self.class_layout_field_at(class_decl, i);
+            if (f != null) {
+                let ft = self.concrete_type_ref(decl_get_ty(f));
+                var align = self.type_ref_abi_align(ft);
+                if (packed) { align = 1; }
+                off = self.align_i64(off, align);
+                off = off + self.type_ref_storage_size(ft);
+            }
+            i = i + 1;
+        }
+        let target = self.class_layout_field_at(class_decl, layout_idx);
+        if (target != null) {
+            var target_align = self.type_ref_abi_align(self.concrete_type_ref(decl_get_ty(target)));
+            if (packed) { target_align = 1; }
+            off = self.align_i64(off, target_align);
+        }
+        return off;
+    }
+
+    fn reflected_fields_blob(self, class_decl: rawptr) -> string {
+        if (class_decl == null) { return ""; }
+        let total = self.count_class_fields(class_decl);
+        var out = "";
+        var visible_idx: i32 = 0;
+        var layout_idx: i32 = 0;
+        while (layout_idx < total) {
+            let f = self.class_layout_field_at(class_decl, layout_idx);
+            if (f != null && self.reflect_member_visible(f)) {
+                if (out.len > 0) { out = out.clone() + ";"; }
+                let field_ty = self.concrete_type_ref(decl_get_ty(f));
+                let field_size = self.type_ref_storage_size(field_ty);
+                let field_off = self.reflected_field_offset(class_decl, layout_idx);
+                var entry = hir_builder_reflect_decl_name(f);
+                entry = entry.clone() + "~" + self.type_name_for_ref(field_ty);
+                entry = entry.clone() + "~" + policy_i64_to_string(visible_idx as i64);
+                entry = entry.clone() + "~" + policy_i64_to_string(field_off);
+                entry = entry.clone() + "~" + policy_i64_to_string(field_size);
+                entry = entry.clone() + "~1~" + hir_builder_reflect_alias_blob(f);
+                out = out.clone() + entry.clone();
+                visible_idx = visible_idx + 1;
+            }
+            layout_idx = layout_idx + 1;
+        }
+        return out;
+    }
+
+    fn reflected_method_params_blob(self, method_decl: rawptr) -> string {
+        if (method_decl == null) { return ""; }
+        var out = "";
+        var p = decl_get_params(method_decl);
+        while (p != null) {
+            if (decl_get_name(p) != "self" && !hir_builder_decl_is_variadic_param(p)) {
+                if (out.len > 0) { out = out.clone() + ","; }
+                out = out.clone() + self.type_name_for_ref(self.concrete_type_ref(decl_get_ty(p)));
+            }
+            p = decl_get_next(p);
+        }
+        return out;
+    }
+
+    fn reflected_methods_blob_for_decl(self, owner_class_name: string, class_decl: rawptr) -> string {
+        if (class_decl == null) { return ""; }
+        var out = "";
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { break; }
+            let parent_blob = self.reflected_methods_blob_for_decl(owner_class_name, parent_decl);
+            if (parent_blob.len > 0) {
+                if (out.len > 0) { out = out.clone() + ";"; }
+                out = out.clone() + parent_blob;
+            }
+            parent_i = parent_i + 1;
+        }
+        var m = decl_get_members(class_decl);
+        while (m != null) {
+            if (decl_get_kind(m) == de_METHOD() && self.reflect_member_visible(m)) {
+                if (out.len > 0) { out = out.clone() + ";"; }
+                var param_count = hir_builder_count_non_variadic_params(decl_get_params(m));
+                let first_param = decl_get_params(m);
+                if (first_param != null && decl_get_name(first_param) == "self" && param_count > 0) {
+                    param_count = param_count - 1;
+                }
+                let method_symbol = hir_builder_class_method_symbol_name(decl_get_name(class_decl), decl_get_name(m));
+                var entry = hir_builder_reflect_decl_name(m);
+                entry = entry.clone() + "~" + self.type_name_for_ref(self.concrete_type_ref(decl_get_ty(m)));
+                entry = entry.clone() + "~" + policy_i64_to_string(param_count as i64);
+                entry = entry.clone() + "~" + self.reflected_method_params_blob(m);
+                entry = entry.clone() + "~" + owner_class_name;
+                entry = entry.clone() + "~" + policy_i64_to_string(hir_builder_reflect_symbol_id(method_symbol));
+                entry = entry.clone() + "~" + hir_builder_reflect_alias_blob(m);
+                entry = entry.clone() + "~";
+                if (hir_builder_method_decl_has_receiver(m)) {
+                    entry = entry.clone() + "1";
+                } else {
+                    entry = entry.clone() + "0";
+                }
+                out = out.clone() + entry.clone();
+            }
+            m = decl_get_next(m);
+        }
+        return out;
+    }
+
+    fn materialize_reflection_method_roots_for_decl(self, class_decl: rawptr) {
+        if (class_decl == null) { return; }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { break; }
+            self.materialize_reflection_method_roots_for_decl(parent_decl);
+            parent_i = parent_i + 1;
+        }
+        var m = decl_get_members(class_decl);
+        while (m != null) {
+            if (decl_get_kind(m) == de_METHOD()
+                && decl_get_body(m) != null
+                && self.reflect_member_visible(m)) {
+                let fn_id = hir_pointer_map_function(self.decl_map,m);
+                if (fn_id != hir_id_invalid()) {
+                    let prior_flags = hir_unit_function_flags(self.unit, fn_id);
+                    var reflection_flags = hir_function_flag_codegen_root()
+                        | hir_function_flag_reflection_root();
+                    if ((prior_flags & hir_function_flag_codegen_root()) != 0
+                        && (prior_flags & hir_function_flag_reflection_root()) == 0) {
+                        reflection_flags = reflection_flags
+                            | hir_function_flag_reflection_named_root();
+                    }
+                    self.unit.add_function_flags(fn_id,
+                                                reflection_flags);
+                    self.ensure_reachable_function_body(m, fn_id, false);
+                }
+            }
+            m = decl_get_next(m);
+        }
+    }
+
+    fn materialize_reflection_method_roots(self) {
+        if (self.source_unit == null) { return; }
+        var cd = unit_get_decls(self.source_unit);
+        while (cd != null) {
+            if (self.reflect_type_visible(cd)) {
+                self.materialize_reflection_method_roots_for_decl(cd);
+            }
+            cd = decl_get_next(cd);
+        }
+    }
+
+    fn source_unit_has_reflect_visible_type(self) -> bool {
+        if (self.source_unit == null) { return false; }
+        var cd = unit_get_decls(self.source_unit);
+        while (cd != null) {
+            if (self.reflect_type_visible(cd)) { return true; }
+            cd = decl_get_next(cd);
+        }
+        return false;
+    }
+
+    fn reflected_parent_name(self, class_decl: rawptr) -> string {
+        let parent_decl = self.class_parent_decl(class_decl);
+        if (parent_decl == null) { return ""; }
+        if (self.reflect_type_visible(parent_decl)) { return hir_builder_reflect_decl_name(parent_decl); }
+        return decl_get_name(parent_decl);
+    }
+
+    fn reflected_interfaces_blob(self, class_decl: rawptr) -> string {
+        if (class_decl == null || (decl_get_generic_flags(class_decl) & 64) == 0) { return ""; }
+        let gp = decl_get_generic_params(class_decl);
+        let prefix_pos = hir_builder_index_of(gp, "|impl:");
+        if (prefix_pos < 0) { return ""; }
+        var start = prefix_pos + 6;
+        var i = start;
+        var out = "";
+        while (i <= gp.len) {
+            if (i == gp.len || gp.charAt(i) == 44 || gp.charAt(i) == 124) {
+                let item = gp.substring(start, i);
+                if (item.len > 0) {
+                    let iface_decl = self.find_class_decl(item);
+                    if (iface_decl != null && ((decl_get_generic_flags(iface_decl) & 2) != 0)) {
+                        if (out.len > 0) { out = out.clone() + ","; }
+                        if (self.reflect_type_visible(iface_decl)) {
+                            out = out.clone() + hir_builder_reflect_decl_name(iface_decl);
+                        } else {
+                            out = out.clone() + item;
+                        }
+                    }
+                }
+                start = i + 1;
+                if (i < gp.len && gp.charAt(i) == 124) { return out; }
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn reflection_kind_name(self, d: rawptr) -> string {
+        if (d == null) { return ""; }
+        if (decl_get_kind(d) == de_ENUM()) { return "enum"; }
+        if (decl_get_kind(d) == de_CLASS()
+            && (((decl_get_generic_flags(d) & 2) != 0)
+                || hir_builder_string_contains(decl_get_generic_params(d), "|kind:interface"))) {
+            return "interface";
+        }
+        return hir_builder_reflect_kind_for_type_name(decl_get_name(d));
+    }
+
+    fn build_reflection_manifest(self) -> string {
+        if (self.source_unit == null) { return ""; }
+        var out = "";
+        var cd = unit_get_decls(self.source_unit);
+        while (cd != null) {
+            if (self.reflect_type_visible(cd)) {
+                if (out.len > 0) { out = out.clone() + "\n"; }
+                let reflect_name = hir_builder_reflect_decl_name(cd);
+                let reflect_aliases = hir_builder_reflect_alias_blob(cd);
+                let type_size = self.type_ref_storage_size(tref_alloc(ty_CLASS(), decl_get_name(cd)));
+                let fcnt = self.reflected_field_count(cd);
+                let mcnt = self.reflected_method_count(cd);
+                var row = reflect_name.clone();
+                row = row.clone() + "|" + reflect_aliases.clone();
+                row = row.clone() + "|" + self.reflection_kind_name(cd);
+                row = row.clone() + "|" + policy_i64_to_string(type_size);
+                row = row.clone() + "|" + policy_i64_to_string(fcnt as i64);
+                row = row.clone() + "|" + policy_i64_to_string(mcnt as i64);
+                row = row.clone() + "|" + self.reflected_fields_blob(cd);
+                row = row.clone() + "|" + self.reflected_methods_blob_for_decl(decl_get_name(cd), cd);
+                row = row.clone() + "|" + self.reflected_parent_name(cd);
+                row = row.clone() + "|" + self.reflected_interfaces_blob(cd);
+                out = out.clone() + row.clone();
+            }
+            cd = decl_get_next(cd);
+        }
+        return out;
+    }
+
+    fn build_reflection_name_map(self) -> string {
+        if (self.source_unit == null) { return ""; }
+        var out = "";
+        var cd = unit_get_decls(self.source_unit);
+        while (cd != null) {
+            if (self.reflect_type_visible(cd)) {
+                if (out.len > 0) { out = out.clone() + "\n"; }
+                let row = decl_get_name(cd) + "~" + hir_builder_reflect_decl_name(cd);
+                out = out.clone() + row.clone();
+            }
+            cd = decl_get_next(cd);
+        }
+        return out;
+    }
+
+    public fn finalize_reflection_metadata(self) {
+        let has_reflect_visible_type = self.source_unit_has_reflect_visible_type();
+        let needs_reflection_manifest = self.reflection_manifest_required
+            || has_reflect_visible_type
+            || self.unit_has_call_named("reflect_manifest")
+            || self.unit_has_call_named("getType")
+            || self.unit_has_call_named("reflect_method_value")
+            || self.unit_has_call_named("reflect_method_ptr_by_id");
+        let needs_reflection_name_map = self.reflection_name_map_required
+            || needs_reflection_manifest
+            || self.unit_has_call_named("reflect_name");
+        if (needs_reflection_manifest) {
+            self.materialize_reflection_method_roots();
+            self.materialize_reachable_function_bodies();
+            self.materialize_concrete_type_items();
+            self.resolve_deferred_member_exprs();
+            self.profile_build_phase("reflection-roots");
+        }
+        if (needs_reflection_manifest) {
+            self.unit.set_reflection_manifest(self.build_reflection_manifest());
+            self.profile_build_phase("reflection-manifest");
+        }
+        if (needs_reflection_name_map) {
+            self.unit.set_reflection_name_map(self.build_reflection_name_map());
+            self.profile_build_phase("reflection-name-map");
+        }
+    }
+}

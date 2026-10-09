@@ -1,0 +1,319 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Profiling for the HIR builder. See README.md.
+
+fn hir_builder_env_value(name: string) -> string {
+    let raw = getenv(name.c_str());
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}
+
+fn hir_builder_env_enabled(name: string) -> bool {
+    let value = hir_builder_env_value(name).trim();
+    if (value.len == 0) { return false; }
+    if (value == "0" || value == "false" || value == "FALSE"
+        || value == "no" || value == "NO" || value == "off" || value == "OFF") {
+        return false;
+    }
+    return true;
+}
+
+fn hir_builder_parse_i64(text: string) -> i64 {
+    let s = text.trim();
+    if (s.len == 0) { return 0; }
+    var i: i32 = 0;
+    var sign: i64 = 1;
+    var out: i64 = 0;
+    if (s.charAt(0) == 45) {
+        sign = -1;
+        i = 1;
+    } else if (s.charAt(0) == 43) {
+        i = 1;
+    }
+    while (i < s.len) {
+        let c = s.charAt(i);
+        if (c < 48 || c > 57) { return out * sign; }
+        out = out * 10 + (c - 48);
+        i = i + 1;
+    }
+    return out * sign;
+}
+
+fn hir_builder_slow_body_threshold_ms() -> i64 {
+    let parsed = hir_builder_parse_i64(hir_builder_env_value("VYX_HIR_SLOW_BODY_MS"));
+    if (parsed > 0) { return parsed; }
+    return 1000;
+}
+
+fn hir_builder_slow_stmt_threshold_ms() -> i64 {
+    let parsed = hir_builder_parse_i64(hir_builder_env_value("VYX_HIR_SLOW_STMT_MS"));
+    if (parsed > 0) { return parsed; }
+    return 100;
+}
+
+fn hir_builder_slow_expr_threshold_ms() -> i64 {
+    let parsed = hir_builder_parse_i64(hir_builder_env_value("VYX_HIR_SLOW_EXPR_MS"));
+    if (parsed > 0) { return parsed; }
+    return 100;
+}
+
+var g_hir_profile_malloc_bytes: i64 = 0;
+var g_hir_profile_malloc_next: i64 = 67108864;
+
+fn hir_profile_malloc(size: u64) -> rawptr {
+    let p = malloc(size);
+    if (p != null && vyx_bootstrap_profile_level() > 0) {
+        g_hir_profile_malloc_bytes = g_hir_profile_malloc_bytes + (size as i64);
+        while (g_hir_profile_malloc_bytes >= g_hir_profile_malloc_next) {
+            print("[hir-malloc] bytes=" + policy_i64_to_string(g_hir_profile_malloc_bytes));
+            g_hir_profile_malloc_next = g_hir_profile_malloc_next + 67108864;
+        }
+    }
+    return p;
+}
+
+fn hir_builder_memory_mb_text(bytes: i64) -> string {
+    if (bytes < 0) { return "-1"; }
+    return policy_i64_to_string(bytes / 1048576);
+}
+
+impl HirUnitBuilder {
+    fn i32_text(self, value: i32) -> string {
+        let wide: i64 = value as i64;
+        return policy_i64_to_string(wide);
+    }
+
+    fn profile_build_phase(self, label: string) {
+        if (vyx_bootstrap_profile_level() <= 1) { return; }
+        let item_count_text = self.i32_text(self.unit.item_count);
+        let function_count_text = self.i32_text(self.unit.function_count);
+        let local_count_text = self.i32_text(self.unit.local_count);
+        let stmt_count_text = self.i32_text(self.unit.stmt_count);
+        let expr_count_text = self.i32_text(self.unit.expr_count);
+        let type_count_text = self.i32_text(self.unit.types.count);
+        print("[hir-build] " + label
+              + " items=" + item_count_text
+              + " functions=" + function_count_text
+              + " locals=" + local_count_text
+              + " stmts=" + stmt_count_text
+              + " exprs=" + expr_count_text
+              + " types=" + type_count_text
+              + " scheduled=" + policy_i64_to_string(self.scheduled_body_count)
+              + " drained=" + policy_i64_to_string(self.materialized_body_count));
+    }
+
+    fn profile_summary(self, label: string) {
+        if (vyx_bootstrap_profile_level() <= 0) { return; }
+        print("[hir-summary] " + label
+              + " items=" + self.i32_text(self.unit.item_count)
+              + " functions=" + self.i32_text(self.unit.function_count)
+              + " locals=" + self.i32_text(self.unit.local_count)
+              + " stmts=" + self.i32_text(self.unit.stmt_count)
+              + " exprs=" + self.i32_text(self.unit.expr_count)
+              + " types=" + self.i32_text(self.unit.types.count)
+              + " scheduled=" + policy_i64_to_string(self.scheduled_body_count)
+              + " drained=" + policy_i64_to_string(self.materialized_body_count)
+              + " open=" + policy_i64_to_string(self.profile_type_open_calls)
+              + " resolve=" + policy_i64_to_string(self.profile_resolve_type_calls)
+              + " rawclass=" + policy_i64_to_string(self.profile_raw_class_calls)
+              + " ensuremeth=" + policy_i64_to_string(self.profile_ensure_method_calls)
+              + " methodtarget=" + policy_i64_to_string(self.profile_method_target_calls)
+              + " field=" + policy_i64_to_string(self.profile_field_lookup_calls)
+              + " fnopen=" + policy_i64_to_string(self.profile_function_open_calls)
+              + " typeref=" + policy_i64_to_string(self.profile_type_id_ref_calls)
+              + " concrete=" + policy_i64_to_string(self.profile_concrete_type_ref_calls)
+              + " typetext=" + policy_i64_to_string(self.profile_type_id_text_calls)
+              + " private_mb=" + hir_builder_memory_mb_text(vyx_rt_process_private_bytes())
+              + " working_mb=" + hir_builder_memory_mb_text(vyx_rt_process_working_set_bytes()));
+    }
+
+    fn profile_body_phase(self, label: string, d: rawptr, fn_id: i32) {
+        if (vyx_bootstrap_profile_level() <= 1) { return; }
+        var name = "";
+        if (d != null) { name = decl_get_name(d); }
+        if (name.len == 0 && fn_id != hir_id_invalid()) { name = self.unit.function_name(fn_id); }
+        print("[hir-body] " + label
+              + " fn=" + name
+              + " id=" + self.i32_text(fn_id)
+              + " items=" + self.i32_text(self.unit.item_count)
+              + " functions=" + self.i32_text(self.unit.function_count)
+              + " locals=" + self.i32_text(self.unit.local_count)
+              + " stmts=" + self.i32_text(self.unit.stmt_count)
+              + " exprs=" + self.i32_text(self.unit.expr_count)
+              + " types=" + self.i32_text(self.unit.types.count)
+              + " open=" + policy_i64_to_string(self.profile_type_open_calls)
+              + " resolve=" + policy_i64_to_string(self.profile_resolve_type_calls)
+              + " rawclass=" + policy_i64_to_string(self.profile_raw_class_calls)
+              + " ensuremeth=" + policy_i64_to_string(self.profile_ensure_method_calls)
+              + " methodtarget=" + policy_i64_to_string(self.profile_method_target_calls)
+              + " field=" + policy_i64_to_string(self.profile_field_lookup_calls)
+              + " fnopen=" + policy_i64_to_string(self.profile_function_open_calls)
+              + " typeref=" + policy_i64_to_string(self.profile_type_id_ref_calls)
+              + " concrete=" + policy_i64_to_string(self.profile_concrete_type_ref_calls)
+              + " typetext=" + policy_i64_to_string(self.profile_type_id_text_calls)
+              + " private_mb=" + hir_builder_memory_mb_text(vyx_rt_process_private_bytes())
+              + " working_mb=" + hir_builder_memory_mb_text(vyx_rt_process_working_set_bytes()));
+    }
+
+    fn profile_materialize_type(self, type_id: i32, type_text: string) {
+        if (vyx_bootstrap_profile_level() <= 1) { return; }
+        print("[hir-materialize] type="
+              + self.i32_text(type_id)
+              + " text=" + type_text
+              + " items=" + self.i32_text(self.unit.item_count)
+              + " functions=" + self.i32_text(self.unit.function_count)
+              + " types=" + self.i32_text(self.unit.types.count));
+    }
+
+    fn profile_trace_near_current_body(self) -> bool {
+        if (vyx_bootstrap_profile_level() <= 2) { return false; }
+        return self.unit.expr_count >= 2100;
+    }
+
+    fn profile_type_ready_phase(self, label: string, type_text: string) {
+        if (!self.profile_trace_near_current_body()) { return; }
+        var fn_name = "";
+        if (self.current_function_id != hir_id_invalid()) {
+            fn_name = self.unit.function_name(self.current_function_id);
+        }
+        print("[hir-ready] " + label
+              + " fn=" + fn_name
+              + " type=" + type_text
+              + " items=" + self.i32_text(self.unit.item_count)
+              + " functions=" + self.i32_text(self.unit.function_count)
+              + " locals=" + self.i32_text(self.unit.local_count)
+              + " stmts=" + self.i32_text(self.unit.stmt_count)
+              + " exprs=" + self.i32_text(self.unit.expr_count)
+              + " types=" + self.i32_text(self.unit.types.count));
+    }
+
+    fn profile_function_instance_phase(self,
+                                             label: string,
+                                             fn_decl: rawptr,
+                                             owner_type_name: string,
+                                             params: string,
+                                             args: string) {
+        if (!self.profile_trace_near_current_body()) { return; }
+        var fn_name = "";
+        if (fn_decl != null) { fn_name = decl_get_name(fn_decl); }
+        print("[hir-instance] " + label
+              + " fn=" + fn_name
+              + " owner=" + owner_type_name
+              + " params=" + params
+              + " args=" + args
+              + " items=" + self.i32_text(self.unit.item_count)
+              + " functions=" + self.i32_text(self.unit.function_count)
+              + " locals=" + self.i32_text(self.unit.local_count)
+              + " stmts=" + self.i32_text(self.unit.stmt_count)
+              + " exprs=" + self.i32_text(self.unit.expr_count)
+              + " types=" + self.i32_text(self.unit.types.count));
+    }
+
+    fn profile_struct_field_phase(self, label: string, owner_type_id: i32, field_name: string, arg_expr: i32) {
+        if (!self.profile_trace_near_current_body()) { return; }
+        var owner_text = "";
+        if (self.type_id_is_valid(owner_type_id)) {
+            owner_text = hir_type_table_text(self.unit.types, owner_type_id);
+        }
+        var arg_text = "";
+        if (arg_expr != hir_id_invalid() && self.type_id_is_valid(self.unit.expr_type(arg_expr))) {
+            arg_text = hir_type_table_text(self.unit.types, self.unit.expr_type(arg_expr));
+        }
+        var fn_name = "";
+        if (self.current_function_id != hir_id_invalid()) {
+            fn_name = self.unit.function_name(self.current_function_id);
+        }
+        print("[hir-struct] " + label
+              + " fn=" + fn_name
+              + " owner=" + owner_text
+              + " field=" + field_name
+              + " arg=" + self.i32_text(arg_expr)
+              + " arg_type=" + arg_text
+              + " items=" + self.i32_text(self.unit.item_count)
+              + " functions=" + self.i32_text(self.unit.function_count)
+              + " locals=" + self.i32_text(self.unit.local_count)
+              + " stmts=" + self.i32_text(self.unit.stmt_count)
+              + " exprs=" + self.i32_text(self.unit.expr_count)
+              + " types=" + self.i32_text(self.unit.types.count));
+    }
+
+    fn profile_stmt_trace(self, label: string, s: rawptr, stmt_id: i32) {
+        if (vyx_bootstrap_profile_level() <= 2) { return; }
+        if (self.unit.expr_count < 2200) { return; }
+        var fn_name = "";
+        if (self.current_function_id != hir_id_invalid()) {
+            fn_name = self.unit.function_name(self.current_function_id);
+        }
+        var stmt_name = "";
+        var kind_text = "0";
+        if (s != null) {
+            stmt_name = stmt_get_name(s);
+            kind_text = self.i32_text(stmt_get_kind(s));
+        }
+        print("[hir-trace] " + label
+              + " fn=" + fn_name
+              + " stmt=" + self.i32_text(stmt_id)
+              + " ast=" + kind_text
+              + " name=" + stmt_name
+              + " stmts=" + self.i32_text(self.unit.stmt_count)
+              + " exprs=" + self.i32_text(self.unit.expr_count)
+              + " types=" + self.i32_text(self.unit.types.count)
+              + " open=" + policy_i64_to_string(self.profile_type_open_calls)
+              + " resolve=" + policy_i64_to_string(self.profile_resolve_type_calls)
+              + " rawclass=" + policy_i64_to_string(self.profile_raw_class_calls)
+              + " ensuremeth=" + policy_i64_to_string(self.profile_ensure_method_calls)
+              + " methodtarget=" + policy_i64_to_string(self.profile_method_target_calls)
+              + " field=" + policy_i64_to_string(self.profile_field_lookup_calls)
+              + " fnopen=" + policy_i64_to_string(self.profile_function_open_calls)
+              + " typeref=" + policy_i64_to_string(self.profile_type_id_ref_calls)
+              + " concrete=" + policy_i64_to_string(self.profile_concrete_type_ref_calls)
+              + " typetext=" + policy_i64_to_string(self.profile_type_id_text_calls));
+    }
+
+    fn profile_expr_trace(self, label: string, e: rawptr, expr_id: i32) {
+        if (vyx_bootstrap_profile_level() <= 2) { return; }
+        if (self.unit.expr_count < 2200) { return; }
+        var fn_name = "";
+        if (self.current_function_id != hir_id_invalid()) {
+            fn_name = self.unit.function_name(self.current_function_id);
+        }
+        var expr_name = "";
+        var kind_text = "0";
+        var sem_text = "0";
+        if (e != null) {
+            expr_name = expr_get_name(e);
+            kind_text = self.i32_text(expr_get_kind(e));
+            sem_text = self.i32_text(expr_get_semantic_kind(e));
+        }
+        print("[hir-trace] " + label
+              + " fn=" + fn_name
+              + " expr=" + self.i32_text(expr_id)
+              + " ast=" + kind_text
+              + " sem=" + sem_text
+              + " name=" + expr_name
+              + " stmts=" + self.i32_text(self.unit.stmt_count)
+              + " exprs=" + self.i32_text(self.unit.expr_count)
+              + " types=" + self.i32_text(self.unit.types.count)
+              + " open=" + policy_i64_to_string(self.profile_type_open_calls)
+              + " resolve=" + policy_i64_to_string(self.profile_resolve_type_calls)
+              + " rawclass=" + policy_i64_to_string(self.profile_raw_class_calls)
+              + " ensuremeth=" + policy_i64_to_string(self.profile_ensure_method_calls)
+              + " methodtarget=" + policy_i64_to_string(self.profile_method_target_calls)
+              + " field=" + policy_i64_to_string(self.profile_field_lookup_calls)
+              + " fnopen=" + policy_i64_to_string(self.profile_function_open_calls)
+              + " typeref=" + policy_i64_to_string(self.profile_type_id_ref_calls)
+              + " concrete=" + policy_i64_to_string(self.profile_concrete_type_ref_calls)
+              + " typetext=" + policy_i64_to_string(self.profile_type_id_text_calls));
+    }
+}

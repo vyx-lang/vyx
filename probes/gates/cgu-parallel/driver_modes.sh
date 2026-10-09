@@ -2,7 +2,7 @@
 # R4 gate (second slice): every driver emit mode still publishes its artifact,
 # and none of them leaks the staging names the publish transaction introduced.
 #
-# `driver_publish_object_family` (src/core/main.vyx) renames a staged generation
+# `driver_publish_object_family` (src/core/driver/main.vyx) renames a staged generation
 # onto the names the caller asked for.  That is invisible to the caller by
 # design, which is also why it needs a gate: a mistake there produces either a
 # missing artifact or an artifact under the wrong name, and a gate that only

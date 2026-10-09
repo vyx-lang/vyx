@@ -1,0 +1,688 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Instance maps for the HIR builder. See README.md.
+
+class HirDeclInstanceMap {
+    public head: rawptr
+
+    public static fn create() -> HirDeclInstanceMap {
+        return HirDeclInstanceMap { head: null };
+    }
+
+    fn dispose(self) {
+        var cur = self.head;
+        while (cur != null) {
+            let next = ast_read_rawptr(ptr_offset(cur, 40));
+            let key_ptr = ast_read_rawptr(ptr_offset(cur, 8));
+            if (key_ptr != null) { free(key_ptr); }
+            free(cur);
+            cur = next;
+        }
+        self.head = null;
+    }
+
+    fn put(self, decl_ptr: rawptr, key: string, item_id: i32, function_id: i32) {
+        if (decl_ptr == null || key.len == 0) { return; }
+        var cur = self.head;
+        while (cur != null) {
+            let d0 = ast_read_rawptr(cur);
+            let kp0 = ast_read_rawptr(ptr_offset(cur, 8));
+            let kl0 = ast_read_i64(ptr_offset(cur, 16));
+            if (d0 == decl_ptr && hir_builder_c_string_equals(kp0, kl0, key)) {
+                ast_write_i32(ptr_offset(cur, 24), item_id);
+                ast_write_i32(ptr_offset(cur, 28), function_id);
+                return;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 40));
+        }
+        let node = hir_profile_malloc(48);
+        if (node == null) { return; }
+        memset(node, 0, 48);
+        ast_write_rawptr(node, decl_ptr);
+        ast_write_rawptr(ptr_offset(node, 8), ast_dup_c_string(key));
+        ast_write_i64(ptr_offset(node, 16), key.len);
+        ast_write_i32(ptr_offset(node, 24), item_id);
+        ast_write_i32(ptr_offset(node, 28), function_id);
+        ast_write_rawptr(ptr_offset(node, 40), self.head);
+        self.head = node;
+    }
+
+    fn item(self, decl_ptr: rawptr, key: string) -> i32 {
+        if (decl_ptr == null || key.len == 0) { return hir_id_invalid(); }
+        var cur = self.head;
+        while (cur != null) {
+            let d0 = ast_read_rawptr(cur);
+            let kp0 = ast_read_rawptr(ptr_offset(cur, 8));
+            let kl0 = ast_read_i64(ptr_offset(cur, 16));
+            if (d0 == decl_ptr && hir_builder_c_string_equals(kp0, kl0, key)) {
+                return ast_read_i32(ptr_offset(cur, 24));
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 40));
+        }
+        return hir_id_invalid();
+    }
+
+    fn function(self, decl_ptr: rawptr, key: string) -> i32 {
+        if (decl_ptr == null || key.len == 0) { return hir_id_invalid(); }
+        var cur = self.head;
+        while (cur != null) {
+            let d0 = ast_read_rawptr(cur);
+            let kp0 = ast_read_rawptr(ptr_offset(cur, 8));
+            let kl0 = ast_read_i64(ptr_offset(cur, 16));
+            if (d0 == decl_ptr && hir_builder_c_string_equals(kp0, kl0, key)) {
+                return ast_read_i32(ptr_offset(cur, 28));
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 40));
+        }
+        return hir_id_invalid();
+    }
+
+    // Instance shells deliberately do not overwrite decl_map: a declaration
+    // can own both its direct function and many closed instances.  Recover
+    // the source declaration by FunctionId when a reachability request starts
+    // from an erased Sema target (for example a trait prototype rebounded to
+    // a concrete implementation).
+    fn decl_for_function(self, function_id: i32) -> rawptr {
+        if (function_id == hir_id_invalid()) { return null; }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_i32(ptr_offset(cur, 28)) == function_id) {
+                return ast_read_rawptr(cur);
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 40));
+        }
+        return null;
+    }
+}
+
+class HirRawOwnerMap {
+    public head: rawptr
+    public buckets: rawptr
+    public bucket_cap: i32
+
+    public static fn create() -> HirRawOwnerMap {
+        return HirRawOwnerMap { head: null, buckets: null, bucket_cap: 0 };
+    }
+
+    fn raw_hash(self, key: rawptr) -> i32 {
+        var v = (key as i64) >> 4;
+        if (v < 0) { v = -v; }
+        v = ((v % 2147483647) * 131 + ((v >> 8) % 2147483647) * 17) % 2147483647;
+        if (v < 0) { v = v + 2147483647; }
+        return (v & 0x7fffffff) as i32;
+    }
+
+    fn ensure_buckets(self) {
+        if (self.buckets != null && self.bucket_cap > 0) { return; }
+        self.bucket_cap = 4096;
+        self.buckets = hir_builder_alloc_ptr_buckets(self.bucket_cap);
+        if (self.buckets == null) {
+            self.bucket_cap = 0;
+            return;
+        }
+        var cur = self.head;
+        while (cur != null) {
+            let key = ast_read_rawptr(cur);
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            let slot_ptr = ptr_offset(self.buckets, (slot as i64) * 8);
+            ast_write_rawptr(ptr_offset(cur, 24), ast_read_rawptr(slot_ptr));
+            ast_write_rawptr(slot_ptr, cur);
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+    }
+
+    fn put(self, key: rawptr, owner: rawptr) {
+        if (key == null || owner == null) { return; }
+        self.ensure_buckets();
+        if (self.buckets != null && self.bucket_cap > 0) {
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            let slot_ptr = ptr_offset(self.buckets, (slot as i64) * 8);
+            var bcur = ast_read_rawptr(slot_ptr);
+            while (bcur != null) {
+                if (ast_read_rawptr(bcur) == key) {
+                    ast_write_rawptr(ptr_offset(bcur, 8), owner);
+                    return;
+                }
+                bcur = ast_read_rawptr(ptr_offset(bcur, 24));
+            }
+            let bnode = hir_profile_malloc(32);
+            if (bnode == null) { return; }
+            memset(bnode, 0, 32);
+            ast_write_rawptr(bnode, key);
+            ast_write_rawptr(ptr_offset(bnode, 8), owner);
+            ast_write_rawptr(ptr_offset(bnode, 16), self.head);
+            ast_write_rawptr(ptr_offset(bnode, 24), ast_read_rawptr(slot_ptr));
+            self.head = bnode;
+            ast_write_rawptr(slot_ptr, bnode);
+            return;
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) {
+                ast_write_rawptr(ptr_offset(cur, 8), owner);
+                return;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+        let node = hir_profile_malloc(32);
+        if (node == null) { return; }
+        memset(node, 0, 32);
+        ast_write_rawptr(node, key);
+        ast_write_rawptr(ptr_offset(node, 8), owner);
+        ast_write_rawptr(ptr_offset(node, 16), self.head);
+        self.head = node;
+    }
+
+    fn get(self, key: rawptr) -> rawptr {
+        if (key == null) { return null; }
+        if (self.buckets != null && self.bucket_cap > 0) {
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            var bcur = ast_read_rawptr(ptr_offset(self.buckets, (slot as i64) * 8));
+            while (bcur != null) {
+                if (ast_read_rawptr(bcur) == key) {
+                    return ast_read_rawptr(ptr_offset(bcur, 8));
+                }
+                bcur = ast_read_rawptr(ptr_offset(bcur, 24));
+            }
+            return null;
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) {
+                return ast_read_rawptr(ptr_offset(cur, 8));
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+        return null;
+    }
+}
+
+class HirRawTypeIdMap {
+    public head: rawptr
+    public buckets: rawptr
+    public bucket_cap: i32
+
+    public static fn create() -> HirRawTypeIdMap {
+        return HirRawTypeIdMap { head: null, buckets: null, bucket_cap: 0 };
+    }
+
+    fn raw_hash(self, key: rawptr) -> i32 {
+        var v = (key as i64) >> 4;
+        if (v < 0) { v = -v; }
+        v = ((v % 2147483647) * 131 + ((v >> 8) % 2147483647) * 17) % 2147483647;
+        if (v < 0) { v = v + 2147483647; }
+        return (v & 0x7fffffff) as i32;
+    }
+
+    // TypeRef identity is queried for every HIR type construction.  A flat
+    // chain turns a large imported unit into O(type_refs^2) pointer walks.
+    // Keep the insertion chain for deterministic disposal, and add a stable
+    // pointer-identity index solely for lookup.
+    fn ensure_buckets(self) {
+        if (self.buckets != null && self.bucket_cap > 0) { return; }
+        self.bucket_cap = 4096;
+        self.buckets = hir_builder_alloc_ptr_buckets(self.bucket_cap);
+        if (self.buckets == null) {
+            self.bucket_cap = 0;
+            return;
+        }
+        var cur = self.head;
+        while (cur != null) {
+            let key = ast_read_rawptr(cur);
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            let slot_ptr = ptr_offset(self.buckets, (slot as i64) * 8);
+            ast_write_rawptr(ptr_offset(cur, 24), ast_read_rawptr(slot_ptr));
+            ast_write_rawptr(slot_ptr, cur);
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+    }
+
+    fn put(self, key: rawptr, type_id: i32) {
+        if (key == null || type_id == hir_id_invalid()) { return; }
+        self.ensure_buckets();
+        if (self.buckets != null && self.bucket_cap > 0) {
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            let slot_ptr = ptr_offset(self.buckets, (slot as i64) * 8);
+            var bcur = ast_read_rawptr(slot_ptr);
+            while (bcur != null) {
+                if (ast_read_rawptr(bcur) == key) {
+                    ast_write_i32(ptr_offset(bcur, 8), type_id);
+                    return;
+                }
+                bcur = ast_read_rawptr(ptr_offset(bcur, 24));
+            }
+            let bnode = hir_profile_malloc(32);
+            if (bnode == null) { return; }
+            memset(bnode, 0, 32);
+            ast_write_rawptr(bnode, key);
+            ast_write_i32(ptr_offset(bnode, 8), type_id);
+            ast_write_rawptr(ptr_offset(bnode, 16), self.head);
+            ast_write_rawptr(ptr_offset(bnode, 24), ast_read_rawptr(slot_ptr));
+            self.head = bnode;
+            ast_write_rawptr(slot_ptr, bnode);
+            return;
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) {
+                ast_write_i32(ptr_offset(cur, 8), type_id);
+                return;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+        let node = hir_profile_malloc(32);
+        if (node == null) { return; }
+        memset(node, 0, 32);
+        ast_write_rawptr(node, key);
+        ast_write_i32(ptr_offset(node, 8), type_id);
+        ast_write_rawptr(ptr_offset(node, 16), self.head);
+        self.head = node;
+    }
+
+    fn get(self, key: rawptr) -> i32 {
+        if (key == null) { return hir_id_invalid(); }
+        if (self.buckets != null && self.bucket_cap > 0) {
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            var bcur = ast_read_rawptr(ptr_offset(self.buckets, (slot as i64) * 8));
+            while (bcur != null) {
+                if (ast_read_rawptr(bcur) == key) { return ast_read_i32(ptr_offset(bcur, 8)); }
+                bcur = ast_read_rawptr(ptr_offset(bcur, 24));
+            }
+            return hir_id_invalid();
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) { return ast_read_i32(ptr_offset(cur, 8)); }
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+        return hir_id_invalid();
+    }
+}
+
+class HirRawIntMap {
+    public head: rawptr
+
+    public static fn create() -> HirRawIntMap {
+        return HirRawIntMap { head: null };
+    }
+
+    fn put(self, key: rawptr, value: i32) {
+        if (key == null) { return; }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) {
+                ast_write_i32(ptr_offset(cur, 8), value);
+                return;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+        let node = hir_profile_malloc(24);
+        if (node == null) { return; }
+        memset(node, 0, 24);
+        ast_write_rawptr(node, key);
+        ast_write_i32(ptr_offset(node, 8), value);
+        ast_write_rawptr(ptr_offset(node, 16), self.head);
+        self.head = node;
+    }
+
+    fn get(self, key: rawptr) -> i32 {
+        if (key == null) { return -1; }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) {
+                return ast_read_i32(ptr_offset(cur, 8));
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+        return -1;
+    }
+}
+
+class HirRawPairIntMap {
+    public head: rawptr
+    public buckets: rawptr
+    public bucket_cap: i32
+
+    public static fn create() -> HirRawPairIntMap {
+        return HirRawPairIntMap { head: null, buckets: null, bucket_cap: 0 };
+    }
+}
+
+fn hir_builder_raw_pair_hash_i32(a: rawptr, b: rawptr) -> i32 {
+    var av = (a as i64) >> 4;
+    var bv = (b as i64) >> 4;
+    if (av < 0) { av = -av; }
+    if (bv < 0) { bv = -bv; }
+    let pa = av % 2147483647;
+    let pb = bv % 2147483647;
+    var h: i64 = (pa * 131 + pb * 313 + ((pa ^ pb) % 2147483647)) % 2147483647;
+    if (h < 0) { h = h + 2147483647; }
+    return (h & 0x7fffffff) as i32;
+}
+
+fn hir_raw_pair_int_map_ensure_buckets(map: HirRawPairIntMap) -> HirRawPairIntMap {
+    if (map.buckets != null && map.bucket_cap > 0) { return map; }
+    map.bucket_cap = 65536;
+    map.buckets = hir_builder_alloc_ptr_buckets(map.bucket_cap);
+    if (map.buckets == null) {
+        map.bucket_cap = 0;
+        return map;
+    }
+    var cur = map.head;
+    while (cur != null) {
+        let key_a = ast_read_rawptr(cur);
+        let key_b = ast_read_rawptr(ptr_offset(cur, 8));
+        let slot = hir_builder_hash_slot(hir_builder_raw_pair_hash_i32(key_a, key_b), map.bucket_cap);
+        let slot_ptr = ptr_offset(map.buckets, (slot as i64) * 8);
+        ast_write_rawptr(ptr_offset(cur, 32), ast_read_rawptr(slot_ptr));
+        ast_write_rawptr(slot_ptr, cur);
+        cur = ast_read_rawptr(ptr_offset(cur, 24));
+    }
+    return map;
+}
+
+fn hir_raw_pair_int_map_put(map: HirRawPairIntMap, key_a: rawptr, key_b: rawptr, value: i32) -> HirRawPairIntMap {
+    if (key_a == null || key_b == null) { return map; }
+    map = hir_raw_pair_int_map_ensure_buckets(map);
+    if (map.buckets != null && map.bucket_cap > 0) {
+        let slot = hir_builder_hash_slot(hir_builder_raw_pair_hash_i32(key_a, key_b), map.bucket_cap);
+        let slot_ptr = ptr_offset(map.buckets, (slot as i64) * 8);
+        var bucket_cur = ast_read_rawptr(slot_ptr);
+        while (bucket_cur != null) {
+            if (ast_read_rawptr(bucket_cur) == key_a
+                && ast_read_rawptr(ptr_offset(bucket_cur, 8)) == key_b) {
+                ast_write_i32(ptr_offset(bucket_cur, 16), value);
+                return map;
+            }
+            bucket_cur = ast_read_rawptr(ptr_offset(bucket_cur, 32));
+        }
+        let node = hir_profile_malloc(40);
+        if (node == null) { return map; }
+        memset(node, 0, 40);
+        ast_write_rawptr(node, key_a);
+        ast_write_rawptr(ptr_offset(node, 8), key_b);
+        ast_write_i32(ptr_offset(node, 16), value);
+        ast_write_rawptr(ptr_offset(node, 24), map.head);
+        ast_write_rawptr(ptr_offset(node, 32), ast_read_rawptr(slot_ptr));
+        map.head = node;
+        ast_write_rawptr(slot_ptr, node);
+        return map;
+    }
+    var cur = map.head;
+    while (cur != null) {
+        if (ast_read_rawptr(cur) == key_a && ast_read_rawptr(ptr_offset(cur, 8)) == key_b) {
+            ast_write_i32(ptr_offset(cur, 16), value);
+            return map;
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 24));
+    }
+    let node = hir_profile_malloc(40);
+    if (node == null) { return map; }
+    memset(node, 0, 40);
+    ast_write_rawptr(node, key_a);
+    ast_write_rawptr(ptr_offset(node, 8), key_b);
+    ast_write_i32(ptr_offset(node, 16), value);
+    ast_write_rawptr(ptr_offset(node, 24), map.head);
+    map.head = node;
+    return map;
+}
+
+fn hir_raw_pair_int_map_get(map: HirRawPairIntMap, key_a: rawptr, key_b: rawptr) -> i32 {
+    if (key_a == null || key_b == null) { return -1; }
+    if (map.buckets != null && map.bucket_cap > 0) {
+        let slot = hir_builder_hash_slot(hir_builder_raw_pair_hash_i32(key_a, key_b), map.bucket_cap);
+        var bucket_cur = ast_read_rawptr(ptr_offset(map.buckets, (slot as i64) * 8));
+        while (bucket_cur != null) {
+            if (ast_read_rawptr(bucket_cur) == key_a
+                && ast_read_rawptr(ptr_offset(bucket_cur, 8)) == key_b) {
+                return ast_read_i32(ptr_offset(bucket_cur, 16));
+            }
+            bucket_cur = ast_read_rawptr(ptr_offset(bucket_cur, 32));
+        }
+        return -1;
+    }
+    var cur = map.head;
+    while (cur != null) {
+        if (ast_read_rawptr(cur) == key_a && ast_read_rawptr(ptr_offset(cur, 8)) == key_b) {
+            return ast_read_i32(ptr_offset(cur, 16));
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 24));
+    }
+    return -1;
+}
+
+fn hir_raw_pair_int_map_dispose(map: HirRawPairIntMap) -> HirRawPairIntMap {
+    var cur = map.head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, 24));
+        free(cur);
+        cur = next;
+    }
+    if (map.buckets != null) { free(map.buckets); }
+    map.head = null;
+    map.buckets = null;
+    map.bucket_cap = 0;
+    return map;
+}
+
+class HirRawPairRawMap {
+    public head: rawptr
+
+    public static fn create() -> HirRawPairRawMap {
+        return HirRawPairRawMap { head: null };
+    }
+}
+
+fn hir_raw_pair_raw_map_put(map: HirRawPairRawMap, key_a: rawptr, key_b: rawptr, value: rawptr) -> HirRawPairRawMap {
+    if (key_a == null || key_b == null || value == null) { return map; }
+    var cur = map.head;
+    while (cur != null) {
+        if (ast_read_rawptr(cur) == key_a && ast_read_rawptr(ptr_offset(cur, 8)) == key_b) {
+            ast_write_rawptr(ptr_offset(cur, 16), value);
+            return map;
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 24));
+    }
+    let node = hir_profile_malloc(32);
+    if (node == null) { return map; }
+    memset(node, 0, 32);
+    ast_write_rawptr(node, key_a);
+    ast_write_rawptr(ptr_offset(node, 8), key_b);
+    ast_write_rawptr(ptr_offset(node, 16), value);
+    ast_write_rawptr(ptr_offset(node, 24), map.head);
+    map.head = node;
+    return map;
+}
+
+fn hir_raw_pair_raw_map_get(map: HirRawPairRawMap, key_a: rawptr, key_b: rawptr) -> rawptr {
+    if (key_a == null || key_b == null) { return null; }
+    var cur = map.head;
+    while (cur != null) {
+        if (ast_read_rawptr(cur) == key_a && ast_read_rawptr(ptr_offset(cur, 8)) == key_b) {
+            return ast_read_rawptr(ptr_offset(cur, 16));
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 24));
+    }
+    return null;
+}
+
+fn hir_raw_pair_raw_map_dispose(map: HirRawPairRawMap) -> HirRawPairRawMap {
+    var cur = map.head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, 24));
+        free(cur);
+        cur = next;
+    }
+    map.head = null;
+    return map;
+}
+
+fn hir_raw_int_map_put(map: HirRawIntMap, key: rawptr, value: i32) -> HirRawIntMap {
+    if (key == null) { return map; }
+    var cur = map.head;
+    while (cur != null) {
+        if (ast_read_rawptr(cur) == key) {
+            ast_write_i32(ptr_offset(cur, 8), value);
+            return map;
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 16));
+    }
+    let node = hir_profile_malloc(24);
+    if (node == null) { return map; }
+    memset(node, 0, 24);
+    ast_write_rawptr(node, key);
+    ast_write_i32(ptr_offset(node, 8), value);
+    ast_write_rawptr(ptr_offset(node, 16), map.head);
+    map.head = node;
+    return map;
+}
+
+fn hir_raw_int_map_get(map: HirRawIntMap, key: rawptr) -> i32 {
+    if (key == null) { return -1; }
+    var cur = map.head;
+    while (cur != null) {
+        if (ast_read_rawptr(cur) == key) {
+            return ast_read_i32(ptr_offset(cur, 8));
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 16));
+    }
+    return -1;
+}
+
+fn hir_raw_type_id_map_put(map: HirRawTypeIdMap, key: rawptr, type_id: i32) -> HirRawTypeIdMap {
+    map.put(key, type_id);
+    return map;
+}
+
+fn hir_raw_type_id_map_get(map: HirRawTypeIdMap, key: rawptr) -> i32 {
+    return map.get(key);
+}
+
+fn hir_raw_owner_map_put(map: HirRawOwnerMap, key: rawptr, owner: rawptr) -> HirRawOwnerMap {
+    map.put(key, owner);
+    return map;
+}
+
+fn hir_raw_owner_map_get(map: HirRawOwnerMap, key: rawptr) -> rawptr {
+    return map.get(key);
+}
+
+fn hir_raw_owner_map_dispose(map: HirRawOwnerMap) -> HirRawOwnerMap {
+    var cur = map.head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, 16));
+        free(cur);
+        cur = next;
+    }
+    if (map.buckets != null) { free(map.buckets); }
+    map.head = null;
+    map.buckets = null;
+    map.bucket_cap = 0;
+    return map;
+}
+
+fn hir_raw_type_id_map_dispose(map: HirRawTypeIdMap) -> HirRawTypeIdMap {
+    var cur = map.head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, 16));
+        free(cur);
+        cur = next;
+    }
+    if (map.buckets != null) { free(map.buckets); }
+    map.head = null;
+    map.buckets = null;
+    map.bucket_cap = 0;
+    return map;
+}
+
+fn hir_raw_int_map_dispose(map: HirRawIntMap) -> HirRawIntMap {
+    var cur = map.head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, 16));
+        free(cur);
+        cur = next;
+    }
+    map.head = null;
+    return map;
+}
+
+fn hir_decl_instance_map_put(map: HirDeclInstanceMap, decl_ptr: rawptr, key: string, item_id: i32, function_id: i32) -> HirDeclInstanceMap {
+    if (decl_ptr == null || key.len == 0) { return map; }
+    var cur = map.head;
+    while (cur != null) {
+        let d0 = ast_read_rawptr(cur);
+        let kp0 = ast_read_rawptr(ptr_offset(cur, 8));
+        let kl0 = ast_read_i64(ptr_offset(cur, 16));
+        if (d0 == decl_ptr && hir_builder_c_string_equals(kp0, kl0, key)) {
+            ast_write_i32(ptr_offset(cur, 24), item_id);
+            ast_write_i32(ptr_offset(cur, 28), function_id);
+            return map;
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 40));
+    }
+    let node = hir_profile_malloc(48);
+    if (node == null) { return map; }
+    memset(node, 0, 48);
+    ast_write_rawptr(node, decl_ptr);
+    ast_write_rawptr(ptr_offset(node, 8), ast_dup_c_string(key));
+    ast_write_i64(ptr_offset(node, 16), key.len);
+    ast_write_i32(ptr_offset(node, 24), item_id);
+    ast_write_i32(ptr_offset(node, 28), function_id);
+    ast_write_rawptr(ptr_offset(node, 40), map.head);
+    map.head = node;
+    return map;
+}
+
+fn hir_decl_instance_map_item(map: HirDeclInstanceMap, decl_ptr: rawptr, key: string) -> i32 {
+    if (decl_ptr == null || key.len == 0) { return hir_id_invalid(); }
+    var cur = map.head;
+    while (cur != null) {
+        let d0 = ast_read_rawptr(cur);
+        let kp0 = ast_read_rawptr(ptr_offset(cur, 8));
+        let kl0 = ast_read_i64(ptr_offset(cur, 16));
+        if (d0 == decl_ptr && hir_builder_c_string_equals(kp0, kl0, key)) {
+            return ast_read_i32(ptr_offset(cur, 24));
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 40));
+    }
+    return hir_id_invalid();
+}
+
+fn hir_decl_instance_map_function(map: HirDeclInstanceMap, decl_ptr: rawptr, key: string) -> i32 {
+    if (decl_ptr == null || key.len == 0) { return hir_id_invalid(); }
+    var cur = map.head;
+    while (cur != null) {
+        let d0 = ast_read_rawptr(cur);
+        let kp0 = ast_read_rawptr(ptr_offset(cur, 8));
+        let kl0 = ast_read_i64(ptr_offset(cur, 16));
+        if (d0 == decl_ptr && hir_builder_c_string_equals(kp0, kl0, key)) {
+            return ast_read_i32(ptr_offset(cur, 28));
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 40));
+    }
+    return hir_id_invalid();
+}
+
+fn hir_decl_instance_map_dispose(map: HirDeclInstanceMap) -> HirDeclInstanceMap {
+    var cur = map.head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, 40));
+        let key_ptr = ast_read_rawptr(ptr_offset(cur, 8));
+        if (key_ptr != null) { free(key_ptr); }
+        free(cur);
+        cur = next;
+    }
+    map.head = null;
+    return map;
+}

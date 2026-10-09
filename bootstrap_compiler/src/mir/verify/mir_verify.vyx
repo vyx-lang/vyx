@@ -1,0 +1,491 @@
+module bootstrap.mir_verify;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+}
+
+fn mv_strict_cat_cfg() -> i32 { return 1; }
+fn mv_strict_cat_call() -> i32 { return 2; }
+fn mv_strict_cat_field() -> i32 { return 3; }
+fn mv_strict_cat_drop() -> i32 { return 4; }
+fn mv_strict_cat_layout() -> i32 { return 5; }
+fn mv_strict_cat_owner() -> i32 { return 6; }
+fn mv_strict_cat_text() -> i32 { return 7; }
+fn mv_strict_cat_canon() -> i32 { return 8; }
+
+fn mv_i32_arr_alloc(count: i32) -> rawptr {
+    var n = count;
+    if (n < 1) { n = 1; }
+    let bytes = ((n + 1) * 4) as u64;
+    let p = malloc(bytes);
+    if (p != null) { memset(p, 0, bytes); }
+    return p;
+}
+
+fn mv_i32_get(p: rawptr, idx: i32) -> i32 {
+    if (p == null || idx < 0) { return 0; }
+    return ast_read_i32(ptr_offset(p, idx * 4));
+}
+
+fn mv_i32_set(p: rawptr, idx: i32, value: i32) {
+    if (p == null || idx < 0) { return; }
+    ast_write_i32(ptr_offset(p, idx * 4), value);
+}
+
+// Streaming lowering may recursively materialize callees while a caller body
+// is still resident. These marks therefore delimit one exact body append
+// region; filtering by owner across the complete tables would still revisit
+// every ancestor body at each pass boundary.
+public class MirFunctionVerifyScope {
+    public function_id: i32
+    public block_mark: i32
+    public local_mark: i32
+    public place_mark: i32
+    public value_mark: i32
+    public instr_mark: i32
+    public case_mark: i32
+
+    public static fn create(function_id: i32,
+                            block_mark: i32,
+                            local_mark: i32,
+                            place_mark: i32,
+                            value_mark: i32,
+                            instr_mark: i32,
+                            case_mark: i32) -> MirFunctionVerifyScope {
+        return MirFunctionVerifyScope {
+            function_id: function_id,
+            block_mark: block_mark,
+            local_mark: local_mark,
+            place_mark: place_mark,
+            value_mark: value_mark,
+            instr_mark: instr_mark,
+            case_mark: case_mark
+        };
+    }
+
+    public fn block_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.block_mark && id <= m.block_count;
+    }
+
+    public fn place_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.place_mark && id <= m.place_count;
+    }
+
+    public fn value_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.value_mark && id <= m.value_count;
+    }
+
+    public fn instr_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.instr_mark && id <= m.instr_count;
+    }
+
+    public fn case_in_range(self, m: MirUnit, id: i32) -> bool {
+        return id > self.case_mark && id <= m.case_count;
+    }
+
+    public fn block_slot(self, m: MirUnit, id: i32) -> i32 {
+        if (!self.block_in_range(m, id)) { return mir_id_invalid(); }
+        return id - self.block_mark;
+    }
+}
+
+// The local table intentionally survives streamed body disposal because later
+// declarations still consume signature metadata. Map only this function's
+// local chain to dense slots so strict drop checks do not allocate by the
+// accumulated project-wide LocalId high-water mark.
+public class MirScopedLocalSlots {
+    public keys: rawptr
+    public slots: rawptr
+    public capacity: i32
+    public count: i32
+
+    public static fn create(hint: i32) -> MirScopedLocalSlots {
+        var want = hint;
+        if (want < 1) { want = 1; }
+        var cap: i32 = 8;
+        while (cap < want * 2) { cap = cap * 2; }
+        return MirScopedLocalSlots {
+            keys: mv_i32_arr_alloc(cap),
+            slots: mv_i32_arr_alloc(cap),
+            capacity: cap,
+            count: 0
+        };
+    }
+
+    public fn index_for(self, local_id: i32) -> i32 {
+        if (self.capacity <= 0 || local_id <= 0) { return -1; }
+        return local_id % self.capacity;
+    }
+
+    public fn put(self, local_id: i32, slot: i32) -> bool {
+        if (local_id <= 0 || slot < 0 || self.keys == null || self.slots == null) { return false; }
+        var idx = self.index_for(local_id);
+        var probes: i32 = 0;
+        while (idx >= 0 && probes < self.capacity) {
+            let prior = mv_i32_get(self.keys, idx);
+            if (prior == 0 || prior == local_id) {
+                if (prior == 0) { self.count = self.count + 1; }
+                mv_i32_set(self.keys, idx, local_id);
+                mv_i32_set(self.slots, idx, slot + 1);
+                return true;
+            }
+            idx = idx + 1;
+            if (idx >= self.capacity) { idx = 0; }
+            probes = probes + 1;
+        }
+        return false;
+    }
+
+    public fn get(self, local_id: i32) -> i32 {
+        if (local_id <= 0 || self.keys == null || self.slots == null) { return -1; }
+        var idx = self.index_for(local_id);
+        var probes: i32 = 0;
+        while (idx >= 0 && probes < self.capacity) {
+            let key = mv_i32_get(self.keys, idx);
+            if (key == 0) { return -1; }
+            if (key == local_id) { return mv_i32_get(self.slots, idx) - 1; }
+            idx = idx + 1;
+            if (idx >= self.capacity) { idx = 0; }
+            probes = probes + 1;
+        }
+        return -1;
+    }
+
+    public fn dispose(self) {
+        if (self.keys != null) { free(self.keys); self.keys = null; }
+        if (self.slots != null) { free(self.slots); self.slots = null; }
+        self.capacity = 0;
+        self.count = 0;
+    }
+}
+
+fn mv_legacy_string_primitive_text(text_in: string) -> bool {
+    let text = text_in.trim();
+    if (text == "string" || text == "__String") { return true; }
+    if (policy_generic_call_has_args(text.clone()) != 0) {
+        let raw_args = policy_generic_call_args(text.clone());
+        var i: i32 = 0;
+        while (i < 64) {
+            let arg = policy_generic_arg_at(raw_args, i).trim();
+            if (arg.len == 0) { return false; }
+            if (mv_legacy_string_primitive_text(arg)) { return true; }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+public class MirVerifier {
+    public errors: i32
+    public strict: bool
+    public strict_printed: i32
+    public strict_print_cap: i32
+    public strict_cfg_errors: i32
+    public strict_call_errors: i32
+    public strict_field_errors: i32
+    public strict_drop_errors: i32
+    public strict_layout_errors: i32
+    public strict_owner_errors: i32
+    public strict_text_errors: i32
+    public strict_canon_errors: i32
+    public print_summary: bool
+    public current_loc: rawptr
+
+    public static fn create() -> MirVerifier {
+        return MirVerifier {
+            errors: 0,
+            strict: false,
+            strict_printed: 0,
+            strict_print_cap: 200,
+            strict_cfg_errors: 0,
+            strict_call_errors: 0,
+            strict_field_errors: 0,
+            strict_drop_errors: 0,
+            strict_layout_errors: 0,
+            strict_owner_errors: 0,
+            strict_text_errors: 0,
+            strict_canon_errors: 0,
+            print_summary: true,
+            current_loc: null
+        };
+    }
+
+    public static fn create_strict() -> MirVerifier {
+        return MirVerifier {
+            errors: 0,
+            strict: true,
+            strict_printed: 0,
+            strict_print_cap: 200,
+            strict_cfg_errors: 0,
+            strict_call_errors: 0,
+            strict_field_errors: 0,
+            strict_drop_errors: 0,
+            strict_layout_errors: 0,
+            strict_owner_errors: 0,
+            strict_text_errors: 0,
+            strict_canon_errors: 0,
+            print_summary: true,
+            current_loc: null
+        };
+    }
+
+    public static fn create_silent() -> MirVerifier {
+        let verifier = MirVerifier.create();
+        verifier.print_summary = false;
+        return verifier;
+    }
+
+    public static fn create_strict_silent() -> MirVerifier {
+        let verifier = MirVerifier.create_strict();
+        verifier.print_summary = false;
+        return verifier;
+    }
+
+    public fn loc_for_value(self, m: MirUnit, value_id: i32) -> rawptr {
+        return mir_unit_diag_loc_for_value(&m,  value_id);
+    }
+
+    public fn focus_function(self, m: MirUnit, function_id: i32) {
+        let loc = mir_unit_diag_loc_for_function(&m,  function_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_block(self, m: MirUnit, block_id: i32) {
+        let loc = mir_unit_diag_loc_for_block(&m,  block_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_local(self, m: MirUnit, local_id: i32) {
+        let loc = mir_unit_diag_loc_for_local(&m,  local_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_place(self, m: MirUnit, place_id: i32) {
+        let loc = mir_unit_diag_loc_for_place(&m,  place_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_value(self, m: MirUnit, value_id: i32) {
+        let loc = mir_unit_diag_loc_for_value(&m,  value_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_instr(self, m: MirUnit, instr_id: i32) {
+        let loc = mir_unit_diag_loc_for_instr(&m,  instr_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_case(self, m: MirUnit, case_id: i32) {
+        let loc = mir_unit_diag_loc_for_case(&m,  case_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_type(self, m: MirUnit, type_id: i32) {
+        let loc = mir_unit_diag_loc_for_type(&m,  type_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn focus_field(self, m: MirUnit, field_id: i32) {
+        let loc = mir_unit_diag_loc_for_field(&m,  field_id);
+        if (loc != null) { self.current_loc = loc; }
+    }
+
+    public fn record_error_at(self, loc: rawptr, msg: string) {
+        self.errors = self.errors + 1;
+        var anchor = loc;
+        if (anchor == null || ast_read_i32(anchor) <= 0) { anchor = self.current_loc; }
+        diag_emit_codegen_at(anchor, "MIR verification failed: " + msg);
+    }
+
+    public fn record_error(self, msg: string) {
+        self.record_error_at(null, msg);
+    }
+
+    public fn record_error_at_value(self, m: MirUnit, value_id: i32, msg: string) {
+        self.record_error_at(self.loc_for_value(m, value_id), msg);
+    }
+
+    public fn record_strict(self, cat: i32, msg: string) {
+        self.errors = self.errors + 1;
+        if (cat == mv_strict_cat_cfg()) { self.strict_cfg_errors = self.strict_cfg_errors + 1; }
+        if (cat == mv_strict_cat_call()) { self.strict_call_errors = self.strict_call_errors + 1; }
+        if (cat == mv_strict_cat_field()) { self.strict_field_errors = self.strict_field_errors + 1; }
+        if (cat == mv_strict_cat_drop()) { self.strict_drop_errors = self.strict_drop_errors + 1; }
+        if (cat == mv_strict_cat_layout()) { self.strict_layout_errors = self.strict_layout_errors + 1; }
+        if (cat == mv_strict_cat_owner()) { self.strict_owner_errors = self.strict_owner_errors + 1; }
+        if (cat == mv_strict_cat_text()) { self.strict_text_errors = self.strict_text_errors + 1; }
+        if (cat == mv_strict_cat_canon()) { self.strict_canon_errors = self.strict_canon_errors + 1; }
+        if (self.strict_printed < self.strict_print_cap) {
+            diag_emit_codegen_at(self.current_loc,
+                                 "MIR strict verification failed: " + msg);
+            self.strict_printed = self.strict_printed + 1;
+            if (self.strict_printed == self.strict_print_cap) {
+                diag_emit_codegen_note_at(self.current_loc,
+                                          "MIR strict verification print cap reached; further strict errors counted but not printed");
+            }
+        }
+    }
+
+    public fn id_text(self, id: i32) -> string {
+        return policy_i64_to_string(id as i64);
+    }
+
+    public fn run_function_strict(self,
+                                  m: MirUnit,
+                                  scope: MirFunctionVerifyScope) -> i32 {
+        self.check_function_scope(m, scope);
+        if (self.errors == 0) {
+            self.strict_check_cfg_scope(m, scope);
+            self.strict_check_calls_scope(m, scope);
+            self.strict_check_field_places_scope(m, scope);
+            self.strict_check_drops_scope(m, scope);
+            self.strict_check_aggregate_layouts_scope(m, scope);
+            self.strict_check_ownership_scope(m, scope);
+            self.strict_check_void_scope(m, scope);
+        }
+        if (self.print_summary) {
+            print("[mir2-verify:function-strict] function=" + self.id_text(scope.function_id)
+                  + " blocks=" + self.id_text(m.block_count - scope.block_mark)
+                  + " locals=" + self.id_text(m.function_local_count(scope.function_id))
+                  + " places=" + self.id_text(m.place_count - scope.place_mark)
+                  + " values=" + self.id_text(m.value_count - scope.value_mark)
+                  + " instrs=" + self.id_text(m.instr_count - scope.instr_mark)
+                  + " cases=" + self.id_text(m.case_count - scope.case_mark)
+                  + " errors=" + self.id_text(self.errors));
+        }
+        return self.errors;
+    }
+
+    public fn run_strict(self, m: MirUnit) {
+        self.current_loc = mir_unit_diag_first_loc(&m);
+        self.strict_check_cfg(m);
+        self.strict_check_calls(m);
+        self.strict_check_field_places(m);
+        self.strict_check_drops(m);
+        self.strict_check_layouts(m);
+        self.strict_check_ownership(m);
+        self.strict_check_void_and_text(m);
+        if (self.print_summary) {
+            print("[mir2-verify:strict] summary"
+                  + " cfg=" + policy_i64_to_string(self.strict_cfg_errors as i64)
+                  + " call=" + policy_i64_to_string(self.strict_call_errors as i64)
+                  + " field=" + policy_i64_to_string(self.strict_field_errors as i64)
+                  + " drop=" + policy_i64_to_string(self.strict_drop_errors as i64)
+                  + " layout=" + policy_i64_to_string(self.strict_layout_errors as i64)
+                  + " owner=" + policy_i64_to_string(self.strict_owner_errors as i64)
+                  + " text=" + policy_i64_to_string(self.strict_text_errors as i64)
+                  + " noncanonical_type=" + policy_i64_to_string(self.strict_canon_errors as i64));
+        }
+    }
+
+    public fn run(self, m: MirUnit) -> i32 {
+        self.current_loc = mir_unit_diag_first_loc(&m);
+        if (m.function_buf == null || m.block_buf == null || m.local_buf == null
+            || m.place_buf == null || m.value_buf == null || m.instr_buf == null
+            || m.case_buf == null || m.static_buf == null || m.types.buf == null) {
+            self.record_error("MIR unit has an unallocated core table");
+        }
+        self.check_functions(m);
+        self.check_blocks(m);
+        self.check_locals(m);
+        self.check_statics(m);
+        self.check_places(m);
+        self.check_values(m);
+        self.check_instrs(m);
+        self.check_cases(m);
+        if (self.strict) {
+            self.run_strict(m);
+        }
+        if (self.print_summary) {
+            var discarded_bodies: i32 = 0;
+            var fid: i32 = 1;
+            while (fid <= m.function_count) {
+                if (m.function_streamed_body_discarded(fid)) {
+                    discarded_bodies = discarded_bodies + 1;
+                }
+                fid = fid + 1;
+            }
+            // function_count includes records whose bodies were already
+            // verified in mir_pass_verify_stage and then discarded.
+            print("verified functions=" + policy_i64_to_string(m.function_count as i64));
+            print("verified discarded_bodies=" + policy_i64_to_string(discarded_bodies as i64));
+            print("[mir2-verify] functions=" + policy_i64_to_string(m.function_count as i64)
+                  + " blocks=" + policy_i64_to_string(m.block_count as i64)
+                  + " locals=" + policy_i64_to_string(m.local_count as i64)
+                  + " places=" + policy_i64_to_string(m.place_count as i64)
+                  + " values=" + policy_i64_to_string(m.value_count as i64)
+                  + " instrs=" + policy_i64_to_string(m.instr_count as i64)
+                  + " cases=" + policy_i64_to_string(m.case_count as i64)
+                  + " statics=" + policy_i64_to_string(m.static_count as i64)
+                  + " errors=" + policy_i64_to_string(self.errors as i64));
+        }
+        return self.errors;
+    }
+}
+
+public fn mir_verify_unit(m: MirUnit) -> i32 {
+    let verifier = MirVerifier.create();
+    return verifier.run(m);
+}
+
+public fn mir_verify_unit_strict(m: MirUnit) -> i32 {
+    let verifier = MirVerifier.create_strict();
+    return verifier.run(m);
+}
+
+public fn mir_verify_unit_silent(m: MirUnit) -> i32 {
+    let verifier = MirVerifier.create_silent();
+    return verifier.run(m);
+}
+
+public fn mir_verify_unit_strict_silent(m: MirUnit) -> i32 {
+    let verifier = MirVerifier.create_strict_silent();
+    return verifier.run(m);
+}
+
+public fn mir_verify_function_strict(m: MirUnit,
+                                     function_id: i32,
+                                     block_mark: i32,
+                                     local_mark: i32,
+                                     place_mark: i32,
+                                     value_mark: i32,
+                                     instr_mark: i32,
+                                     case_mark: i32) -> i32 {
+    let verifier = MirVerifier.create_strict();
+    let scope = MirFunctionVerifyScope.create(function_id,
+                                               block_mark,
+                                               local_mark,
+                                               place_mark,
+                                               value_mark,
+                                               instr_mark,
+                                               case_mark);
+    return verifier.run_function_strict(m, scope);
+}
+
+public fn mir_verify_function_strict_silent(m: MirUnit,
+                                            function_id: i32,
+                                            block_mark: i32,
+                                            local_mark: i32,
+                                            place_mark: i32,
+                                            value_mark: i32,
+                                            instr_mark: i32,
+                                            case_mark: i32) -> i32 {
+    let verifier = MirVerifier.create_strict_silent();
+    let scope = MirFunctionVerifyScope.create(function_id,
+                                               block_mark,
+                                               local_mark,
+                                               place_mark,
+                                               value_mark,
+                                               instr_mark,
+                                               case_mark);
+    return verifier.run_function_strict(m, scope);
+}

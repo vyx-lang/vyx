@@ -1,0 +1,620 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Generic inference for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn seed_bindings_from_args(self, bindings: &mut HirGenericBindingMap, params: string, args: string) {
+        var i: i32 = 0;
+        while (i < 64) {
+            let p = hir_builder_generic_param_at(params, i);
+            if (p.len == 0) { return; }
+            let a = policy_generic_arg_at(args, i);
+            if (a.len > 0) { bindings.bind(p, a); }
+            i = i + 1;
+        }
+    }
+
+    fn infer_name_bindings(self,
+                                  pattern: string,
+                                  actual: string,
+                                  allowed_params: string,
+                                  locked_params: string,
+                                  bindings: &mut HirGenericBindingMap) {
+        if (pattern.len == 0 || actual.len == 0) { return; }
+        if (hir_builder_generic_contains(allowed_params, pattern)) {
+            if (bindings.lookup(pattern).len > 0) {
+                return;
+            }
+            bindings.bind(pattern, actual);
+            return;
+        }
+        let pattern_base = policy_generic_call_base(pattern);
+        let pattern_args = policy_generic_call_args(pattern);
+        let actual_base = policy_generic_call_base(actual);
+        let actual_args = policy_generic_call_args(actual);
+        if (pattern_args.len == 0 || actual_args.len == 0) { return; }
+        if (!policy_type_name_equal(pattern_base, actual_base)) { return; }
+        var i: i32 = 0;
+        while (i < 64) {
+            let pa = policy_generic_arg_at(pattern_args, i);
+            let aa = policy_generic_arg_at(actual_args, i);
+            if (pa.len == 0 || aa.len == 0) { return; }
+            self.infer_name_bindings(pa, aa, allowed_params, locked_params, bindings);
+            i = i + 1;
+        }
+    }
+
+    fn infer_type_bindings_from_text(self,
+                                            param_text: string,
+                                            actual_text: string,
+                                            allowed_params: string,
+                                            locked_params: string,
+                                            bindings: &mut HirGenericBindingMap) {
+        if (param_text.len == 0 || actual_text.len == 0) { return; }
+        self.infer_name_bindings(param_text, actual_text, allowed_params, locked_params, bindings);
+        self.infer_function_type_bindings_from_text(param_text, actual_text, allowed_params, locked_params, bindings);
+        let param_base = hir_builder_last_path_segment(policy_generic_call_base(param_text));
+        let actual_base = hir_builder_last_path_segment(policy_generic_call_base(actual_text));
+        if ((param_base == "ptr" || param_base == "ref")
+            && (actual_base == "ptr" || actual_base == "ref")) {
+            let param_args = policy_generic_call_args(param_text);
+            let actual_args = policy_generic_call_args(actual_text);
+            let param_elem = policy_generic_arg_at(param_args, 0);
+            let actual_elem = policy_generic_arg_at(actual_args, 0);
+            if (param_elem.len > 0 && actual_elem.len > 0) {
+                self.infer_name_bindings(param_elem, actual_elem, allowed_params, locked_params, bindings);
+            }
+        }
+    }
+
+    fn function_type_open_index(self, text: string) -> i32 {
+        if (text.len >= 3 && text.substring(0, 3) == "fn(") { return 2; }
+        if (text.len >= 4 && text.substring(0, 4) == "cfn(") { return 3; }
+        if (text.len >= 10 && text.substring(0, 10) == "unsafe fn(") { return 9; }
+        return -1;
+    }
+
+    fn infer_function_type_bindings_from_text(self,
+                                                     param_text: string,
+                                                     actual_text: string,
+                                                     allowed_params: string,
+                                                     locked_params: string,
+                                                     bindings: &mut HirGenericBindingMap) {
+        let param_open = self.function_type_open_index(param_text);
+        let actual_open = self.function_type_open_index(actual_text);
+        if (param_open < 0 || actual_open < 0) { return; }
+        let param_close = self.fn_type_text_close_paren(param_text, param_open);
+        let actual_close = self.fn_type_text_close_paren(actual_text, actual_open);
+        if (param_close < 0 || actual_close < 0) { return; }
+        if (param_close + 2 >= param_text.len || actual_close + 2 >= actual_text.len) { return; }
+        if (param_text.charAt(param_close + 1) != 45 || param_text.charAt(param_close + 2) != 62) { return; }
+        if (actual_text.charAt(actual_close + 1) != 45 || actual_text.charAt(actual_close + 2) != 62) { return; }
+        let param_args = param_text.substring(param_open + 1, param_close);
+        let actual_args = actual_text.substring(actual_open + 1, actual_close);
+        var idx: i32 = 0;
+        while (idx < 256) {
+            let param_arg = policy_generic_arg_at(param_args, idx);
+            let actual_arg = policy_generic_arg_at(actual_args, idx);
+            if (param_arg.len == 0 && actual_arg.len == 0) { break; }
+            if (param_arg.len == 0 || actual_arg.len == 0) { return; }
+            self.infer_type_bindings_from_text(param_arg,
+                                               actual_arg,
+                                               allowed_params,
+                                               locked_params,
+                                               bindings);
+            idx = idx + 1;
+        }
+        let param_ret = param_text.substring(param_close + 3, param_text.len);
+        let actual_ret = actual_text.substring(actual_close + 3, actual_text.len);
+        self.infer_type_bindings_from_text(param_ret,
+                                           actual_ret,
+                                           allowed_params,
+                                           locked_params,
+                                           bindings);
+    }
+
+    fn infer_call_bindings(self,
+                                  call_expr: rawptr,
+                                  target_decl: rawptr,
+                                  owner_params: string,
+                                  owner_args: string,
+                                  method_params: string,
+                                  explicit_method_args: string) -> HirGenericBindingMap {
+        if (vyx_bootstrap_profile_level() > 2) {
+            var target_name = "";
+            if (target_decl != null) { target_name = decl_get_name(target_decl); }
+            print("[hir-infer-call] enter target=" + target_name
+                  + " owner_params=" + owner_params
+                  + " owner_args=" + owner_args
+                  + " method_params=" + method_params
+                  + " explicit=" + explicit_method_args);
+        }
+        var bindings = HirGenericBindingMap.create();
+        self.seed_bindings_from_args(&mut bindings, owner_params, owner_args);
+        self.seed_bindings_from_args(&mut bindings, method_params, explicit_method_args);
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[hir-infer-call] seeded");
+        }
+        let allowed = hir_builder_append_csv(owner_params, method_params);
+        var locked = hir_builder_params_with_args(owner_params, owner_args);
+        locked = hir_builder_append_csv(locked, hir_builder_params_with_args(method_params, explicit_method_args));
+        var env_params = owner_params;
+        var env_args = owner_args;
+        if (explicit_method_args.len > 0) {
+            env_params = hir_builder_append_csv(env_params, method_params);
+            env_args = hir_builder_append_csv(env_args, explicit_method_args);
+        }
+        var arg_cell: rawptr = null;
+        if (call_expr != null && expr_get_kind(call_expr) == ex_CALL()) {
+            arg_cell = expr_get_args(call_expr);
+        }
+        var param = decl_get_params(target_decl);
+        if (param != null && decl_get_name(param) == "self") {
+            param = decl_get_next(param);
+        }
+        while (param != null && arg_cell != null) {
+            let arg_expr = stmt_get_init(arg_cell);
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-infer-call] arg-enter param=" + decl_get_name(param)
+                      + " arg_kind=" + self.i32_text(expr_get_kind(arg_expr))
+                      + " arg_name=" + expr_get_name(arg_expr));
+            }
+            let param_text = self.inference_type_text_from_ref_env(decl_get_ty(param), env_params, env_args);
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-infer-call] param-text=" + param_text);
+            }
+            let actual_text = self.inference_type_text_from_ref_env(expr_get_ty(arg_expr),
+                                                                    self.current_generic_params,
+                                                                    self.current_generic_args);
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-infer-call] actual-text=" + actual_text);
+            }
+            self.infer_type_bindings_from_text(param_text, actual_text, allowed, locked, &mut bindings);
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-infer-call] arg-leave param=" + decl_get_name(param));
+            }
+            param = decl_get_next(param);
+            arg_cell = stmt_get_next(arg_cell);
+        }
+        // Return-position inference is only meaningful when some generic
+        // params are still unbound; when explicit args already cover every
+        // param the branch previously fed the callee's own fn-type text
+        // (fn(..)->..) as the "actual" result type, producing junk bindings.
+        var need_return_inference: bool = call_expr != null;
+        if (need_return_inference
+            && hir_builder_env_args_cover_params(owner_params, owner_args)
+            && hir_builder_env_args_cover_params(method_params, explicit_method_args)) {
+            need_return_inference = false;
+        }
+        if (need_return_inference) {
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-infer-call] return-enter");
+            }
+            let return_pattern = self.inference_type_text_from_ref_env(decl_get_ty(target_decl), env_params, env_args);
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[hir-infer-call] return-pattern=" + return_pattern);
+            }
+            // expr_get_ty(call_expr) carries the callee's function type, not
+            // the call result; match the return position against the fn
+            // type's return slot instead of the whole fn(..)->.. text.
+            var return_actual_ty = expr_get_ty(call_expr);
+            if (return_actual_ty != null) {
+                let return_actual_kind = tref_get_kind(return_actual_ty);
+                if (return_actual_kind == ty_FN() || return_actual_kind == ty_CFN()) {
+                    return_actual_ty = tref_fn_ret(return_actual_ty);
+                }
+            }
+            if (return_actual_ty != null) {
+                let return_actual = self.inference_type_text_from_ref_env(return_actual_ty,
+                                                                          self.current_generic_params,
+                                                                          self.current_generic_args);
+                if (vyx_bootstrap_profile_level() > 2) {
+                    print("[hir-infer-call] return-actual=" + return_actual);
+                }
+                self.infer_type_bindings_from_text(return_pattern, return_actual, allowed, locked, &mut bindings);
+            }
+        }
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[hir-infer-call] leave");
+        }
+        return bindings;
+    }
+
+    // Semantic lowering occasionally resolves a method after its source
+    // expression has already been built (assignment and index operators).
+    // Treat those forms as a one-argument call over the stable HIR child
+    // rather than reconstructing an untyped temporary AST call.
+    fn hir_method_call_first_arg(self, expr_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let kind = self.unit.expr_kind(expr_id);
+        if (kind == ex_CALL()) { return self.unit.expr_first_arg(expr_id); }
+        if (kind == ex_ASSIGN() || kind == ex_INDEX()) { return self.unit.expr_rhs(expr_id); }
+        return hir_id_invalid();
+    }
+
+    fn hir_method_call_next_arg(self, call_expr_id: i32, arg_id: i32) -> i32 {
+        if (call_expr_id == hir_id_invalid() || arg_id == hir_id_invalid()) {
+            return hir_id_invalid();
+        }
+        if (self.unit.expr_kind(call_expr_id) == ex_CALL()) {
+            return self.unit.expr_next_arg(arg_id);
+        }
+        return hir_id_invalid();
+    }
+
+    fn infer_hir_call_bindings(self,
+                                      call_expr_id: i32,
+                                      target_decl: rawptr,
+                                      owner_params: string,
+                                      owner_args: string,
+                                      method_params: string,
+                                      explicit_method_args: string) -> HirGenericBindingMap {
+        var bindings = HirGenericBindingMap.create();
+        self.seed_bindings_from_args(&mut bindings, owner_params, owner_args);
+        self.seed_bindings_from_args(&mut bindings, method_params, explicit_method_args);
+        let allowed = hir_builder_append_csv(owner_params, method_params);
+        var locked = hir_builder_params_with_args(owner_params, owner_args);
+        locked = hir_builder_append_csv(locked, hir_builder_params_with_args(method_params, explicit_method_args));
+        var env_params = owner_params;
+        var env_args = owner_args;
+        if (explicit_method_args.len > 0) {
+            env_params = hir_builder_append_csv(env_params, method_params);
+            env_args = hir_builder_append_csv(env_args, explicit_method_args);
+        }
+        var arg_id = self.hir_method_call_first_arg(call_expr_id);
+        var param = decl_get_params(target_decl);
+        if (param != null && decl_get_name(param) == "self") {
+            param = decl_get_next(param);
+        }
+        while (param != null && arg_id != hir_id_invalid()) {
+            let param_text = self.inference_type_text_from_ref_env(decl_get_ty(param), env_params, env_args);
+            let actual_type_id = self.unit.expr_type(arg_id);
+            var actual_text = "";
+            if (self.type_id_is_valid(actual_type_id)) {
+                actual_text = hir_type_table_text(self.unit.types, actual_type_id);
+            }
+            self.infer_type_bindings_from_text(param_text, actual_text, allowed, locked, &mut bindings);
+            param = decl_get_next(param);
+            arg_id = self.hir_method_call_next_arg(call_expr_id, arg_id);
+        }
+        if (call_expr_id != hir_id_invalid() && self.unit.expr_kind(call_expr_id) == ex_CALL()) {
+            let return_pattern = self.inference_type_text_from_ref_env(decl_get_ty(target_decl), env_params, env_args);
+            let return_type_id = self.unit.expr_type(call_expr_id);
+            var return_actual = "";
+            if (self.type_id_is_valid(return_type_id)) {
+                return_actual = hir_type_table_text(self.unit.types, return_type_id);
+            }
+            self.infer_type_bindings_from_text(return_pattern, return_actual, allowed, locked, &mut bindings);
+        }
+        return bindings;
+    }
+
+    fn args_for_params(self,
+                              params: string,
+                              explicit_args: string,
+                              bindings: HirGenericBindingMap) -> string {
+        var out = "";
+        var i: i32 = 0;
+        while (i < 64) {
+            let p = hir_builder_generic_param_at(params, i);
+            if (p.len == 0) { return out.clone(); }
+            var a = policy_generic_arg_at(explicit_args, i);
+            if (a.len == 0) { a = bindings.lookup(p); }
+            if (a.len > 0) { a = self.resolve_type_text_in_current_env(a); }
+            if (a.len == 0) { return out.clone(); }
+            out = hir_builder_append_csv(out, a);
+            i = i + 1;
+        }
+        return out.clone();
+    }
+
+    fn variadic_pack_arg_texts_for_call(self, call_expr: rawptr, target_decl: rawptr, pack_name: string) -> string {
+        if (call_expr == null || expr_get_kind(call_expr) != ex_CALL() || target_decl == null || pack_name.len == 0) {
+            return "";
+        }
+        var arg_cell = expr_get_args(call_expr);
+        var param = decl_get_params(target_decl);
+        if (param != null && decl_get_name(param) == "self") {
+            param = decl_get_next(param);
+        }
+        while (param != null && !hir_builder_variadic_param(param)) {
+            if (arg_cell != null) { arg_cell = stmt_get_next(arg_cell); }
+            param = decl_get_next(param);
+        }
+        if (param == null) { return ""; }
+        var out = "";
+        while (arg_cell != null) {
+            let arg_expr = stmt_get_init(arg_cell);
+            let actual_text = self.type_text_from_ref_env(expr_get_ty(arg_expr),
+                                                          self.current_generic_params,
+                                                          self.current_generic_args);
+            if (actual_text.len == 0) { return ""; }
+            out = hir_builder_append_csv(out, actual_text);
+            arg_cell = stmt_get_next(arg_cell);
+        }
+        return out.clone();
+    }
+
+    fn variadic_pack_arg_texts_for_hir_call(self,
+                                                   call_expr_id: i32,
+                                                   target_decl: rawptr,
+                                                   pack_name: string) -> string {
+        if (call_expr_id == hir_id_invalid()
+            || target_decl == null
+            || pack_name.len == 0) {
+            return "";
+        }
+        var arg_id = self.hir_method_call_first_arg(call_expr_id);
+        var param = decl_get_params(target_decl);
+        if (param != null && decl_get_name(param) == "self") {
+            param = decl_get_next(param);
+        }
+        while (param != null && !hir_builder_variadic_param(param)) {
+            if (arg_id != hir_id_invalid()) { arg_id = self.hir_method_call_next_arg(call_expr_id, arg_id); }
+            param = decl_get_next(param);
+        }
+        if (param == null) { return ""; }
+        var out = "";
+        while (arg_id != hir_id_invalid()) {
+            let actual_type_id = self.unit.expr_type(arg_id);
+            if (!self.type_id_is_valid(actual_type_id)) { return ""; }
+            var actual_text = hir_type_table_text(self.unit.types, actual_type_id);
+            if (actual_text.len == 0) { return ""; }
+            let resolved = self.resolve_type_text_in_current_env(actual_text);
+            if (resolved.len > 0) { actual_text = resolved; }
+            if (actual_text.len == 0) { return ""; }
+            out = hir_builder_append_csv(out, actual_text);
+            arg_id = self.hir_method_call_next_arg(call_expr_id, arg_id);
+        }
+        return out.clone();
+    }
+
+    fn args_for_call_params(self,
+                                   call_expr: rawptr,
+                                   target_decl: rawptr,
+                                   params: string,
+                                   explicit_args: string,
+                                   bindings: HirGenericBindingMap) -> string {
+        var pack_name = "";
+        var param = decl_get_params(target_decl);
+        while (param != null && pack_name.len == 0) {
+            if (hir_builder_variadic_param(param)) {
+                pack_name = hir_builder_param_pack_type_name(param);
+            }
+            param = decl_get_next(param);
+        }
+        if (pack_name.len == 0) {
+            return self.args_for_params(params, explicit_args, bindings);
+        }
+        let pack_args = self.variadic_pack_arg_texts_for_call(call_expr, target_decl, pack_name);
+        var out = "";
+        var i: i32 = 0;
+        while (i < 256) {
+            let p = hir_builder_generic_param_at(params, i);
+            if (p.len == 0) { return out.clone(); }
+            if (p == pack_name) {
+                if (pack_args.len > 0) {
+                    out = hir_builder_append_csv(out, pack_args);
+                }
+            } else {
+                var a = policy_generic_arg_at(explicit_args, i);
+                if (a.len == 0) { a = bindings.lookup(p); }
+                if (a.len > 0) { a = self.resolve_type_text_in_current_env(a); }
+                if (a.len == 0) { return out.clone(); }
+                out = hir_builder_append_csv(out, a);
+            }
+            i = i + 1;
+        }
+        return out.clone();
+    }
+
+    fn args_for_hir_call_params(self,
+                                       call_expr_id: i32,
+                                       target_decl: rawptr,
+                                       params: string,
+                                       explicit_args: string,
+                                       bindings: HirGenericBindingMap) -> string {
+        var pack_name = "";
+        var param = decl_get_params(target_decl);
+        while (param != null && pack_name.len == 0) {
+            if (hir_builder_variadic_param(param)) {
+                pack_name = hir_builder_param_pack_type_name(param);
+            }
+            param = decl_get_next(param);
+        }
+        if (pack_name.len == 0) {
+            return self.args_for_params(params, explicit_args, bindings);
+        }
+        let pack_args = self.variadic_pack_arg_texts_for_hir_call(call_expr_id, target_decl, pack_name);
+        var out = "";
+        var explicit_index: i32 = 0;
+        var i: i32 = 0;
+        while (i < 256) {
+            let p = hir_builder_generic_param_at(params, i);
+            if (p.len == 0) { return out.clone(); }
+            if (p == pack_name) {
+                if (pack_args.len > 0) {
+                    out = hir_builder_append_csv(out, pack_args);
+                }
+            } else {
+                var a = policy_generic_arg_at(explicit_args, explicit_index);
+                explicit_index = explicit_index + 1;
+                if (a.len == 0) { a = bindings.lookup(p); }
+                if (a.len > 0) { a = self.resolve_type_text_in_current_env(a); }
+                if (a.len == 0) { return out.clone(); }
+                out = hir_builder_append_csv(out, a);
+            }
+            i = i + 1;
+        }
+        return out.clone();
+    }
+
+    fn receiver_expr_for_call(self, e: rawptr) -> rawptr {
+        if (e == null) { return null; }
+        if (expr_get_kind(e) == ex_CALL()) {
+            let callee = expr_get_lhs(e);
+            if (callee != null && expr_get_kind(callee) == ex_MEMBER()) {
+                return expr_get_lhs(callee);
+            }
+            return null;
+        }
+        if (expr_get_kind(e) == ex_MEMBER()) {
+            return expr_get_lhs(e);
+        }
+        return null;
+    }
+
+    fn decl_has_variadic_param(self, d: rawptr) -> bool {
+        var param = decl_get_params(d);
+        while (param != null) {
+            if (hir_builder_variadic_param(param)) { return true; }
+            param = decl_get_next(param);
+        }
+        return false;
+    }
+
+    fn env_args_cover_params_for_decl(self, d: rawptr, params: string, args: string) -> bool {
+        if (hir_builder_env_args_cover_params(params, args)) { return true; }
+        if (d == null || params.len == 0) { return false; }
+        var pack_name = "";
+        var param = decl_get_params(d);
+        while (param != null && pack_name.len == 0) {
+            if (hir_builder_variadic_param(param)) {
+                pack_name = hir_builder_param_pack_type_name(param);
+            }
+            param = decl_get_next(param);
+        }
+        if (pack_name.len == 0) { return false; }
+        var pack_index: i32 = -1;
+        var param_count: i32 = 0;
+        while (param_count < 256) {
+            let p = hir_builder_generic_param_at(params, param_count);
+            if (p.len == 0) { break; }
+            if (p == pack_name) { pack_index = param_count; }
+            param_count = param_count + 1;
+        }
+        if (pack_index < 0) { return false; }
+        let arg_count = hir_builder_generic_arg_count(args);
+        let trailing_params = param_count - pack_index - 1;
+        if (arg_count < pack_index + trailing_params) { return false; }
+        var i: i32 = 0;
+        while (i < pack_index) {
+            if (policy_generic_arg_at(args, i).len == 0) { return false; }
+            i = i + 1;
+        }
+        var tail: i32 = 0;
+        while (tail < trailing_params) {
+            if (policy_generic_arg_at(args, arg_count - trailing_params + tail).len == 0) {
+                return false;
+            }
+            tail = tail + 1;
+        }
+        return true;
+    }
+
+    fn env_args_are_closed(self, args: string) -> bool {
+        if (args.len == 0) { return true; }
+        var idx: i32 = 0;
+        while (idx < 256) {
+            let arg = policy_generic_arg_at(args, idx);
+            if (arg.len == 0) { return true; }
+            if (self.type_text_has_open_template_atom(arg)) { return false; }
+            idx = idx + 1;
+        }
+        return false;
+    }
+
+    fn env_args_reference_params(self, params: string, args: string) -> bool {
+        if (params.len == 0 || args.len == 0) { return false; }
+        var arg_idx: i32 = 0;
+        while (arg_idx < 256) {
+            let arg = policy_generic_arg_at(args, arg_idx);
+            if (arg.len == 0) { return false; }
+            var param_idx: i32 = 0;
+            while (param_idx < 256) {
+                let param = hir_builder_generic_param_at(params, param_idx);
+                if (param.len == 0) { break; }
+                if (hir_builder_type_text_contains_template_param(arg, param)) {
+                    return true;
+                }
+                param_idx = param_idx + 1;
+            }
+            arg_idx = arg_idx + 1;
+        }
+        return false;
+    }
+
+    fn explicit_generic_args_for_call(self, e: rawptr) -> string {
+        if (e == null) { return ""; }
+        var source = e;
+        if (expr_get_kind(e) == ex_CALL() && expr_get_lhs(e) != null) {
+            source = expr_get_lhs(e);
+        }
+        return policy_generic_call_args(expr_get_name(source));
+    }
+
+    fn resolve_explicit_generic_args_for_call(self, e: rawptr) -> string {
+        let raw_args = self.explicit_generic_args_for_call(e);
+        if (raw_args.len == 0) { return ""; }
+        var out = "";
+        var i: i32 = 0;
+        while (i < 64) {
+            let raw_arg = policy_generic_arg_at(raw_args, i);
+            if (raw_arg.len == 0) { return out; }
+            let resolved_arg = self.canonical_type_text_in_current_env(raw_arg);
+            if (resolved_arg.len == 0) { return ""; }
+            out = hir_builder_append_csv(out, resolved_arg);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn resolve_explicit_generic_args_for_hir_call(self, call_expr_id: i32) -> string {
+        if (call_expr_id == hir_id_invalid() || self.unit.expr_kind(call_expr_id) != ex_CALL()) { return ""; }
+        let callee_expr_id = self.unit.expr_lhs(call_expr_id);
+        if (callee_expr_id == hir_id_invalid()) { return ""; }
+        let raw_args = policy_generic_call_args(self.unit.expr_name(callee_expr_id).clone());
+        if (raw_args.len == 0) { return ""; }
+        var out = "";
+        var i: i32 = 0;
+        while (i < 64) {
+            let raw_arg = policy_generic_arg_at(raw_args, i);
+            if (raw_arg.len == 0) { return out; }
+            let resolved_arg = self.canonical_type_text_in_function_env(raw_arg,
+                                                                        self.unit.expr_function(call_expr_id));
+            if (resolved_arg.len == 0) { return ""; }
+            out = hir_builder_append_csv(out, resolved_arg);
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn resolve_explicit_generic_args_for_hir_member_expr(self, member_expr_id: i32) -> string {
+        if (member_expr_id == hir_id_invalid() || self.unit.expr_kind(member_expr_id) != ex_MEMBER()) { return ""; }
+        let raw_args = policy_generic_call_args(self.unit.expr_name(member_expr_id).clone());
+        if (raw_args.len == 0) { return ""; }
+        var out = "";
+        var i: i32 = 0;
+        while (i < 64) {
+            let raw_arg = policy_generic_arg_at(raw_args, i);
+            if (raw_arg.len == 0) { return out; }
+            let resolved_arg = self.canonical_type_text_in_function_env(raw_arg,
+                                                                        self.unit.expr_function(member_expr_id));
+            if (resolved_arg.len == 0) { return ""; }
+            out = hir_builder_append_csv(out, resolved_arg);
+            i = i + 1;
+        }
+        return out;
+    }
+}

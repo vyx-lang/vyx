@@ -1,0 +1,202 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn lower_control_if_expr(self, expr_id: i32) -> i32 {
+        let result_place = self.add_temp_place_with_flags(self.h.expr_type(expr_id),
+                                                           expr_id,
+                                                           "ifexpr",
+                                                           mir_local_flag_if_expr_result());
+        let cond_value = self.lower_expr(self.h.expr_lhs(expr_id));
+        let then_block = self.add_block(hir_unit_expr_stmt_rhs(self.h, expr_id));
+        let else_block = self.add_block(hir_unit_expr_stmt_aux(self.h, expr_id));
+        let join_block = self.add_block(hir_id_invalid());
+        let branch_drop_mark = self.drop_stack_head;
+        let branch_defer_mark = self.defer_stack_head;
+        let branch_storage_mark = self.storage_stack_head;
+        let branch_drop_state = self.drop_stack_snapshot();
+        self.terminate_current(mir_term_branch(),
+                               cond_value,
+                               then_block,
+                               else_block,
+                               mir_id_invalid(),
+                               expr_id);
+
+        self.set_current_block(then_block);
+        self.drop_stack_head = branch_drop_mark;
+        self.defer_stack_head = branch_defer_mark;
+        self.storage_stack_head = branch_storage_mark;
+        self.lower_stmt_into_place(hir_unit_expr_stmt_rhs(self.h, expr_id), result_place, expr_id);
+        let then_reaches = !self.current_block_terminated();
+        var then_end_state: rawptr = null;
+        var then_cont_block: i32 = mir_id_invalid();
+        if (then_reaches) {
+            self.emit_scope_exit_until(branch_defer_mark,
+                                       branch_drop_mark,
+                                       branch_storage_mark,
+                                       expr_id);
+            then_cont_block = self.current_block_id;
+            then_end_state = self.drop_stack_snapshot();
+        }
+        self.drop_stack_restore_activity(branch_drop_state);
+
+        self.set_current_block(else_block);
+        self.drop_stack_head = branch_drop_mark;
+        self.defer_stack_head = branch_defer_mark;
+        self.storage_stack_head = branch_storage_mark;
+        if (self.h.expr_aux(expr_id) != hir_id_invalid()) {
+            let else_if_value = self.lower_control_if_expr(self.h.expr_aux(expr_id));
+            self.emit_assign(result_place, else_if_value, hir_id_invalid(), self.h.expr_aux(expr_id));
+        } else {
+            self.lower_stmt_into_place(hir_unit_expr_stmt_aux(self.h, expr_id), result_place, expr_id);
+        }
+        let else_reaches = !self.current_block_terminated();
+        var else_end_state: rawptr = null;
+        var else_cont_block: i32 = mir_id_invalid();
+        if (else_reaches) {
+            self.emit_scope_exit_until(branch_defer_mark,
+                                       branch_drop_mark,
+                                       branch_storage_mark,
+                                       expr_id);
+            else_cont_block = self.current_block_id;
+            else_end_state = self.drop_stack_snapshot();
+        }
+        self.drop_stack_restore_activity(branch_drop_state);
+
+        self.set_current_block(then_cont_block);
+        if (then_reaches) {
+            self.drop_stack_restore_activity(then_end_state);
+            if (else_reaches) {
+                self.emit_branch_compensation_drops(else_end_state, expr_id);
+            }
+            then_end_state = self.drop_stack_snapshot();
+            self.terminate_current_goto(join_block);
+        }
+
+        self.set_current_block(else_cont_block);
+        if (else_reaches) {
+            self.drop_stack_restore_activity(else_end_state);
+            if (then_reaches) {
+                self.emit_branch_compensation_drops(then_end_state, expr_id);
+            }
+            else_end_state = self.drop_stack_snapshot();
+            self.terminate_current_goto(join_block);
+        }
+
+        self.set_current_block(join_block);
+        self.drop_stack_head = branch_drop_mark;
+        self.defer_stack_head = branch_defer_mark;
+        self.storage_stack_head = branch_storage_mark;
+        self.merge_branch_join_drop_state(then_end_state, then_reaches,
+                                          else_end_state, else_reaches,
+                                          branch_drop_state);
+        return self.add_read_value(result_place, expr_id);
+    }
+
+    public fn lower_stmt_chain_into_place(self, first_stmt_id: i32, result_place: i32, source_expr_id: i32) {
+        var cur = first_stmt_id;
+        while (cur != hir_id_invalid() && !self.current_block_terminated()) {
+            let next = self.h.stmt_next(cur);
+            if (next == hir_id_invalid() && self.h.stmt_kind(cur) == hir_stmt_expr()) {
+                let expr_id = self.h.stmt_expr(cur);
+                let value_id = self.lower_expr_as(expr_id, self.unit.place_type(result_place));
+                self.emit_assign(result_place, value_id, cur, expr_id);
+                self.deactivate_moved_source_expr_except(expr_id, hir_id_invalid());
+                return;
+            }
+            self.lower_stmt(cur);
+            cur = next;
+        }
+    }
+
+    public fn lower_stmt_into_place(self, stmt_id: i32, result_place: i32, source_expr_id: i32) {
+        if (stmt_id == hir_id_invalid() || result_place == mir_id_invalid() || self.current_block_terminated()) { return; }
+        let k = self.h.stmt_kind(stmt_id);
+        if (k == hir_stmt_expr()) {
+            let expr_id = self.h.stmt_expr(stmt_id);
+            let value_id = self.lower_expr_as(expr_id, self.unit.place_type(result_place));
+            self.emit_assign(result_place, value_id, stmt_id, expr_id);
+            self.deactivate_moved_source_expr_except(expr_id, hir_id_invalid());
+            return;
+        }
+        if (k == hir_stmt_block()) {
+            let saved_drop_stack = self.drop_stack_head;
+            let saved_defer_stack = self.defer_stack_head;
+            let saved_storage_stack = self.storage_stack_head;
+            self.lower_stmt_chain_into_place(self.h.stmt_child(stmt_id), result_place, source_expr_id);
+            if (!self.current_block_terminated()) {
+                self.emit_scope_exit_until(saved_defer_stack,
+                                           saved_drop_stack,
+                                           saved_storage_stack,
+                                           stmt_id);
+            } else {
+                self.drop_stack_head = saved_drop_stack;
+                self.defer_stack_head = saved_defer_stack;
+                self.storage_stack_head = saved_storage_stack;
+            }
+            return;
+        }
+        self.lower_stmt(stmt_id);
+    }
+
+    public fn lower_short_circuit_binary_expr(self, expr_id: i32, type_id: i32) -> i32 {
+        let op = self.h.expr_op(expr_id);
+        if (op != tk_AND() && op != tk_OR()) { return mir_id_invalid(); }
+        var result_type = type_id;
+        if (result_type == hir_id_invalid() || self.type_text(result_type).len == 0) {
+            result_type = self.bool_type_id();
+        }
+        let result_place = self.add_temp_place(result_type, expr_id, "logic");
+        let lhs_value = self.lower_expr(self.h.expr_lhs(expr_id));
+        if (lhs_value == mir_id_invalid() || self.current_block_terminated()) { return mir_id_invalid(); }
+        let rhs_block = self.add_block(self.h.expr_rhs(expr_id));
+        let short_block = self.add_block(hir_id_invalid());
+        let join_block = self.add_block(hir_id_invalid());
+        if (op == tk_AND()) {
+            self.terminate_current(mir_term_branch(),
+                                   lhs_value,
+                                   rhs_block,
+                                   short_block,
+                                   mir_id_invalid(),
+                                   expr_id);
+        } else {
+            self.terminate_current(mir_term_branch(),
+                                   lhs_value,
+                                   short_block,
+                                   rhs_block,
+                                   mir_id_invalid(),
+                                   expr_id);
+        }
+
+        self.set_current_block(rhs_block);
+        let rhs_value = self.lower_expr_as(self.h.expr_rhs(expr_id), result_type);
+        self.emit_assign(result_place, rhs_value, hir_id_invalid(), self.h.expr_rhs(expr_id));
+        if (!self.current_block_terminated()) {
+            self.terminate_current_goto(join_block);
+        }
+
+        self.set_current_block(short_block);
+        let short_value = self.add_const_bool_value(op == tk_OR(), expr_id);
+        self.emit_assign(result_place, short_value, hir_id_invalid(), expr_id);
+        if (!self.current_block_terminated()) {
+            self.terminate_current_goto(join_block);
+        }
+
+        self.set_current_block(join_block);
+        return self.add_read_value(result_place, expr_id);
+    }
+}

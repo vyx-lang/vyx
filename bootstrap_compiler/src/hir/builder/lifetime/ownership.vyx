@@ -1,0 +1,392 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Ownership for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn type_text_has_instance_drop(self, type_text: string) -> bool {
+        return self.raw_drop_decl_for_type_text(type_text) != null;
+    }
+
+    fn type_text_has_instance_dup(self, type_text: string) -> bool {
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) { return false; }
+        var member = decl_get_members(cd);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && decl_get_name(member) == "dup"
+                && !decl_get_is_static(member)) {
+                return true;
+            }
+            if (decl_get_kind(member) == de_METHOD()
+                && decl_get_name(member) == "destroy"
+                && !decl_get_is_static(member)) {
+                return true;
+            }
+            member = decl_get_next(member);
+        }
+        return false;
+    }
+
+    fn type_text_requires_dci_stub_drop(self, type_text: string) -> bool {
+        if (type_text.len == 0) { return false; }
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) { return false; }
+        return self.class_decl_requires_dci_stub(cd, 0);
+    }
+
+    fn type_text_is_ref_lang_item(self, type_text: string) -> bool {
+        let cd = self.raw_class_decl_for_type_text(type_text);
+        if (cd == null) { return false; }
+        if (hir_builder_decl_has_attr(cd, "lang_item(\"ref\")")) { return true; }
+        return hir_builder_type_base_name(type_text) == "Ref";
+    }
+
+    fn type_text_is_string_like(self, type_text: string) -> bool {
+        let base = hir_builder_type_base_name(type_text);
+        return hir_builder_is_primitive_str_name(base);
+    }
+
+    // `str` owns its buffer when its ABI ownership tag says so.  Unlike class
+    // values, its destructor is the language-level free function `str_drop`.
+    // Keep this lookup exact: unrelated same-named methods/functions are not
+    // a primitive-string lifecycle contract.
+    fn primitive_str_drop_function(self) -> i32 {
+        var fn_id: i32 = 1;
+        while (fn_id <= self.unit.function_count) {
+            if (self.unit.function_record(fn_id) != null
+                && self.unit.function_name(fn_id) == "str_drop"
+                && self.unit.function_owner_type(fn_id).len == 0
+                && hir_type_table_kind(self.unit.types, self.unit.function_return_type(fn_id)) == ty_VOID()) {
+                let param = self.unit.function_first_local(fn_id);
+                if (param != hir_id_invalid()
+                    && hir_type_table_kind(self.unit.types, self.unit.local_type(param)) == ty_STRING()
+                    && self.unit.local_next(param) == hir_id_invalid()) {
+                    // This lookup runs while lazy generic bodies are being
+                    // materialized. It establishes only the lifecycle
+                    // contract; recursively materializing str_drop here can
+                    // mutate the same HIR tables and invalidates the active
+                    // builder state. The normal call/drop reachability path
+                    // schedules its body after this local is recorded.
+                    return fn_id;
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    fn callable_consumes_primitive_str(self, callable: rawptr, param: rawptr, type_id: i32) -> bool {
+        if (callable == null || param == null || type_id == hir_id_invalid()) { return false; }
+        if (decl_get_name(callable) != "str_drop") { return false; }
+        if (decl_get_params(callable) != param || decl_get_next(param) != null) { return false; }
+        return hir_type_table_kind(self.unit.types, type_id) == ty_STRING();
+    }
+
+    // A local can carry a lexical `str_drop` only when its initializer is a
+    // distinct result or a tag-safe literal/interpolation value. Parameters,
+    // fields, indexing and arbitrary calls may be aliases of an owner outside
+    // this scope, so they are not positive evidence for automatic destruction.
+    fn type_text_should_transfer_by_value(self, type_text: string) -> bool {
+        if (type_text.len == 0 || self.type_text_is_string_like(type_text)) { return false; }
+        return self.type_text_has_instance_drop(type_text);
+    }
+
+    fn method_decl_structurally_borrows_args(self, d: rawptr) -> bool {
+        if (d == null || decl_get_kind(d) != de_METHOD()) { return false; }
+        if (decl_get_name(d) != "of") { return false; }
+        let ret_text = self.type_text_from_ref_env(decl_get_ty(d),
+                                                   self.current_generic_params,
+                                                   self.current_generic_args);
+        let first_param = decl_get_params(d);
+        if (first_param == null) { return false; }
+        let first_text = self.type_text_from_ref_env(decl_get_ty(first_param),
+                                                     self.current_generic_params,
+                                                     self.current_generic_args);
+        let ret_base = hir_builder_type_base_name(ret_text);
+        let first_base = hir_builder_type_base_name(first_text);
+        if (ret_base.len == 0 || first_base.len == 0 || first_base == ret_base) { return false; }
+        return first_base == "Ref" || first_base == "Scope";
+    }
+
+    fn callable_borrows_args(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        let cached = hir_raw_int_map_get(self.callable_borrow_cache,d);
+        if (cached == 1) { return false; }
+        if (cached == 2) { return true; }
+        let out = hir_builder_decl_has_attr(d, "borrow_args")
+            || self.method_decl_readonly_contract_borrows_args(d)
+            || self.method_decl_structurally_borrows_args(d);
+        if (out) {
+            self.callable_borrow_cache = hir_raw_int_map_put(self.callable_borrow_cache,d, 2);
+        } else {
+            self.callable_borrow_cache = hir_raw_int_map_put(self.callable_borrow_cache,d, 1);
+        }
+        return out;
+    }
+
+    fn method_decl_readonly_contract_borrows_args(self, d: rawptr) -> bool {
+        if (d == null || decl_get_kind(d) != de_METHOD()) { return false; }
+        let name = decl_get_name(d);
+        return name == "operator_eq" || name == "operator==" || name == "compare" || name == "hash";
+    }
+
+    fn expr_is_to_rawptr_addr_of_ident(self, e: rawptr, name: string) -> bool {
+        if (e == null || name.len == 0 || expr_get_kind(e) != ex_CALL()) { return false; }
+        let callee = expr_get_lhs(e);
+        if (callee == null || expr_get_kind(callee) != ex_IDENT()) { return false; }
+        if (policy_generic_call_base_equals(expr_get_name(callee), "to_rawptr") == 0) { return false; }
+        let args = expr_get_args(e);
+        if (args == null) { return false; }
+        let arg = stmt_get_init(args);
+        if (arg == null || expr_get_kind(arg) != ex_ADDR_OF()) { return false; }
+        let inner = expr_get_lhs(arg);
+        if (inner == null || expr_get_kind(inner) != ex_IDENT()) { return false; }
+        return expr_get_name(inner) == name;
+    }
+
+    fn expr_moves_param_to_raw_storage(self, e: rawptr, name: string) -> bool {
+        if (e == null || name.len == 0) { return false; }
+        let k = expr_get_kind(e);
+        if (k == ex_CLOSURE()) {
+            return self.stmt_moves_param_to_raw_storage(expr_get_lhs(e), name);
+        }
+        if (k == ex_CALL()) {
+            let callee = expr_get_lhs(e);
+            if (callee != null && expr_get_kind(callee) == ex_IDENT()) {
+                let cname = policy_generic_call_base(expr_get_name(callee));
+                if (cname == "memcpy" || cname == "memmove") {
+                    let src_e = hir_builder_arg_expr_at(expr_get_args(e), 1);
+                    if (self.expr_is_to_rawptr_addr_of_ident(src_e, name)) { return true; }
+                }
+            }
+            var arg = expr_get_args(e);
+            while (arg != null) {
+                if (self.expr_moves_param_to_raw_storage(stmt_get_init(arg), name)) { return true; }
+                arg = stmt_get_next(arg);
+            }
+        }
+        if (self.expr_moves_param_to_raw_storage(expr_get_lhs(e), name)) { return true; }
+        if (self.expr_moves_param_to_raw_storage(expr_get_rhs(e), name)) { return true; }
+        return false;
+    }
+
+    fn stmt_moves_param_to_raw_storage(self, s: rawptr, name: string) -> bool {
+        if (s == null || name.len == 0) { return false; }
+        let k = stmt_get_kind(s);
+        if (self.expr_moves_param_to_raw_storage(stmt_get_init(s), name)) { return true; }
+        if (self.expr_moves_param_to_raw_storage(stmt_get_cond(s), name)) { return true; }
+        if (k == st_BLOCK()) {
+            var cur = stmt_get_body(s);
+            while (cur != null) {
+                if (self.stmt_moves_param_to_raw_storage(cur, name)) { return true; }
+                cur = stmt_get_next(cur);
+            }
+        }
+        if (k == st_IF()) {
+            if (self.stmt_moves_param_to_raw_storage(stmt_get_then_blk(s), name)) { return true; }
+            if (self.stmt_moves_param_to_raw_storage(stmt_get_else_blk(s), name)) { return true; }
+        }
+        if (k == st_WHILE() || k == st_FOR() || k == st_FOREACH()) {
+            if (self.stmt_moves_param_to_raw_storage(stmt_get_body(s), name)) { return true; }
+        }
+        return false;
+    }
+
+    fn param_moves_to_raw_storage(self, callable: rawptr, name: string) -> bool {
+        if (callable == null || name.len == 0) { return false; }
+        let cached = hir_decl_instance_map_item(self.param_raw_move_cache,callable, name);
+        if (cached == 1) { return false; }
+        if (cached == 2) { return true; }
+        let out = self.stmt_moves_param_to_raw_storage(decl_get_body(callable), name);
+        if (out) {
+            self.param_raw_move_cache = hir_decl_instance_map_put(self.param_raw_move_cache,callable, name, 2, hir_id_invalid());
+        } else {
+            self.param_raw_move_cache = hir_decl_instance_map_put(self.param_raw_move_cache,callable, name, 1, hir_id_invalid());
+        }
+        return out;
+    }
+
+    fn local_type_id_should_auto_drop(self, type_id: i32) -> bool {
+        if (type_id == hir_id_invalid()) { return false; }
+        let text = hir_type_table_text(self.unit.types, type_id);
+        if (self.type_text_has_instance_drop(text)) { return true; }
+        return self.type_text_requires_dci_stub_drop(text);
+    }
+
+    fn param_type_id_should_move_arg(self, callable: rawptr, param: rawptr, type_id: i32) -> bool {
+        if (param == null || type_id == hir_id_invalid()) { return false; }
+        if (decl_get_name(param) == "self") {
+            if (!hir_builder_self_receiver_is_owning(param)) { return false; }
+            let markers = decl_get_generic_params(param);
+            if (hir_builder_string_contains(markers, "|receiver:own_mut")) {
+                let text = hir_type_table_text(self.unit.types, type_id);
+                if (self.type_text_has_instance_dup(text)) { return false; }
+            }
+            return true;
+        }
+        if (self.callable_consumes_primitive_str(callable, param, type_id)) { return true; }
+        if (self.callable_borrows_args(callable)) { return false; }
+        if (self.param_moves_to_raw_storage(callable, decl_get_name(param))) { return true; }
+        let text = hir_type_table_text(self.unit.types, type_id);
+        if (self.type_text_is_ref_lang_item(text)) { return true; }
+        return self.type_text_should_transfer_by_value(text);
+    }
+
+    fn param_type_id_should_auto_drop(self, callable: rawptr, param: rawptr, type_id: i32) -> bool {
+        if (param == null || type_id == hir_id_invalid()) { return false; }
+        if (decl_get_name(param) == "self") {
+            return self.param_type_id_should_move_arg(callable, param, type_id)
+                && self.local_type_id_should_auto_drop(type_id);
+        }
+        if (self.callable_borrows_args(callable)) { return false; }
+        if (self.param_moves_to_raw_storage(callable, decl_get_name(param))) { return false; }
+        let text = hir_type_table_text(self.unit.types, type_id);
+        if (self.type_text_is_ref_lang_item(text)) { return true; }
+        return false;
+    }
+
+    fn init_expr_returns_borrowed_container_element(self, init_e: rawptr) -> bool {
+        if (init_e == null || expr_get_kind(init_e) != ex_CALL()) { return false; }
+        let callee = expr_get_lhs(init_e);
+        if (callee == null || expr_get_kind(callee) != ex_MEMBER()) { return false; }
+        let method_name = policy_generic_call_base(expr_get_name(callee));
+        let receiver = expr_get_lhs(callee);
+        if (receiver == null) { return false; }
+        let receiver_type_id = self.type_id_from_ref(expr_get_ty(receiver));
+        if (receiver_type_id == hir_id_invalid()) { return false; }
+        let base = hir_builder_type_base_name(hir_type_table_text(self.unit.types, receiver_type_id));
+        if (base == "Vec") {
+            return method_name == "get"
+                || method_name == "get_unchecked"
+                || method_name == "first"
+                || method_name == "last";
+        }
+        if (base == "Dict"
+            || base == "UnorderedMap"
+            || base == "HashMap"
+            || base == "StringMap"
+            || base == "ConcurrentDict") {
+            return method_name == "get" || method_name == "try_get";
+        }
+        return false;
+    }
+
+    fn local_stmt_is_raw_copy_view(self, s: rawptr, name: string) -> bool {
+        if (s == null || name.len == 0) { return false; }
+        // Ref::drop and Box::drop materialise an owning T with memcpy before
+        // releasing the outer allocation. That local is an ownership transfer,
+        // not a view: it must retain ordinary drop glue after monomorphisation.
+        if (self.current_function_id != hir_id_invalid()
+            && (self.function_candidate_matches_method_name(self.current_function_id, "drop")
+                || self.function_candidate_matches_method_name(self.current_function_id, "set"))
+            && (hir_builder_type_base_name(hir_unit_function_owner_type(self.unit,
+                                                                         self.current_function_id)) == "Box"
+                || hir_builder_type_base_name(hir_unit_function_owner_type(self.unit,
+                                                                            self.current_function_id)) == "Ref")) {
+            return false;
+        }
+        if (stmt_get_init(s) != null) { return false; }
+        let next_stmt = stmt_get_next(s);
+        if (next_stmt == null || stmt_get_kind(next_stmt) != st_EXPR()) { return false; }
+        let e = stmt_get_init(next_stmt);
+        if (e == null || expr_get_kind(e) != ex_CALL()) { return false; }
+        let callee = expr_get_lhs(e);
+        if (callee == null || expr_get_kind(callee) != ex_IDENT()) { return false; }
+        let cname = policy_generic_call_base(expr_get_name(callee));
+        if (cname != "memcpy" && cname != "memmove") { return false; }
+        let dst_e = hir_builder_arg_expr_at(expr_get_args(e), 0);
+        return self.expr_is_to_rawptr_addr_of_ident(dst_e, name);
+    }
+
+    fn set_local_drop_for_type(self, local_id: i32, type_id: i32) {
+        if (local_id == hir_id_invalid() || type_id == hir_id_invalid()) { return; }
+        if (hir_type_table_kind(self.unit.types, type_id) == ty_STRING()) {
+            let drop_fn = self.primitive_str_drop_function();
+            if (drop_fn != hir_id_invalid()) {
+                self.unit.set_local_drop_function(local_id, drop_fn);
+            }
+            return;
+        }
+        let type_text = hir_type_table_text(self.unit.types, type_id);
+        if (self.type_text_requires_dci_stub_drop(type_text)) { return; }
+        let drop_fn = self.ensure_drop_instance_for_type_text(type_text);
+        if (drop_fn != hir_id_invalid()) {
+            self.unit.set_local_drop_function(local_id, drop_fn);
+        }
+    }
+
+    fn mark_param_local_drop_if_needed(self, callable: rawptr, param: rawptr, local_id: i32) {
+        if (callable == null || param == null || local_id == hir_id_invalid()) { return; }
+        let flags = self.unit.local_flags(local_id);
+        if ((flags & hir_local_flag_param()) == 0) { return; }
+        let type_id = self.unit.local_type(local_id);
+        var next_flags = flags;
+        if (self.param_type_id_should_move_arg(callable, param, type_id)) {
+            next_flags = next_flags | hir_local_flag_move_arg();
+        }
+        if (self.param_type_id_should_auto_drop(callable, param, type_id)) {
+            next_flags = next_flags | hir_local_flag_auto_drop();
+            self.set_local_drop_for_type(local_id, type_id);
+        }
+        if (next_flags != flags) {
+            self.unit.set_local_flags(local_id, next_flags);
+        }
+    }
+
+    fn refresh_function_param_drop_metadata(self, fn_id: i32, d: rawptr) {
+        if (fn_id == hir_id_invalid() || d == null) { return; }
+        var param = decl_get_params(d);
+        var local_id = self.unit.function_first_local(fn_id);
+        if (local_id != hir_id_invalid()
+            && self.local_is_constructor_abi_self(fn_id, local_id)
+            && (param == null || decl_get_name(param) != "self")) {
+            local_id = self.unit.local_next(local_id);
+        }
+        while (param != null && local_id != hir_id_invalid()) {
+            if (hir_builder_variadic_param(param)) {
+                let pack_name = hir_builder_param_pack_type_name(param);
+                let pack_count = self.current_pack_count(pack_name);
+                var i: i32 = 0;
+                while (i < pack_count && local_id != hir_id_invalid()) {
+                    self.mark_param_local_drop_if_needed(d, param, local_id);
+                    local_id = self.unit.local_next(local_id);
+                    i = i + 1;
+                }
+                param = decl_get_next(param);
+            } else {
+                self.mark_param_local_drop_if_needed(d, param, local_id);
+                local_id = self.unit.local_next(local_id);
+                param = decl_get_next(param);
+            }
+        }
+    }
+
+    fn refresh_param_drop_metadata_for_decl_chain(self, head: rawptr, owner_template: bool) {
+        var cur = head;
+        while (cur != null) {
+            let k = decl_get_kind(cur);
+            if (k == de_FN() || k == de_METHOD() || k == de_EXTERN_FN()) {
+                if (!owner_template && !hir_builder_decl_template_head(cur)) {
+                    self.refresh_function_param_drop_metadata(hir_pointer_map_function(self.decl_map,cur), cur);
+                }
+            } else if (k == de_CLASS() || k == de_ENUM()) {
+                let templ = owner_template
+                    || hir_builder_decl_template_head(cur)
+                    || self.decl_members_have_template_type(cur);
+                self.refresh_param_drop_metadata_for_decl_chain(decl_get_members(cur), templ);
+            }
+            cur = decl_get_next(cur);
+        }
+    }
+}

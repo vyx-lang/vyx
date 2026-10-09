@@ -1,0 +1,151 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Patterns for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn variant_decl_for_type_id_and_name(self, type_id: i32, variant_name: string) -> rawptr {
+        if (!self.type_id_is_valid(type_id) || variant_name.len == 0) { return null; }
+        let owner_text = hir_type_table_text(self.unit.types, type_id);
+        if (owner_text.len == 0 || self.type_text_has_open_template_atom(owner_text)) { return null; }
+        let member = self.raw_member_decl_for_type_text(owner_text, policy_generic_call_base(variant_name.clone()));
+        if (member == null || decl_get_kind(member) != de_VARIANT()) { return null; }
+        return member;
+    }
+
+    fn owner_template_params_for_type_text(self, owner_decl: rawptr, owner_type_name: string) -> string {
+        var owner_params = hir_builder_decl_template_params(owner_decl);
+        let owner_args = policy_generic_call_args(owner_type_name.clone());
+        if (owner_params.len == 0 && owner_args.len > 0) {
+            let template_owner = self.raw_template_class_decl_for_type_text(owner_type_name);
+            if (template_owner != null) {
+                let template_params = hir_builder_decl_template_params(template_owner);
+                if (template_params.len > 0
+                    && hir_builder_generic_param_count(template_params) == hir_builder_generic_arg_count(owner_args)) {
+                    owner_params = template_params;
+                }
+            }
+        }
+        return owner_params;
+    }
+
+    fn owner_template_args_for_type_text(self, owner_params: string, owner_type_name: string) -> string {
+        var owner_args = hir_builder_owner_args_for_params(owner_params, owner_type_name);
+        if (owner_args.len == 0 && owner_params.len > 0) {
+            let type_args = policy_generic_call_args(owner_type_name.clone());
+            if (type_args.len > 0
+                && hir_builder_generic_arg_count(type_args) == hir_builder_generic_param_count(owner_params)) {
+                owner_args = type_args;
+            }
+        }
+        return owner_args;
+    }
+
+    fn variant_param_type_id_for_owner(self,
+                                             owner_type_id: i32,
+                                             variant_decl: rawptr,
+                                             arg_index: i32) -> i32 {
+        if (!self.type_id_is_valid(owner_type_id) || variant_decl == null || arg_index < 0) {
+            return hir_id_invalid();
+        }
+        let owner_text = hir_type_table_text(self.unit.types, owner_type_id);
+        if (owner_text.len == 0) { return hir_id_invalid(); }
+        let owner_decl = self.raw_class_decl_for_type_text(owner_text);
+        if (owner_decl == null) { return hir_id_invalid(); }
+        let owner_params = self.owner_template_params_for_type_text(owner_decl, owner_text);
+        let owner_args = self.owner_template_args_for_type_text(owner_params, owner_text);
+        var param = decl_get_params(variant_decl);
+        var index: i32 = 0;
+        while (param != null) {
+            if (index == arg_index) {
+                return self.type_id_from_ref_env(decl_get_ty(param), owner_params, owner_args);
+            }
+            index = index + 1;
+            param = decl_get_next(param);
+        }
+        return hir_id_invalid();
+    }
+
+    fn push_pattern_binds_for_type(self, pat: rawptr, scrutinee_type_id: i32) {
+        if (pat == null) { return; }
+        if (expr_get_kind(pat) == ex_IDENT()) {
+            let name = expr_get_name(pat);
+            if (name != "_" && self.variant_decl_for_type_id_and_name(scrutinee_type_id, name) == null) {
+                var bind_type = scrutinee_type_id;
+                if (bind_type == hir_id_invalid()) { bind_type = self.type_id_from_expr(pat); }
+                let local_id = self.unit.add_local(self.current_function_id, name, bind_type, 0);
+                self.locals = hir_local_scope_push(self.locals,
+                                     name,
+                                     local_id,
+                                     bind_type,
+                                     self.current_function_id,
+                                     expr_get_semantic_target(pat));
+            }
+            return;
+        }
+        if (expr_get_kind(pat) != ex_CALL()) {
+            self.push_pattern_binds(pat);
+            return;
+        }
+        let callee = expr_get_lhs(pat);
+        var variant_decl: rawptr = null;
+        if (callee != null) {
+            variant_decl = self.variant_decl_for_type_id_and_name(scrutinee_type_id, expr_get_name(callee));
+        }
+        var ac = expr_get_args(pat);
+        var arg_index: i32 = 0;
+        while (ac != null) {
+            let arg = stmt_get_init(ac);
+            if (arg != null && expr_get_kind(arg) == ex_IDENT()) {
+                let name = expr_get_name(arg);
+                if (name != "_") {
+                    var type_id = self.variant_param_type_id_for_owner(scrutinee_type_id, variant_decl, arg_index);
+                    if (type_id == hir_id_invalid()) { type_id = self.type_id_from_expr(arg); }
+                    let local_id = self.unit.add_local(self.current_function_id, name, type_id, 0);
+                    self.locals = hir_local_scope_push(self.locals,
+                                         name,
+                                         local_id,
+                                         type_id,
+                                         self.current_function_id,
+                                         expr_get_semantic_target(arg));
+                }
+            }
+            arg_index = arg_index + 1;
+            ac = stmt_get_next(ac);
+        }
+    }
+
+    fn push_pattern_binds(self, pat: rawptr) {
+        if (pat == null) { return; }
+        if (expr_get_kind(pat) == ex_CALL()) {
+            var ac = expr_get_args(pat);
+            while (ac != null) {
+                let arg = stmt_get_init(ac);
+                if (arg != null && expr_get_kind(arg) == ex_IDENT()) {
+                    let name = expr_get_name(arg);
+                    if (name != "_") {
+                        let type_id = self.type_id_from_expr(arg);
+                        let local_id = self.unit.add_local(self.current_function_id, name, type_id, 0);
+                        self.locals = hir_local_scope_push(self.locals,
+                                             name,
+                                             local_id,
+                                             type_id,
+                                             self.current_function_id,
+                                             expr_get_semantic_target(arg));
+                    }
+                }
+                ac = stmt_get_next(ac);
+            }
+        }
+    }
+}

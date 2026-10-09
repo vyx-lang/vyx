@@ -923,8 +923,8 @@ Active 协议库分别记录实体、请求和产物包身份，产物包支持�
 | 产物身份与发布 | [artifact_bundle.py](../tools/dci/artifact_bundle.py)、[产物包测试](../tools/dci/tests/test_artifact_bundle.py) |
 | 生产端实例化 | [C++ 测试](../tools/dci/tests/test_active_cpp.py)、[Rust 测试](../tools/dci/tests/test_active_rust.py)、[开放泛型项目](../tests/projects/dci_opengeneric/README.md) |
 | 消费方驱动的实例闭合 | [dci_close_instances.py](../tools/dci/dci_close_instances.py)、[开放泛型项目门](../tests/projects/dci_opengeneric/run_vyx.sh) |
-| 生命周期与 wrapper | [HIR binder](../bootstrap_compiler/src/hir/dci_binder.vyx)、[LLVM Consumer](../bootstrap_compiler/src/codegen/llvm_lower.vyx)、[Consumer 测试](../tools/dci/tests/test_dci_consumer.py) |
-| 存储与异常清理 | [llvm_lifetime.vyx](../bootstrap_compiler/src/codegen/llvm_lifetime.vyx)、[llvm_unwind.vyx](../bootstrap_compiler/src/codegen/llvm_unwind.vyx)、[存储回归](../probes/gates/dci-storage/README.md)、[异常门](../probes/gates/dci-exceptions/README.md) |
+| 生命周期与 wrapper | [HIR binder](../bootstrap_compiler/src/hir/resolve/dci_binder.vyx)、[LLVM Consumer](../bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx)、[Consumer 测试](../tools/dci/tests/test_dci_consumer.py) |
+| 存储与异常清理 | [llvm_lifetime.vyx](../bootstrap_compiler/src/codegen/llvm/lifetime/llvm_lifetime.vyx)、[llvm_unwind.vyx](../bootstrap_compiler/src/codegen/llvm/lifetime/llvm_unwind.vyx)、[存储回归](../probes/gates/dci-storage/README.md)、[异常门](../probes/gates/dci-exceptions/README.md) |
 | 生态与重复压测 | [C++ ICU](../probes/gates/dci-cpp-ecosystem/README.md)、[Rust Cargo](../probes/gates/dci-rust-ecosystem/README.md)、[DCI 工业压测编排](../probes/gates/dci-industrial/README.md) |
 
 契约验证、生产端事实复核和编译链接运行分别检查不同问题。

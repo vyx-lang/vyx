@@ -1,0 +1,767 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn profile_phase(self, label: string) {
+        if (vyx_bootstrap_profile_level() <= 0) { return; }
+        print("[llvm-mir] " + label
+              + " funcs=" + policy_i64_to_string(self.m.function_count as i64)
+              + " blocks=" + policy_i64_to_string(self.m.block_count as i64)
+              + " values=" + policy_i64_to_string(self.m.value_count as i64)
+              + " instrs=" + policy_i64_to_string(self.m.instr_count as i64)
+              + " str_active_mb=" + self.memory_mb_text(vyx_rt_string_arena_active_bytes())
+              + " str_reserved_mb=" + self.memory_mb_text(vyx_rt_string_arena_reserved_bytes())
+              + " astdup_mb=" + self.memory_mb_text(vyx_rt_ast_dup_bytes_total())
+              + " astnode_mb=" + self.memory_mb_text(vyx_rt_ast_node_bytes_total())
+              + " private_mb=" + self.memory_mb_text(vyx_rt_process_private_bytes())
+              + " working_mb=" + self.memory_mb_text(vyx_rt_process_working_set_bytes())
+              + " peak_private_mb=" + self.memory_mb_text(vyx_rt_process_peak_private_bytes())
+              + " peak_working_mb=" + self.memory_mb_text(vyx_rt_process_peak_working_set_bytes())
+              + " errors=" + policy_i64_to_string(self.error_count as i64));
+    }
+
+    public fn clear_streaming_body_caches(self,
+                                          block_mark: i32,
+                                          local_mark: i32,
+                                          place_mark: i32,
+                                          value_mark: i32,
+                                          instr_mark: i32,
+                                          case_mark: i32) {
+        llvm_mir_map_clear_range(self.block_values, block_mark + 1, self.m.block_count);
+        llvm_mir_map_clear_range(self.local_slots, local_mark + 1, self.m.local_count);
+        llvm_mir_i32_map_clear_range(self.local_lifetime_marker_candidates,
+                                     local_mark + 1,
+                                     self.m.local_count);
+        llvm_mir_i32_map_clear_range(self.local_lifetime_marker_live_orders,
+                                     local_mark + 1,
+                                     self.m.local_count);
+        llvm_mir_i32_map_clear_range(self.local_lifetime_marker_dead_orders,
+                                     local_mark + 1,
+                                     self.m.local_count);
+        llvm_mir_i32_map_clear_range(self.local_slot_reuse_candidates,
+                                     local_mark + 1,
+                                     self.m.local_count);
+        llvm_mir_i32_map_clear_range(self.local_slot_reuse_sources,
+                                     local_mark + 1,
+                                     self.m.local_count);
+        llvm_mir_map_clear_range(self.foreach_iterator_slots, value_mark + 1, self.m.value_count);
+        llvm_mir_map_clear_range(self.value_cache, value_mark + 1, self.m.value_count);
+        llvm_mir_i32_map_clear_range(self.direct_call_callee_value_map, value_mark + 1, self.m.value_count);
+    }
+
+    public fn discard_streaming_function_body(self,
+                                               builder: &mut MirUnitBuilder,
+                                               function_id: i32,
+                                               block_mark: i32,
+                                               local_mark: i32,
+                                               place_mark: i32,
+                                               value_mark: i32,
+                                               instr_mark: i32,
+                                               case_mark: i32) {
+        self.clear_streaming_body_caches(block_mark,
+                                         local_mark,
+                                         place_mark,
+                                         value_mark,
+                                         instr_mark,
+                                         case_mark);
+        mir_unit_discard_recent_body_records(&mut builder.unit,
+                                             function_id,
+                                             block_mark,
+                                             local_mark,
+                                             place_mark,
+                                             value_mark,
+                                             instr_mark,
+                                             case_mark);
+        self.m = builder.unit;
+    }
+
+    public fn scan_adapter_uses_for_value_range(self, first_value: i32, last_value: i32) {
+        if (last_value < first_value) {
+            self.adapter_need_cache_ready = true;
+            return;
+        }
+        llvm_mir_i32_map_clear_range(self.direct_call_callee_value_map, first_value, last_value);
+        var value_id = first_value;
+        while (value_id <= last_value) {
+            if (self.m.value_kind(value_id) == mir_value_call()) {
+                let callee = self.m.value_lhs(value_id);
+                if (callee != mir_id_invalid()
+                    && self.m.value_target_kind(value_id) == mir_target_function()) {
+                    llvm_mir_i32_map_put(self.direct_call_callee_value_map, callee, 2);
+                }
+            }
+            value_id = value_id + 1;
+        }
+        value_id = first_value;
+        while (value_id <= last_value) {
+            let target_kind = self.m.value_target_kind(value_id);
+            let target_id = self.m.value_target_id(value_id);
+            if (target_kind == mir_target_function() && target_id != mir_id_invalid()) {
+                if (self.type_is_fn_abi_destination(self.m.value_type(value_id))
+                    && llvm_mir_i32_map_get(self.direct_call_callee_value_map, value_id) != 2) {
+                    llvm_mir_i32_map_put(self.function_value_adapter_need_map, target_id, 2);
+                }
+            }
+            if (self.m.value_kind(value_id) == mir_value_cast()
+                && self.type_is_raw_callback_scalar_target(self.m.value_type(value_id))) {
+                let lhs = self.m.value_lhs(value_id);
+                if (lhs != mir_id_invalid()
+                    && self.m.value_kind(lhs) == mir_value_target_ref()
+                    && self.m.value_target_kind(lhs) == mir_target_function()) {
+                    llvm_mir_i32_map_put(self.raw_callback_adapter_use_map,
+                                         self.m.value_target_id(lhs),
+                                         2);
+                }
+            }
+            value_id = value_id + 1;
+        }
+        self.adapter_need_cache_ready = true;
+    }
+
+    public fn declare_streaming_adapters_for_value_range(self, first_value: i32, last_value: i32) {
+        if (vyx_bootstrap_profile_level() > 1) {
+            print("[llvm-mir-stream] adapters-scan range="
+                  + policy_i64_to_string(first_value as i64)
+                  + ".."
+                  + policy_i64_to_string(last_value as i64));
+        }
+        self.scan_adapter_uses_for_value_range(first_value, last_value);
+        var value_id = first_value;
+        while (value_id <= last_value) {
+            let target_kind = self.m.value_target_kind(value_id);
+            let target_id = self.m.value_target_id(value_id);
+            if (target_kind == mir_target_function() && target_id != mir_id_invalid()) {
+                if (self.type_is_fn_abi_destination(self.m.value_type(value_id))
+                    && llvm_mir_i32_map_get(self.direct_call_callee_value_map, value_id) != 2) {
+                    if (vyx_bootstrap_profile_level() > 1) {
+                        print("[llvm-mir-stream] fn-adapter value="
+                              + policy_i64_to_string(value_id as i64)
+                              + " target="
+                              + policy_i64_to_string(target_id as i64)
+                              + " name="
+                              + self.m.function_name(target_id));
+                    }
+                    self.declare_function_value_adapter_for(target_id);
+                }
+            }
+            if (self.m.value_kind(value_id) == mir_value_cast()
+                && self.type_is_raw_callback_scalar_target(self.m.value_type(value_id))) {
+                let lhs = self.m.value_lhs(value_id);
+                if (lhs != mir_id_invalid()
+                    && self.m.value_kind(lhs) == mir_value_target_ref()
+                    && self.m.value_target_kind(lhs) == mir_target_function()) {
+                    if (vyx_bootstrap_profile_level() > 1) {
+                        print("[llvm-mir-stream] raw-adapter value="
+                              + policy_i64_to_string(value_id as i64)
+                              + " target="
+                              + policy_i64_to_string(self.m.value_target_id(lhs) as i64)
+                              + " name="
+                              + self.m.function_name(self.m.value_target_id(lhs)));
+                    }
+                    self.declare_raw_callback_adapter_for(self.m.value_target_id(lhs));
+                }
+            }
+            value_id = value_id + 1;
+        }
+        if (vyx_bootstrap_profile_level() > 1) {
+            print("[llvm-mir-stream] adapters-done");
+        }
+    }
+
+    public fn lower_streamed_function_from_builder(self, builder: &mut MirUnitBuilder, fn_id: i32) -> bool {
+        if (fn_id == mir_id_invalid()) { return false; }
+        if (builder.function_is_lowered(fn_id)) { return false; }
+        if (self.cgu_collect_only
+            && llvm_mir_i32_map_get(self.cgu_member_map, fn_id) != 0) {
+            builder.mark_function_lowered(fn_id);
+            return false;
+        }
+        if (self.cgu_emit_index > 0) {
+            let member = llvm_mir_i32_map_get(self.cgu_member_map, fn_id);
+            if (member != 0 && member != self.cgu_emit_index) {
+                self.declare_function_signature(fn_id);
+                builder.mark_function_lowered(fn_id);
+                return false;
+            }
+            if (member == 0) {
+                llvm_mir_i32_map_put(self.cgu_member_map, fn_id, self.cgu_emit_index);
+            }
+        }
+        if (builder.function_is_partition_external_root(fn_id)) {
+            builder.mark_function_lowered(fn_id);
+            return false;
+        }
+        if (builder.function_is_partition_declaration_only(fn_id)
+            && !self.function_name_is_language_lowering_root(builder.unit.function_name(fn_id))) {
+            builder.mark_function_lowered(fn_id);
+            return false;
+        }
+        let hir_fn = builder.unit.function_hir_id(fn_id);
+        if (hir_fn == hir_id_invalid()) {
+            builder.mark_function_lowered(fn_id);
+            return false;
+        }
+        // One slice record per invocation.  Materialisation recurses through
+        // the dependency drain, which re-enters this function, so a single
+        // reusable scratch record would be overwritten by the nested call
+        // before this call had finished reading its own marks.
+        let slot = mir_slice_alloc();
+        if (slot == null) { return false; }
+        // Bodies are retained as the collect walk descends, and every retention
+        // moves this counter.  Remember where it stood before this body was
+        // built: an enclosing body has to stay in the arena too, or releasing
+        // it would rewind the arena through the retained body inside it.
+        let retained_before = self.cgu_retain_count;
+        if (!self.slice_materialize(builder, slot, fn_id, hir_fn)) {
+            self.slice_release(builder, slot);
+            mir_slice_free(slot);
+            return false;
+        }
+        // Materialising a body appends to the MIR arena, and a growing arena may
+        // reallocate it.  `self.m` is a *by-value* copy of `builder.unit` whose
+        // fields are raw arena pointers, so every copy taken before the growth
+        // now dangles.  Refresh before anything reads through it again --
+        // otherwise the next `self.m` field access, and every `mir_unit_*`
+        // helper handed `&self.m`, reads freed memory (observed as a raw AV, or
+        // as a field type silently resolving to `i64`).
+        self.m = builder.unit;
+        let mir_pass_errors = self.slice_optimize(builder, slot);
+        // The MIR pass pipeline can append instructions too.
+        self.m = builder.unit;
+        if (mir_pass_errors > 0) {
+            self.error_count = self.error_count + mir_pass_errors;
+            self.slice_release(builder, slot);
+            mir_slice_free(slot);
+            return false;
+        }
+        if (self.cgu_collect_only) {
+            // This is the only walk that still has the body in the arena, so it
+            // is the only place that can see an async callee's full local list.
+            // The frozen local mark keeps the record to *this* build's
+            // temporaries, even if earlier rounds left locals in the chain.
+            self.async_ctx_record_temp_specs(fn_id,
+                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_LOCAL_MARK)));
+            let instr_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_INSTR_MARK));
+            let collected_slot = self.cgu_record_function(fn_id, self.m.instr_count - instr_mark);
+            if (self.cgu_must_retain_collected_body(builder, fn_id)
+                || self.cgu_must_retain_enclosing_body(retained_before)) {
+                // Leave the body in the arena: the emit walk will lower it from
+                // these marks instead of building it again.
+                if (!self.cgu_retain_record(collected_slot, fn_id, slot)) {
+                    // The marks could not be filed, so the emit walk cannot
+                    // reuse this body -- but it still must not be released,
+                    // because the rewind would destroy the retained body
+                    // inside it.  Leaving it in place only costs the region.
+                    mir_slice_free(slot);
+                    return true;
+                }
+            } else {
+                self.slice_release(builder, slot);
+            }
+            mir_slice_free(slot);
+            return true;
+        }
+        self.slice_lower(fn_id, slot);
+        let body_was_emitted = ast_read_i32(ptr_offset(slot, MIR_SLICE_EMITTED)) != 0;
+        if (ast_read_i32(ptr_offset(slot, MIR_SLICE_RETAINED)) != 0) {
+            // The body is one of the retained ones and may have other bodies
+            // sitting above it in the arena, so it cannot be released here.
+            // `cgu_release_retained_bodies` unwinds them all at the end, in
+            // reverse order.
+            self.cgu_retain_note_emitted(fn_id, body_was_emitted);
+        } else {
+            self.slice_release(builder, slot);
+            if (body_was_emitted) {
+                builder.unit.set_function_streamed_body_discarded(fn_id, true);
+                self.m = builder.unit;
+            }
+        }
+        // Every function is lowered exactly once (the drain only enqueues it
+        // once), so summing over all calls gives the per-phase cost of the
+        // whole pass without counting any function twice.  Nested calls along
+        // the dependency drain are other functions, not repeats of this one.
+        if (llvm_mir_slice_timing_enabled()) {
+            llvm_cgu_phases_note(ast_read_i64(ptr_offset(slot, MIR_SLICE_T_BODY)),
+                                 ast_read_i64(ptr_offset(slot, MIR_SLICE_T_OPTIMIZE)),
+                                 ast_read_i64(ptr_offset(slot, MIR_SLICE_T_DEPS)),
+                                 ast_read_i64(ptr_offset(slot, MIR_SLICE_T_LOWER)),
+                                 ast_read_i64(ptr_offset(slot, MIR_SLICE_T_DISCARD)));
+        }
+        if (llvm_mir_timing_enabled()) {
+            let now_discard = vyx_bootstrap_now_ms();
+            let timing_elapsed = now_discard - ast_read_i64(ptr_offset(slot, MIR_SLICE_T_TOTAL));
+            if (timing_elapsed >= llvm_mir_slow_fn_threshold_ms()) {
+                print("[mir-timing] fn #" + policy_i64_to_string(fn_id as i64)
+                      + " " + self.m.function_name(fn_id)
+                      + " total=" + timing_elapsed.toString() + " ms"
+                      + " body=" + ast_read_i64(ptr_offset(slot, MIR_SLICE_T_BODY)).toString()
+                      + " deps=" + ast_read_i64(ptr_offset(slot, MIR_SLICE_T_DEPS)).toString()
+                      + " adapters=" + ast_read_i64(ptr_offset(slot, MIR_SLICE_T_ADAPTERS)).toString()
+                      + " signature=" + ast_read_i64(ptr_offset(slot, MIR_SLICE_T_SIGNATURE)).toString()
+                      + " blocks=" + ast_read_i64(ptr_offset(slot, MIR_SLICE_T_BLOCKS)).toString()
+                      + " lower=" + ast_read_i64(ptr_offset(slot, MIR_SLICE_T_LOWER)).toString()
+                      + " discard=" + ast_read_i64(ptr_offset(slot, MIR_SLICE_T_DISCARD)).toString()
+                      + " values_delta=" + policy_i64_to_string((self.m.value_count - ast_read_i32(ptr_offset(slot, MIR_SLICE_VALUE_MARK))) as i64)
+                      + " instrs_delta=" + policy_i64_to_string((self.m.instr_count - ast_read_i32(ptr_offset(slot, MIR_SLICE_INSTR_MARK))) as i64));
+            }
+        }
+        mir_slice_free(slot);
+        return true;
+    }
+
+    // ── The four phases of one streamed function ─────────────────────────
+    //
+    // Materialise and optimise mutate the shared MIR arena -- and, through
+    // lazy HIR materialisation, the shared HIR id allocator -- so they stay
+    // serial.  Lowering only reads the arena and writes this lowerer's module,
+    // which owns its own LLVMContext (`vyx_rt_module_new`), so it is the stage
+    // that can later run per codegen unit.  What travels between the phases is
+    // `slot`, whose marks are frozen while the body is still live, including
+    // the value/instr *end* marks -- which is what stops lowering from having
+    // to ask the arena how far it has grown.
+
+    // Phase 1/4: materialise `fn_id`'s HIR body into the shared arena and
+    // freeze the region it occupies.  Returns false when the function ends up
+    // with no body, leaving the frozen record in its EMPTY state.
+    public fn slice_materialize(self,
+                                builder: &mut MirUnitBuilder,
+                                slot: rawptr,
+                                fn_id: i32,
+                                hir_fn: i32) -> bool {
+        var block_mark = builder.unit.block_count;
+        var local_mark = builder.unit.local_count;
+        var place_mark = builder.unit.place_count;
+        var value_mark = builder.unit.value_count;
+        var instr_mark = builder.unit.instr_count;
+        var case_mark = builder.unit.case_count;
+        var function_mark = builder.unit.function_count;
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_FN_ID), fn_id);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_HIR_FN), hir_fn);
+        // Reuse the body the collect walk left in the arena instead of building
+        // it again.  Only the HIR -> MIR build is skipped: the dependency drain
+        // below still has to run, because that is what pulls the callees that
+        // live in a sibling unit into this unit's module as declarations.
+        var reused_body = false;
+        if (self.cgu_emit_index > 0 && self.cgu_retain_load(fn_id, slot)) {
+            reused_body = true;
+            function_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_FUNC_MARK));
+            block_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_BLOCK_MARK));
+            local_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_LOCAL_MARK));
+            place_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_PLACE_MARK));
+            value_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_VALUE_MARK));
+            instr_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_INSTR_MARK));
+            case_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_CASE_MARK));
+        }
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_FUNC_MARK), function_mark);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_BLOCK_MARK), block_mark);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_LOCAL_MARK), local_mark);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_PLACE_MARK), place_mark);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_VALUE_MARK), value_mark);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_INSTR_MARK), instr_mark);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_CASE_MARK), case_mark);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_STATE), MIR_SLICE_ST_MATERIALIZING);
+        if (llvm_mir_slice_timing_enabled()) {
+            let now_total = vyx_bootstrap_now_ms();
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_TOTAL), now_total);
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_MARK), now_total);
+        }
+        // Keep already queued export roots outside this dependency walk.  A
+        // body may reference one of those roots, so suspending the queue also
+        // clears their pending reachability marks and lets the real call edge
+        // enqueue that function in this scoped DFS.
+        let suspended_queue = builder.suspend_reachable_function_queue();
+        if (self.cgu_emit_index > 0 && ((fn_id % 32) == 0)
+            && policy_phase_summary_enabled()) {
+            print("[llvm-cgu] emit-unit=" + policy_i64_to_string(self.cgu_emit_index as i64)
+                  + " fn=" + policy_i64_to_string(fn_id as i64)
+                  + " " + builder.unit.function_name(fn_id));
+        }
+        if (!reused_body) {
+            builder.build_function_body(hir_fn);
+        }
+        self.m = builder.unit;
+        var value_end = self.m.value_count;
+        if (reused_body) {
+            value_end = ast_read_i32(ptr_offset(slot, MIR_SLICE_VALUE_END));
+        }
+        builder.enqueue_live_function_target_dependencies(value_mark + 1,
+                                                          value_end);
+        self.m = builder.unit;
+        self.invalidate_streaming_function_template_cache(fn_id,
+                                                          function_mark + 1,
+                                                          value_mark + 1,
+                                                          value_end);
+        // Freeze the extent here, while it is still this function's.  Every
+        // later phase reads these marks instead of the live counters, which is
+        // what lets lowering run after the arena has moved on.  A reused body
+        // already carries the extent frozen by the collect walk, and the arena
+        // has moved on since, so those marks must not be refreshed here.
+        if (!reused_body) {
+            ast_write_i32(ptr_offset(slot, MIR_SLICE_VALUE_END), value_end);
+            ast_write_i32(ptr_offset(slot, MIR_SLICE_INSTR_END), self.m.instr_count);
+        }
+        if (llvm_mir_slice_timing_enabled()) {
+            let now_body = vyx_bootstrap_now_ms();
+            let body_ms = now_body - ast_read_i64(ptr_offset(slot, MIR_SLICE_T_MARK));
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_BODY), body_ms);
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_MARK), now_body);
+            if (llvm_mir_timing_enabled()) {
+                g_llvm_stream_body_ms = g_llvm_stream_body_ms + body_ms;
+            }
+        }
+        if (vyx_bootstrap_profile_level() > 1) {
+            print("[llvm-mir-stream] body-built fn="
+                  + policy_i64_to_string(fn_id as i64)
+                  + " name="
+                  + self.m.function_name(fn_id)
+                  + " values="
+                  + policy_i64_to_string(self.m.value_count as i64));
+        }
+        if (self.m.function_first_block(fn_id) == mir_id_invalid()) {
+            builder.restore_reachable_function_queue(suspended_queue);
+            ast_write_i32(ptr_offset(slot, MIR_SLICE_STATE), MIR_SLICE_ST_EMPTY);
+            return false;
+        }
+        self.drain_streaming_builder_queue(builder);
+        builder.restore_reachable_function_queue(suspended_queue);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_STATE), MIR_SLICE_ST_MATERIALIZED);
+        return true;
+    }
+
+    // Phase 2/4: run the MIR pass pipeline over the frozen region.  Still on
+    // the serial side -- the passes mutate the shared arena -- but no longer
+    // dependent on the materialisation call frame.
+    public fn slice_optimize(self, builder: &mut MirUnitBuilder, slot: rawptr) -> i32 {
+        let fn_id = ast_read_i32(ptr_offset(slot, MIR_SLICE_FN_ID));
+        var mir_pass_errors: i32 = 0;
+        if (!self.cgu_collect_only) {
+            var pipeline_start_ms: i64 = 0;
+            if (llvm_mir_slice_timing_enabled()) {
+                pipeline_start_ms = vyx_bootstrap_now_ms();
+            }
+            mir_pass_errors = mir_run_function_pass_pipeline(&mut builder.unit,
+                                                             fn_id,
+                                                             self.mir_opt_level,
+                                                             self.mir_verify_strict,
+                                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_BLOCK_MARK)),
+                                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_LOCAL_MARK)),
+                                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_PLACE_MARK)),
+                                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_VALUE_MARK)),
+                                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_INSTR_MARK)),
+                                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_CASE_MARK)));
+            if (llvm_mir_slice_timing_enabled()) {
+                let pass_ms = vyx_bootstrap_now_ms() - pipeline_start_ms;
+                ast_write_i64(ptr_offset(slot, MIR_SLICE_T_OPTIMIZE), pass_ms);
+                if (llvm_mir_timing_enabled()) {
+                    g_llvm_stream_pipeline_ms = g_llvm_stream_pipeline_ms + pass_ms;
+                }
+            }
+        }
+        self.m = builder.unit;
+        if (llvm_mir_slice_timing_enabled()) {
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_MARK), vyx_bootstrap_now_ms());
+        }
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_MIR_ERRORS), mir_pass_errors);
+        return mir_pass_errors;
+    }
+
+    // Phase 3/4: emit LLVM for the frozen region.  This is the stage that may
+    // leave the materialisation thread: it reads the shared arena and the
+    // slice, and writes nothing but this lowerer's own module.
+    public fn slice_lower(self, fn_id: i32, slot: rawptr) {
+        let value_mark = ast_read_i32(ptr_offset(slot, MIR_SLICE_VALUE_MARK));
+        let value_end = ast_read_i32(ptr_offset(slot, MIR_SLICE_VALUE_END));
+        if (llvm_mir_slice_timing_enabled()) {
+            let now_deps = vyx_bootstrap_now_ms();
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_DEPS),
+                          now_deps - ast_read_i64(ptr_offset(slot, MIR_SLICE_T_MARK)));
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_MARK), now_deps);
+        }
+        if (vyx_bootstrap_profile_level() > 1) {
+            print("[llvm-mir-stream] before-adapters fn="
+                  + policy_i64_to_string(fn_id as i64));
+        }
+        // `value_end`, not `self.m.value_count`: the frozen end mark is what
+        // makes this stage independent of how far the arena has grown since.
+        self.declare_streaming_adapters_for_value_range(value_mark + 1, value_end);
+        if (llvm_mir_slice_timing_enabled()) {
+            let now_adapters = vyx_bootstrap_now_ms();
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_ADAPTERS),
+                          now_adapters - ast_read_i64(ptr_offset(slot, MIR_SLICE_T_MARK)));
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_MARK), now_adapters);
+        }
+        if (vyx_bootstrap_profile_level() > 1) {
+            print("[llvm-mir-stream] before-signature fn="
+                  + policy_i64_to_string(fn_id as i64));
+        }
+        self.declare_function_signature(fn_id);
+        if (llvm_mir_slice_timing_enabled()) {
+            let now_signature = vyx_bootstrap_now_ms();
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_SIGNATURE),
+                          now_signature - ast_read_i64(ptr_offset(slot, MIR_SLICE_T_MARK)));
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_MARK), now_signature);
+        }
+        if (vyx_bootstrap_profile_level() > 1) {
+            print("[llvm-mir-stream] before-blocks fn="
+                  + policy_i64_to_string(fn_id as i64));
+        }
+        self.declare_blocks_for_function(fn_id);
+        if (llvm_mir_slice_timing_enabled()) {
+            let now_blocks = vyx_bootstrap_now_ms();
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_BLOCKS),
+                          now_blocks - ast_read_i64(ptr_offset(slot, MIR_SLICE_T_MARK)));
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_MARK), now_blocks);
+        }
+        if (vyx_bootstrap_profile_level() > 1) {
+            print("[llvm-mir-stream] before-lower fn="
+                  + policy_i64_to_string(fn_id as i64));
+        }
+        self.pending_value_first = value_mark + 1;
+        self.pending_value_last = value_end;
+        // Freeze which locals belong to the body being lowered.  The chain also
+        // carries the locals of every earlier build of this body (they are kept
+        // on purpose, see `discard_recent_body_records`), and the async frame
+        // slot numbering must not count them.
+        self.current_body_local_first = ast_read_i32(ptr_offset(slot, MIR_SLICE_LOCAL_MARK));
+        self.lower_function(fn_id);
+        if (llvm_mir_slice_timing_enabled()) {
+            let now_lower = vyx_bootstrap_now_ms();
+            let lower_ms = now_lower - ast_read_i64(ptr_offset(slot, MIR_SLICE_T_MARK));
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_LOWER), lower_ms);
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_MARK), now_lower);
+            if (llvm_mir_timing_enabled()) {
+                g_llvm_stream_lower_ms = g_llvm_stream_lower_ms + lower_ms;
+            }
+        }
+        if (vyx_bootstrap_profile_level() > 1) {
+            print("[llvm-mir-stream] before-discard fn="
+                  + policy_i64_to_string(fn_id as i64));
+        }
+        var emitted: i32 = 0;
+        if (self.function_definition_was_directly_emitted(fn_id)) { emitted = 1; }
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_EMITTED), emitted);
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_STATE), MIR_SLICE_ST_LOWERED);
+    }
+
+    // Phase 4/4: release the frozen region back to the arena, using only the
+    // marks captured in phase 1.
+    public fn slice_release(self, builder: &mut MirUnitBuilder, slot: rawptr) {
+        var release_start_ms: i64 = 0;
+        if (llvm_mir_slice_timing_enabled()) { release_start_ms = vyx_bootstrap_now_ms(); }
+        self.discard_streaming_function_body(builder,
+                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_FN_ID)),
+                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_BLOCK_MARK)),
+                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_LOCAL_MARK)),
+                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_PLACE_MARK)),
+                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_VALUE_MARK)),
+                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_INSTR_MARK)),
+                                             ast_read_i32(ptr_offset(slot, MIR_SLICE_CASE_MARK)));
+        if (llvm_mir_slice_timing_enabled()) {
+            ast_write_i64(ptr_offset(slot, MIR_SLICE_T_DISCARD),
+                          vyx_bootstrap_now_ms() - release_start_ms);
+        }
+        ast_write_i32(ptr_offset(slot, MIR_SLICE_STATE), MIR_SLICE_ST_RELEASED);
+    }
+
+    public fn drain_streaming_builder_queue(self, builder: &mut MirUnitBuilder) {
+        var drain_start_ms: i64 = 0;
+        if (llvm_mir_timing_enabled()) {
+            drain_start_ms = vyx_bootstrap_now_ms();
+            g_llvm_stream_drain_depth = g_llvm_stream_drain_depth + 1;
+        }
+        var lowered_count: i32 = 0;
+        var fn_id = builder.pop_reachable_function();
+        while (fn_id != mir_id_invalid()) {
+            let lowered = self.lower_streamed_function_from_builder(builder, fn_id);
+            if (lowered) {
+                lowered_count = lowered_count + 1;
+                if (vyx_bootstrap_profile_level() > 0
+                    && ((lowered_count % 100) == 0 || fn_id >= 850)) {
+                    self.profile_phase("stream-lowered-" + policy_i64_to_string(lowered_count as i64)
+                                       + "-fn-" + policy_i64_to_string(fn_id as i64));
+                }
+                // The emit thread may be inside LLVM while this runs; the
+                // heap trim is process-global, so skip it under the pipeline.
+                if ((lowered_count % 4096) == 0 && g_cgu_pipe_workers == null) {
+                    vyx_rt_heap_trim();
+                }
+            }
+            fn_id = builder.pop_reachable_function();
+        }
+        if (llvm_mir_timing_enabled()) {
+            g_llvm_stream_drain_depth = g_llvm_stream_drain_depth - 1;
+            if (g_llvm_stream_drain_depth == 0) {
+                g_llvm_stream_drain_ms = g_llvm_stream_drain_ms
+                                         + (vyx_bootstrap_now_ms() - drain_start_ms);
+            }
+        }
+    }
+
+    public fn finish_module_handle(self) -> rawptr {
+        self.release_aux_storage();
+        vyx_rt_heap_trim();
+        if (self.error_count > 0) {
+            vyx_rt_module_free(self.mod);
+            self.mod = null;
+            return null;
+        }
+        let handle = malloc(64);
+        if (handle == null) {
+            vyx_rt_module_free(self.mod);
+            self.mod = null;
+            return null;
+        }
+        memset(handle, 0, 64);
+        ast_write_rawptr(handle, self.mod);
+        return handle;
+    }
+
+    public fn run_streaming_from_builder(self, builder: &mut MirUnitBuilder) -> rawptr {
+        if (self.mod == null) {
+            self.report_error("cannot create LLVM module");
+            builder.release_build_state();
+            self.release_aux_storage();
+            return null;
+        }
+        var timing_total: i64 = 0;
+        var timing_mark: i64 = 0;
+        if (llvm_mir_timing_enabled()) {
+            timing_total = vyx_bootstrap_now_ms();
+            timing_mark = timing_total;
+        }
+        self.profile_phase("stream-start");
+        // Phases are accumulated the same way on the single-unit and the
+        // multi-CGU path, so the report sits after the two branches rather
+        // than inside the CGU one.
+        llvm_cgu_phases_reset();
+        let use_cgu = llvm_mir_cli_cgu_wanted();
+        if (use_cgu) {
+            if (policy_phase_summary_enabled()) { print("[llvm-cgu] collect-start"); }
+            if (self.cgu_member_map == null) {
+                self.cgu_member_map = llvm_mir_alloc_i32_map(self.m.function_count + 1);
+            }
+            // The partition must be derived from the *whole* unit, not from the
+            // shells that happen to have a body already.  Bodies materialize
+            // lazily, so a scan run before the materialization walk sees only a
+            // handful of functions; everything it misses stays unassigned
+            // (member == 0) and is then only materialized if some unit reaches
+            // it through a call edge.  Functions reachable only through a
+            // side channel -- notably the concrete methods a `dyn` vtable
+            // materializes -- are never reached at all, so the vtable lookup
+            // finds no candidate and compilation aborts.  Run the collect-only
+            // walk first: it materializes every body once, runs the MIR pass,
+            // records the function and releases the body, which is exactly the
+            // set the partition needs.  `cgu_collect_from_shells` afterwards
+            // stays as the additive net for functions that only appear later.
+            self.cgu_retain_bodies = policy_cgu_retain_enabled();
+            if (self.cgu_retain_bodies && policy_phase_summary_enabled()) {
+                print("[llvm-cgu] retain-bodies=1");
+            }
+            self.cgu_collect_only = true;
+            builder.prepare_streaming_codegen_round();
+            self.m = builder.unit;
+            self.drain_streaming_builder_queue(builder);
+            builder.prepare_streaming_codegen_round();
+            self.m = builder.unit;
+            self.drain_streaming_builder_queue(builder);
+            var collect_retry: i32 = 0;
+            while (builder.pending_deferred_materializations() > 0 && collect_retry < 64) {
+                builder.prepare_streaming_codegen_round();
+                self.m = builder.unit;
+                self.drain_streaming_builder_queue(builder);
+                collect_retry = collect_retry + 1;
+            }
+            self.cgu_collect_only = false;
+            // The collect walk above released every body; make sure `self.m`
+            // reflects the arena as it stands now before the shell sweep reads
+            // function records through it.
+            self.m = builder.unit;
+            self.cgu_collect_from_shells(builder);
+            if (policy_dyn_probe_enabled()) { self.dyn_probe_list_fns("after-collect"); }
+            g_llvm_stream_shell_base = mir_builder_streaming_new_shells();
+            timing_mark = llvm_mir_timing_mark("stream cgu-collect", timing_mark);
+            if (!self.emit_cgu_objects_from_builder(builder)) {
+                if (self.error_count <= 0) { self.error_count = 1; }
+            }
+            self.m = builder.unit;
+            self.cgu_release_retained_bodies(builder);
+            timing_mark = llvm_mir_timing_mark("stream cgu-emit", timing_mark);
+        } else {
+            self.declare_runtime_builtins();
+            timing_mark = llvm_mir_timing_mark("stream runtime-builtins", timing_mark);
+            self.profile_phase("stream-runtime-builtins");
+            self.define_main_arg_runtime_helpers();
+            timing_mark = llvm_mir_timing_mark("stream runtime-helpers", timing_mark);
+            self.profile_phase("stream-runtime-helpers");
+            builder.prepare_streaming_codegen_round();
+            self.m = builder.unit;
+            timing_mark = llvm_mir_timing_mark("stream initial-layouts", timing_mark);
+            timing_mark = llvm_mir_timing_mark("stream reflection-prefinalized", timing_mark);
+            self.profile_phase("stream-reflection-prefinalized");
+            self.declare_functions();
+            timing_mark = llvm_mir_timing_mark("stream initial-declare-functions", timing_mark);
+            self.emit_static_storage_roots();
+            self.profile_phase("stream-initial-functions-declared");
+            if (policy_dyn_probe_enabled()) { self.dyn_probe_list_fns("noncgu-before-first-drain"); }
+            self.drain_streaming_builder_queue(builder);
+            timing_mark = llvm_mir_timing_mark("stream first-drain", timing_mark);
+            builder.prepare_streaming_codegen_round();
+            self.m = builder.unit;
+            self.declare_functions();
+            timing_mark = llvm_mir_timing_mark("stream reflection-finalized", timing_mark);
+            self.emit_static_storage_roots();
+            self.profile_phase("stream-reflection-finalized");
+            if (policy_dyn_probe_enabled()) { self.dyn_probe_list_fns("noncgu-after-second-declare"); }
+            self.drain_streaming_builder_queue(builder);
+            timing_mark = llvm_mir_timing_mark("stream final-drain", timing_mark);
+            var deferred_retry: i32 = 0;
+            while (builder.pending_deferred_materializations() > 0 && deferred_retry < 64) {
+                builder.prepare_streaming_codegen_round();
+                self.m = builder.unit;
+                self.declare_functions();
+                self.emit_static_storage_roots();
+                self.drain_streaming_builder_queue(builder);
+                deferred_retry = deferred_retry + 1;
+            }
+            timing_mark = llvm_mir_timing_mark("stream deferred-retry-drain", timing_mark);
+            self.m = builder.unit;
+            self.dci_synthesize_stub_wrappers();
+            self.profile_phase("stream-dci-stub-wrappers");
+        }
+        let deferred_body_errors = builder.report_unresolved_deferred_function_materializations();
+        if (deferred_body_errors > 0) {
+            self.error_count = self.error_count + deferred_body_errors;
+        }
+        self.m = builder.unit;
+        if (self.mir_verify_strict) {
+            let final_strict_errors = mir_verify_unit_strict(self.m);
+            if (final_strict_errors > 0) {
+                self.report_error("strict MIR verification failed after streaming drain with "
+                                  + policy_i64_to_string(final_strict_errors as i64)
+                                  + " error(s)");
+            }
+        }
+        builder.release_build_state();
+        vyx_rt_heap_trim();
+        timing_mark = llvm_mir_timing_mark("stream release-build-state", timing_mark);
+        llvm_cgu_phases_report();
+        if (llvm_mir_timing_enabled()) {
+            print("[mir-timing] stream own-sums: body=" + g_llvm_stream_body_ms.toString()
+                  + " ms pipeline=" + g_llvm_stream_pipeline_ms.toString()
+                  + " ms lower=" + g_llvm_stream_lower_ms.toString()
+                  + " ms drain-top=" + g_llvm_stream_drain_ms.toString()
+                  + " ms new-shells=" + (mir_builder_streaming_new_shells() - g_llvm_stream_shell_base).toString());
+            print("[mir-timing] stream pass-sums:" + mir_pass_timing_text());
+            g_llvm_stream_pipeline_ms = 0;
+            g_llvm_stream_lower_ms = 0;
+            g_llvm_stream_body_ms = 0;
+            g_llvm_stream_drain_ms = 0;
+            g_llvm_stream_shell_base = 0;
+            mir_pass_timing_reset();
+        }
+        llvm_mir_timing_mark("stream total", timing_total);
+        self.profile_phase("stream-functions-lowered");
+        let finished_handle = self.finish_module_handle();
+        return finished_handle;
+    }
+}

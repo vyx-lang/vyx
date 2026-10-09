@@ -1,0 +1,296 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Pointer maps for the HIR builder. See README.md.
+
+class HirPointerMap {
+    public head: rawptr
+    public buckets: rawptr
+    public bucket_cap: i32
+    public item_raws: rawptr
+    public item_cap: i32
+    public function_raws: rawptr
+    public function_cap: i32
+
+    public static fn create() -> HirPointerMap {
+        return HirPointerMap {
+            head: null,
+            buckets: null,
+            bucket_cap: 0,
+            item_raws: null,
+            item_cap: 0,
+            function_raws: null,
+            function_cap: 0
+        };
+    }
+
+    fn raw_hash(self, key: rawptr) -> i32 {
+        var v = (key as i64) >> 4;
+        if (v < 0) { v = -v; }
+        v = ((v % 2147483647) * 131 + ((v >> 8) % 2147483647) * 17) % 2147483647;
+        if (v < 0) { v = v + 2147483647; }
+        return (v & 0x7fffffff) as i32;
+    }
+
+    fn ensure_buckets(self) {
+        if (self.buckets != null && self.bucket_cap > 0) { return; }
+        self.bucket_cap = 16384;
+        self.buckets = hir_builder_alloc_ptr_buckets(self.bucket_cap);
+        if (self.buckets == null) {
+            self.bucket_cap = 0;
+            return;
+        }
+        var cur = self.head;
+        while (cur != null) {
+            let key = ast_read_rawptr(cur);
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            let slot_ptr = ptr_offset(self.buckets, (slot as i64) * 8);
+            ast_write_rawptr(ptr_offset(cur, 32), ast_read_rawptr(slot_ptr));
+            ast_write_rawptr(slot_ptr, cur);
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+    }
+
+    fn ensure_item_raw_cap(self, want_id: i32) {
+        if (want_id <= 0 || want_id <= self.item_cap) { return; }
+        var new_cap = self.item_cap;
+        if (new_cap < 1024) { new_cap = 1024; }
+        while (new_cap < want_id) { new_cap = new_cap * 2; }
+        let bytes = (new_cap as i64) * 8;
+        let new_buf = hir_profile_malloc(bytes as u64);
+        if (new_buf == null) { return; }
+        memset(new_buf, 0, bytes as u64);
+        if (self.item_raws != null && self.item_cap > 0) {
+            memcpy(new_buf, self.item_raws, ((self.item_cap as i64) * 8) as u64);
+            free(self.item_raws);
+        }
+        self.item_raws = new_buf;
+        self.item_cap = new_cap;
+    }
+
+    fn ensure_function_raw_cap(self, want_id: i32) {
+        if (want_id <= 0 || want_id <= self.function_cap) { return; }
+        var new_cap = self.function_cap;
+        if (new_cap < 1024) { new_cap = 1024; }
+        while (new_cap < want_id) { new_cap = new_cap * 2; }
+        let bytes = (new_cap as i64) * 8;
+        let new_buf = hir_profile_malloc(bytes as u64);
+        if (new_buf == null) { return; }
+        memset(new_buf, 0, bytes as u64);
+        if (self.function_raws != null && self.function_cap > 0) {
+            memcpy(new_buf, self.function_raws, ((self.function_cap as i64) * 8) as u64);
+            free(self.function_raws);
+        }
+        self.function_raws = new_buf;
+        self.function_cap = new_cap;
+    }
+
+    fn put(self, key: rawptr, item_id: i32, function_id: i32, item_kind: i32) {
+        if (key == null) { return; }
+        self.ensure_buckets();
+        if (self.buckets != null && self.bucket_cap > 0) {
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            let slot_ptr = ptr_offset(self.buckets, (slot as i64) * 8);
+            var bcur = ast_read_rawptr(slot_ptr);
+            while (bcur != null) {
+                if (ast_read_rawptr(bcur) == key) {
+                    ast_write_i32(ptr_offset(bcur, 8), item_id);
+                    ast_write_i32(ptr_offset(bcur, 12), function_id);
+                    ast_write_i32(ptr_offset(bcur, 16), item_kind);
+                    if (item_id != hir_id_invalid()) {
+                        self.ensure_item_raw_cap(item_id);
+                        if (self.item_raws != null && item_id <= self.item_cap) {
+                            ast_write_rawptr(ptr_offset(self.item_raws, ((item_id - 1) as i64) * 8), key);
+                        }
+                    }
+                    if (function_id != hir_id_invalid()) {
+                        self.ensure_function_raw_cap(function_id);
+                        if (self.function_raws != null && function_id <= self.function_cap) {
+                            ast_write_rawptr(ptr_offset(self.function_raws, ((function_id - 1) as i64) * 8), key);
+                        }
+                    }
+                    return;
+                }
+                bcur = ast_read_rawptr(ptr_offset(bcur, 32));
+            }
+            let bnode = hir_profile_malloc(40);
+            if (bnode == null) { return; }
+            memset(bnode, 0, 40);
+            ast_write_rawptr(bnode, key);
+            ast_write_i32(ptr_offset(bnode, 8), item_id);
+            ast_write_i32(ptr_offset(bnode, 12), function_id);
+            ast_write_i32(ptr_offset(bnode, 16), item_kind);
+            ast_write_rawptr(ptr_offset(bnode, 24), self.head);
+            ast_write_rawptr(ptr_offset(bnode, 32), ast_read_rawptr(slot_ptr));
+            self.head = bnode;
+            ast_write_rawptr(slot_ptr, bnode);
+            if (item_id != hir_id_invalid()) {
+                self.ensure_item_raw_cap(item_id);
+                if (self.item_raws != null && item_id <= self.item_cap) {
+                    ast_write_rawptr(ptr_offset(self.item_raws, ((item_id - 1) as i64) * 8), key);
+                }
+            }
+            if (function_id != hir_id_invalid()) {
+                self.ensure_function_raw_cap(function_id);
+                if (self.function_raws != null && function_id <= self.function_cap) {
+                    ast_write_rawptr(ptr_offset(self.function_raws, ((function_id - 1) as i64) * 8), key);
+                }
+            }
+            return;
+        }
+        let node = hir_profile_malloc(40);
+        if (node == null) { return; }
+        memset(node, 0, 40);
+        ast_write_rawptr(node, key);
+        ast_write_i32(ptr_offset(node, 8), item_id);
+        ast_write_i32(ptr_offset(node, 12), function_id);
+        ast_write_i32(ptr_offset(node, 16), item_kind);
+        ast_write_rawptr(ptr_offset(node, 24), self.head);
+        self.head = node;
+        if (item_id != hir_id_invalid()) {
+            self.ensure_item_raw_cap(item_id);
+            if (self.item_raws != null && item_id <= self.item_cap) {
+                ast_write_rawptr(ptr_offset(self.item_raws, ((item_id - 1) as i64) * 8), key);
+            }
+        }
+        if (function_id != hir_id_invalid()) {
+            self.ensure_function_raw_cap(function_id);
+            if (self.function_raws != null && function_id <= self.function_cap) {
+                ast_write_rawptr(ptr_offset(self.function_raws, ((function_id - 1) as i64) * 8), key);
+            }
+        }
+    }
+
+    fn item(self, key: rawptr) -> i32 {
+        if (self.buckets != null && self.bucket_cap > 0) {
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            var bcur = ast_read_rawptr(ptr_offset(self.buckets, (slot as i64) * 8));
+            while (bcur != null) {
+                if (ast_read_rawptr(bcur) == key) { return ast_read_i32(ptr_offset(bcur, 8)); }
+                bcur = ast_read_rawptr(ptr_offset(bcur, 32));
+            }
+            return hir_id_invalid();
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) { return ast_read_i32(ptr_offset(cur, 8)); }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        return hir_id_invalid();
+    }
+
+    fn function(self, key: rawptr) -> i32 {
+        if (self.buckets != null && self.bucket_cap > 0) {
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            var bcur = ast_read_rawptr(ptr_offset(self.buckets, (slot as i64) * 8));
+            while (bcur != null) {
+                if (ast_read_rawptr(bcur) == key) { return ast_read_i32(ptr_offset(bcur, 12)); }
+                bcur = ast_read_rawptr(ptr_offset(bcur, 32));
+            }
+            return hir_id_invalid();
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) { return ast_read_i32(ptr_offset(cur, 12)); }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        return hir_id_invalid();
+    }
+
+    fn kind(self, key: rawptr) -> i32 {
+        if (self.buckets != null && self.bucket_cap > 0) {
+            let slot = hir_builder_hash_slot(self.raw_hash(key), self.bucket_cap);
+            var bcur = ast_read_rawptr(ptr_offset(self.buckets, (slot as i64) * 8));
+            while (bcur != null) {
+                if (ast_read_rawptr(bcur) == key) { return ast_read_i32(ptr_offset(bcur, 16)); }
+                bcur = ast_read_rawptr(ptr_offset(bcur, 32));
+            }
+            return hir_target_none();
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_rawptr(cur) == key) { return ast_read_i32(ptr_offset(cur, 16)); }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        return hir_target_none();
+    }
+
+    fn raw_for_item(self, item_id: i32) -> rawptr {
+        if (item_id == hir_id_invalid()) { return null; }
+        if (self.item_raws != null && item_id > 0 && item_id <= self.item_cap) {
+            let cached = ast_read_rawptr(ptr_offset(self.item_raws, ((item_id - 1) as i64) * 8));
+            if (cached != null) { return cached; }
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_i32(ptr_offset(cur, 8)) == item_id) { return ast_read_rawptr(cur); }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        return null;
+    }
+
+    fn raw_for_function(self, function_id: i32) -> rawptr {
+        if (function_id == hir_id_invalid()) { return null; }
+        if (self.function_raws != null && function_id > 0 && function_id <= self.function_cap) {
+            let cached = ast_read_rawptr(ptr_offset(self.function_raws, ((function_id - 1) as i64) * 8));
+            if (cached != null) { return cached; }
+        }
+        var cur = self.head;
+        while (cur != null) {
+            if (ast_read_i32(ptr_offset(cur, 12)) == function_id) { return ast_read_rawptr(cur); }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        return null;
+    }
+}
+
+fn hir_pointer_map_put(map: HirPointerMap, key: rawptr, item_id: i32, function_id: i32, item_kind: i32) -> HirPointerMap {
+    map.put(key, item_id, function_id, item_kind);
+    return map;
+}
+
+fn hir_pointer_map_item(map: HirPointerMap, key: rawptr) -> i32 {
+    return map.item(key);
+}
+
+fn hir_pointer_map_function(map: HirPointerMap, key: rawptr) -> i32 {
+    return map.function(key);
+}
+
+fn hir_pointer_map_raw_for_item(map: HirPointerMap, item_id: i32) -> rawptr {
+    return map.raw_for_item(item_id);
+}
+
+fn hir_pointer_map_raw_for_function(map: HirPointerMap, function_id: i32) -> rawptr {
+    return map.raw_for_function(function_id);
+}
+
+fn hir_pointer_map_dispose(map: HirPointerMap) -> HirPointerMap {
+    var cur = map.head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, 24));
+        free(cur);
+        cur = next;
+    }
+    map.head = null;
+    if (map.buckets != null) { free(map.buckets); }
+    if (map.item_raws != null) { free(map.item_raws); }
+    if (map.function_raws != null) { free(map.function_raws); }
+    map.buckets = null;
+    map.bucket_cap = 0;
+    map.item_raws = null;
+    map.function_raws = null;
+    map.item_cap = 0;
+    map.function_cap = 0;
+    return map;
+}

@@ -170,5 +170,5 @@ vyxc build --target vyxc-dap
 ```
 
 构建与运行依赖见[编译器说明](../bootstrap_compiler/README.md)。当前实现位于
-[lsp_main.vyx](../bootstrap_compiler/src/core/lsp_main.vyx) 和
-[dap_main.vyx](../bootstrap_compiler/src/core/dap_main.vyx)。
+[lsp_main.vyx](../bootstrap_compiler/src/core/tooling/lsp_main.vyx) 和
+[dap_main.vyx](../bootstrap_compiler/src/core/tooling/dap_main.vyx)。

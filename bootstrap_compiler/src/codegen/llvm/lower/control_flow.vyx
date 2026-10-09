@@ -1,0 +1,399 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn declare_blocks_for_function(self, function_id: i32) {
+        let temp_string_mark = vyx_rt_string_arena_checkpoint();
+        if (!self.function_should_emit(function_id)) {
+            self.release_temp_strings(temp_string_mark);
+            return;
+        }
+        let fn_value = llvm_mir_map_get(self.function_values, function_id);
+        var block = mir_unit_function_first_block(&self.m, function_id);
+        while (block != mir_id_invalid()) {
+            let name = "mir.bb." + policy_i64_to_string(block as i64);
+            let bb = vyx_rt_append_block(self.mod, fn_value, name.c_str(), name.len as u64);
+            if (bb == null) {
+                self.report_error("cannot create LLVM block " + name);
+            } else {
+                llvm_mir_map_put(self.block_values, block, bb);
+            }
+            block = mir_unit_block_next(&self.m, block);
+        }
+        self.release_temp_strings(temp_string_mark);
+    }
+
+    public fn emit_return_value(self, function_id: i32, ret_v: rawptr) {
+        if (self.function_uses_hidden_sret(function_id)) {
+            let sret = vyx_rt_get_param(self.mod, self.current_function_value, 0);
+            if (sret == null || ret_v == null) {
+                self.report_error("cannot store sret return for " + self.m.function_name(function_id));
+                return;
+            }
+            vyx_rt_build_store(self.mod, ret_v, sret);
+            vyx_rt_build_ret_void(self.mod);
+            return;
+        }
+        var outgoing = ret_v;
+        if (self.foreign_c_handle_uses_raw_pointer_abi(
+                function_id, self.m.function_return_type(function_id))) {
+            outgoing = self.pointer_handle_address(ret_v, "c.abi.ptr.out");
+            if (outgoing == null) {
+                self.report_error("cannot extract native pointer return for " + self.m.function_name(function_id));
+                return;
+            }
+        }
+        if (self.function_return_uses_c_sysv_coerce(function_id)) {
+            outgoing = self.c_sysv_coerce_value(ret_v,
+                                               self.m.function_return_type(function_id),
+                                               "c.abi.out");
+            if (outgoing == null) {
+                self.report_error("cannot coerce C SysV return for " + self.m.function_name(function_id));
+                return;
+            }
+        }
+        vyx_rt_build_ret(self.mod, outgoing);
+    }
+
+    public fn lower_terminator(self, block_id: i32) {
+        let kind = self.m.block_term_kind(block_id);
+        if (kind == mir_term_return()) {
+            let ret_value_id = self.m.block_term_value(block_id);
+            let ret_function = self.m.block_function(block_id);
+            let ret_type = self.m.function_return_type(ret_function);
+            if (ret_value_id == mir_id_invalid()
+                && self.function_uses_i32_main_abi(ret_function)) {
+                vyx_rt_build_ret(self.mod, vyx_rt_const_int(self.mod, self.ty_i32, 0, 0));
+                return;
+            }
+            if (self.function_name_matches_method(self.m.function_name(ret_function), "constructor")
+                && self.source_param_uses_self_pointer_abi(ret_function, 0)
+                && llvm_mir_type_kind(&self.m, ret_type) != ty_VOID()
+                && ret_value_id == mir_id_invalid()) {
+                let self_local = self.function_source_param_local(ret_function, 0);
+                let self_slot = llvm_mir_map_get(self.local_slots, self_local);
+                if (self_slot == null) {
+                    self.report_error("cannot resolve constructor self slot for "
+                              + self.m.function_name(ret_function));
+                    return;
+                }
+                let self_ptr = vyx_rt_build_load(self.mod,
+                                                 self.ty_ptr,
+                                                 self_slot,
+                                                 "mir.ctor.self".c_str(),
+                                                 13);
+                if (self_ptr == null) {
+                    self.report_error("cannot load constructor self pointer for "
+                              + self.m.function_name(ret_function));
+                    return;
+                }
+                if (self.function_uses_hidden_sret(ret_function)) {
+                    let loaded = vyx_rt_build_load(self.mod,
+                                                   self.lower_type(ret_type),
+                                                   self_ptr,
+                                                   "mir.ctor.sret".c_str(),
+                                                   13);
+                    self.emit_return_value(ret_function, loaded);
+                } else {
+                    vyx_rt_build_ret(self.mod, self_ptr);
+                }
+                return;
+            }
+            if (ret_value_id == mir_id_invalid() || llvm_mir_type_kind(&self.m, ret_type) == ty_VOID()) {
+                vyx_rt_build_ret_void(self.mod);
+            } else {
+                let ret_v = self.lower_value_as(ret_value_id, ret_type);
+                if (ret_v == null) {
+                    self.report_error_at_value(ret_value_id,
+                                               "cannot lower return value in block #"
+                                               + policy_i64_to_string(block_id as i64));
+                    return;
+                }
+                self.emit_return_value(ret_function, ret_v);
+            }
+            return;
+        }
+        if (kind == mir_term_goto()) {
+            let target = llvm_mir_map_get(self.block_values, self.m.block_term_target(block_id));
+            if (target == null) {
+                self.report_error("cannot lower goto target for block #" + policy_i64_to_string(block_id as i64));
+                return;
+            }
+            vyx_rt_build_br(self.mod, target);
+            return;
+        }
+        if (kind == mir_term_branch()) {
+            let cond_id = self.m.block_term_value(block_id);
+            var branch_mark: i64 = 0;
+            var branch_lower_ms: i64 = 0;
+            var branch_truthy_ms: i64 = 0;
+            var branch_target_ms: i64 = 0;
+            if (llvm_mir_timing_enabled()) { branch_mark = vyx_bootstrap_now_ms(); }
+            let cond_raw = self.lower_value(cond_id);
+            if (llvm_mir_timing_enabled()) {
+                let now_lower = vyx_bootstrap_now_ms();
+                branch_lower_ms = now_lower - branch_mark;
+                branch_mark = now_lower;
+            }
+            let cond = self.truthy_value(cond_raw, self.m.value_type(cond_id));
+            if (llvm_mir_timing_enabled()) {
+                let now_truthy = vyx_bootstrap_now_ms();
+                branch_truthy_ms = now_truthy - branch_mark;
+                branch_mark = now_truthy;
+            }
+            let then_bb = llvm_mir_map_get(self.block_values, self.m.block_term_target(block_id));
+            let else_bb = llvm_mir_map_get(self.block_values, self.m.block_term_false(block_id));
+            if (llvm_mir_timing_enabled()) {
+                let now_target = vyx_bootstrap_now_ms();
+                branch_target_ms = now_target - branch_mark;
+                branch_mark = now_target;
+            }
+            if (cond == null || then_bb == null || else_bb == null) {
+                if (cond == null && self.error_count > 0) { return; }
+                var branch_detail = "";
+                if (vyx_bootstrap_profile_level() > 0) {
+                    branch_detail = " [block #" + policy_i64_to_string(block_id as i64) + "]";
+                }
+                if (cond == null) {
+                    self.report_error_at_value(cond_id, "cannot lower branch condition" + branch_detail);
+                } else {
+                    self.report_error("cannot lower branch target" + branch_detail);
+                }
+                return;
+            }
+            vyx_rt_build_cond_br(self.mod, cond, then_bb, else_bb);
+            if (llvm_mir_timing_enabled()) {
+                let branch_total = branch_lower_ms + branch_truthy_ms + branch_target_ms + (vyx_bootstrap_now_ms() - branch_mark);
+                if (branch_total >= llvm_mir_slow_instr_threshold_ms()) {
+                    print("[mir-timing] branch fn #" + policy_i64_to_string(self.current_function_id as i64)
+                          + " " + self.m.function_name(self.current_function_id)
+                          + " block=" + policy_i64_to_string(block_id as i64)
+                          + " cond=" + policy_i64_to_string(cond_id as i64)
+                          + " cond_kind=" + policy_i64_to_string(self.m.value_kind(cond_id) as i64)
+                          + " cond_type=" + llvm_mir_type_text(&self.m, self.m.value_type(cond_id))
+                          + " lower=" + branch_lower_ms.toString()
+                          + " truthy=" + branch_truthy_ms.toString()
+                          + " targets=" + branch_target_ms.toString()
+                          + " total=" + branch_total.toString() + " ms");
+                }
+            }
+            return;
+        }
+        if (kind == mir_term_unreachable()) {
+            vyx_rt_build_unreachable(self.mod);
+            return;
+        }
+        if (kind == mir_term_match()) {
+            self.lower_match_terminator(block_id);
+            return;
+        }
+        if (kind == mir_term_foreach_next()) {
+            self.lower_foreach_next_terminator(block_id);
+            return;
+        }
+        if (kind == mir_term_yield()) {
+            self.lower_async_yield_terminator(block_id);
+            return;
+        }
+        self.report_error("cannot lower terminator kind=" + policy_i64_to_string(kind as i64)
+                  + " in block #" + policy_i64_to_string(block_id as i64));
+    }
+
+    public fn lower_block(self, block_id: i32) {
+        self.current_block_id = block_id;
+        self.current_instr_id = mir_id_invalid();
+        self.current_value_id = mir_id_invalid();
+        self.current_place_id = mir_id_invalid();
+        let bb = llvm_mir_map_get(self.block_values, block_id);
+        if (bb == null) {
+            self.report_error("missing LLVM block for MIR block #" + policy_i64_to_string(block_id as i64));
+            return;
+        }
+        var timing_block_start: i64 = 0;
+        var timing_instr_threshold: i64 = 0;
+        var timing_instr_count: i64 = 0;
+        if (llvm_mir_timing_enabled()) {
+            timing_block_start = vyx_bootstrap_now_ms();
+            timing_instr_threshold = llvm_mir_slow_instr_threshold_ms();
+        }
+        vyx_rt_position_at_end(self.mod, bb);
+        var instr = self.m.block_first_instr(block_id);
+        while (instr != mir_id_invalid()) {
+            self.current_instr_id = instr;
+            self.current_value_id = self.m.instr_value(instr);
+            self.current_place_id = self.m.instr_place(instr);
+            var timing_instr_start: i64 = 0;
+            if (llvm_mir_timing_enabled()) { timing_instr_start = vyx_bootstrap_now_ms(); }
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[llvm-mir-instr] before fn="
+                      + policy_i64_to_string(self.current_function_id as i64)
+                      + " block=" + policy_i64_to_string(block_id as i64)
+                      + " instr=" + policy_i64_to_string(instr as i64)
+                      + " kind=" + policy_i64_to_string(self.m.instr_kind(instr) as i64)
+                      + " value=" + policy_i64_to_string(self.m.instr_value(instr) as i64)
+                      + " place=" + policy_i64_to_string(self.m.instr_place(instr) as i64));
+            }
+            self.set_debug_location_for_instr(instr);
+            self.lower_instr(instr);
+            if (llvm_mir_timing_enabled()) {
+                timing_instr_count = timing_instr_count + 1;
+                let timing_instr_elapsed = vyx_bootstrap_now_ms() - timing_instr_start;
+                if (timing_instr_elapsed >= timing_instr_threshold) {
+                    let instr_value = self.m.instr_value(instr);
+                    var instr_value_kind: i32 = mir_id_invalid();
+                    var instr_type_text: string = "";
+                    if (instr_value != mir_id_invalid()) {
+                        instr_value_kind = self.m.value_kind(instr_value);
+                        instr_type_text = llvm_mir_type_text(&self.m, self.m.value_type(instr_value));
+                    }
+                    print("[mir-timing] instr fn #" + policy_i64_to_string(self.current_function_id as i64)
+                          + " " + self.m.function_name(self.current_function_id)
+                          + " block=" + policy_i64_to_string(block_id as i64)
+                          + " instr=" + policy_i64_to_string(instr as i64)
+                          + " kind=" + policy_i64_to_string(self.m.instr_kind(instr) as i64)
+                          + " value=" + policy_i64_to_string(instr_value as i64)
+                          + " value_kind=" + policy_i64_to_string(instr_value_kind as i64)
+                          + " type=" + instr_type_text
+                          + " elapsed=" + timing_instr_elapsed.toString() + " ms");
+                }
+            }
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[llvm-mir-instr] after fn="
+                      + policy_i64_to_string(self.current_function_id as i64)
+                      + " block=" + policy_i64_to_string(block_id as i64)
+                      + " instr=" + policy_i64_to_string(instr as i64)
+                      + " errors=" + policy_i64_to_string(self.error_count as i64));
+            }
+            instr = self.m.instr_next(instr);
+        }
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[llvm-mir-term] before fn="
+                  + policy_i64_to_string(self.current_function_id as i64)
+                  + " block=" + policy_i64_to_string(block_id as i64)
+                  + " term=" + policy_i64_to_string(self.m.block_term_kind(block_id) as i64)
+                  + " value=" + policy_i64_to_string(self.m.block_term_value(block_id) as i64));
+        }
+        var timing_term_start: i64 = 0;
+        if (llvm_mir_timing_enabled()) { timing_term_start = vyx_bootstrap_now_ms(); }
+        self.current_instr_id = mir_id_invalid();
+        self.current_value_id = self.m.block_term_value(block_id);
+        self.current_place_id = mir_id_invalid();
+        self.set_debug_location_for_terminator(block_id);
+        self.lower_terminator(block_id);
+        var timing_term_elapsed: i64 = 0;
+        if (llvm_mir_timing_enabled()) {
+            timing_term_elapsed = vyx_bootstrap_now_ms() - timing_term_start;
+            if (timing_term_elapsed >= timing_instr_threshold) {
+                print("[mir-timing] term fn #" + policy_i64_to_string(self.current_function_id as i64)
+                      + " " + self.m.function_name(self.current_function_id)
+                      + " block=" + policy_i64_to_string(block_id as i64)
+                      + " kind=" + policy_i64_to_string(self.m.block_term_kind(block_id) as i64)
+                      + " value=" + policy_i64_to_string(self.m.block_term_value(block_id) as i64)
+                      + " elapsed=" + timing_term_elapsed.toString() + " ms");
+            }
+            let timing_block_elapsed = vyx_bootstrap_now_ms() - timing_block_start;
+            if (timing_block_elapsed >= llvm_mir_slow_fn_threshold_ms()) {
+                print("[mir-timing] block fn #" + policy_i64_to_string(self.current_function_id as i64)
+                      + " " + self.m.function_name(self.current_function_id)
+                      + " block=" + policy_i64_to_string(block_id as i64)
+                      + " instrs=" + timing_instr_count.toString()
+                      + " term_ms=" + timing_term_elapsed.toString()
+                      + " elapsed=" + timing_block_elapsed.toString() + " ms");
+            }
+        }
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[llvm-mir-term] after fn="
+                  + policy_i64_to_string(self.current_function_id as i64)
+                  + " block=" + policy_i64_to_string(block_id as i64)
+                  + " errors=" + policy_i64_to_string(self.error_count as i64));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Frame-invariant borrow hoisting.
+    //
+    // A borrow of a place rooted at a local slot with constant projections has
+    // the same address on every evaluation, so re-creating its region inside a
+    // loop is pure overhead: the runtime call measured ~60ns before the region
+    // dedup cache and still ~2ns (an out-of-line call) after it, which made a
+    // linked-list walk 2x slower than the equivalent C.
+    //
+    // Region descriptors for borrows are created with capability 1 or 2, and
+    // vyx_pointer_region_delete aborts on both tags, so the compiler never
+    // emits a release for one: they are immutable, never-freed descriptors of
+    // (base, span).  Creating one at the frame entry instead of at every
+    // evaluation therefore changes nothing observable.
+    //
+    // Places whose address is not frame invariant (a deref root, a computed
+    // index) keep the ordinary per-evaluation create, as do class-object
+    // pointers, whose address is read out of a slot that may not be
+    // initialised yet at frame entry.
+    public fn lower_function(self, function_id: i32) {
+        let temp_string_mark = vyx_rt_string_arena_checkpoint();
+        if (!self.function_should_emit(function_id)) {
+            self.release_temp_strings(temp_string_mark);
+            return;
+        }
+        if (self.m.function_first_block(function_id) == mir_id_invalid()) {
+            self.release_temp_strings(temp_string_mark);
+            return;
+        }
+        self.current_function_id = function_id;
+        self.current_block_id = mir_id_invalid();
+        self.current_instr_id = mir_id_invalid();
+        self.current_value_id = mir_id_invalid();
+        self.current_place_id = mir_id_invalid();
+        self.current_function_value = llvm_mir_map_get(self.function_values, function_id);
+        self.current_entry_block = llvm_mir_map_get(self.block_values, self.m.function_first_block(function_id));
+        if (self.current_function_value == null || self.current_entry_block == null) {
+            self.report_error("cannot enter function " + self.m.function_name(function_id));
+            self.release_temp_strings(temp_string_mark);
+            return;
+        }
+        self.apply_function_definition_linkage(function_id, self.current_function_value);
+        self.apply_function_codegen_attrs(function_id, self.current_function_value);
+        let debug_line = self.debug_function_line(function_id);
+        if (self.debug_enabled) {
+            let source_name = self.m.function_name(function_id);
+            vyx_rt_debug_set_function(self.mod,
+                                      self.current_function_value,
+                                      source_name.c_str(),
+                                      source_name.len as u64,
+                                      debug_line);
+        }
+        self.prepare_local_lifetime_marker_candidates(function_id);
+        if (self.error_count > 0) {
+            self.release_temp_strings(temp_string_mark);
+            return;
+        }
+        vyx_rt_position_at_end(self.mod, self.current_entry_block);
+        if (self.debug_enabled) { vyx_rt_debug_location(self.mod, debug_line, 1); }
+        self.allocate_locals_for_function(function_id);
+        self.declare_debug_locals_for_function(function_id);
+        self.store_params_for_function(function_id);
+        self.hoist_frame_invariant_borrow_regions(function_id);
+        var block = self.m.function_first_block(function_id);
+        while (block != mir_id_invalid()) {
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[llvm-mir-block] before fn="
+                      + policy_i64_to_string(function_id as i64)
+                      + " block=" + policy_i64_to_string(block as i64)
+                      + " instrs=" + policy_i64_to_string(self.m.block_instr_count(block) as i64)
+                      + " term=" + policy_i64_to_string(self.m.block_term_kind(block) as i64)
+                      + " value=" + policy_i64_to_string(self.m.block_term_value(block) as i64));
+            }
+            self.lower_block(block);
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[llvm-mir-block] after fn="
+                      + policy_i64_to_string(function_id as i64)
+                      + " block=" + policy_i64_to_string(block as i64)
+                      + " errors=" + policy_i64_to_string(self.error_count as i64));
+            }
+            block = self.m.block_next(block);
+        }
+        if (self.error_count == 0) {
+            self.mark_function_definition_emitted(function_id);
+        }
+        self.release_temp_strings(temp_string_mark);
+    }
+}

@@ -1,0 +1,297 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn allocate_locals_for_function(self, function_id: i32) {
+        var frame: rawptr = null;
+        var ctx_ty: rawptr = null;
+        if (self.function_is_async_task_callable(function_id)) {
+            frame = self.async_runtime_call0("vio_async_frame_get");
+            ctx_ty = self.get_or_create_async_context_type(function_id);
+        }
+        let zero32 = vyx_rt_const_int(self.mod, self.ty_i32, 0, 1);
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (!self.local_is_capture(local)) {
+                let effective_type = self.local_effective_type(local);
+                if (effective_type == mir_id_invalid()
+                    || llvm_mir_type_text(&self.m, effective_type).len == 0
+                    || llvm_mir_type_kind(&self.m, effective_type) == ty_VOID()) {
+                    self.report_error("cannot allocate local "
+                                      + self.m.local_name(local)
+                                      + " with invalid type `"
+                                      + llvm_mir_type_text(&self.m, effective_type)
+                                      + "`");
+                    local = self.m.local_next(local);
+                    continue;
+                }
+                var ty = self.lower_type(effective_type);
+                if (vyx_bootstrap_profile_level() > 2) {
+                    let canonical_type = self.canonical_record_type_id(effective_type);
+                    print("[llvm-mir-local] fn=" + policy_i64_to_string(function_id as i64)
+                          + " local=" + policy_i64_to_string(local as i64)
+                          + " name=" + self.m.local_name(local)
+                          + " type=" + policy_i64_to_string(effective_type as i64)
+                          + " text=" + llvm_mir_type_text(&self.m, effective_type)
+                          + " kind=" + policy_i64_to_string(llvm_mir_type_kind(&self.m, effective_type) as i64)
+                          + " canonical=" + policy_i64_to_string(canonical_type as i64)
+                          + " fields=" + policy_i64_to_string(mir_unit_field_count_for_type(&self.m, canonical_type) as i64)
+                          + " body=" + policy_i64_to_string(llvm_mir_i32_map_get(self.type_struct_body_field_counts,
+                                                                                 canonical_type) as i64));
+                }
+                if (self.local_is_self_pointer_abi_slot(function_id, local)) {
+                    ty = self.ty_ptr;
+                }
+                if (ty == null) {
+                    self.report_error("cannot lower local type for "
+                                      + self.m.local_name(local)
+                                      + " as `"
+                                      + llvm_mir_type_text(&self.m, effective_type)
+                                      + "`");
+                    local = self.m.local_next(local);
+                    continue;
+                }
+                let name = self.m.local_name(local);
+                var slot: rawptr = null;
+                var reuse_source = mir_id_invalid();
+                // Earlier generated temporaries remain in the chain but are
+                // absent from this body. HIR-backed locals are reused and keep
+                // their frame slots even when their ids precede the body mark.
+                var frame_field: i32 = -1;
+                if (self.async_local_is_frame_slot(function_id, local)
+                    && frame != null && ctx_ty != null) {
+                    frame_field = self.async_ctx_field_for_local(function_id, local);
+                }
+                if (frame_field >= 0) {
+                    slot = vyx_rt_build_gep2(self.mod,
+                                             ctx_ty,
+                                             frame,
+                                             zero32,
+                                             vyx_rt_const_int(self.mod, self.ty_i32, frame_field as i64, 1),
+                                             name.c_str(),
+                                             name.len as u64);
+                } else {
+                    reuse_source = self.local_slot_reuse_source_for(function_id, local);
+                    if (reuse_source != mir_id_invalid()) {
+                        let source_slot = llvm_mir_map_get(self.local_slots, reuse_source);
+                        if (source_slot != null) {
+                            slot = source_slot;
+                            llvm_mir_i32_map_put(self.local_slot_reuse_sources, local, reuse_source);
+                            llvm_mir_i32_map_put(self.local_slot_reuse_sources, reuse_source, -1);
+                        } else {
+                            reuse_source = mir_id_invalid();
+                        }
+                    }
+                    if (slot == null) {
+                        slot = vyx_rt_build_alloca(self.mod, ty, name.c_str(), name.len as u64);
+                    }
+                }
+                if (slot == null) {
+                    self.report_error("cannot allocate local " + name);
+                } else {
+                    if (reuse_source == mir_id_invalid()
+                        && !self.async_local_is_frame_slot(function_id, local)) {
+                        let dci_alignment = self.dci_type_value_alignment(effective_type);
+                        if (dci_alignment > 0) {
+                            vyx_rt_set_alignment(self.mod, slot, dci_alignment as i32);
+                        }
+                    }
+                    llvm_mir_map_put(self.local_slots, local, slot);
+                    if (reuse_source == mir_id_invalid()
+                        && !self.async_local_is_frame_slot(function_id, local)
+                        && self.type_is_class_pointer_abi(self.local_effective_type(local))) {
+                        vyx_rt_build_store(self.mod,
+                                           vyx_rt_const_ptr_null(self.mod, self.ty_ptr),
+                                           slot);
+                    }
+                }
+            }
+            local = self.m.local_next(local);
+        }
+    }
+
+    public fn bind_captures_from_env(self, function_id: i32, env_param: rawptr) {
+        if (self.function_capture_count(function_id) <= 0) { return; }
+        if (env_param == null) {
+            self.report_error("missing closure env parameter for " + self.m.function_name(function_id));
+            return;
+        }
+        var idx: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_capture(local)) {
+                let field_ptr = self.closure_env_field_ptr(function_id, env_param, idx, self.m.local_name(local));
+                if (field_ptr == null) {
+                    self.report_error("cannot bind captured local " + self.m.local_name(local));
+                    return;
+                }
+                if (self.local_is_reference_capture(local)) {
+                    let captured_slot = vyx_rt_build_load(self.mod,
+                                                          self.ty_ptr,
+                                                          field_ptr,
+                                                          self.m.local_name(local).c_str(),
+                                                          self.m.local_name(local).len as u64);
+                    if (captured_slot == null) {
+                        self.report_error("cannot bind reference capture " + self.m.local_name(local));
+                        return;
+                    }
+                    llvm_mir_map_put(self.local_slots, local, captured_slot);
+                } else {
+                    llvm_mir_map_put(self.local_slots, local, field_ptr);
+                }
+                idx = idx + 1;
+            }
+            local = self.m.local_next(local);
+        }
+    }
+
+    public fn store_params_for_function(self, function_id: i32) {
+        if (vyx_bootstrap_profile_level() > 2) {
+            print("[llvm-mir-store-params] fn="
+                  + policy_i64_to_string(function_id as i64)
+                  + " src=" + policy_i64_to_string(self.function_source_param_count(function_id) as i64)
+                  + " llvm=" + policy_i64_to_string(self.function_llvm_param_count(function_id) as i64)
+                  + " actual=" + policy_i64_to_string(self.debug_llvm_function_param_count(self.current_function_value) as i64)
+                  + " first_local=" + policy_i64_to_string(self.m.function_first_local(function_id) as i64)
+                  + " name=" + self.m.function_name(function_id));
+        }
+        var param_index: i32 = 0;
+        if (self.function_uses_hidden_sret(function_id)) {
+            param_index = 1;
+        }
+        if (self.function_uses_c_main_abi(function_id)) {
+            if (!self.declare_main_arg_globals()) { return; }
+            let argc_param = vyx_rt_get_param(self.mod, self.current_function_value, 0);
+            let argv_param = vyx_rt_get_param(self.mod, self.current_function_value, 1);
+            if (argc_param == null || argv_param == null) {
+                self.report_error("cannot read C main argc/argv parameters");
+                return;
+            }
+            if (self.runtime_set_args_fn == null || self.runtime_set_args_fty == null) {
+                self.report_error("process argument initializer is unavailable");
+                return;
+            }
+            let init_args = vyx_rt_build_call2(self.mod,
+                                               self.runtime_set_args_fty,
+                                               self.runtime_set_args_fn,
+                                               argc_param,
+                                               argv_param,
+                                               llvm_mir_empty_name(),
+                                               0);
+            if (init_args == null) {
+                self.report_error("cannot initialize process arguments");
+                return;
+            }
+            vyx_rt_build_store(self.mod, argc_param, self.runtime_argc_global);
+            vyx_rt_build_store(self.mod, argv_param, self.runtime_argv_global);
+            param_index = 2;
+        }
+        if (self.function_hidden_env_param_count(function_id) > 0) {
+            let env_param = vyx_rt_get_param(self.mod, self.current_function_value, param_index as u64);
+            if (self.function_capture_count(function_id) > 0) {
+                self.bind_captures_from_env(function_id, env_param);
+            }
+            param_index = param_index + 1;
+        }
+        var source_idx: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_source_param(local)) {
+                if (self.async_local_is_frame_slot(function_id, local)) {
+                    // The spawn side already stored the logical argument in
+                    // this frame slot. Rebinding on each worker poll would
+                    // reset mutable parameters to their original values.
+                    param_index = param_index + 1;
+                    source_idx = source_idx + 1;
+                } else if (self.dci_abi_passing(self.dci_source_parameter_abi(function_id, source_idx))
+                    == "inalloca"
+                    && self.dci_function_inalloca_count(function_id) > 1) {
+                    source_idx = source_idx + 1;
+                } else {
+                let param = vyx_rt_get_param(self.mod, self.current_function_value, param_index as u64);
+                if (param == null) {
+                    self.report_error("cannot load LLVM parameter " + self.m.local_name(local));
+                } else {
+                    let slot = llvm_mir_map_get(self.local_slots, local);
+                    if (slot == null) {
+                        self.report_error("cannot bind parameter " + self.m.local_name(local));
+                    } else if (self.source_param_uses_native_byval_abi(function_id, source_idx)) {
+                        let struct_ty = self.lower_storage_type(self.local_effective_type(local));
+                        let loaded = vyx_rt_build_load(self.mod,
+                                                       struct_ty,
+                                                       param,
+                                                       "mir.byval.load".c_str(),
+                                                       14);
+                        if (struct_ty == null || loaded == null) {
+                            self.report_error("cannot load byval parameter " + self.m.local_name(local));
+                        } else {
+                            let debug_store = vyx_rt_build_store(self.mod, loaded, slot);
+                            self.emit_debug_local_at_assignment(local, debug_store);
+                        }
+                    } else if (self.source_param_uses_c_sysv_coerce(function_id, source_idx)) {
+                        let restored = self.c_sysv_uncoerce_value(param,
+                                                                 self.local_effective_type(local),
+                                                                 "c.abi.param");
+                        if (restored == null) {
+                            self.report_error("cannot uncoerce C SysV parameter "
+                                      + self.m.local_name(local));
+                        } else {
+                            let debug_store = vyx_rt_build_store(self.mod, restored, slot);
+                            self.emit_debug_local_at_assignment(local, debug_store);
+                        }
+                    } else {
+                        var stored = param;
+                        if (self.source_param_incoming_is_raw_pointer_handle(function_id, source_idx)) {
+                            stored = self.build_pointer_handle(
+                                param,
+                                vyx_rt_const_ptr_null(self.mod, self.ty_ptr),
+                                "mir.param.handle");
+                            if (stored == null) {
+                                self.report_error("cannot wrap raw-pointer parameter "
+                                          + self.m.local_name(local));
+                            }
+                        }
+                        if (stored != null) {
+                            let debug_store = vyx_rt_build_store(self.mod, stored, slot);
+                            self.emit_debug_local_at_assignment(local, debug_store);
+                        }
+                    }
+                }
+                param_index = param_index + 1;
+                source_idx = source_idx + 1;
+                }
+            }
+            local = self.m.local_next(local);
+        }
+        if (self.dci_function_inalloca_count(function_id) > 1) {
+            let frame = vyx_rt_get_param(self.mod, self.current_function_value, param_index as u64);
+            if (frame == null) {
+                self.report_error("cannot load packed DCI inalloca frame for `"
+                          + self.m.function_name(function_id) + "`");
+                return;
+            }
+            var packed_idx: i32 = 0;
+            var packed_local = self.m.function_first_local(function_id);
+            while (packed_local != mir_id_invalid()) {
+                if (self.local_is_source_param(packed_local)) {
+                    if (self.dci_abi_passing(self.dci_source_parameter_abi(function_id, packed_idx))
+                        == "inalloca") {
+                        let slot = llvm_mir_map_get(self.local_slots, packed_local);
+                        let field_ptr = self.dci_inalloca_frame_field_ptr(function_id,
+                                                                          frame,
+                                                                          packed_idx);
+                        if (slot == null || field_ptr == null) {
+                            self.report_error("cannot bind packed DCI inalloca parameter "
+                                      + self.m.local_name(packed_local));
+                        } else {
+                            let debug_store = vyx_rt_build_store(self.mod, field_ptr, slot);
+                            self.emit_debug_local_at_assignment(packed_local, debug_store);
+                        }
+                    }
+                    packed_idx = packed_idx + 1;
+                }
+                packed_local = self.m.local_next(packed_local);
+            }
+        }
+    }
+}

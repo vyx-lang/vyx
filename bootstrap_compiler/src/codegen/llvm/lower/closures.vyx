@@ -1,0 +1,1142 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn get_or_create_function_env_type(self, function_id: i32) -> rawptr {
+        if (self.function_capture_count(function_id) <= 0) { return null; }
+        let cached = llvm_mir_map_get(self.function_env_types, function_id);
+        if (cached != null) { return cached; }
+        let name = self.m.function_name(function_id) + ".env";
+        let st = vyx_rt_struct_ty_named(self.mod, name.c_str(), name.len as u64);
+        if (st == null) {
+            self.report_error("cannot create closure env type for " + self.m.function_name(function_id));
+            return null;
+        }
+        let n = self.function_capture_count(function_id);
+        let fields = malloc((n * 8) as u64);
+        if (fields == null) {
+            self.report_error("cannot allocate closure env field list for " + self.m.function_name(function_id));
+            return null;
+        }
+        var idx: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_capture(local)) {
+                var field_ty = self.lower_type(self.local_effective_type(local));
+                if (self.local_is_reference_capture(local)) { field_ty = self.ty_ptr; }
+                ast_write_rawptr(ptr_offset(fields, idx * 8), field_ty);
+                idx = idx + 1;
+            }
+            local = self.m.local_next(local);
+        }
+        if (vyx_rt_struct_ty_set_body(self.mod, st, fields, n as u64, 0) != 0) {
+            free(fields);
+            self.report_error("cannot finalize closure env type for " + self.m.function_name(function_id));
+            return null;
+        }
+        free(fields);
+        llvm_mir_map_put(self.function_env_types, function_id, st);
+        return st;
+    }
+
+    public fn malloc_bytes_value(self, size: i64, name: string) -> rawptr {
+        if (size <= 0) {
+            self.report_error("invalid allocation size for " + name);
+            return null;
+        }
+        if (self.builtin_malloc_fn == null || self.builtin_malloc_fty == null) {
+            self.report_error("malloc is not declared before " + name);
+            return null;
+        }
+        let size_v = vyx_rt_const_int(self.mod, self.ty_i64, size, 0);
+        return vyx_rt_build_call1(self.mod,
+                                  self.builtin_malloc_fty,
+                                  self.builtin_malloc_fn,
+                                  size_v,
+                                  name.c_str(),
+                                  name.len as u64);
+    }
+
+    public fn class_alloc_bytes_value(self, size: i64, name: string) -> rawptr {
+        if (size <= 0) {
+            self.report_error("invalid class allocation size for " + name);
+            return null;
+        }
+        if (self.builtin_class_alloc_fn == null || self.builtin_class_alloc_fty == null) {
+            return self.malloc_bytes_value(size, name);
+        }
+        let size_v = vyx_rt_const_int(self.mod, self.ty_i64, size, 0);
+        return vyx_rt_build_call1(self.mod,
+                                  self.builtin_class_alloc_fty,
+                                  self.builtin_class_alloc_fn,
+                                  size_v,
+                                  name.c_str(),
+                                  name.len as u64);
+    }
+
+    public fn closure_fat_field_ptr(self, fat: rawptr, idx: i32, name: string) -> rawptr {
+        let fat_ty = self.get_or_create_closure_fat_ty();
+        if (fat == null || fat_ty == null) { return null; }
+        if (idx < 0 || idx >= 2) {
+            self.report_error("closure fat field index out of range: " + policy_i64_to_string(idx as i64));
+            return null;
+        }
+        return vyx_rt_build_gep2(self.mod,
+                                 fat_ty,
+                                 fat,
+                                 vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                 vyx_rt_const_int(self.mod, self.ty_i32, idx as i64, 0),
+                                 name.c_str(),
+                                 name.len as u64);
+    }
+
+    public fn closure_env_field_ptr(self, function_id: i32, env: rawptr, idx: i32, name: string) -> rawptr {
+        let env_ty = self.get_or_create_function_env_type(function_id);
+        if (env == null || env_ty == null) { return null; }
+        let capture_count = self.function_capture_count(function_id);
+        if (idx < 0 || idx >= capture_count) {
+            self.report_error("closure env field index out of range for "
+                      + self.m.function_name(function_id)
+                      + ": "
+                      + policy_i64_to_string(idx as i64));
+            return null;
+        }
+        return vyx_rt_build_gep2(self.mod,
+                                 env_ty,
+                                 env,
+                                 vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                 vyx_rt_const_int(self.mod, self.ty_i32, idx as i64, 0),
+                                 name.c_str(),
+                                 name.len as u64);
+    }
+
+    public fn build_closure_env_value(self, function_id: i32) -> rawptr {
+        let capture_count = self.function_capture_count(function_id);
+        if (capture_count <= 0) { return vyx_rt_const_ptr_null(self.mod, self.ty_ptr); }
+        let env_ty = self.get_or_create_function_env_type(function_id);
+        if (env_ty == null) { return null; }
+        let env_size = vyx_rt_type_alloc_size(self.mod, env_ty);
+        let env_mem = self.malloc_bytes_value(env_size, self.m.function_name(function_id) + ".env.alloc");
+        if (env_mem == null) { return null; }
+        var idx: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_capture(local)) {
+                var cap_value: rawptr = null;
+                let init_value = self.m.local_capture_init_value(local);
+                if (init_value != mir_id_invalid()) {
+                    cap_value = self.lower_value_as(init_value, self.local_effective_type(local));
+                } else {
+                    let source_local = self.m.local_capture_source(local);
+                    let source_slot = llvm_mir_map_get(self.local_slots, source_local);
+                    if (source_local == mir_id_invalid() || source_slot == null) {
+                        self.report_error("cannot resolve capture source for " + self.m.local_name(local)
+                                  + " in " + self.m.function_name(function_id));
+                        return null;
+                    }
+                    if (self.local_is_reference_capture(local)) {
+                        cap_value = source_slot;
+                    } else {
+                        let source_value = vyx_rt_build_load(self.mod,
+                                                             self.lower_type(self.m.local_type(source_local)),
+                                                             source_slot,
+                                                             self.m.local_name(local).c_str(),
+                                                             self.m.local_name(local).len as u64);
+                        cap_value = self.cast_value(source_value, self.local_effective_type(source_local), self.local_effective_type(local));
+                    }
+                }
+                let field_ptr = self.closure_env_field_ptr(function_id, env_mem, idx, self.m.local_name(local));
+                if (cap_value == null || field_ptr == null) {
+                    self.report_error("cannot store capture " + self.m.local_name(local));
+                    return null;
+                }
+                vyx_rt_build_store(self.mod, cap_value, field_ptr);
+                idx = idx + 1;
+            }
+            local = self.m.local_next(local);
+        }
+        return env_mem;
+    }
+
+    public fn build_closure_fat_value(self, function_id: i32) -> rawptr {
+        let fat_ty = self.get_or_create_closure_fat_ty();
+        var fn_value = llvm_mir_map_get(self.function_closure_adapter_values, function_id);
+        if (fn_value == null) {
+            // A closure-value request is itself proof that this function needs
+            // a value adapter: the adapter-need precomputation is keyed on the
+            // MIR type kind and can miss a target whose type entry was interned
+            // as a class stub carrying `fn(...)` text.  Declaring on demand
+            // keeps the invariant "every closure fat pointer wraps an adapter"
+            // airtight instead of emitting the raw code address into a
+            // `__VyxClosureFat` slot.
+            if (llvm_mir_i32_map_get(self.function_value_adapter_need_map, function_id) != 2) {
+                llvm_mir_i32_map_put(self.function_value_adapter_need_map, function_id, 2);
+            }
+            self.declare_function_value_adapter_for(function_id);
+            fn_value = llvm_mir_map_get(self.function_closure_adapter_values, function_id);
+        }
+        if (fat_ty == null || fn_value == null) {
+            self.report_error("cannot build closure value for " + self.m.function_name(function_id));
+            return null;
+        }
+        let fat_size = vyx_rt_type_alloc_size(self.mod, fat_ty);
+        let fat_mem = self.malloc_bytes_value(fat_size, self.m.function_name(function_id) + ".fat.alloc");
+        let env_mem = self.build_closure_env_value(function_id);
+        if (fat_mem == null || env_mem == null) { return null; }
+        let fn_field = self.closure_fat_field_ptr(fat_mem, 0, "closure.fn");
+        let env_field = self.closure_fat_field_ptr(fat_mem, 1, "closure.env");
+        if (fn_field == null || env_field == null) {
+            self.report_error("cannot address closure fat fields");
+            return null;
+        }
+        vyx_rt_build_store(self.mod, fn_value, fn_field);
+        vyx_rt_build_store(self.mod, env_mem, env_field);
+        return fat_mem;
+    }
+
+    public fn build_closure_fat_from_parts(self, fn_value: rawptr, env_value: rawptr, label: string) -> rawptr {
+        let fat_ty = self.get_or_create_closure_fat_ty();
+        if (fat_ty == null || fn_value == null) {
+            self.report_error("cannot build reflected closure fat pointer for " + label);
+            return null;
+        }
+        var env = env_value;
+        if (env == null) { env = vyx_rt_const_ptr_null(self.mod, self.ty_ptr); }
+        let fat_size = vyx_rt_type_alloc_size(self.mod, fat_ty);
+        let fat_mem = self.malloc_bytes_value(fat_size, label + ".fat.alloc");
+        if (fat_mem == null) { return null; }
+        let fn_field = self.closure_fat_field_ptr(fat_mem, 0, label + ".fn");
+        let env_field = self.closure_fat_field_ptr(fat_mem, 1, label + ".env");
+        if (fn_field == null || env_field == null) {
+            self.report_error("cannot address reflected closure fat fields for " + label);
+            return null;
+        }
+        vyx_rt_build_store(self.mod, fn_value, fn_field);
+        vyx_rt_build_store(self.mod, env, env_field);
+        return fat_mem;
+    }
+
+    public fn closure_fat_function_value(self, fat: rawptr) -> rawptr {
+        let fn_field = self.closure_fat_field_ptr(fat, 0, "closure.fn");
+        if (fn_field == null) { return null; }
+        return vyx_rt_build_load(self.mod, self.ty_ptr, fn_field, llvm_mir_empty_name(), 0);
+    }
+
+    public fn closure_fat_env_value(self, fat: rawptr) -> rawptr {
+        let env_field = self.closure_fat_field_ptr(fat, 1, "closure.env");
+        if (env_field == null) { return null; }
+        return vyx_rt_build_load(self.mod, self.ty_ptr, env_field, llvm_mir_empty_name(), 0);
+    }
+
+    public fn build_function_value_adapter_type(self, function_id: i32) -> rawptr {
+        let source_count = self.function_source_param_count(function_id);
+        let total = source_count + 1;
+        var params: rawptr = null;
+        if (total > 0) {
+            params = malloc((total * 8) as u64);
+            if (params == null) {
+                self.report_error("cannot allocate function-value adapter signature for " + self.m.function_name(function_id));
+                return null;
+            }
+        }
+        ast_write_rawptr(params, self.ty_ptr);
+        var out_idx: i32 = 1;
+        var source_idx: i32 = 0;
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.local_is_source_param(local)) {
+                if (self.source_param_uses_self_pointer_abi(function_id, source_idx)) {
+                    ast_write_rawptr(ptr_offset(params, out_idx * 8), self.ty_ptr);
+                } else {
+                    ast_write_rawptr(ptr_offset(params, out_idx * 8), self.lower_type(self.local_effective_type(local)));
+                }
+                out_idx = out_idx + 1;
+                source_idx = source_idx + 1;
+            }
+            local = self.m.local_next(local);
+        }
+        let fty = vyx_rt_fn_type(self.mod,
+                                 self.lower_type(self.m.function_return_type(function_id)),
+                                 params,
+                                 total as u64,
+                                 0);
+        if (params != null) { free(params); }
+        return fty;
+    }
+
+    /// A function-value adapter is entered through the closure fat ABI, whose
+    /// signature exposes the *logical* parameter types and returns the logical
+    /// result.  The target it forwards to may have a different machine shape:
+    /// a large return becomes a hidden `sret` pointer and a large parameter is
+    /// passed indirectly.  Callers therefore cannot forward their own incoming
+    /// arguments verbatim; they must rebuild them in the target's LLVM order
+    /// and materialize the hidden ones.  This is true exactly when those two
+    /// shapes diverge.
+    public fn function_value_adapter_needs_abi_marshal(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.function_uses_hidden_sret(function_id)) { return true; }
+        var index: i32 = 0;
+        while (index < self.function_source_param_count(function_id)) {
+            if (self.source_param_uses_native_byval_abi(function_id, index)
+                && !self.source_param_uses_self_pointer_abi(function_id, index)) {
+                return true;
+            }
+            index = index + 1;
+        }
+        return false;
+    }
+
+    public fn emit_function_value_adapter_body(self, function_id: i32, adapter_fn: rawptr, adapter_type: rawptr) {
+        let target_fn = llvm_mir_map_get(self.function_values, function_id);
+        let target_type = llvm_mir_map_get(self.function_types, function_id);
+        if (target_fn == null || target_type == null || adapter_fn == null || adapter_type == null) {
+            self.report_error("cannot emit function-value adapter for " + self.m.function_name(function_id));
+            return;
+        }
+        let saved_block = vyx_rt_get_insert_block(self.mod);
+        let name = self.function_symbol_name(function_id) + "$fn_value_adapter.entry";
+        let bb = vyx_rt_append_block(self.mod, adapter_fn, name.c_str(), name.len as u64);
+        if (bb == null) {
+            self.report_error("cannot create function-value adapter block for " + self.m.function_name(function_id));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return;
+        }
+        vyx_rt_position_at_end(self.mod, bb);
+        let source_count = self.function_source_param_count(function_id);
+        if (self.dci_module_default_shared_abi()) { llvm_unwind_prepare_adapter(self.mod, adapter_fn, self.target_triple); }
+        // Incoming parameters start at LLVM index 1: index 0 is the hidden
+        // closure-environment pointer of the fat closure ABI.
+        var incoming: rawptr = null;
+        if (source_count > 0) {
+            incoming = malloc((source_count * 8) as u64);
+            if (incoming == null) {
+                self.report_error("cannot allocate function-value adapter arguments for " + self.m.function_name(function_id));
+                if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+                return;
+            }
+            var read_index: i32 = 0;
+            while (read_index < source_count) {
+                let param = vyx_rt_get_param(self.mod, adapter_fn, (read_index + 1) as u64);
+                if (param == null) {
+                    free(incoming);
+                    self.report_error("cannot read function-value adapter parameter #" + policy_i64_to_string(read_index as i64)
+                              + " for " + self.m.function_name(function_id));
+                    if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+                    return;
+                }
+                ast_write_rawptr(ptr_offset(incoming, read_index * 8), param);
+                read_index = read_index + 1;
+            }
+        }
+        let ret_type = self.m.function_return_type(function_id);
+        let uses_sret = self.function_uses_hidden_sret(function_id);
+        if (uses_sret && self.dci_member_sret_after_receiver(function_id)) {
+            if (incoming != null) { free(incoming); }
+            self.report_error("cannot emit function-value adapter for " + self.m.function_name(function_id)
+                      + ": receiver-prefixed sret return is unsupported");
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return;
+        }
+        var marshal_ok: bool = true;
+        var slot_count: i32 = source_count;
+        if (uses_sret) { slot_count = slot_count + 1; }
+        var args: rawptr = null;
+        if (slot_count > 0) {
+            args = malloc((slot_count * 8) as u64);
+            if (args == null) {
+                if (incoming != null) { free(incoming); }
+                self.report_error("cannot allocate function-value adapter forwarding arguments for " + self.m.function_name(function_id));
+                if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+                return;
+            }
+        }
+        var out_index: i32 = 0;
+        var sret_slot: rawptr = null;
+        if (uses_sret) {
+            let sret_storage = self.lower_storage_type(ret_type);
+            if (sret_storage == null) {
+                marshal_ok = false;
+            } else {
+                sret_slot = vyx_rt_build_alloca(self.mod, sret_storage, "mir.fn.adapter.sret".c_str(), 19);
+                var sret_align = self.native_aggregate_align_bytes(ret_type);
+                if (sret_align <= 0) { sret_align = 8; }
+                if (sret_slot == null) {
+                    marshal_ok = false;
+                } else {
+                    vyx_rt_set_alignment(self.mod, sret_slot, sret_align as i32);
+                }
+            }
+            if (!marshal_ok) {
+                if (incoming != null) { free(incoming); }
+                if (args != null) { free(args); }
+                self.report_error("cannot materialize function-value adapter return slot for " + self.m.function_name(function_id));
+                if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+                return;
+            }
+            ast_write_rawptr(ptr_offset(args, out_index * 8), sret_slot);
+            out_index = out_index + 1;
+        }
+        var source_index: i32 = 0;
+        while (source_index < source_count && marshal_ok) {
+            let forwarded = ast_read_rawptr(ptr_offset(incoming, source_index * 8));
+            if (self.source_param_uses_native_byval_abi(function_id, source_index)
+                && !self.source_param_uses_self_pointer_abi(function_id, source_index)) {
+                // The target expects a pointer to the aggregate; the adapter
+                // received it by value, so spill it to a slot first.
+                let param_type = self.function_source_param_type(function_id, source_index);
+                let storage = self.lower_storage_type(param_type);
+                var byval_align = self.native_aggregate_align_bytes(param_type);
+                if (byval_align <= 0) { byval_align = 8; }
+                var slot: rawptr = null;
+                if (storage != null && forwarded != null) {
+                    slot = vyx_rt_build_alloca(self.mod, storage, "mir.fn.adapter.byval".c_str(), 20);
+                } else {
+                    marshal_ok = false;
+                }
+                if (marshal_ok && slot == null) { marshal_ok = false; }
+                if (marshal_ok) {
+                    vyx_rt_set_alignment(self.mod, slot, byval_align as i32);
+                    vyx_rt_build_store(self.mod, forwarded, slot);
+                    ast_write_rawptr(ptr_offset(args, out_index * 8), slot);
+                    out_index = out_index + 1;
+                }
+            } else {
+                ast_write_rawptr(ptr_offset(args, out_index * 8), forwarded);
+                out_index = out_index + 1;
+            }
+            source_index = source_index + 1;
+        }
+        if (incoming != null) { free(incoming); }
+        if (!marshal_ok) {
+            if (args != null) { free(args); }
+            self.report_error("cannot marshal function-value adapter arguments for " + self.m.function_name(function_id));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return;
+        }
+        var call_name = "mir.fn.adapter.call";
+        let target_returns_void = uses_sret
+            || llvm_mir_type_kind(&self.m, ret_type) == ty_VOID();
+        if (target_returns_void) { call_name = ""; }
+        var result = vyx_rt_build_call(self.mod,
+                                       target_type,
+                                       target_fn,
+                                       args,
+                                       slot_count as u64,
+                                       call_name.c_str(),
+                                       call_name.len as u64);
+        if (args != null) { free(args); }
+        if (result != null && self.function_value_adapter_needs_abi_marshal(function_id)) {
+            if (!self.apply_native_c_aggregate_abi_attrs(function_id, result)) { result = null; }
+        }
+        if (llvm_mir_type_kind(&self.m, ret_type) == ty_VOID()) {
+            vyx_rt_build_ret_void(self.mod);
+        } elif (uses_sret) {
+            let return_storage = self.lower_storage_type(ret_type);
+            let loaded = vyx_rt_build_load(self.mod, return_storage, sret_slot, "mir.fn.adapter.ret".c_str(), 18);
+            if (loaded == null) {
+                self.report_error("cannot emit function-value adapter return for " + self.m.function_name(function_id));
+            } else {
+                vyx_rt_build_ret(self.mod, loaded);
+            }
+        } elif (result != null) {
+            vyx_rt_build_ret(self.mod, result);
+        } else {
+            self.report_error("cannot emit function-value adapter return for " + self.m.function_name(function_id));
+        }
+        if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+    }
+
+    public fn compute_adapter_need_cache(self) {
+        if (self.adapter_need_cache_ready) { return; }
+        var value_id: i32 = 1;
+        while (value_id <= self.m.value_count) {
+            if (self.m.value_kind(value_id) == mir_value_call()) {
+                let callee = self.m.value_lhs(value_id);
+                if (callee != mir_id_invalid()
+                    && self.m.value_target_kind(value_id) == mir_target_function()) {
+                    llvm_mir_i32_map_put(self.direct_call_callee_value_map, callee, 2);
+                }
+            }
+            value_id = value_id + 1;
+        }
+        value_id = 1;
+        while (value_id <= self.m.value_count) {
+            let target_kind = self.m.value_target_kind(value_id);
+            let target_id = self.m.value_target_id(value_id);
+            if (target_kind == mir_target_function() && target_id != mir_id_invalid()) {
+                if (self.type_is_fn_abi_destination(self.m.value_type(value_id))
+                    && llvm_mir_i32_map_get(self.direct_call_callee_value_map, value_id) != 2) {
+                    llvm_mir_i32_map_put(self.function_value_adapter_need_map, target_id, 2);
+                }
+            }
+            if (self.m.value_kind(value_id) == mir_value_cast()
+                && self.type_is_raw_callback_scalar_target(self.m.value_type(value_id))) {
+                let lhs = self.m.value_lhs(value_id);
+                if (lhs != mir_id_invalid()
+                    && self.m.value_kind(lhs) == mir_value_target_ref()
+                    && self.m.value_target_kind(lhs) == mir_target_function()) {
+                    llvm_mir_i32_map_put(self.raw_callback_adapter_use_map,
+                                         self.m.value_target_id(lhs),
+                                         2);
+                }
+            }
+            value_id = value_id + 1;
+        }
+        self.adapter_need_cache_ready = true;
+    }
+
+    public fn function_needs_value_adapter(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        self.compute_adapter_need_cache();
+        return llvm_mir_i32_map_get(self.function_value_adapter_need_map, function_id) == 2;
+    }
+
+    public fn value_is_direct_call_callee(self, callee_value_id: i32) -> bool {
+        if (callee_value_id == mir_id_invalid()) { return false; }
+        self.compute_adapter_need_cache();
+        return llvm_mir_i32_map_get(self.direct_call_callee_value_map, callee_value_id) == 2;
+    }
+
+    public fn declare_function_value_adapters(self) {
+        var fn_id: i32 = 1;
+        while (fn_id <= self.m.function_count) {
+            self.declare_function_value_adapter_for(fn_id);
+            fn_id = fn_id + 1;
+        }
+    }
+
+    public fn declare_function_value_adapter_for(self, fn_id: i32) {
+        let temp_string_mark = vyx_rt_string_arena_checkpoint();
+        if (self.function_can_be_declared(fn_id) && self.function_needs_value_adapter(fn_id)) {
+            if (llvm_mir_map_get(self.function_closure_adapter_values, fn_id) != null) {
+                self.release_temp_strings(temp_string_mark);
+                return;
+            }
+            self.declare_function_signature(fn_id);
+            let fn_value = llvm_mir_map_get(self.function_values, fn_id);
+            if (fn_value == null) {
+                self.report_error("cannot declare function-value target " + self.m.function_name(fn_id));
+                self.release_temp_strings(temp_string_mark);
+                return;
+            }
+            if (self.function_hidden_env_param_count(fn_id) > 0) {
+                llvm_mir_map_put(self.function_closure_adapter_values, fn_id, fn_value);
+            } else {
+                let adapter_type = self.build_function_value_adapter_type(fn_id);
+                if (adapter_type != null) {
+                    let name = self.function_symbol_name(fn_id)
+                        + "$fn_value_adapter$"
+                        + policy_mangle_part(self.module_symbol_name);
+                    let adapter_fn = vyx_rt_add_function(self.mod, name.c_str(), name.len as u64, adapter_type);
+                    if (adapter_fn == null) {
+                        self.report_error("cannot declare function-value adapter " + name);
+                    } else {
+                        vyx_rt_set_linkage(self.mod, adapter_fn, 1);
+                        llvm_mir_map_put(self.function_closure_adapter_values, fn_id, adapter_fn);
+                        self.emit_function_value_adapter_body(fn_id, adapter_fn, adapter_type);
+                    }
+                }
+            }
+        }
+        self.release_temp_strings(temp_string_mark);
+    }
+
+    public fn raw_callback_adapter_type(self) -> rawptr {
+        let params = malloc(8);
+        if (params == null) {
+            self.report_error("cannot allocate raw callback adapter signature");
+            return null;
+        }
+        ast_write_rawptr(params, self.ty_ptr);
+        let fty = vyx_rt_fn_type(self.mod, self.ty_i32, params, 1, 0);
+        free(params);
+        return fty;
+    }
+
+    public fn function_raw_callback_return_compatible(self, function_id: i32) -> bool {
+        let ret_kind = llvm_mir_type_kind(&self.m, self.m.function_return_type(function_id));
+        return ret_kind == ty_I32() || ret_kind == ty_U32();
+    }
+
+    public fn type_can_receive_raw_callback_context(self, type_id: i32) -> bool {
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        if (kind == ty_RAWPTR() || kind == ty_PTR() || kind == ty_REF() || kind == ty_MUTREF()) { return true; }
+        return llvm_mir_int_bits_for_kind(kind) > 0;
+    }
+
+    public fn function_is_raw_callback_abi_compatible(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.function_hidden_env_param_count(function_id) != 0) { return false; }
+        if (self.function_source_param_count(function_id) != 1) { return false; }
+        let param_type = self.function_source_param_type(function_id, 0);
+        if (!self.type_can_receive_raw_callback_context(param_type)) { return false; }
+        return self.function_raw_callback_return_compatible(function_id);
+    }
+
+    public fn function_can_use_raw_callback_adapter(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.function_hidden_env_param_count(function_id) != 0) { return false; }
+        let source_count = self.function_source_param_count(function_id);
+        if (source_count == 0) { return true; }
+        if (source_count == 1) {
+            return self.type_can_receive_raw_callback_context(self.function_source_param_type(function_id, 0));
+        }
+        return false;
+    }
+
+    public fn type_is_raw_callback_scalar_target(self, type_id: i32) -> bool {
+        let kind = llvm_mir_type_kind(&self.m, type_id);
+        // Integer casts are the legacy thread/fiber callback shorthand.  A
+        // pointer cast asks for the function's real address and must not be
+        // rewritten to the canonical (rawptr) -> i32 adapter signature.
+        return llvm_mir_int_bits_for_kind(kind) > 0;
+    }
+
+    public fn function_has_raw_callback_scalar_cast_use(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        self.compute_adapter_need_cache();
+        return llvm_mir_i32_map_get(self.raw_callback_adapter_use_map, function_id) == 2;
+    }
+
+    public fn function_needs_raw_callback_adapter(self, function_id: i32) -> bool {
+        if (!self.function_has_raw_callback_scalar_cast_use(function_id)) { return false; }
+        return !self.function_is_raw_callback_abi_compatible(function_id);
+    }
+
+    public fn emit_raw_callback_adapter_body(self, function_id: i32, adapter_fn: rawptr, adapter_type: rawptr) {
+        let target_fn = llvm_mir_map_get(self.function_values, function_id);
+        let target_type = llvm_mir_map_get(self.function_types, function_id);
+        if (target_fn == null || target_type == null || adapter_fn == null || adapter_type == null) {
+            self.report_error("cannot emit raw callback adapter for " + self.m.function_name(function_id));
+            return;
+        }
+        let saved_block = vyx_rt_get_insert_block(self.mod);
+        let name = self.function_symbol_name(function_id) + "$raw_callback_adapter.entry";
+        let bb = vyx_rt_append_block(self.mod, adapter_fn, name.c_str(), name.len as u64);
+        if (bb == null) {
+            self.report_error("cannot create raw callback adapter block for " + self.m.function_name(function_id));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return;
+        }
+        vyx_rt_position_at_end(self.mod, bb);
+        let source_count = self.function_source_param_count(function_id);
+        var args: rawptr = null;
+        if (self.dci_module_default_shared_abi()) { llvm_unwind_prepare_adapter(self.mod, adapter_fn, self.target_triple); }
+        if (source_count > 0) {
+            args = malloc((source_count * 8) as u64);
+            if (args == null) {
+                self.report_error("cannot allocate raw callback adapter arguments for " + self.m.function_name(function_id));
+                if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+                return;
+            }
+        }
+        if (source_count == 1) {
+            let ctx_param = vyx_rt_get_param(self.mod, adapter_fn, 0);
+            let rawptr_type = self.type_id_by_text("rawptr");
+            let target_param_type = self.function_source_param_type(function_id, 0);
+            let ctx_arg = self.cast_value(ctx_param, rawptr_type, target_param_type);
+            if (ctx_param == null || rawptr_type == mir_id_invalid() || target_param_type == mir_id_invalid() || ctx_arg == null) {
+                if (args != null) { free(args); }
+                self.report_error("cannot lower raw callback context for " + self.m.function_name(function_id));
+                if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+                return;
+            }
+            ast_write_rawptr(args, ctx_arg);
+        } else if (source_count != 0) {
+            if (args != null) { free(args); }
+            self.report_error("raw callback adapter requires zero or one source parameter for " + self.m.function_name(function_id));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return;
+        }
+        var call_name = "mir.raw.callback.call";
+        let ret_type = self.m.function_return_type(function_id);
+        let ret_kind = llvm_mir_type_kind(&self.m, ret_type);
+        if (ret_kind == ty_VOID()) { call_name = ""; }
+        let result = vyx_rt_build_call(self.mod,
+                                       target_type,
+                                       target_fn,
+                                       args,
+                                       source_count as u64,
+                                       call_name.c_str(),
+                                       call_name.len as u64);
+        if (args != null) { free(args); }
+        if (ret_kind == ty_VOID()) {
+            vyx_rt_build_ret(self.mod, vyx_rt_const_int(self.mod, self.ty_i32, 0, 0));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return;
+        }
+        let ret_bits = llvm_mir_int_bits_for_kind(ret_kind);
+        if (ret_bits <= 0 || result == null) {
+            self.report_error("raw callback adapter return must be void or integer for " + self.m.function_name(function_id));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return;
+        }
+        let out = self.int_value_to_bits(result, ret_type, 32);
+        if (out == null) {
+            self.report_error("cannot lower raw callback return for " + self.m.function_name(function_id));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return;
+        }
+        vyx_rt_build_ret(self.mod, out);
+        if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+    }
+
+    public fn declare_raw_callback_adapters(self) {
+        var fn_id: i32 = 1;
+        while (fn_id <= self.m.function_count) {
+            self.declare_raw_callback_adapter_for(fn_id);
+            fn_id = fn_id + 1;
+        }
+    }
+
+    public fn declare_raw_callback_adapter_for(self, fn_id: i32) {
+        let temp_string_mark = vyx_rt_string_arena_checkpoint();
+        if (self.function_can_be_declared(fn_id) && self.function_needs_raw_callback_adapter(fn_id)) {
+            if (llvm_mir_map_get(self.function_raw_callback_adapter_values, fn_id) != null) {
+                self.release_temp_strings(temp_string_mark);
+                return;
+            }
+            if (!self.function_can_use_raw_callback_adapter(fn_id)) {
+                self.report_error("cannot expose " + self.m.function_name(fn_id) + " as raw callback");
+            } else {
+                self.declare_function_signature(fn_id);
+                if (llvm_mir_map_get(self.function_values, fn_id) == null) {
+                    self.report_error("cannot declare raw callback target " + self.m.function_name(fn_id));
+                    self.release_temp_strings(temp_string_mark);
+                    return;
+                }
+                let adapter_type = self.raw_callback_adapter_type();
+                if (adapter_type != null) {
+                    let name = self.function_symbol_name(fn_id)
+                        + "$raw_callback_adapter$"
+                        + policy_mangle_part(self.module_symbol_name);
+                    let adapter_fn = vyx_rt_add_function(self.mod, name.c_str(), name.len as u64, adapter_type);
+                    if (adapter_fn == null) {
+                        self.report_error("cannot declare raw callback adapter " + name);
+                    } else {
+                        vyx_rt_set_linkage(self.mod, adapter_fn, 1);
+                        llvm_mir_map_put(self.function_raw_callback_adapter_values, fn_id, adapter_fn);
+                        self.emit_raw_callback_adapter_body(fn_id, adapter_fn, adapter_type);
+                    }
+                }
+            }
+        }
+        self.release_temp_strings(temp_string_mark);
+    }
+
+    public fn type_is_fn_abi_destination(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        if (llvm_mir_type_kind(&self.m, type_id) == ty_FN()) { return true; }
+        let text = llvm_mir_type_text(&self.m, type_id);
+        return text.len >= 3 && text.substring(0, 3) == "fn(";
+    }
+
+    public fn lower_function_target_as_fn_abi(self, value_id: i32, dst_type_id: i32) -> rawptr {
+        if (value_id == mir_id_invalid() || dst_type_id == mir_id_invalid()) { return null; }
+        if (self.m.value_kind(value_id) != mir_value_target_ref()) { return null; }
+        if (self.m.value_target_kind(value_id) != mir_target_function()) { return null; }
+        if (!self.type_is_fn_abi_destination(dst_type_id)) {
+            if (llvm_mir_env_enabled("VYX_FNABI_TRACE")) {
+                print("[fnabi-trace] skip value="
+                      + policy_i64_to_string(value_id as i64)
+                      + " target=" + self.m.function_name(self.m.value_target_id(value_id))
+                      + " dst=" + policy_i64_to_string(dst_type_id as i64)
+                      + " kind=" + policy_i64_to_string(llvm_mir_type_kind(&self.m, dst_type_id) as i64)
+                      + " text=" + llvm_mir_type_text(&self.m, dst_type_id));
+            }
+            return null;
+        }
+        if (llvm_mir_type_kind(&self.m, dst_type_id) != ty_FN()
+            && llvm_mir_env_enabled("VYX_FNABI_TRACE")) {
+            print("[fnabi-trace] textual-fn dst value="
+                  + policy_i64_to_string(value_id as i64)
+                  + " target=" + self.m.function_name(self.m.value_target_id(value_id))
+                  + " dst=" + policy_i64_to_string(dst_type_id as i64)
+                  + " kind=" + policy_i64_to_string(llvm_mir_type_kind(&self.m, dst_type_id) as i64)
+                  + " text=" + llvm_mir_type_text(&self.m, dst_type_id));
+        }
+        let target_fn = self.m.value_target_id(value_id);
+        if (target_fn == mir_id_invalid()) { return null; }
+        self.declare_function_signature(target_fn);
+        return self.build_closure_fat_value(target_fn);
+    }
+
+    public fn lower_direct_function_target_as_scalar(self, value_id: i32, dst_type_id: i32) -> rawptr {
+        if (value_id == mir_id_invalid() || dst_type_id == mir_id_invalid()) { return null; }
+        if (self.m.value_kind(value_id) != mir_value_target_ref()) { return null; }
+        if (self.m.value_target_kind(value_id) != mir_target_function()) { return null; }
+        let dst_kind = llvm_mir_type_kind(&self.m, dst_type_id);
+        let dst_bits = llvm_mir_int_bits_for_kind(dst_kind);
+        let wants_pointer = dst_kind == ty_CFN()
+            || dst_kind == ty_RAWPTR()
+            || dst_kind == ty_PTR()
+            || dst_kind == ty_REF()
+            || dst_kind == ty_MUTREF();
+        if (dst_bits <= 0 && !wants_pointer) { return null; }
+        let target_fn = self.m.value_target_id(value_id);
+        self.declare_function_signature(target_fn);
+        var fn_value = llvm_mir_map_get(self.function_values, target_fn);
+        if (dst_bits > 0 && self.function_needs_raw_callback_adapter(target_fn)) {
+            self.declare_raw_callback_adapter_for(target_fn);
+            fn_value = llvm_mir_map_get(self.function_raw_callback_adapter_values, target_fn);
+            if (fn_value == null) {
+                self.report_error("cannot resolve raw callback adapter for " + self.m.function_name(target_fn));
+                return null;
+            }
+        }
+        if (dst_bits <= 0 && self.function_hidden_env_param_count(target_fn) != 0) {
+            self.report_error("cannot expose capturing function "
+                      + self.m.function_name(target_fn)
+                      + " as a raw pointer");
+            return null;
+        }
+        if (fn_value == null) {
+            self.report_error("cannot resolve function address for " + self.m.function_name(target_fn));
+            return null;
+        }
+        if (dst_bits > 0) {
+            return vyx_rt_build_ptr_to_int(self.mod,
+                                           fn_value,
+                                           self.int_type_for_bits(dst_bits),
+                                           llvm_mir_empty_name(),
+                                           0);
+        }
+        if (llvm_mir_kind_pointer_handle(dst_kind)) {
+            return self.pointer_handle_from_raw(fn_value,
+                                                hir_type_table_elem(self.m.types, dst_type_id),
+                                                0,
+                                                0,
+                                                "mir.fn.ptr");
+        }
+        if (llvm_mir_env_enabled("VYX_FNABI_TRACE")) {
+            print("[fnabi-trace] bare-address value="
+                  + policy_i64_to_string(value_id as i64)
+                  + " target=" + self.m.function_name(target_fn)
+                  + " dst=" + policy_i64_to_string(dst_type_id as i64)
+                  + " kind=" + policy_i64_to_string(dst_kind as i64)
+                  + " text=" + llvm_mir_type_text(&self.m, dst_type_id));
+        }
+        return fn_value;
+    }
+
+    public fn fn_type_param_start(self, text: string) -> i32 {
+        var i: i32 = 0;
+        while (i < text.len) {
+            if (text.charAt(i) == 40) { return i + 1; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn fn_type_param_end(self, text: string) -> i32 {
+        var i: i32 = 0;
+        var depth: i32 = 0;
+        while (i < text.len) {
+            let ch = text.charAt(i);
+            if (ch == 40) { depth = depth + 1; }
+            if (ch == 41) {
+                depth = depth - 1;
+                if (depth == 0) { return i; }
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public fn fn_type_signature_text_is_direct(self, text: string) -> bool {
+        let clean = self.trim_type_text(text);
+        if (clean.len >= 3 && clean.substring(0, 3) == "fn(") { return true; }
+        if (clean.len >= 4 && clean.substring(0, 4) == "cfn(") { return true; }
+        if (clean.len >= 10 && clean.substring(0, 10) == "unsafe fn(") { return true; }
+        return false;
+    }
+
+    public fn fn_type_signature_text(self, fn_type_id: i32) -> string {
+        let text = llvm_mir_type_text(&self.m, fn_type_id);
+        if (self.fn_type_signature_text_is_direct(text)) { return text; }
+        let kind = llvm_mir_type_kind(&self.m, fn_type_id);
+        if (kind != ty_FN() && kind != ty_CFN()) { return text; }
+        let ret_id = hir_type_table_elem(self.m.types, fn_type_id);
+        var id: i32 = 1;
+        while (id <= self.m.types.count) {
+            if (id != fn_type_id
+                && llvm_mir_type_kind(&self.m, id) == kind
+                && hir_type_table_elem(self.m.types, id) == ret_id
+                && self.fn_type_signature_text_is_direct(llvm_mir_type_text(&self.m, id))) {
+                return llvm_mir_type_text(&self.m, id);
+            }
+            id = id + 1;
+        }
+        return text;
+    }
+
+    public fn fn_type_param_count(self, fn_type_id: i32) -> i32 {
+        let text = self.fn_type_signature_text(fn_type_id);
+        let start = self.fn_type_param_start(text);
+        let end = self.fn_type_param_end(text);
+        if (start < 0 || end < start) { return 0; }
+        if (self.trim_type_text(text.substring(start, end)).len == 0) { return 0; }
+        var count: i32 = 1;
+        var angle_depth: i32 = 0;
+        var paren_depth: i32 = 0;
+        var i = start;
+        while (i < end) {
+            let ch = text.charAt(i);
+            if (ch == 60) { angle_depth = angle_depth + 1; }
+            else if (ch == 62 && angle_depth > 0) { angle_depth = angle_depth - 1; }
+            else if (ch == 40) { paren_depth = paren_depth + 1; }
+            else if (ch == 41 && paren_depth > 0) { paren_depth = paren_depth - 1; }
+            else if (ch == 44 && angle_depth == 0 && paren_depth == 0) { count = count + 1; }
+            i = i + 1;
+        }
+        return count;
+    }
+
+    public fn fn_type_param_text_at(self, fn_type_id: i32, wanted: i32) -> string {
+        let text = self.fn_type_signature_text(fn_type_id);
+        let start = self.fn_type_param_start(text);
+        let end = self.fn_type_param_end(text);
+        if (start < 0 || end < start) { return ""; }
+        var idx: i32 = 0;
+        var part_start = start;
+        var angle_depth: i32 = 0;
+        var paren_depth: i32 = 0;
+        var i = start;
+        while (i <= end) {
+            var split = false;
+            if (i == end) {
+                split = true;
+            } else {
+                let ch = text.charAt(i);
+                if (ch == 60) { angle_depth = angle_depth + 1; }
+                else if (ch == 62 && angle_depth > 0) { angle_depth = angle_depth - 1; }
+                else if (ch == 40) { paren_depth = paren_depth + 1; }
+                else if (ch == 41 && paren_depth > 0) { paren_depth = paren_depth - 1; }
+                else if (ch == 44 && angle_depth == 0 && paren_depth == 0) { split = true; }
+            }
+            if (split) {
+                if (idx == wanted) { return self.trim_type_text(text.substring(part_start, i)); }
+                idx = idx + 1;
+                part_start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public fn fn_type_param_type_at(self, fn_type_id: i32, wanted: i32) -> i32 {
+        var text = self.fn_type_param_text_at(fn_type_id, wanted);
+        if (text.len == 0) { return mir_id_invalid(); }
+        var angle_depth: i32 = 0;
+        var paren_depth: i32 = 0;
+        var colon_pos: i32 = -1;
+        var i: i32 = 0;
+        while (i < text.len) {
+            let ch = text.charAt(i);
+            if (ch == 60) { angle_depth = angle_depth + 1; }
+            else if (ch == 62 && angle_depth > 0) { angle_depth = angle_depth - 1; }
+            else if (ch == 40) { paren_depth = paren_depth + 1; }
+            else if (ch == 41 && paren_depth > 0) { paren_depth = paren_depth - 1; }
+            else if (ch == 58 && angle_depth == 0 && paren_depth == 0) {
+                let next_is_colon = i + 1 < text.len && text.charAt(i + 1) == 58;
+                let prev_is_colon = i > 0 && text.charAt(i - 1) == 58;
+                if (!next_is_colon && !prev_is_colon) { colon_pos = i; }
+            }
+            i = i + 1;
+        }
+        if (colon_pos >= 0 && colon_pos + 1 < text.len) {
+            text = self.trim_type_text(text.substring(colon_pos + 1, text.len));
+        }
+        return self.type_id_for_resolved_text(self.current_function_id, text);
+    }
+
+    public fn fn_type_return_text(self, fn_type_id: i32) -> string {
+        let text = self.fn_type_signature_text(fn_type_id);
+        var angle_depth: i32 = 0;
+        var paren_depth: i32 = 0;
+        var i: i32 = 0;
+        while (i + 1 < text.len) {
+            let ch = text.charAt(i);
+            if (ch == 60) { angle_depth = angle_depth + 1; }
+            else if (ch == 62 && angle_depth > 0) { angle_depth = angle_depth - 1; }
+            else if (ch == 40) { paren_depth = paren_depth + 1; }
+            else if (ch == 41 && paren_depth > 0) { paren_depth = paren_depth - 1; }
+            else if (ch == 45 && text.charAt(i + 1) == 62
+                     && angle_depth == 0 && paren_depth == 0) {
+                return self.trim_type_text(text.substring(i + 2, text.len));
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public fn fn_type_return_type(self, fn_type_id: i32) -> i32 {
+        if (fn_type_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let recorded = hir_type_table_elem(self.m.types, fn_type_id);
+        if (recorded != mir_id_invalid()) { return recorded; }
+        let text = self.fn_type_return_text(fn_type_id);
+        if (text.len == 0) { return mir_id_invalid(); }
+        return self.type_id_for_resolved_text(self.current_function_id, text);
+    }
+
+    public fn build_fn_value_call_type(self, fn_type_id: i32, include_env: bool) -> rawptr {
+        let source_count = self.fn_type_param_count(fn_type_id);
+        var total = source_count;
+        if (include_env) { total = total + 1; }
+        var params: rawptr = null;
+        if (total > 0) {
+            params = malloc((total * 8) as u64);
+            if (params == null) {
+                self.report_error("cannot allocate function-value signature");
+                return null;
+            }
+        }
+        var out_idx: i32 = 0;
+        if (include_env) {
+            ast_write_rawptr(params, self.ty_ptr);
+            out_idx = 1;
+        }
+        var i: i32 = 0;
+        while (i < source_count) {
+            let param_type = self.fn_type_param_type_at(fn_type_id, i);
+            if (param_type == mir_id_invalid()) {
+                if (params != null) { free(params); }
+                self.report_error("cannot resolve function-value parameter type #" + policy_i64_to_string(i as i64));
+                return null;
+            }
+            var param_ll = self.lower_type(param_type);
+            if (!include_env && self.type_uses_c_sysv_direct_coerce(param_type)) {
+                let coerce_param = self.c_sysv_coerce_llvm_type(param_type);
+                if (coerce_param != null) { param_ll = coerce_param; }
+            } elif (!include_env && self.type_uses_c_sysv_memory(param_type)) {
+                param_ll = self.ty_ptr;
+            }
+            ast_write_rawptr(ptr_offset(params, out_idx * 8), param_ll);
+            out_idx = out_idx + 1;
+            i = i + 1;
+        }
+        let return_type = self.fn_type_return_type(fn_type_id);
+        if (return_type == mir_id_invalid()) {
+            if (params != null) { free(params); }
+            self.report_error("cannot resolve function-value return type for " + llvm_mir_type_text(&self.m, fn_type_id));
+            return null;
+        }
+        var ret_ll = self.lower_type(return_type);
+        if (!include_env && self.type_uses_c_sysv_direct_coerce(return_type)) {
+            let coerce_ret = self.c_sysv_coerce_llvm_type(return_type);
+            if (coerce_ret != null) { ret_ll = coerce_ret; }
+        } elif (!include_env && self.type_uses_c_sysv_memory(return_type)) {
+            ret_ll = self.ty_void;
+        }
+        let fty = vyx_rt_fn_type(self.mod,
+                                 ret_ll,
+                                 params,
+                                 total as u64,
+                                 0);
+        if (params != null) { free(params); }
+        return fty;
+    }
+
+    public fn lower_fn_value_call(self, value_id: i32) -> rawptr {
+        let callee_id = self.m.value_lhs(value_id);
+        if (callee_id == mir_id_invalid()) {
+            self.report_error("function-value call has no callee");
+            return null;
+        }
+        let fn_type_id = self.m.value_type(callee_id);
+        let fn_kind = llvm_mir_type_kind(&self.m, fn_type_id);
+        let include_env = fn_kind == ty_FN();
+        if (fn_kind != ty_FN() && fn_kind != ty_CFN()) {
+            self.report_error("callee is not a function value for value #" + policy_i64_to_string(value_id as i64));
+            return null;
+        }
+        let source_argc = self.call_arg_count(value_id);
+        let expected_argc = self.fn_type_param_count(fn_type_id);
+        if (fn_kind == ty_CFN()) {
+            if (source_argc < expected_argc) {
+                self.report_error("function-value call argument count mismatch for " + llvm_mir_type_text(&self.m, fn_type_id));
+                return null;
+            }
+        } elif (source_argc != expected_argc) {
+            self.report_error("function-value call argument count mismatch for " + llvm_mir_type_text(&self.m, fn_type_id));
+            return null;
+        }
+        let fty = self.build_fn_value_call_type(fn_type_id, include_env);
+        if (fty == null) { return null; }
+        let callee_payload = self.lower_value(callee_id);
+        if (callee_payload == null) {
+            self.report_error("cannot lower function-value callee");
+            return null;
+        }
+        var fn_ptr = callee_payload;
+        var env_ptr: rawptr = null;
+        var total_argc = source_argc;
+        if (include_env) {
+            fn_ptr = self.closure_fat_function_value(callee_payload);
+            env_ptr = self.closure_fat_env_value(callee_payload);
+            total_argc = source_argc + 1;
+            if (fn_ptr == null || env_ptr == null) {
+                self.report_error("cannot lower function-value fat pointer");
+                return null;
+            }
+        }
+        var args: rawptr = null;
+        if (total_argc > 0) {
+            args = malloc((total_argc * 8) as u64);
+            if (args == null) {
+                self.report_error("cannot allocate function-value call arguments");
+                return null;
+            }
+        }
+        var out_idx: i32 = 0;
+        if (include_env) {
+            ast_write_rawptr(args, env_ptr);
+            out_idx = 1;
+        }
+        var i: i32 = 0;
+        while (i < source_argc) {
+            let arg_id = self.call_arg_at(value_id, i);
+            var param_type = self.fn_type_param_type_at(fn_type_id, i);
+            if (param_type == mir_id_invalid() && fn_kind == ty_CFN()) {
+                param_type = self.value_effective_type(arg_id);
+            }
+            if (param_type == mir_id_invalid()) {
+                if (args != null) { free(args); }
+                self.report_error("cannot resolve function-value parameter #" + policy_i64_to_string(i as i64));
+                return null;
+            }
+            var arg_val = self.lower_value_as(arg_id, param_type);
+            if (arg_val != null && !include_env && self.type_uses_c_sysv_direct_coerce(param_type)) {
+                arg_val = self.c_sysv_coerce_value(arg_val, param_type, "c.abi.cfn.arg");
+            } elif (arg_val != null && !include_env && self.type_uses_c_sysv_memory(param_type)) {
+                arg_val = self.materialize_aggregate_pointer_argument(arg_id, param_type, "c.abi.cfn.byval");
+            }
+            if (arg_val == null) {
+                if (args != null) { free(args); }
+                self.report_error("cannot lower function-value argument #" + policy_i64_to_string(i as i64));
+                return null;
+            }
+            ast_write_rawptr(ptr_offset(args, out_idx * 8), arg_val);
+            out_idx = out_idx + 1;
+            i = i + 1;
+        }
+        var call_out_name = "mir.fn.call";
+        let ret_kind = llvm_mir_type_kind(&self.m, self.m.value_type(value_id));
+        if (ret_kind == ty_VOID()) { call_out_name = ""; }
+        var out = vyx_rt_build_call(self.mod,
+                                    fty,
+                                    fn_ptr,
+                                    args,
+                                    total_argc as u64,
+                                    call_out_name.c_str(),
+                                    call_out_name.len as u64);
+        if (args != null) { free(args); }
+        if (out != null && !include_env) {
+            let ret_type = self.m.value_type(value_id);
+            if (self.type_uses_c_sysv_direct_coerce(ret_type)) {
+                out = self.c_sysv_uncoerce_value(out, ret_type, "c.abi.cfn.ret");
+            }
+        }
+        return out;
+    }
+}

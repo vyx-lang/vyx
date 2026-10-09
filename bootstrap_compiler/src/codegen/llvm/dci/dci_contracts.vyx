@@ -1,0 +1,766 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn function_has_closure_env_param(self, function_id: i32) -> bool {
+        return mir_unit_function_item_kind(&self.m, function_id) == hir_item_closure();
+    }
+
+    public fn function_hidden_env_param_count(self, function_id: i32) -> i32 {
+        if (self.function_has_closure_env_param(function_id)) { return 1; }
+        return 0;
+    }
+
+    public fn function_is_foreign_dci(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci(&self.m, function_id);
+    }
+
+    public fn function_is_foreign_c(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        return self.m.function_item_kind(function_id) == hir_item_extern_function()
+            && !self.function_is_foreign_dci(function_id);
+    }
+
+    public fn foreign_c_handle_uses_raw_pointer_abi(self,
+                                                     function_id: i32,
+                                                     type_id: i32) -> bool {
+        // Native subclass thunks declare Vyx overrides as extern C functions.
+        // Their pointer parameters and returns therefore carry one address,
+        // just like imported C functions, rather than a Vyx pointer handle.
+        if ((!self.function_is_foreign_c(function_id)
+             && !self.function_is_dci_vyx_override_callback(function_id))
+            || type_id == mir_id_invalid()
+            || type_id <= 0
+            || type_id > self.m.types.count) {
+            return false;
+        }
+        return llvm_mir_kind_pointer_handle(llvm_mir_type_kind(&self.m, type_id));
+    }
+
+    public fn function_is_foreign_dci_ctor(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_ctor(&self.m, function_id);
+    }
+
+    public fn function_is_foreign_dci_dtor(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_dtor(&self.m, function_id);
+    }
+
+    public fn function_is_foreign_dci_instance_method(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_instance_method(&self.m, function_id);
+    }
+
+    public fn function_is_foreign_dci_static_method(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_static_method(&self.m, function_id);
+    }
+
+    public fn function_is_foreign_dci_const_method(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_const_method(&self.m, function_id);
+    }
+
+    public fn function_is_foreign_dci_virtual_method(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_virtual_method(&self.m, function_id);
+    }
+
+    public fn function_is_foreign_dci_override_method(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_override_method(&self.m, function_id);
+    }
+
+    public fn function_is_foreign_dci_final_method(self, function_id: i32) -> bool {
+        return mir_unit_function_is_foreign_dci_final_method(&self.m, function_id);
+    }
+
+    public fn dci_dispose_indexes(self) {
+        if (self.dci_layout_index != null) {
+            llvm_mir_dispose_symbol_index(self.dci_layout_index, self.dci_layout_index_cap, true);
+            self.dci_layout_index = null;
+            self.dci_layout_index_cap = 0;
+        }
+        if (self.dci_symbol_index != null) {
+            llvm_mir_dispose_symbol_index(self.dci_symbol_index, self.dci_symbol_index_cap, true);
+            self.dci_symbol_index = null;
+            self.dci_symbol_index_cap = 0;
+        }
+        if (self.dci_alias_index != null) {
+            llvm_mir_dispose_symbol_index(self.dci_alias_index, self.dci_alias_index_cap, true);
+            self.dci_alias_index = null;
+            self.dci_alias_index_cap = 0;
+        }
+        self.dci_index_ready = false;
+        if (self.dci_symbol_object_cache != null) {
+            llvm_mir_map_clear_range(self.dci_symbol_object_cache, 1, self.m.function_count);
+        }
+    }
+
+    fn dci_root_exports_array(self, key: string) -> rawptr {
+        return self.dci_exports_array_from(self.dci_json_root, key);
+    }
+
+    fn dci_exports_array_from(self, root: rawptr, key: string) -> rawptr {
+        let exports = self.dci_json_item(root, "exports");
+        if (exports == null || cJSON_IsObject(exports) == 0) { return null; }
+        let arr = self.dci_json_item(exports, key);
+        if (arr == null || cJSON_IsArray(arr) == 0) { return null; }
+        return arr;
+    }
+
+    fn dci_dispatch_tables_from(self, root: rawptr) -> rawptr {
+        let tables = self.dci_exports_array_from(root, "dispatch_tables");
+        if (tables != null && cJSON_GetArraySize(tables) > 0) { return tables; }
+        return self.dci_exports_array_from(root, "vtables");
+    }
+
+    fn dci_contract_count(self) -> i32 {
+        if (self.dci_json_bundle != null) { return dci_bundle_count(self.dci_json_bundle); }
+        if (self.dci_json_root != null) { return 1; }
+        return 0;
+    }
+
+    fn dci_contract_at(self, index: i32) -> rawptr {
+        if (self.dci_json_bundle != null) { return dci_bundle_root_at(self.dci_json_bundle, index); }
+        if (index == 0) { return self.dci_json_root; }
+        return null;
+    }
+
+    fn dci_put_layout_name(self, name: string, obj: rawptr) {
+        if (name.len == 0 || obj == null) { return; }
+        llvm_mir_dci_obj_index_put(self.dci_layout_index, self.dci_layout_index_cap, name, obj);
+        if (!llvm_mir_dci_type_name_is_plain(name)) {
+            let canon = self.dci_canonical_type_name_text(name);
+            if (canon.len > 0 && canon != name) {
+                llvm_mir_dci_obj_index_put(self.dci_layout_index, self.dci_layout_index_cap, canon, obj);
+            }
+        }
+    }
+
+    fn dci_put_symbol_key(self, key: string, obj: rawptr) {
+        if (key.len == 0 || obj == null) { return; }
+        llvm_mir_dci_obj_index_put(self.dci_symbol_index, self.dci_symbol_index_cap, key, obj);
+    }
+
+    fn dci_put_alias_name(self, name: string, obj: rawptr) {
+        if (name.len == 0 || obj == null) { return; }
+        llvm_mir_dci_obj_index_put(self.dci_alias_index, self.dci_alias_index_cap, name, obj);
+        if (!llvm_mir_dci_type_name_is_plain(name)) {
+            let canon = self.dci_canonical_type_name_text(name);
+            if (canon.len > 0 && canon != name) {
+                llvm_mir_dci_obj_index_put(self.dci_alias_index, self.dci_alias_index_cap, canon, obj);
+            }
+        }
+    }
+
+    public fn dci_build_indexes(self) {
+        self.dci_dispose_indexes();
+        if (self.dci_json_root == null) { return; }
+        self.dci_layout_index_cap = 65536;
+        self.dci_layout_index = llvm_mir_symbol_index_new(self.dci_layout_index_cap);
+        self.dci_symbol_index_cap = 131072;
+        self.dci_symbol_index = llvm_mir_symbol_index_new(self.dci_symbol_index_cap);
+        self.dci_alias_index_cap = 65536;
+        self.dci_alias_index = llvm_mir_symbol_index_new(self.dci_alias_index_cap);
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let layouts = self.dci_exports_array_from(self.dci_contract_at(root_i), "layouts");
+            var layout = dci_cjson_child(layouts);
+            while (layout != null) {
+                if (cJSON_IsObject(layout) != 0) {
+                    self.dci_put_layout_name(self.dci_json_string(layout, "type_name"), layout);
+                }
+                layout = dci_cjson_next(layout);
+            }
+            root_i = root_i + 1;
+        }
+        var alias_round: i32 = 0;
+        while (alias_round < 8) {
+            root_i = 0;
+            while (root_i < root_n) {
+                let aliases = self.dci_exports_array_from(self.dci_contract_at(root_i), "aliases");
+                var alias = dci_cjson_child(aliases);
+                while (alias != null) {
+                    if (cJSON_IsObject(alias) != 0) {
+                        let alias_name = self.dci_json_string(alias, "name");
+                        let target_name = self.dci_json_string(alias, "target");
+                        self.dci_put_alias_name(alias_name, alias);
+                        var target_layout = llvm_mir_dci_obj_index_first(self.dci_layout_index,
+                                                                          self.dci_layout_index_cap,
+                                                                          target_name);
+                        if (target_layout == null && !llvm_mir_dci_type_name_is_plain(target_name)) {
+                            target_layout = llvm_mir_dci_obj_index_first(self.dci_layout_index,
+                                                                          self.dci_layout_index_cap,
+                                                                          self.dci_canonical_type_name_text(target_name));
+                        }
+                        if (target_layout != null) {
+                            self.dci_put_layout_name(alias_name, target_layout);
+                        }
+                    }
+                    alias = dci_cjson_next(alias);
+                }
+                root_i = root_i + 1;
+            }
+            alias_round = alias_round + 1;
+        }
+        root_i = 0;
+        while (root_i < root_n) {
+            let symbols = self.dci_exports_array_from(self.dci_contract_at(root_i), "symbols");
+            var symbol = dci_cjson_child(symbols);
+            while (symbol != null) {
+                if (cJSON_IsObject(symbol) != 0) {
+                    self.dci_put_symbol_key(self.dci_json_string(symbol, "name"), symbol);
+                    self.dci_put_symbol_key(self.dci_json_string(symbol, "semantic_id"), symbol);
+                    self.dci_put_symbol_key(self.dci_json_string(symbol, "link_name"), symbol);
+                    self.dci_put_symbol_key(self.dci_json_string(symbol, "mangled"), symbol);
+                    let kind = self.dci_json_string(symbol, "kind");
+                    var member = self.dci_json_string(symbol, "member_name");
+                    if (member.len == 0) { member = self.dci_json_string(symbol, "name"); }
+                    if (kind.len > 0 && member.len > 0) {
+                        self.dci_put_symbol_key(kind + "#" + member, symbol);
+                        let owner = self.dci_json_string(symbol, "owner");
+                        if (owner.len > 0) {
+                            self.dci_put_symbol_key(kind + "#" + member + "#" + owner, symbol);
+                        }
+                    }
+                }
+                symbol = dci_cjson_next(symbol);
+            }
+            root_i = root_i + 1;
+        }
+        self.dci_index_ready = true;
+    }
+
+    public fn dci_ensure_indexes(self) {
+        if (self.dci_index_ready) { return; }
+        if (self.dci_json_root == null) { return; }
+        self.dci_build_indexes();
+    }
+
+    public fn dci_json(self) -> rawptr {
+        let text = mir_unit_dci_abi_text(&self.m);
+        let path = mir_unit_dci_abi_path(&self.m);
+        if (!mir_unit_has_dci_abi(&self.m)) { return null; }
+        var source_key = "json:" + text;
+        if (path.len > 0) { source_key = "dcib:" + path; }
+        if (self.dci_json_root != null && self.dci_json_text_cache == source_key) { return self.dci_json_root; }
+        if (self.dci_json_bundle != null || self.dci_json_root != null) {
+            self.dci_dispose_indexes();
+            if (self.dci_json_bundle != null) {
+                cJSON_Delete(self.dci_json_bundle);
+            } else if (self.dci_json_root != null) {
+                cJSON_Delete(self.dci_json_root);
+            }
+            self.dci_json_bundle = null;
+            self.dci_json_root = null;
+        }
+        self.dci_json_text_cache = source_key;
+        if (dci_path_list_count(path.clone()) > 0) {
+            let loaded = dci_load_contract_bundle(path.clone());
+            if (loaded.roots == null) {
+                var detail = loaded.message;
+                if (detail.len == 0) { detail = "unknown DCI error"; }
+                self.report_error("invalid DCI ABI contract: " + detail);
+                return null;
+            }
+            self.dci_json_bundle = loaded.roots;
+            self.dci_json_root = dci_bundle_root_at(self.dci_json_bundle, 0);
+        } else {
+            self.dci_json_root = cJSON_Parse(text.c_str());
+            if (self.dci_json_root == null) {
+                self.report_error("invalid DCI ABI JSON");
+                return null;
+            }
+            let bundle = cJSON_CreateArray();
+            if (bundle == null || cJSON_AddItemToArray(bundle, self.dci_json_root) == 0) {
+                if (bundle != null) { cJSON_Delete(bundle); }
+                else { cJSON_Delete(self.dci_json_root); }
+                self.dci_json_root = null;
+                self.report_error("out of memory while loading DCI ABI JSON");
+                return null;
+            }
+            self.dci_json_bundle = bundle;
+        }
+        var root_i: i32 = 0;
+        let root_n = self.dci_contract_count();
+        while (root_i < root_n) {
+            let root = self.dci_contract_at(root_i);
+            if (root == null || cJSON_IsObject(root) == 0) {
+                cJSON_Delete(self.dci_json_bundle);
+                self.dci_json_bundle = null;
+                self.dci_json_root = null;
+                self.report_error("DCI ABI root must be an object");
+                return null;
+            }
+            if (!self.dci_validate_descriptor(root)) {
+                cJSON_Delete(self.dci_json_bundle);
+                self.dci_json_bundle = null;
+                self.dci_json_root = null;
+                return null;
+            }
+            root_i = root_i + 1;
+        }
+        self.dci_build_indexes();
+        return self.dci_json_root;
+    }
+
+    public fn dci_json_item(self, obj: rawptr, key: string) -> rawptr {
+        if (obj == null || key.len == 0) { return null; }
+        return cJSON_GetObjectItemCaseSensitive(obj, key.c_str());
+    }
+
+    public fn dci_json_string(self, obj: rawptr, key: string) -> string {
+        let item = self.dci_json_item(obj, key);
+        if (item == null || cJSON_IsString(item) == 0) { return ""; }
+        let raw = cJSON_GetStringValue(item);
+        if (raw == null) { return ""; }
+        return from_cstr(raw);
+    }
+
+    public fn dci_json_cstr(self, obj: rawptr, key: string) -> rawptr {
+        let item = self.dci_json_item(obj, key);
+        if (item == null || cJSON_IsString(item) == 0) { return null; }
+        return cJSON_GetStringValue(item);
+    }
+
+    public fn dci_json_number_item_i64(self, item: rawptr, context: string) -> i64 {
+        if (item == null || cJSON_IsNumber(item) == 0) {
+            self.report_error("DCI JSON number is missing for " + context);
+            return 0;
+        }
+        let raw = cJSON_GetNumberValue(item);
+        if (raw != raw) {
+            self.report_error("DCI JSON number `" + context + "` is NaN");
+            return 0;
+        }
+        if (raw > 9007199254740992.0 || raw < -9007199254740992.0) {
+            self.report_error("DCI JSON integer `" + context
+                      + "` exceeds the cJSON exact range (±2^53)");
+            return 0;
+        }
+        let n = raw as i64;
+        if ((n as f64) != raw) {
+            self.report_error("DCI JSON number `" + context + "` is not an integer");
+            return 0;
+        }
+        return n;
+    }
+
+    public fn dci_json_i64(self, obj: rawptr, key: string) -> i64 {
+        let item = self.dci_json_item(obj, key);
+        if (item == null || cJSON_IsNumber(item) == 0) { return 0; }
+        return self.dci_json_number_item_i64(item, key);
+    }
+
+    public fn dci_json_bool(self, obj: rawptr, key: string) -> bool {
+        let item = self.dci_json_item(obj, key);
+        if (item == null) { return false; }
+        return cJSON_IsTrue(item) != 0;
+    }
+
+    public fn dci_json_array_contains_string(self, arr: rawptr, wanted: string) -> bool {
+        if (arr == null || cJSON_IsArray(arr) == 0 || wanted.len == 0) { return false; }
+        var item = dci_cjson_child(arr);
+        while (item != null) {
+            if (cJSON_IsString(item) != 0 && dci_cstr_eq(cJSON_GetStringValue(item), wanted)) {
+                return true;
+            }
+            item = dci_cjson_next(item);
+        }
+        return false;
+    }
+
+    public fn dci_symbol_link_name(self, obj: rawptr) -> string {
+        var out = self.dci_json_string(obj, "link_name");
+        if (out.len == 0) { out = self.dci_json_string(obj, "mangled"); }
+        return out;
+    }
+
+    public fn dci_descriptor_target_triple(self, root: rawptr) -> string {
+        if (root == null) { return ""; }
+        let target = self.dci_json_item(root, "target");
+        if (target != null && cJSON_IsObject(target) != 0) {
+            let direct = self.dci_json_string(target, "triple");
+            if (direct.len > 0) { return direct; }
+        }
+        let source = self.dci_json_item(root, "source");
+        let legacy_target = self.dci_json_item(source, "target");
+        return self.dci_json_string(legacy_target, "triple");
+    }
+
+    public fn dci_descriptor_target_object(self, root: rawptr) -> rawptr {
+        if (root == null) { return null; }
+        let target = self.dci_json_item(root, "target");
+        if (target != null && cJSON_IsObject(target) != 0) { return target; }
+        return self.dci_json_item(self.dci_json_item(root, "source"), "target");
+    }
+
+    public fn dci_validate_descriptor(self, root: rawptr) -> bool {
+        if (root == null || cJSON_IsObject(root) == 0) {
+            self.report_error("DCI descriptor root must be an object");
+            return false;
+        }
+        let version = self.dci_json_string(root, "dci");
+        if (version.len == 0) {
+            self.report_error("DCI descriptor has no `dci` version");
+            return false;
+        }
+        if (version != "1" && !version.startsWith("1.")) {
+            self.report_error("unsupported DCI version `" + version + "`");
+            return false;
+        }
+        let kind = self.dci_json_string(root, "kind");
+        if (kind != "abi") {
+            self.report_error("unsupported DCI descriptor kind `" + kind + "`");
+            return false;
+        }
+        let schema = self.dci_json_item(root, "schema");
+        if (schema != null && cJSON_IsObject(schema) != 0) {
+            let schema_name = self.dci_json_string(schema, "name");
+            let encoding = self.dci_json_string(schema, "encoding");
+            if (schema_name.len > 0 && schema_name != "dci") {
+                self.report_error("unsupported DCI schema `" + schema_name + "`");
+                return false;
+            }
+            if (encoding.len > 0) {
+                var expected_encoding: string = "json";
+                if (mir_unit_dci_abi_is_binary(&self.m)) { expected_encoding = "dcib"; }
+                if (encoding != expected_encoding) {
+                    self.report_error("DCI encoding `" + encoding + "` does not match the imported "
+                              + expected_encoding + " contract");
+                    return false;
+                }
+            }
+        }
+        let exports = self.dci_json_item(root, "exports");
+        if (exports == null || cJSON_IsObject(exports) == 0) {
+            self.report_error("DCI descriptor has no `exports` object");
+            return false;
+        }
+        let descriptor_target = self.dci_descriptor_target_triple(root);
+        if (self.target_triple.len > 0
+            && descriptor_target.len > 0
+            && self.target_triple != descriptor_target) {
+            self.report_error("DCI target mismatch: descriptor `" + descriptor_target
+                      + "`, compiler `" + self.target_triple + "`");
+            return false;
+        }
+        let target_object = self.dci_descriptor_target_object(root);
+        if (target_object != null && cJSON_IsObject(target_object) != 0) {
+            let pointer_width_item = self.dci_json_item(target_object, "pointer_width");
+            if (pointer_width_item != null) {
+                if (cJSON_IsNumber(pointer_width_item) == 0) {
+                    self.report_error("DCI target pointer_width must be numeric");
+                    return false;
+                }
+                let errs = self.error_count;
+                let pointer_width = self.dci_json_number_item_i64(pointer_width_item, "pointer_width");
+                if (self.error_count > errs) { return false; }
+                if (pointer_width != 64) {
+                    self.report_error("unsupported DCI target pointer width "
+                              + pointer_width.toString());
+                    return false;
+                }
+            }
+            let endianness = self.dci_json_string(target_object, "endianness");
+            if (endianness.len > 0 && endianness != "little") {
+                self.report_error("unsupported DCI target endianness `" + endianness + "`");
+                return false;
+            }
+        }
+        let target_platform = self.dci_json_string(target_object, "platform");
+        let target_architecture = self.dci_json_string(target_object, "architecture");
+        var target_abi_family = self.dci_json_string(target_object, "abi_family");
+        if (target_abi_family.len == 0) {
+            target_abi_family = self.dci_json_string(target_object, "abi");
+        }
+        let requires_constructor_pointer_return =
+            (target_platform == "windows" || descriptor_target.contains("windows"))
+            && (target_architecture == "x86_64" || descriptor_target.startsWith("x86_64"))
+            && (target_abi_family == "msvc" || descriptor_target.contains("msvc"));
+        if (requires_constructor_pointer_return) {
+            let symbols = self.dci_json_item(exports, "symbols");
+            if (symbols != null && cJSON_IsArray(symbols) != 0) {
+                var symbol = dci_cjson_child(symbols);
+                while (symbol != null) {
+                    if (dci_cstr_eq(self.dci_json_cstr(symbol, "kind"), "constructor")) {
+                        let abi = self.dci_json_item(symbol, "abi");
+                        let abi_return = self.dci_json_item(abi, "return");
+                        let return_type = self.dci_json_item(abi_return, "type");
+                        let owner = self.dci_json_string(symbol, "owner");
+                        if (owner.len == 0
+                            || !dci_cstr_eq(self.dci_json_cstr(abi_return, "passing"), "direct")
+                            || !dci_cstr_eq(self.dci_json_cstr(return_type, "name"), owner)
+                            || !dci_cstr_eq(self.dci_json_cstr(return_type, "kind"), "class")
+                            || !dci_cstr_eq(self.dci_json_cstr(return_type, "reference"), "pointer")) {
+                            self.report_error("DCI x86_64 MSVC constructor `"
+                                      + self.dci_json_string(symbol, "name")
+                                      + "` must return its owner pointer directly");
+                            return false;
+                        }
+                    }
+                    symbol = dci_cjson_next(symbol);
+                }
+            }
+        }
+        let profile = self.dci_json_item(root, "profile");
+        if (profile != null) {
+            if (cJSON_IsObject(profile) == 0) {
+                self.report_error("DCI profile must be an object");
+                return false;
+            }
+            let modes = self.dci_json_item(profile, "consumer_modes");
+            if (modes == null || cJSON_IsArray(modes) == 0 || cJSON_GetArraySize(modes) == 0) {
+                self.report_error("DCI profile has no consumer_modes");
+                return false;
+            }
+            let has_direct = self.dci_json_array_contains_string(modes, "direct");
+            let has_stub = self.dci_json_array_contains_string(modes, "stub");
+            if (!has_direct && !has_stub) {
+                self.report_error("DCI profile has no supported Consumer mode");
+                return false;
+            }
+            var mode_i: i32 = 0;
+            while (mode_i < cJSON_GetArraySize(modes)) {
+                let mode_item = cJSON_GetArrayItem(modes, mode_i);
+                if (mode_item == null || cJSON_IsString(mode_item) == 0) {
+                    self.report_error("DCI consumer_modes entries must be strings");
+                    return false;
+                }
+                let mode_raw = cJSON_GetStringValue(mode_item);
+                if (mode_raw == null) {
+                    self.report_error("DCI consumer_modes contains an invalid string");
+                    return false;
+                }
+                let mode = from_cstr(mode_raw);
+                if (mode != "direct" && mode != "stub") {
+                    self.report_error("unsupported DCI Consumer mode `" + mode + "`");
+                    return false;
+                }
+                mode_i = mode_i + 1;
+            }
+            if (!has_direct) {
+                self.report_error("this DCI compilation requires the Direct Consumer mode");
+                return false;
+            }
+        }
+        let control = self.dci_json_item(root, "control_flow");
+        if (control != null && cJSON_IsObject(control) != 0) {
+            let boundary = self.dci_control_flow_boundary(control);
+            let boundary_error = self.dci_control_flow_boundary_data_error(control);
+            if (boundary_error.len > 0) {
+                self.report_error(boundary_error);
+                return false;
+            }
+            if (!self.dci_control_flow_contract_supported(control)) {
+                self.report_error("DCI control-flow boundary `" + boundary
+                          + "` requires an unsupported propagation ABI");
+                return false;
+            }
+        }
+        if (!self.dci_validate_stub_requests(root, exports,
+                self.dci_consumer_modes_contains(root, "stub"))) {
+            return false;
+        }
+        return true;
+    }
+
+    public fn dci_exports_array(self, key: string) -> rawptr {
+        let root = self.dci_json();
+        if (root == null) { return null; }
+        let exports = self.dci_json_item(root, "exports");
+        if (exports == null || cJSON_IsObject(exports) == 0) { return null; }
+        let arr = self.dci_json_item(exports, key);
+        if (arr == null || cJSON_IsArray(arr) == 0) { return null; }
+        return arr;
+    }
+
+    public fn dci_dispatch_tables_array(self) -> rawptr {
+        let tables = self.dci_exports_array("dispatch_tables");
+        if (tables != null && cJSON_GetArraySize(tables) > 0) { return tables; }
+        return self.dci_exports_array("vtables");
+    }
+
+    public fn dci_symbol_lookup_unique(self, reference: string, report_conflict: bool) -> rawptr {
+        if (reference.len == 0) { return null; }
+        if (self.dci_json() == null) { return null; }
+        self.dci_ensure_indexes();
+        var result: rawptr = null;
+        var chain = llvm_mir_dci_obj_index_lookup(self.dci_symbol_index, self.dci_symbol_index_cap, reference);
+        if (chain != null) {
+            while (chain != null) {
+                let symbol = ast_read_rawptr(chain);
+                let matches = dci_cstr_eq(self.dci_json_cstr(symbol, "name"), reference)
+                    || dci_cstr_eq(self.dci_json_cstr(symbol, "semantic_id"), reference)
+                    || dci_cstr_eq(self.dci_json_cstr(symbol, "link_name"), reference)
+                    || dci_cstr_eq(self.dci_json_cstr(symbol, "mangled"), reference);
+                if (matches) {
+                    if (result != null
+                        && !self.dci_symbol_contracts_equivalent(result, symbol)) {
+                        if (report_conflict) {
+                            self.report_error("conflicting DCI operation symbol reference `" + reference + "`");
+                        }
+                        return null;
+                    }
+                    result = symbol;
+                }
+                chain = ast_read_rawptr(ptr_offset(chain, 8));
+            }
+            return result;
+        }
+        let symbols = self.dci_root_exports_array("symbols");
+        var symbol = dci_cjson_child(symbols);
+        while (symbol != null) {
+            let matches2 = dci_cstr_eq(self.dci_json_cstr(symbol, "name"), reference)
+                || dci_cstr_eq(self.dci_json_cstr(symbol, "semantic_id"), reference)
+                || dci_cstr_eq(self.dci_json_cstr(symbol, "link_name"), reference)
+                || dci_cstr_eq(self.dci_json_cstr(symbol, "mangled"), reference);
+            if (matches2) {
+                if (result != null
+                    && !self.dci_symbol_contracts_equivalent(result, symbol)) {
+                    if (report_conflict) {
+                        self.report_error("conflicting DCI operation symbol reference `" + reference + "`");
+                    }
+                    return null;
+                }
+                result = symbol;
+            }
+            symbol = dci_cjson_next(symbol);
+        }
+        return result;
+    }
+
+    public fn dci_symbol_object_for_reference(self, reference: string) -> rawptr {
+        return self.dci_symbol_lookup_unique(reference, true);
+    }
+
+    public fn dci_runtime_cast_symbol_contract_matches(self,
+                                                        symbol: rawptr,
+                                                        source_type_id: i32,
+                                                        target_type_id: i32) -> bool {
+        if (symbol == null || self.dci_json_string(symbol, "kind") != "function") { return false; }
+        if (!self.dci_symbol_calling_convention_supported(symbol)
+            || !self.dci_symbol_unwind_supported(symbol)) {
+            return false;
+        }
+        let params = self.dci_json_item(symbol, "params");
+        if (params == null || cJSON_IsArray(params) == 0 || cJSON_GetArraySize(params) != 1) {
+            return false;
+        }
+        let param = cJSON_GetArrayItem(params, 0);
+        let param_type = self.dci_json_item(param, "type");
+        if (!self.dci_type_object_matches_type(param_type, source_type_id)
+            || !self.dci_json_bool(param_type, "nullable")
+            || self.dci_json_string(param, "ownership") != "borrow") {
+            return false;
+        }
+        let result = self.dci_json_item(symbol, "return");
+        let result_type = self.dci_json_item(result, "type");
+        if (result == null
+            || !self.dci_type_object_matches_type(result_type, target_type_id)
+            || !self.dci_json_bool(result_type, "nullable")
+            || self.dci_json_string(result, "ownership") != "borrow") {
+            return false;
+        }
+        let abi = self.dci_json_item(symbol, "abi");
+        if (abi == null || cJSON_IsObject(abi) == 0) { return false; }
+        let abi_params = self.dci_json_item(abi, "parameters");
+        if (abi_params == null
+            || cJSON_IsArray(abi_params) == 0
+            || cJSON_GetArraySize(abi_params) != 1
+            || self.dci_abi_passing(cJSON_GetArrayItem(abi_params, 0)) != "direct") {
+            return false;
+        }
+        if (self.dci_abi_passing(self.dci_json_item(abi, "return")) != "direct") { return false; }
+        let hidden = self.dci_json_item(abi, "hidden_parameters");
+        return hidden == null || (cJSON_IsArray(hidden) != 0 && cJSON_GetArraySize(hidden) == 0);
+    }
+
+    public fn dci_runtime_operation_cache_node(self, symbol: string) -> rawptr {
+        var node = self.dci_runtime_operation_cache_head;
+        while (node != null) {
+            let cached_name = ast_read_rawptr(node);
+            if (cached_name != null && from_cstr(cached_name) == symbol) { return node; }
+            node = ast_read_rawptr(ptr_offset(node, 32));
+        }
+        return null;
+    }
+
+    public fn dci_runtime_operation_function(self,
+                                              symbol: rawptr,
+                                              link_name: string) -> rawptr {
+        let cached = self.dci_runtime_operation_cache_node(link_name);
+        if (cached != null) {
+            let cached_contract = ast_read_rawptr(ptr_offset(cached, 24));
+            if (!self.dci_symbol_contracts_equivalent(cached_contract, symbol)) {
+                self.report_error("conflicting DCI runtime operation contract for `" + link_name + "`");
+                return null;
+            }
+            return cached;
+        }
+        var fn_value: rawptr = null;
+        var fn_type: rawptr = null;
+        var function_id: i32 = 1;
+        while (function_id <= self.m.function_count) {
+            if (self.function_is_foreign_dci(function_id)
+                && self.dci_link_name_for_function(function_id) == link_name) {
+                if (!self.declare_function_signature(function_id)) { return null; }
+                let existing_value = llvm_mir_map_get(self.function_values, function_id);
+                let existing_type = llvm_mir_map_get(self.function_types, function_id);
+                if (fn_value != null && fn_value != existing_value) {
+                    self.report_error("ambiguous DCI runtime operation declaration `" + link_name + "`");
+                    return null;
+                }
+                fn_value = existing_value;
+                fn_type = existing_type;
+            }
+            function_id = function_id + 1;
+        }
+        if (fn_value == null) {
+            let params = malloc(8);
+            if (params == null) {
+                self.report_error("cannot allocate DCI runtime operation signature");
+                return null;
+            }
+            ast_write_rawptr(params, self.ty_ptr);
+            fn_type = vyx_rt_fn_type(self.mod, self.ty_ptr, params, 1, 0);
+            free(params);
+            if (fn_type == null) {
+                self.report_error("cannot build DCI runtime operation signature `" + link_name + "`");
+                return null;
+            }
+            fn_value = vyx_rt_add_function(self.mod,
+                                           link_name.c_str(),
+                                           link_name.len as u64,
+                                           fn_type);
+            if (fn_value == null) {
+                self.report_error("cannot declare DCI runtime operation `" + link_name + "`");
+                return null;
+            }
+        }
+        let cc = self.dci_symbol_calling_convention(symbol);
+        if (cc.len > 0
+            && vyx_rt_set_calling_convention(self.mod,
+                                             fn_value,
+                                             cc.c_str(),
+                                             cc.len as u64) != 0) {
+            self.report_error("cannot apply DCI runtime operation calling convention `" + cc
+                      + "` to `" + link_name + "`: " + self.runtime_last_error());
+            return null;
+        }
+        vyx_rt_set_function_attr(self.mod,
+                                 fn_value,
+                                 "nounwind".c_str(),
+                                 8,
+                                 "".c_str(),
+                                 0);
+        let node = malloc(40);
+        if (node == null) {
+            self.report_error("cannot cache DCI runtime operation `" + link_name + "`");
+            return null;
+        }
+        ast_write_rawptr(node, ast_dup_c_string(link_name.clone()));
+        ast_write_rawptr(ptr_offset(node, 8), fn_value);
+        ast_write_rawptr(ptr_offset(node, 16), fn_type);
+        ast_write_rawptr(ptr_offset(node, 24), symbol);
+        ast_write_rawptr(ptr_offset(node, 32), self.dci_runtime_operation_cache_head);
+        self.dci_runtime_operation_cache_head = node;
+        return node;
+    }
+}

@@ -62,37 +62,59 @@ foreach ($line in [IO.File]::ReadLines($records)) {
     $path = $fields[0].Replace('\', '/')
     if ($path -notmatch '^src/(core|hir|mir|codegen)/.+\.vyx$') { continue }
     if ($fields[1] -notmatch '\.obj$') { continue }
-    if (-not $selected.Add($path)) { throw "Duplicate boot object record: $path" }
-    if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $path) -PathType Leaf)) {
-        throw "Boot object record points to a missing source: $path"
+    # One object can represent a multi-file logical module. The record's
+    # primary path alone omits the implementations in that object; its source
+    # stamp records the exact group compiled by the project builder.
+    $group = [Collections.Generic.List[string]]::new()
+    $group.Add($path)
+    if ($fields.Length -ge 3) {
+        # Normal records append the content stamp to the path; dependency
+        # partitioning writes the path alone and a separate group_src_content.
+        foreach ($member in [regex]::Matches($fields[2], '(?:^|;)group_src=([^;]+?)(?:=bytes:\d+,fnv1a64:\d+)?(?=;)')) {
+            $memberPath = $member.Groups[1].Value.Replace('\', '/')
+            if ($memberPath -match '^src/(core|hir|mir|codegen)/.+\.vyx$' -and $memberPath -ne $path) {
+                $group.Add($memberPath)
+            }
+        }
     }
-    $sources.Add($path)
+    foreach ($memberPath in $group) {
+        if (-not $selected.Add($memberPath)) { throw "Duplicate boot source record: $memberPath" }
+        if (-not (Test-Path -LiteralPath (Join-Path $projectRoot $memberPath) -PathType Leaf)) {
+            throw "Boot object record points to a missing source: $memberPath"
+        }
+        $sources.Add($memberPath)
+    }
 }
-if ($sources.Count -eq 0 -or -not $selected.Contains('src/core/main.vyx')) {
+if ($sources.Count -eq 0 -or -not $selected.Contains('src/core/driver/main.vyx')) {
     throw "Current boot object records contain no compiler entry and sources: $records"
 }
 
 # Reject an incomplete record set before spending minutes and gigabytes on
 # cross emission. Every bootstrap import in the selected unit needs its source
 # in the same list; shallow interfaces alone are insufficient for this crate.
-$modulePaths = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+$modulePaths = [Collections.Generic.Dictionary[string,Collections.Generic.List[string]]]::new([StringComparer]::Ordinal)
 foreach ($file in Get-ChildItem -LiteralPath (Join-Path $projectRoot 'src') -Filter '*.vyx' -File -Recurse) {
     $text = [IO.File]::ReadAllText($file.FullName)
     $module = [regex]::Match($text, '(?m)^\s*module\s+(bootstrap\.[A-Za-z0-9_.]+)\s*;')
     if (-not $module.Success) { continue }
     $relative = [IO.Path]::GetRelativePath($projectRoot, $file.FullName).Replace('\', '/')
     $name = $module.Groups[1].Value
-    if ($modulePaths.ContainsKey($name)) { throw "Duplicate bootstrap module: $name" }
-    $modulePaths.Add($name, $relative)
+    if (-not $modulePaths.ContainsKey($name)) {
+        $modulePaths.Add($name, [Collections.Generic.List[string]]::new())
+    }
+    $modulePaths[$name].Add($relative)
 }
 foreach ($path in $sources) {
     $text = [IO.File]::ReadAllText((Join-Path $projectRoot $path))
-    foreach ($import in [regex]::Matches($text, '(?m)^\s*use\s+(bootstrap\.[A-Za-z0-9_.]+)\s*;')) {
+    # Check the file's own module as well: every implementation peer must be
+    # in the current object's recorded group, even if nobody imports it yet.
+    foreach ($import in [regex]::Matches($text, '(?m)^\s*(?:module|use)\s+(bootstrap\.[A-Za-z0-9_.]+)\s*;')) {
         $name = $import.Groups[1].Value
         if (-not $modulePaths.ContainsKey($name)) { throw "Unmapped bootstrap import $name in $path" }
-        $dependency = $modulePaths[$name]
-        if (-not $selected.Contains($dependency)) {
-            throw "Incomplete boot object records: $path imports $name ($dependency)"
+        foreach ($dependency in $modulePaths[$name]) {
+            if (-not $selected.Contains($dependency)) {
+                throw "Incomplete boot object records: $path requires $name ($dependency)"
+            }
         }
     }
 }
@@ -130,7 +152,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($oldLlvmRoot)) { $env:LLVM_ROOT = Join-Path $repoRoot 'clang' }
     Push-Location $projectRoot
     try {
-        & $compiler --src=file 'src\core\main.vyx' `
+        & $compiler --src=file 'src\core\driver\main.vyx' `
             --project-unit-sources $sourceList --emit=obj `
             -L out -l vyx_compiler_backend -l vyx_runtime -l synchronization `
             -O2 "--triplet=$Triplet" -o $candidate *> $log

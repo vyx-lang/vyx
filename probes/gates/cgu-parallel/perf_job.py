@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 # The build system compiles the whole self-host crate as one unity object.
 DEFAULT_JOB = [
-    "out/boot.exe", "--emit=obj", "--src=file", "src/core/main.vyx",
+    "out/boot.exe", "--emit=obj", "--src=file", "src/core/driver/main.vyx",
     "-o", ".cache/perfjob.obj",
     "-L", "out", "-l", "vyx_compiler_backend", "-l", "vyx_runtime",
     "-l", "synchronization", "-O2",

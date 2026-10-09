@@ -4,7 +4,7 @@
 # cross-file calls (main -> build_toml_get_platform_value, etc.) at link.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-BS="$ROOT/bootstrap_compiler/src/core/build_system.vyx"
+BS="$ROOT/bootstrap_compiler/src/core/project/build_system.vyx"
 
 if grep -F 'return "build_system_run|build_system_run_script"' "$BS" >/dev/null; then
   echo "FAIL: build_system.vyx still hardcodes a two-name export set"

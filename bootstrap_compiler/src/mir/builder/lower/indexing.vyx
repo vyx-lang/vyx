@@ -1,0 +1,243 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn index_operator_target_for_expr(self, expr_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid() || self.h.expr_kind(expr_id) != ex_INDEX()) { return mir_id_invalid(); }
+        if (self.h.expr_target_kind(expr_id) == hir_target_function()) {
+            let direct = self.target_id_from_hir_expr(expr_id);
+            if (direct != mir_id_invalid()) { return direct; }
+        }
+        let receiver_expr_id = self.h.expr_lhs(expr_id);
+        if (receiver_expr_id == hir_id_invalid()) { return mir_id_invalid(); }
+        let receiver_type_id = self.h.expr_type(receiver_expr_id);
+        if (receiver_type_id == hir_id_invalid()) { return mir_id_invalid(); }
+        // A reference is a view of its pointee for overloaded indexing.  Use
+        // the concrete owner type when recovering a target from older HIR
+        // (or from a deferred place) so `&mut Vec<T>[i]` cannot fall back to
+        // a lookup on the wrapper type itself.
+        var lookup_type_id = receiver_type_id;
+        let receiver_kind = hir_type_table_kind(self.h.types, receiver_type_id);
+        if (receiver_kind == ty_REF() || receiver_kind == ty_MUTREF()
+            || receiver_kind == ty_PTR()) {
+            let pointee = hir_type_table_elem(self.h.types, receiver_type_id);
+            if (pointee != mir_id_invalid()) {
+                let pointee_kind = hir_type_table_kind(self.h.types, pointee);
+                if (pointee_kind == ty_CLASS() || pointee_kind == ty_ARRAY()) {
+                    lookup_type_id = pointee;
+                }
+            }
+        }
+        let receiver_text = self.resolve_type_text_in_function(self.current_function_id,
+                                                               self.type_text(lookup_type_id));
+        if (receiver_text.len == 0) { return mir_id_invalid(); }
+        let base_text = policy_generic_call_base(receiver_text.clone());
+        if (policy_primitive_type_kind(base_text) != 0) { return mir_id_invalid(); }
+        return self.function_target_by_owner_type_and_method(receiver_text, "operator[]");
+    }
+
+    /// True when an overloaded index expression should keep its reference
+    /// handle value instead of collapsing to the element view: the expected
+    /// type (or, when unconstrained, the expression's own WYSIWYG type) is a
+    /// reference.  Scalar expected types keep the element-view read.
+    /// True only when the expected type explicitly asks for a reference:
+    /// `var r: &mut T = v[i]`, a `&mut T` parameter, etc.  An unconstrained
+    /// context (polymorphic builtins like print, inference sites) keeps the
+    /// element view so `print(v[i])` and `v[i] + 1` read the value.  Code
+    /// that wants the reference writes the annotation.
+    /// True when the expected type explicitly asks for a reference:
+    /// `var r: &mut T = v[i]`, a `&mut T` parameter, or WYSIWYG argument
+    /// passing (typeof).  Value-consuming contexts read the element view;
+    /// print/println dereference reference handles at the print site.
+    public fn index_expr_wants_reference_value(self, expr_id: i32, expected_type_id: i32) -> bool {
+        if (expected_type_id == mir_id_invalid() || expected_type_id == 0) { return false; }
+        let kind = hir_type_table_kind(self.h.types, expected_type_id);
+        if (kind == ty_REF() || kind == ty_MUTREF()) { return true; }
+        let text = self.type_text(expected_type_id);
+        let base = policy_generic_call_base(text.clone());
+        return base == "ref" || base == "mutref";
+    }
+
+    public fn index_operator_place_type_from_return(self, return_type_id: i32) -> i32 {
+        if (return_type_id == mir_id_invalid()) { return mir_id_invalid(); }
+        // WYSIWYG index types: the HIR expression keeps the declared return
+        // type.  The deref PLACE, however, is the storage view: a reference
+        // return (`&mut T` / `&T`) stores and loads the element through the
+        // reference, so its place type is the pointee; a pointer return
+        // (`*T`) is the pointer itself — element writes go through a further
+        // index (`b[i][j] = x`) and never through this deref place.
+        let kind = hir_type_table_kind(self.h.types, return_type_id);
+        let return_text = self.type_text(return_type_id);
+        let return_base = policy_generic_call_base(return_text.clone());
+        let is_ref = kind == ty_REF() || kind == ty_MUTREF()
+            || return_base == "ref" || return_base == "mutref";
+        let is_ptr = kind == ty_PTR() || return_base == "ptr";
+        if (is_ptr && !is_ref) { return mir_id_invalid(); }
+        if (is_ref) {
+            let elem = hir_type_table_elem(self.h.types, return_type_id);
+            if (elem != mir_id_invalid() && !self.type_id_has_open_template_atom(elem)) { return elem; }
+            let args = policy_generic_call_args(return_text.clone());
+            let arg0 = policy_generic_arg_at(args, 0);
+            if (arg0.len > 0 && !self.type_name_has_open_template_atom(arg0)) {
+                return self.intern_type_id_by_text(arg0);
+            }
+            if (elem != mir_id_invalid()) { return elem; }
+            return mir_id_invalid();
+        }
+        return mir_id_invalid();
+    }
+
+    /// WYSIWYG guard for `dest = value` where the destination expression's
+    /// declared (HIR) type is a concrete pointer `*T`: the destination is the
+    /// pointer slot, so a non-pointer value is a type error, not an element
+    /// store.  Null literals and pointer/reference/rawptr values pass; open
+    /// generic placeholders defer to instantiation.
+    public fn assign_dest_pointer_type_mismatch(self, lhs_expr: i32, rhs_expr: i32) -> bool {
+        if (lhs_expr == hir_id_invalid() || rhs_expr == hir_id_invalid()) { return false; }
+        if (self.h.expr_kind(rhs_expr) == ex_NULL_LIT()) { return false; }
+        // Only WYSIWYG element destinations (`b[i]`, `x.f`, `*p`) hand back a
+        // pointer slot.  A bare `var p: *T = <array>` / `var a: [T;N] = [...]`
+        // initializer also carries a pointer type on the destination after
+        // array-to-pointer decay, but there the assignment is the ordinary
+        // aggregate store — rejecting it would break every array variable
+        // declaration.  (See tests/cases/pointer_array_decay_multidim.)
+        let lhs_kind = self.h.expr_kind(lhs_expr);
+        if (lhs_kind != ex_INDEX() && lhs_kind != ex_MEMBER() && lhs_kind != ex_DEREF()) { return false; }
+        let lt = self.h.expr_type(lhs_expr);
+        let rt = self.h.expr_type(rhs_expr);
+        if (lt == mir_id_invalid() || lt == 0 || rt == mir_id_invalid() || rt == 0) { return false; }
+        if (self.type_id_has_open_template_atom(lt) || self.type_id_has_open_template_atom(rt)) { return false; }
+        let lkind = hir_type_table_kind(self.h.types, lt);
+        if (lkind != ty_PTR()) { return false; }
+        let rkind = hir_type_table_kind(self.h.types, rt);
+        if (rkind == ty_PTR() || rkind == ty_REF() || rkind == ty_MUTREF() || rkind == ty_RAWPTR()) { return false; }
+        if (self.type_text(rt) == "rawptr") { return false; }
+        return true;
+    }
+
+    public fn lower_index_operator_call(self, expr_id: i32, return_type_id: i32, target_fn: i32) -> i32 {
+        if (expr_id == hir_id_invalid() || target_fn == mir_id_invalid()) { return mir_id_invalid(); }
+        let receiver_expr_id = self.h.expr_lhs(expr_id);
+        if (receiver_expr_id == hir_id_invalid()) { return mir_id_invalid(); }
+        let receiver_value = self.lower_expr(receiver_expr_id);
+        if (receiver_value == mir_id_invalid()) { return mir_id_invalid(); }
+        let callee_ref = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_target_ref(),
+                                           return_type_id,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           target_fn,
+                                           expr_id,
+                                           hir_unit_expr_flags(self.h, expr_id),
+                                           self.h.expr_op(expr_id),
+                                           hir_unit_expr_int_value(self.h, expr_id),
+                                           "operator[]",
+                                           self.h.expr_value_text(expr_id));
+        self.unit.set_value_lhs( callee_ref, receiver_value);
+        let call_value = self.unit.add_value(
+                                           self.current_function_id,
+                                           mir_value_call(),
+                                           return_type_id,
+                                           mir_id_invalid(),
+                                           mir_target_function(),
+                                           target_fn,
+                                           expr_id,
+                                           hir_unit_expr_flags(self.h, expr_id),
+                                           self.h.expr_op(expr_id),
+                                           hir_unit_expr_int_value(self.h, expr_id),
+                                           "operator[]",
+                                           self.h.expr_value_text(expr_id));
+        self.unit.set_value_lhs( call_value, callee_ref);
+        let arg_expr_id = self.h.expr_rhs(expr_id);
+        if (arg_expr_id != hir_id_invalid()) {
+            let arg_value = self.lower_expr_as(arg_expr_id, self.h.expr_type(arg_expr_id));
+            if (arg_value != mir_id_invalid()) {
+                self.append_value_arg(call_value, mir_id_invalid(), mir_id_invalid(), arg_value);
+            }
+        }
+        return call_value;
+    }
+
+    /// `want_place` selects the channel: in place context a `*T`-returning
+    /// operator[] is materialised into a temporary `*T` place so a further
+    /// index (`b[i][j]`, WYSIWYG pointer stepping) has a real pointer base
+    /// place; in value context the call value (the pointer handle) flows
+    /// through unchanged.
+    public fn lower_overloaded_index_place(self, expr_id: i32, want_place: bool) -> i32 {
+        if (expr_id == hir_id_invalid() || self.h.expr_kind(expr_id) != ex_INDEX()) { return mir_id_invalid(); }
+        let target_fn = self.index_operator_target_for_expr(expr_id);
+        var return_type_id = mir_id_invalid();
+        var place_type = mir_id_invalid();
+        var address_value = mir_id_invalid();
+        if (target_fn != mir_id_invalid()) {
+            return_type_id = self.unit.function_return_type(target_fn);
+            place_type = self.index_operator_place_type_from_return(return_type_id);
+            if (place_type != mir_id_invalid()) {
+                address_value = self.lower_index_operator_call(expr_id, return_type_id, target_fn);
+            }
+            if (want_place && place_type == mir_id_invalid() && return_type_id != mir_id_invalid()) {
+                // Pointer-returning operator[] in place context: keep the
+                // pointer handle addressable so nested pointer indexing and
+                // `b[i][j] = x` element writes lower through the ordinary
+                // pointer-index place path.
+                let rkind = hir_type_table_kind(self.h.types, return_type_id);
+                let rtext = self.type_text(return_type_id);
+                let rbase = policy_generic_call_base(rtext.clone());
+                let r_is_ref = rkind == ty_REF() || rkind == ty_MUTREF()
+                    || rbase == "ref" || rbase == "mutref";
+                let r_is_ptr = rkind == ty_PTR() || rbase == "ptr";
+                if (r_is_ptr && !r_is_ref) {
+                    let ptr_call = self.lower_index_operator_call(expr_id, return_type_id, target_fn);
+                    if (ptr_call != mir_id_invalid()) {
+                        let ptr_place = self.add_temp_place(return_type_id, expr_id, "idxptr");
+                        self.emit_assign(ptr_place, ptr_call, hir_id_invalid(), expr_id);
+                        return ptr_place;
+                    }
+                }
+            }
+        }
+        if (address_value == mir_id_invalid()) {
+            let expr_type = self.h.expr_type(expr_id);
+            place_type = self.index_operator_place_type_from_return(expr_type);
+            if (place_type == mir_id_invalid()) { return mir_id_invalid(); }
+            address_value = self.lower_operator_method_call(self.h.expr_lhs(expr_id),
+                                                            "operator[]",
+                                                            self.h.expr_rhs(expr_id),
+                                                            expr_type,
+                                                            expr_id);
+            if (address_value != mir_id_invalid()) {
+                return_type_id = self.unit.value_type(address_value);
+                let call_place_type = self.index_operator_place_type_from_return(return_type_id);
+                if (call_place_type != mir_id_invalid()) { place_type = call_place_type; }
+            }
+        }
+        if (place_type == mir_id_invalid()) { return mir_id_invalid(); }
+        if (address_value == mir_id_invalid()) { return mir_id_invalid(); }
+        let deref_place = self.unit.add_place(
+                                  self.current_function_id,
+                                  mir_place_deref(),
+                                  place_type,
+                                  mir_id_invalid(),
+                                  mir_id_invalid(),
+                                  mir_id_invalid(),
+                                  address_value,
+                                  expr_id,
+                                  self.h.expr_name(expr_id));
+        return self.mark_place_unsafe_if_needed(deref_place);
+    }
+}

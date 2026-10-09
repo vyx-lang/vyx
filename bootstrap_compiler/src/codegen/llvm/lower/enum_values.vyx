@@ -1,0 +1,869 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn result_arg_type(self, type_id: i32, idx: i32) -> i32 {
+        if (!self.type_is_result_abi(type_id)) { return mir_id_invalid(); }
+        let args = policy_generic_call_args(llvm_mir_type_text(&self.m, type_id));
+        let arg_text = policy_generic_arg_at(args, idx);
+        let arg_type = self.type_id_by_text(arg_text);
+        if (arg_type == mir_id_invalid()) {
+            self.report_error("cannot resolve Result type argument " + arg_text);
+        }
+        return arg_type;
+    }
+
+    public fn result_ok_type(self, type_id: i32) -> i32 {
+        return self.result_arg_type(type_id, 0);
+    }
+
+    public fn result_err_type(self, type_id: i32) -> i32 {
+        return self.result_arg_type(type_id, 1);
+    }
+
+    public fn option_payload_type(self, type_id: i32) -> i32 {
+        if (!self.type_is_option_abi(type_id)) { return mir_id_invalid(); }
+        let canonical = self.canonical_record_type_id(type_id);
+        let elem = hir_type_table_elem(self.m.types, canonical);
+        if (elem > 0) { return elem; }
+        let args = policy_generic_call_args(llvm_mir_type_text(&self.m, type_id));
+        let arg_text = policy_generic_arg_at(args, 0);
+        let arg_type = self.type_id_by_text(arg_text);
+        if (arg_type == mir_id_invalid()) {
+            self.report_error("cannot resolve Option payload type " + arg_text);
+        }
+        return arg_type;
+    }
+
+    public fn get_or_create_option_ty(self, type_id: i32) -> rawptr {
+        let cached = llvm_mir_map_get(self.type_struct_values, type_id);
+        if (cached != null) { return cached; }
+        let payload_type = self.option_payload_type(type_id);
+        if (payload_type == mir_id_invalid()) { return null; }
+        let name = "mir.option." + policy_i64_to_string(type_id as i64);
+        let st = vyx_rt_struct_ty_named(self.mod, name.c_str(), name.len as u64);
+        if (st == null) {
+            self.report_error("cannot create Option ABI type " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        llvm_mir_map_put(self.type_struct_values, type_id, st);
+        let payload_ll = self.lower_type(payload_type);
+        if (payload_ll == null || llvm_mir_type_kind(&self.m, payload_type) == ty_VOID()) {
+            self.report_error("cannot create Option ABI payload for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        let fields = malloc(16);
+        if (fields == null) {
+            self.report_error("cannot allocate Option ABI field list");
+            return null;
+        }
+        ast_write_rawptr(fields, self.ty_i32);
+        ast_write_rawptr(ptr_offset(fields, 8), payload_ll);
+        if (vyx_rt_struct_ty_set_body(self.mod, st, fields, 2, 0) != 0) {
+            free(fields);
+            self.report_error("cannot finalize Option ABI type " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        free(fields);
+        return st;
+    }
+
+    public fn option_field_ptr(self, storage: rawptr, option_type: i32, idx: i32, name: string) -> rawptr {
+        let option_ty = self.get_or_create_option_ty(option_type);
+        if (storage == null || option_ty == null) { return null; }
+        if (idx < 0 || idx >= 2) {
+            self.report_error("Option field index out of range for "
+                      + llvm_mir_type_text(&self.m, option_type)
+                      + ": "
+                      + policy_i64_to_string(idx as i64));
+            return null;
+        }
+        return vyx_rt_build_gep2(self.mod,
+                                 option_ty,
+                                 storage,
+                                 vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                 vyx_rt_const_int(self.mod, self.ty_i32, idx as i64, 0),
+                                 name.c_str(),
+                                 name.len as u64);
+    }
+
+    public fn build_option_value_from_parts(self,
+                                            option_type: i32,
+                                            tag_value: rawptr,
+                                            payload_value: rawptr) -> rawptr {
+        let option_ty = self.get_or_create_option_ty(option_type);
+        let payload_type = self.option_payload_type(option_type);
+        if (option_ty == null || payload_type == mir_id_invalid()) { return null; }
+        var payload_v = payload_value;
+        if (payload_v == null) { payload_v = vyx_rt_const_null(self.mod, self.lower_type(payload_type)); }
+        let tmp = vyx_rt_build_alloca(self.mod, option_ty, "mir.option.tmp".c_str(), 14);
+        if (tmp == null) {
+            self.report_error("cannot allocate Option ABI temporary");
+            return null;
+        }
+        let tag_ptr = self.option_field_ptr(tmp, option_type, 0, "option.tag");
+        let payload_ptr = self.option_field_ptr(tmp, option_type, 1, "option.value");
+        if (tag_ptr == null || payload_ptr == null || tag_value == null || payload_v == null) {
+            self.report_error("cannot address Option ABI fields");
+            return null;
+        }
+        vyx_rt_build_store(self.mod, tag_value, tag_ptr);
+        vyx_rt_build_store(self.mod, payload_v, payload_ptr);
+        return vyx_rt_build_load(self.mod, option_ty, tmp, "mir.option.val".c_str(), 14);
+    }
+
+    public fn option_tag_for_variant(self, variant_id: i32, variant_name: string) -> rawptr {
+        let tag = mir_unit_variant_tag(&self.m, variant_id);
+        if (tag < 0) {
+            self.report_error("cannot resolve Option variant tag for " + variant_name);
+            return null;
+        }
+        return vyx_rt_const_int(self.mod, self.ty_i32, tag as i64, 0);
+    }
+
+    public fn lower_option_variant_ref(self, value_id: i32) -> rawptr {
+        let option_type = self.m.value_type(value_id);
+        let variant_id = self.m.value_target_id(value_id);
+        let variant_name = mir_unit_variant_name(&self.m, variant_id);
+        if (!self.type_is_option_abi(option_type)) {
+            self.report_error("Option variant reference requires Option type");
+            return null;
+        }
+        if (variant_name != "None") {
+            self.report_error("Option variant " + variant_name + " requires constructor call");
+            return null;
+        }
+        return self.build_option_value_from_parts(option_type,
+                                                  self.option_tag_for_variant(variant_id, variant_name),
+                                                  null);
+    }
+
+    public fn lower_option_variant_call(self, value_id: i32) -> rawptr {
+        let option_type = self.m.value_type(value_id);
+        if (!self.type_is_option_abi(option_type)) {
+            self.report_error("Option variant call requires Option return type");
+            return null;
+        }
+        var variant_id = self.m.value_target_id(value_id);
+        if (self.m.value_target_kind(value_id) != mir_target_hir_variant()) {
+            let callee_id = self.m.value_lhs(value_id);
+            if (callee_id != mir_id_invalid()
+                && self.m.value_target_kind(callee_id) == mir_target_hir_variant()) {
+                variant_id = self.m.value_target_id(callee_id);
+            }
+        }
+        if (variant_id == mir_id_invalid()) {
+            self.report_error("cannot resolve Option constructor variant");
+            return null;
+        }
+        let variant_name = mir_unit_variant_name(&self.m, variant_id);
+        let argc = self.call_arg_count(value_id);
+        let tag_v = self.option_tag_for_variant(variant_id, variant_name);
+        if (variant_name == "None") {
+            if (argc != 0) {
+                self.report_error("Option.None constructor received arguments");
+                return null;
+            }
+            return self.build_option_value_from_parts(option_type, tag_v, null);
+        }
+        if (variant_name == "Some") {
+            if (argc != 1) {
+                self.report_error("Option.Some constructor argument count mismatch");
+                return null;
+            }
+            let payload_type = self.option_payload_type(option_type);
+            if (payload_type == mir_id_invalid()) { return null; }
+            let payload = self.lower_value_as(self.call_arg_at(value_id, 0), payload_type);
+            if (payload == null) {
+                self.report_error("cannot lower Option.Some payload");
+                return null;
+            }
+            return self.build_option_value_from_parts(option_type, tag_v, payload);
+        }
+        self.report_error("unknown Option variant " + variant_name);
+        return null;
+    }
+
+    public fn option_field_value(self, value: rawptr, option_type: i32, idx: i32, field_type: rawptr, name: string) -> rawptr {
+        let option_ty = self.get_or_create_option_ty(option_type);
+        if (value == null || option_ty == null || field_type == null) { return null; }
+        let tmp = vyx_rt_build_alloca(self.mod, option_ty, "mir.option.extract".c_str(), 18);
+        if (tmp == null) { return null; }
+        vyx_rt_build_store(self.mod, value, tmp);
+        let ptr = self.option_field_ptr(tmp, option_type, idx, name);
+        if (ptr == null) { return null; }
+        return vyx_rt_build_load(self.mod, field_type, ptr, name.c_str(), name.len as u64);
+    }
+
+    public fn option_tag_value(self, value: rawptr, option_type: i32) -> rawptr {
+        return self.option_field_value(value, option_type, 0, self.ty_i32, "option.tag");
+    }
+
+    public fn option_payload_value(self, value: rawptr, option_type: i32) -> rawptr {
+        let payload_type = self.option_payload_type(option_type);
+        if (payload_type == mir_id_invalid()) { return null; }
+        return self.option_field_value(value,
+                                       option_type,
+                                       1,
+                                       self.lower_type(payload_type),
+                                       "option.payload");
+    }
+
+    public fn type_is_plain_enum_abi(self, type_id: i32) -> bool {
+        let canonical_type = self.canonical_record_type_id(type_id);
+        if (self.type_is_option_abi(canonical_type) || self.type_is_result_abi(canonical_type)) { return false; }
+        if (llvm_mir_type_kind(&self.m, canonical_type) != ty_CLASS()) { return false; }
+        return mir_unit_variant_count_for_type(&self.m, canonical_type) > 0
+            && mir_unit_field_count_for_type(&self.m, canonical_type) == 0;
+    }
+
+    public fn pattern_variant_id(self, pattern_id: i32) -> i32 {
+        var variant_id = self.m.value_target_id(pattern_id);
+        if (self.m.value_target_kind(pattern_id) != mir_target_hir_variant()) {
+            let callee_id = self.m.value_lhs(pattern_id);
+            if (callee_id != mir_id_invalid()
+                && self.m.value_target_kind(callee_id) == mir_target_hir_variant()) {
+                variant_id = self.m.value_target_id(callee_id);
+            }
+        }
+        return variant_id;
+    }
+
+    // Duplicate enum registrations (module-qualified vs plain text) own
+    // parallel variant lists. Normalize any variant id onto the same-name
+    // variant owned by the canonical (representative) enum entry so id
+    // comparisons hold across the duplicates.
+    public fn canonical_variant_id(self, variant_id: i32) -> i32 {
+        if (variant_id == mir_id_invalid()) { return variant_id; }
+        let owner = mir_unit_variant_owner_type(&self.m, variant_id);
+        if (owner == mir_id_invalid()) { return variant_id; }
+        let canonical_owner = self.canonical_record_type_id(owner);
+        let tag = mir_unit_variant_tag(&self.m, variant_id);
+        if (tag >= 0) {
+            let primary = mir_unit_variant_id_for_type_tag(&self.m, canonical_owner, tag);
+            if (primary != mir_id_invalid()) { return primary; }
+        }
+        if (canonical_owner == owner) { return variant_id; }
+        let wanted_name = mir_unit_variant_name(&self.m, variant_id);
+        var cur: i32 = 1;
+        while (cur <= self.m.variant_count) {
+            if (mir_unit_variant_owner_type(&self.m, cur) == canonical_owner
+                && mir_unit_variant_name(&self.m, cur) == wanted_name) {
+                return cur;
+            }
+            cur = cur + 1;
+        }
+        return variant_id;
+    }
+
+    public fn value_is_variant_constructor_for_type(self, value_id: i32, enum_type: i32, variant_id: i32) -> bool {
+        if (value_id == mir_id_invalid()) { return false; }
+        if (self.m.value_kind(value_id) != mir_value_call()) { return false; }
+        if (self.canonical_record_type_id(self.m.value_type(value_id)) != self.canonical_record_type_id(enum_type)) { return false; }
+        return self.canonical_variant_id(self.pattern_variant_id(value_id)) == self.canonical_variant_id(variant_id);
+    }
+
+    public fn value_is_fail_variant_for_type(self, value_id: i32, enum_type: i32, variant_id: i32) -> bool {
+        if (value_id == mir_id_invalid() || variant_id == mir_id_invalid()) { return false; }
+        if (self.m.value_kind(value_id) != mir_value_unary()) { return false; }
+        let result_type = self.m.value_type(value_id);
+        if (!self.type_is_result_abi(result_type)) { return false; }
+        let err_type = self.result_err_type(result_type);
+        if (self.canonical_record_type_id(err_type) != self.canonical_record_type_id(enum_type)) { return false; }
+        return self.m.value_text(value_id) == mir_unit_variant_name(&self.m, variant_id);
+    }
+
+    public fn enum_variant_payload_count(self, enum_type: i32, variant_id: i32) -> i32 {
+        let canonical_type = self.canonical_record_type_id(enum_type);
+        var out: i32 = mir_unit_variant_payload_count(&self.m, self.canonical_variant_id(variant_id));
+        var value_id: i32 = 1;
+        while (value_id <= self.m.value_count) {
+            if (self.value_is_variant_constructor_for_type(value_id, canonical_type, variant_id)) {
+                let argc = self.call_arg_count(value_id);
+                if (argc > out) { out = argc; }
+            } else if (self.value_is_fail_variant_for_type(value_id, canonical_type, variant_id)
+                       && self.m.value_lhs(value_id) != mir_id_invalid()) {
+                if (out < 1) { out = 1; }
+            }
+            value_id = value_id + 1;
+        }
+        return out;
+    }
+
+    public fn enum_declared_payload_type_at(self, enum_type: i32, variant_id: i32, arg_index: i32) -> i32 {
+        if (arg_index < 0) { return mir_id_invalid(); }
+        let canonical_variant = self.canonical_variant_id(variant_id);
+        let payloads = mir_unit_variant_payload_types(&self.m, canonical_variant);
+        if (payloads.len == 0) { return mir_id_invalid(); }
+        let payload_text = policy_generic_arg_at(payloads, arg_index);
+        if (payload_text.len == 0) { return mir_id_invalid(); }
+        let direct = self.type_id_by_text(payload_text);
+        if (direct != mir_id_invalid()) { return direct; }
+        let enum_text = llvm_mir_type_text(&self.m, self.canonical_record_type_id(enum_type));
+        if (policy_generic_call_has_args(enum_text.clone()) != 0) {
+            let resolved = self.resolve_type_text_for_owner(payload_text, enum_text);
+            if (resolved.len > 0) {
+                let resolved_type = self.type_id_by_text(resolved);
+                if (resolved_type != mir_id_invalid()) { return resolved_type; }
+            }
+        }
+        return mir_id_invalid();
+    }
+
+    public fn enum_variant_payload_type_at(self, enum_type: i32, variant_id: i32, arg_index: i32) -> i32 {
+        let canonical_type = self.canonical_record_type_id(enum_type);
+        let declared_type = self.enum_declared_payload_type_at(canonical_type, variant_id, arg_index);
+        if (declared_type != mir_id_invalid()) { return declared_type; }
+        var value_id: i32 = 1;
+        while (value_id <= self.m.value_count) {
+            if (self.value_is_variant_constructor_for_type(value_id, canonical_type, variant_id)) {
+                let arg_id = self.call_arg_at(value_id, arg_index);
+                if (arg_id != mir_id_invalid()) { return self.m.value_type(arg_id); }
+            } else if (arg_index == 0
+                       && self.value_is_fail_variant_for_type(value_id, canonical_type, variant_id)) {
+                let payload_id = self.m.value_lhs(value_id);
+                if (payload_id != mir_id_invalid()) { return self.m.value_type(payload_id); }
+            }
+            value_id = value_id + 1;
+        }
+        self.report_error("cannot resolve enum payload type for variant " + mir_unit_variant_name(&self.m, variant_id));
+        return mir_id_invalid();
+    }
+
+    public fn enum_payload_total_count(self, enum_type: i32) -> i32 {
+        let canonical_type = self.canonical_record_type_id(enum_type);
+        var out: i32 = 0;
+        var variant_id: i32 = 1;
+        while (variant_id <= self.m.variant_count) {
+            if (mir_unit_variant_owner_type(&self.m, variant_id) == canonical_type
+                && mir_unit_variant_is_primary_for_type_tag(&self.m, variant_id)) {
+                out = out + self.enum_variant_payload_count(canonical_type, variant_id);
+            }
+            variant_id = variant_id + 1;
+        }
+        return out;
+    }
+
+    public fn enum_payload_field_index(self, enum_type: i32, variant_id: i32, arg_index: i32) -> i32 {
+        let canonical_type = self.canonical_record_type_id(enum_type);
+        let wanted_variant = self.canonical_variant_id(variant_id);
+        var field_index: i32 = 1;
+        var cur_variant: i32 = 1;
+        while (cur_variant <= self.m.variant_count) {
+            if (mir_unit_variant_owner_type(&self.m, cur_variant) == canonical_type
+                && mir_unit_variant_is_primary_for_type_tag(&self.m, cur_variant)) {
+                if (cur_variant == wanted_variant) { return field_index + arg_index; }
+                field_index = field_index + self.enum_variant_payload_count(canonical_type, cur_variant);
+            }
+            cur_variant = cur_variant + 1;
+        }
+        return -1;
+    }
+
+    public fn get_or_create_enum_ty(self, type_id: i32) -> rawptr {
+        let canonical_type = self.canonical_record_type_id(type_id);
+        let cached = llvm_mir_map_get(self.type_struct_values, canonical_type);
+        if (cached != null) { return cached; }
+        let field_count = self.enum_payload_total_count(canonical_type) + 1;
+        let name = "mir.enum." + llvm_mir_type_text(&self.m, canonical_type);
+        let st = vyx_rt_struct_ty_named(self.mod, name.c_str(), name.len as u64);
+        if (st == null) {
+            self.report_error("cannot create enum ABI type " + llvm_mir_type_text(&self.m, canonical_type));
+            return null;
+        }
+        llvm_mir_map_put(self.type_struct_values, canonical_type, st);
+        let fields = malloc((field_count * 8) as u64);
+        if (fields == null) {
+            self.report_error("cannot allocate enum ABI field list");
+            return null;
+        }
+        ast_write_rawptr(fields, self.ty_i32);
+        var out_index: i32 = 1;
+        var variant_id: i32 = 1;
+        while (variant_id <= self.m.variant_count) {
+            if (mir_unit_variant_owner_type(&self.m, variant_id) == canonical_type
+                && mir_unit_variant_is_primary_for_type_tag(&self.m, variant_id)) {
+                let payload_count = self.enum_variant_payload_count(canonical_type, variant_id);
+                var arg_index: i32 = 0;
+                while (arg_index < payload_count) {
+                    let payload_type = self.enum_variant_payload_type_at(canonical_type, variant_id, arg_index);
+                    let payload_ll = self.lower_type(payload_type);
+                    if (payload_type == mir_id_invalid() || payload_ll == null) {
+                        free(fields);
+                        self.report_error("cannot lower enum payload type for " + mir_unit_variant_name(&self.m, variant_id));
+                        return null;
+                    }
+                    ast_write_rawptr(ptr_offset(fields, out_index * 8), payload_ll);
+                    out_index = out_index + 1;
+                    arg_index = arg_index + 1;
+                }
+            }
+            variant_id = variant_id + 1;
+        }
+        if (vyx_rt_struct_ty_set_body(self.mod, st, fields, field_count as u64, 0) != 0) {
+            free(fields);
+            self.report_error("cannot finalize enum ABI type " + llvm_mir_type_text(&self.m, canonical_type));
+            return null;
+        }
+        free(fields);
+        return st;
+    }
+
+    public fn enum_field_ptr(self, storage: rawptr, enum_type: i32, idx: i32, name: string) -> rawptr {
+        let enum_ty = self.get_or_create_enum_ty(enum_type);
+        if (storage == null || enum_ty == null || idx < 0) { return null; }
+        let canonical_type = self.canonical_record_type_id(enum_type);
+        let field_count = self.enum_payload_total_count(canonical_type) + 1;
+        if (idx >= field_count) {
+            self.report_error("enum field index "
+                      + policy_i64_to_string(idx as i64)
+                      + " is outside "
+                      + llvm_mir_type_text(&self.m, canonical_type)
+                      + " field_count="
+                      + policy_i64_to_string(field_count as i64));
+            return null;
+        }
+        return vyx_rt_build_gep2(self.mod,
+                                 enum_ty,
+                                 storage,
+                                 vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                 vyx_rt_const_int(self.mod, self.ty_i32, idx as i64, 0),
+                                 name.c_str(),
+                                 name.len as u64);
+    }
+
+    public fn build_enum_value_from_variant(self, enum_type: i32, variant_id: i32, value_id: i32) -> rawptr {
+        let enum_ty = self.get_or_create_enum_ty(enum_type);
+        if (enum_ty == null) { return null; }
+        let tmp = vyx_rt_build_alloca(self.mod, enum_ty, "mir.enum.tmp".c_str(), 12);
+        if (tmp == null) {
+            self.report_error("cannot allocate enum ABI temporary");
+            return null;
+        }
+        let zero_init = vyx_rt_const_null(self.mod, enum_ty);
+        let tag_ptr = self.enum_field_ptr(tmp, enum_type, 0, "enum.tag");
+        let tag_v = self.lower_variant_tag_value(variant_id);
+        if (zero_init == null || tag_ptr == null || tag_v == null) {
+            self.report_error("cannot initialize enum ABI tag");
+            return null;
+        }
+        vyx_rt_build_store(self.mod, zero_init, tmp);
+        vyx_rt_build_store(self.mod, tag_v, tag_ptr);
+        var arg_index: i32 = 0;
+        var arg_id = self.m.value_first_arg(value_id);
+        while (arg_id != mir_id_invalid()) {
+            let field_index = self.enum_payload_field_index(enum_type, variant_id, arg_index);
+            let payload_type = self.enum_variant_payload_type_at(enum_type, variant_id, arg_index);
+            let payload_ptr = self.enum_field_ptr(tmp, enum_type, field_index, "enum.payload");
+            let payload_val = self.lower_value_as(arg_id, payload_type);
+            if (field_index < 0 || payload_type == mir_id_invalid() || payload_ptr == null || payload_val == null) {
+                self.report_error("cannot lower enum payload for " + mir_unit_variant_name(&self.m, variant_id));
+                return null;
+            }
+            vyx_rt_build_store(self.mod, payload_val, payload_ptr);
+            arg_index = arg_index + 1;
+            arg_id = self.m.value_next_arg(arg_id);
+        }
+        return vyx_rt_build_load(self.mod, enum_ty, tmp, "mir.enum.val".c_str(), 12);
+    }
+
+    public fn lower_enum_variant_call(self, value_id: i32) -> rawptr {
+        let enum_type = self.m.value_type(value_id);
+        var variant_id = self.pattern_variant_id(value_id);
+        if (variant_id == mir_id_invalid()) {
+            self.report_error("cannot resolve enum constructor variant");
+            return null;
+        }
+        return self.build_enum_value_from_variant(enum_type, variant_id, value_id);
+    }
+
+    public fn lower_enum_variant_ref(self, value_id: i32) -> rawptr {
+        let enum_type = self.m.value_type(value_id);
+        let variant_id = self.m.value_target_id(value_id);
+        if (variant_id == mir_id_invalid()) {
+            self.report_error("cannot resolve enum variant reference");
+            return null;
+        }
+        return self.build_enum_value_from_variant(enum_type, variant_id, value_id);
+    }
+
+    public fn enum_field_value(self, value: rawptr, enum_type: i32, idx: i32, field_type: rawptr, name: string) -> rawptr {
+        let enum_ty = self.get_or_create_enum_ty(enum_type);
+        if (value == null || enum_ty == null || field_type == null || idx < 0) { return null; }
+        let tmp = vyx_rt_build_alloca(self.mod, enum_ty, "mir.enum.extract".c_str(), 16);
+        if (tmp == null) { return null; }
+        vyx_rt_build_store(self.mod, value, tmp);
+        let ptr = self.enum_field_ptr(tmp, enum_type, idx, name);
+        if (ptr == null) { return null; }
+        return vyx_rt_build_load(self.mod, field_type, ptr, name.c_str(), name.len as u64);
+    }
+
+    public fn enum_tag_value(self, value: rawptr, enum_type: i32) -> rawptr {
+        return self.enum_field_value(value, enum_type, 0, self.ty_i32, "enum.tag");
+    }
+
+    public fn enum_payload_value(self, value: rawptr, enum_type: i32, variant_id: i32, arg_index: i32) -> rawptr {
+        let payload_type = self.enum_variant_payload_type_at(enum_type, variant_id, arg_index);
+        let field_index = self.enum_payload_field_index(enum_type, variant_id, arg_index);
+        if (payload_type == mir_id_invalid() || field_index < 0) { return null; }
+        return self.enum_field_value(value,
+                                     enum_type,
+                                     field_index,
+                                     self.lower_type(payload_type),
+                                     "enum.payload");
+    }
+
+    public fn get_or_create_result_ty(self, type_id: i32) -> rawptr {
+        let cached = llvm_mir_map_get(self.type_struct_values, type_id);
+        if (cached != null) { return cached; }
+        let ok_type = self.result_ok_type(type_id);
+        let err_type = self.result_err_type(type_id);
+        if (ok_type == mir_id_invalid() || err_type == mir_id_invalid()) { return null; }
+        let name = "mir.result." + policy_i64_to_string(type_id as i64);
+        let st = vyx_rt_struct_ty_named(self.mod, name.c_str(), name.len as u64);
+        if (st == null) {
+            self.report_error("cannot create Result ABI type " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        llvm_mir_map_put(self.type_struct_values, type_id, st);
+        let fields = malloc(24);
+        if (fields == null) {
+            self.report_error("cannot allocate Result ABI field list");
+            return null;
+        }
+        ast_write_rawptr(fields, self.ty_i32);
+        ast_write_rawptr(ptr_offset(fields, 8), self.lower_type(ok_type));
+        ast_write_rawptr(ptr_offset(fields, 16), self.lower_type(err_type));
+        if (vyx_rt_struct_ty_set_body(self.mod, st, fields, 3, 0) != 0) {
+            free(fields);
+            self.report_error("cannot finalize Result ABI type " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        free(fields);
+        return st;
+    }
+
+    public fn result_field_ptr(self, storage: rawptr, result_type: i32, idx: i32, name: string) -> rawptr {
+        let result_ty = self.get_or_create_result_ty(result_type);
+        if (storage == null || result_ty == null) { return null; }
+        if (idx < 0 || idx >= 3) {
+            self.report_error("Result field index out of range for "
+                      + llvm_mir_type_text(&self.m, result_type)
+                      + ": "
+                      + policy_i64_to_string(idx as i64));
+            return null;
+        }
+        return vyx_rt_build_gep2(self.mod,
+                                 result_ty,
+                                 storage,
+                                 vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                 vyx_rt_const_int(self.mod, self.ty_i32, idx as i64, 0),
+                                 name.c_str(),
+                                 name.len as u64);
+    }
+
+    public fn build_result_value_from_parts(self,
+                                            result_type: i32,
+                                            tag_value: rawptr,
+                                            ok_value: rawptr,
+                                            err_value: rawptr) -> rawptr {
+        let result_ty = self.get_or_create_result_ty(result_type);
+        let ok_type = self.result_ok_type(result_type);
+        let err_type = self.result_err_type(result_type);
+        if (result_ty == null || ok_type == mir_id_invalid() || err_type == mir_id_invalid()) { return null; }
+        let tmp = vyx_rt_build_alloca(self.mod, result_ty, "mir.result.tmp".c_str(), 14);
+        if (tmp == null) {
+            self.report_error("cannot allocate Result ABI temporary");
+            return null;
+        }
+        var ok_v = ok_value;
+        var err_v = err_value;
+        if (ok_v == null) { ok_v = vyx_rt_const_null(self.mod, self.lower_type(ok_type)); }
+        if (err_v == null) { err_v = vyx_rt_const_null(self.mod, self.lower_type(err_type)); }
+        let tag_ptr = self.result_field_ptr(tmp, result_type, 0, "result.tag");
+        let ok_ptr = self.result_field_ptr(tmp, result_type, 1, "result.ok");
+        let err_ptr = self.result_field_ptr(tmp, result_type, 2, "result.err");
+        if (tag_ptr == null || ok_ptr == null || err_ptr == null || tag_value == null || ok_v == null || err_v == null) {
+            self.report_error("cannot address Result ABI fields");
+            return null;
+        }
+        vyx_rt_build_store(self.mod, tag_value, tag_ptr);
+        vyx_rt_build_store(self.mod, ok_v, ok_ptr);
+        vyx_rt_build_store(self.mod, err_v, err_ptr);
+        return vyx_rt_build_load(self.mod, result_ty, tmp, "mir.result.val".c_str(), 14);
+    }
+
+    public fn variant_id_for_type_and_name(self, type_id: i32, variant_name: string) -> i32 {
+        if (variant_name.len == 0) { return mir_id_invalid(); }
+        let canonical_type = self.canonical_record_type_id(type_id);
+        var variant_id: i32 = 1;
+        while (variant_id <= self.m.variant_count) {
+            if (mir_unit_variant_owner_type(&self.m, variant_id) == canonical_type
+                && mir_unit_variant_name(&self.m, variant_id) == variant_name) {
+                return variant_id;
+            }
+            variant_id = variant_id + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn build_enum_value_from_variant_payload(self,
+                                                    enum_type: i32,
+                                                    variant_id: i32,
+                                                    payload_value_id: i32,
+                                                    source_value_id: i32) -> rawptr {
+        let enum_ty = self.get_or_create_enum_ty(enum_type);
+        if (enum_ty == null || variant_id == mir_id_invalid()) { return null; }
+        let payload_count = self.enum_variant_payload_count(enum_type, variant_id);
+        if (payload_count > 1) {
+            self.report_error("fail can only lower single-payload error variant " + mir_unit_variant_name(&self.m, variant_id));
+            return null;
+        }
+        if (payload_count == 0 && payload_value_id != mir_id_invalid() && self.m.value_op(source_value_id) == 1) {
+            self.report_error("error variant " + mir_unit_variant_name(&self.m, variant_id) + " does not accept fail payload");
+            return null;
+        }
+        let tmp = vyx_rt_build_alloca(self.mod, enum_ty, "mir.fail.enum.tmp".c_str(), 17);
+        let zero_init = vyx_rt_const_null(self.mod, enum_ty);
+        let tag_ptr = self.enum_field_ptr(tmp, enum_type, 0, "enum.tag");
+        let tag_v = self.lower_variant_tag_value(variant_id);
+        if (tmp == null || zero_init == null || tag_ptr == null || tag_v == null) {
+            self.report_error("cannot initialize fail enum value");
+            return null;
+        }
+        vyx_rt_build_store(self.mod, zero_init, tmp);
+        vyx_rt_build_store(self.mod, tag_v, tag_ptr);
+        if (payload_count == 1) {
+            let payload_type = self.enum_variant_payload_type_at(enum_type, variant_id, 0);
+            let payload_ptr = self.enum_field_ptr(tmp,
+                                                  enum_type,
+                                                  self.enum_payload_field_index(enum_type, variant_id, 0),
+                                                  "enum.payload");
+            var payload_val: rawptr = null;
+            if (payload_value_id == mir_id_invalid()) {
+                payload_val = self.default_value_for_type(payload_type);
+            } else {
+                payload_val = self.lower_value_as(payload_value_id, payload_type);
+            }
+            if (payload_type == mir_id_invalid() || payload_ptr == null || payload_val == null) {
+                self.report_error("cannot lower fail payload for " + mir_unit_variant_name(&self.m, variant_id));
+                return null;
+            }
+            vyx_rt_build_store(self.mod, payload_val, payload_ptr);
+        } else if (payload_value_id != mir_id_invalid()) {
+            self.lower_value(payload_value_id);
+        }
+        return vyx_rt_build_load(self.mod, enum_ty, tmp, "mir.fail.enum".c_str(), 13);
+    }
+
+    public fn lower_result_fail_value(self, value_id: i32) -> rawptr {
+        let result_type = self.m.value_type(value_id);
+        if (!self.type_is_result_abi(result_type)) {
+            self.report_error("fail requires Result value type");
+            return null;
+        }
+        let err_type = self.result_err_type(result_type);
+        if (err_type == mir_id_invalid()) { return null; }
+        let payload_value_id = self.m.value_lhs(value_id);
+        var err_payload: rawptr = null;
+        if (self.type_is_plain_enum_abi(err_type)) {
+            let variant_id = self.variant_id_for_type_and_name(err_type, self.m.value_text(value_id));
+            if (variant_id == mir_id_invalid()) {
+                self.report_error("cannot resolve fail error variant "
+                          + llvm_mir_type_text(&self.m, err_type)
+                          + "." + self.m.value_text(value_id));
+                return null;
+            }
+            err_payload = self.build_enum_value_from_variant_payload(err_type,
+                                                                     variant_id,
+                                                                     payload_value_id,
+                                                                     value_id);
+        } else {
+            if (payload_value_id == mir_id_invalid()) {
+                self.report_error("fail for non-enum error type requires payload");
+                return null;
+            }
+            err_payload = self.lower_value_as(payload_value_id, err_type);
+        }
+        if (err_payload == null) {
+            self.report_error("cannot lower fail error payload");
+            return null;
+        }
+        let result_err_tag = self.result_tag_for_variant_name("Err");
+        if (result_err_tag == null) { return null; }
+        return self.build_result_value_from_parts(result_type,
+                                                  result_err_tag,
+                                                  null,
+                                                  err_payload);
+    }
+
+    public fn lower_result_ok_wrap_value(self, value_id: i32, result_type: i32) -> rawptr {
+        let ok_type = self.result_ok_type(result_type);
+        if (ok_type == mir_id_invalid()) { return null; }
+        let payload = self.lower_value_as(value_id, ok_type);
+        if (payload == null) {
+            self.report_error("cannot lower Result Ok payload");
+            return null;
+        }
+        return self.build_result_value_from_parts(result_type,
+                                                  vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                                  payload,
+                                                  null);
+    }
+
+    public fn result_payload_type_for_variant(self, result_type: i32, variant_id: i32) -> i32 {
+        if (!self.type_is_result_abi(result_type) || variant_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let variant_name = mir_unit_variant_name(&self.m, variant_id);
+        if (variant_name == "Ok") { return self.result_ok_type(result_type); }
+        if (variant_name == "Err") { return self.result_err_type(result_type); }
+        self.report_error("unknown Result variant " + variant_name);
+        return mir_id_invalid();
+    }
+
+    public fn lower_result_variant_ref(self, value_id: i32) -> rawptr {
+        let result_type = self.m.value_type(value_id);
+        if (!self.type_is_result_abi(result_type)) {
+            self.report_error("Result variant reference requires Result type");
+            return null;
+        }
+        let variant_id = self.m.value_target_id(value_id);
+        let variant_name = mir_unit_variant_name(&self.m, variant_id);
+        self.report_error("Result variant " + variant_name + " requires constructor call");
+        return null;
+    }
+
+    public fn lower_result_variant_call(self, value_id: i32) -> rawptr {
+        let result_type = self.m.value_type(value_id);
+        if (!self.type_is_result_abi(result_type)) {
+            self.report_error("Result variant call requires Result return type");
+            return null;
+        }
+        var variant_id = self.m.value_target_id(value_id);
+        if (self.m.value_target_kind(value_id) != mir_target_hir_variant()) {
+            let callee_id = self.m.value_lhs(value_id);
+            if (callee_id != mir_id_invalid()
+                && self.m.value_target_kind(callee_id) == mir_target_hir_variant()) {
+                variant_id = self.m.value_target_id(callee_id);
+            }
+        }
+        if (variant_id == mir_id_invalid()) {
+            self.report_error("cannot resolve Result constructor variant");
+            return null;
+        }
+        let variant_name = mir_unit_variant_name(&self.m, variant_id);
+        let argc = self.call_arg_count(value_id);
+        if (argc != 1) {
+            self.report_error("Result." + variant_name + " constructor argument count mismatch");
+            return null;
+        }
+        let payload_type = self.result_payload_type_for_variant(result_type, variant_id);
+        if (payload_type == mir_id_invalid()) { return null; }
+        let payload = self.lower_value_as(self.call_arg_at(value_id, 0), payload_type);
+        let tag_v = self.result_tag_for_variant_name(variant_name);
+        if (payload == null || tag_v == null) {
+            self.report_error("cannot lower Result." + variant_name + " payload");
+            return null;
+        }
+        if (variant_name == "Ok") {
+            return self.build_result_value_from_parts(result_type, tag_v, payload, null);
+        }
+        if (variant_name == "Err") {
+            return self.build_result_value_from_parts(result_type, tag_v, null, payload);
+        }
+        self.report_error("unknown Result variant " + variant_name);
+        return null;
+    }
+
+    public fn result_field_value(self, value: rawptr, result_type: i32, idx: i32, field_type: rawptr, name: string) -> rawptr {
+        let result_ty = self.get_or_create_result_ty(result_type);
+        if (value == null || result_ty == null || field_type == null) { return null; }
+        let tmp = vyx_rt_build_alloca(self.mod, result_ty, "mir.result.extract".c_str(), 18);
+        if (tmp == null) { return null; }
+        vyx_rt_build_store(self.mod, value, tmp);
+        let ptr = self.result_field_ptr(tmp, result_type, idx, name);
+        if (ptr == null) { return null; }
+        return vyx_rt_build_load(self.mod, field_type, ptr, name.c_str(), name.len as u64);
+    }
+
+    public fn result_tag_value(self, value: rawptr, result_type: i32) -> rawptr {
+        return self.result_field_value(value, result_type, 0, self.ty_i32, "result.tag");
+    }
+
+    public fn result_ok_value(self, value: rawptr, result_type: i32) -> rawptr {
+        let ok_type = self.result_ok_type(result_type);
+        if (ok_type == mir_id_invalid()) { return null; }
+        return self.result_field_value(value, result_type, 1, self.lower_type(ok_type), "result.ok");
+    }
+
+    public fn result_err_value(self, value: rawptr, result_type: i32) -> rawptr {
+        let err_type = self.result_err_type(result_type);
+        if (err_type == mir_id_invalid()) { return null; }
+        return self.result_field_value(value, result_type, 2, self.lower_type(err_type), "result.err");
+    }
+
+    public fn lower_result_try_value(self, value_id: i32) -> rawptr {
+        let result_value_id = self.m.value_lhs(value_id);
+        let result_type = self.m.value_type(result_value_id);
+        if (!self.type_is_result_abi(result_type)) {
+            self.report_error("question operator requires Result input");
+            return null;
+        }
+        let result_value = self.lower_value_as(result_value_id, result_type);
+        let tag = self.result_tag_value(result_value, result_type);
+        if (result_value == null || tag == null) {
+            self.report_error("cannot lower Result question operand");
+            return null;
+        }
+        let is_err = vyx_rt_build_icmp(self.mod,
+                                       llvm_mir_icmp_eq(),
+                                       tag,
+                                       vyx_rt_const_int(self.mod, self.ty_i32, 1, 0),
+                                       llvm_mir_empty_name(),
+                                       0);
+        let err_name = "mir.try.err." + policy_i64_to_string(value_id as i64);
+        let ok_name = "mir.try.ok." + policy_i64_to_string(value_id as i64);
+        let err_bb = vyx_rt_append_block(self.mod,
+                                         self.current_function_value,
+                                         err_name.c_str(),
+                                         err_name.len as u64);
+        let ok_bb = vyx_rt_append_block(self.mod,
+                                        self.current_function_value,
+                                        ok_name.c_str(),
+                                        ok_name.len as u64);
+        if (is_err == null || err_bb == null || ok_bb == null) {
+            self.report_error("cannot create Result question control flow");
+            return null;
+        }
+        vyx_rt_build_cond_br(self.mod, is_err, err_bb, ok_bb);
+
+        vyx_rt_position_at_end(self.mod, err_bb);
+        let ret_type = self.m.function_return_type(self.current_function_id);
+        if (llvm_mir_type_kind(&self.m, ret_type) == ty_VOID()) {
+            vyx_rt_build_ret_void(self.mod);
+        } else if (self.type_is_result_abi(ret_type)) {
+            if (ret_type == result_type) {
+                self.emit_return_value(self.current_function_id, result_value);
+            } else {
+                let err_payload = self.result_err_value(result_value, result_type);
+                let ret_err_type = self.result_err_type(ret_type);
+                let cast_err = self.cast_value(err_payload, self.result_err_type(result_type), ret_err_type);
+                let ret_result = self.build_result_value_from_parts(ret_type,
+                                                                    vyx_rt_const_int(self.mod, self.ty_i32, 1, 0),
+                                                                    null,
+                                                                    cast_err);
+                if (ret_result == null) { vyx_rt_build_ret_void(self.mod); }
+                else { self.emit_return_value(self.current_function_id, ret_result); }
+            }
+        } else {
+            var ret_v = self.result_err_value(result_value, result_type);
+            if (ret_v == null) { ret_v = vyx_rt_const_int(self.mod, self.ty_i32, -1, 1); }
+            let cast_ret = self.cast_value(ret_v, self.result_err_type(result_type), ret_type);
+            if (cast_ret == null) { vyx_rt_build_ret_void(self.mod); }
+            else { self.emit_return_value(self.current_function_id, cast_ret); }
+        }
+
+        vyx_rt_position_at_end(self.mod, ok_bb);
+        let ok_payload = self.result_ok_value(result_value, result_type);
+        return self.cast_value(ok_payload, self.result_ok_type(result_type), self.m.value_type(value_id));
+    }
+}

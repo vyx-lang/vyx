@@ -1,0 +1,268 @@
+module bootstrap.mir_verify;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_verify.MirVerifier {
+    // ── S4: drop closure ─────────────────────────────────────────────
+
+    public fn strict_drop_local_of_instr(self, m: MirUnit, instr_id: i32) -> i32 {
+        let place = m.instr_place(instr_id);
+        if (place < 1 || place > m.place_count) { return mir_id_invalid(); }
+        if (m.place_kind(place) != mir_place_local()) { return mir_id_invalid(); }
+        return m.place_local(place);
+    }
+
+    public fn strict_block_contains_drop_of(self, m: MirUnit, block_id: i32, local_id: i32) -> bool {
+        var i = m.block_first_instr(block_id);
+        while (i != mir_id_invalid()) {
+            if (m.instr_kind(i) == mir_instr_drop()
+                && self.strict_drop_local_of_instr(m, i) == local_id) {
+                return true;
+            }
+            i = m.instr_next(i);
+        }
+        return false;
+    }
+
+    public fn strict_place_local(self, m: MirUnit, place_id: i32) -> i32 {
+        if (place_id == mir_id_invalid()) { return mir_id_invalid(); }
+        if (m.place_kind(place_id) == mir_place_local()) { return m.place_local(place_id); }
+        let base = m.place_base(place_id);
+        if (base != mir_id_invalid()) { return self.strict_place_local(m, base); }
+        return mir_id_invalid();
+    }
+
+    public fn strict_value_consumes_local(self, m: MirUnit, value_id: i32, local_id: i32, depth: i32) -> bool {
+        if (value_id == mir_id_invalid() || local_id == mir_id_invalid() || depth > 32) { return false; }
+        if (m.value_kind(value_id) == mir_value_read_place()
+            && (m.value_flags(value_id) & mir_value_flag_move_arg()) != 0
+            && self.strict_place_local(m, m.value_place(value_id)) == local_id) {
+            return true;
+        }
+        if (self.strict_value_consumes_local(m, m.value_lhs(value_id), local_id, depth + 1)) { return true; }
+        if (self.strict_value_consumes_local(m, m.value_rhs(value_id), local_id, depth + 1)) { return true; }
+        if (self.strict_value_consumes_local(m, m.value_aux(value_id), local_id, depth + 1)) { return true; }
+        var arg = m.value_first_arg(value_id);
+        var guard: i32 = 0;
+        while (arg != mir_id_invalid() && guard <= m.value_count) {
+            if (self.strict_value_consumes_local(m, arg, local_id, depth + 1)) { return true; }
+            arg = m.value_next_arg(arg);
+            guard = guard + 1;
+        }
+        return false;
+    }
+
+    public fn strict_block_contains_move_of(self, m: MirUnit, block_id: i32, local_id: i32) -> bool {
+        var i = m.block_first_instr(block_id);
+        while (i != mir_id_invalid()) {
+            if (self.strict_value_consumes_local(m, m.instr_value(i), local_id, 0)
+                || self.strict_value_consumes_local(m, m.instr_lhs(i), local_id, 0)
+                || self.strict_value_consumes_local(m, m.instr_rhs(i), local_id, 0)) {
+                return true;
+            }
+            i = m.instr_next(i);
+        }
+        return self.strict_value_consumes_local(m, m.block_term_value(block_id), local_id, 0);
+    }
+
+    public fn strict_block_closes_local(self, m: MirUnit, block_id: i32, local_id: i32) -> bool {
+        if (self.strict_block_contains_drop_of(m, block_id, local_id)) { return true; }
+        return self.strict_block_contains_move_of(m, block_id, local_id);
+    }
+
+    public fn strict_block_contains_storage_live_of(self, m: MirUnit, block_id: i32, local_id: i32) -> bool {
+        var i = m.block_first_instr(block_id);
+        while (i != mir_id_invalid()) {
+            if (m.instr_kind(i) == mir_instr_storage_live()
+                && self.strict_drop_local_of_instr(m, i) == local_id) {
+                return true;
+            }
+            i = m.instr_next(i);
+        }
+        return false;
+    }
+
+    // True when some path from `block_id` reaches a return terminator
+    // without passing any block that drops `local_id`.
+    public fn strict_drop_escape(self,
+                                 m: MirUnit,
+                                 fid: i32,
+                                 block_id: i32,
+                                 local_id: i32,
+                                 stamp: i32,
+                                 memo_val: rawptr,
+                                 memo_stamp: rawptr) -> bool {
+        if (block_id == mir_id_invalid() || block_id < 1 || block_id > m.block_count) { return false; }
+        if (m.block_function(block_id) != fid) { return false; }
+        if (mv_i32_get(memo_stamp, block_id) == stamp) {
+            return mv_i32_get(memo_val, block_id) == 2;
+        }
+        mv_i32_set(memo_stamp, block_id, stamp);
+        mv_i32_set(memo_val, block_id, 1);
+        if (self.strict_block_closes_local(m, block_id, local_id)) { return false; }
+        let term = m.block_term_kind(block_id);
+        if (term == mir_term_return()) {
+            mv_i32_set(memo_val, block_id, 2);
+            return true;
+        }
+        if (term == mir_term_unreachable()) { return false; }
+        let n = self.strict_block_succ_total(m, block_id);
+        var o: i32 = 0;
+        while (o < n) {
+            let s = self.strict_block_succ_at(m, block_id, o);
+            if (self.strict_drop_escape(m, fid, s, local_id, stamp, memo_val, memo_stamp)) {
+                mv_i32_set(memo_val, block_id, 2);
+                return true;
+            }
+            o = o + 1;
+        }
+        return false;
+    }
+
+    public fn strict_check_drops(self, m: MirUnit) {
+        // structural closure of each drop instruction
+        var iid: i32 = 1;
+        while (iid <= m.instr_count) {
+            self.focus_instr(m, iid);
+            if (mir_unit_instr_owner_is_removed(&m,  iid)) {
+                iid = iid + 1;
+                continue;
+            }
+            if (m.instr_kind(iid) == mir_instr_drop()) {
+                let where_text = "drop instr #" + self.id_text(iid)
+                    + " in function #" + self.id_text(m.instr_function(iid));
+                let local_id = self.strict_drop_local_of_instr(m, iid);
+                if (local_id == mir_id_invalid()) {
+                    self.record_strict(mv_strict_cat_drop(),
+                                       where_text + " has no local place operand");
+                } else if (m.instr_target_kind(iid) == mir_target_none()
+                           && m.instr_target_id(iid) == mir_id_invalid()) {
+                    // DCI stub-owned C++ objects lower to __dci_stub_destroy_Type
+                    // from the place type instead of a MIR function target.
+                } else if (m.instr_target_kind(iid) != mir_target_function()) {
+                    self.record_strict(mv_strict_cat_drop(),
+                                       where_text + " target is not a function (kind "
+                                       + self.id_text(m.instr_target_kind(iid)) + ")");
+                } else {
+                    let target = m.instr_target_id(iid);
+                    if (target >= 1 && target <= m.function_count) {
+                        let first_param = self.strict_first_param(m, target);
+                        let pcount = self.strict_param_count_from(m, first_param);
+                        if (pcount != 1) {
+                            self.record_strict(mv_strict_cat_drop(),
+                                               where_text + " target " + m.function_name(target)
+                                               + " is not unary fn(T): param count "
+                                               + self.id_text(pcount));
+                        } else {
+                            self.strict_report_type_relation(m,
+                                                             mv_strict_cat_drop(),
+                                                             m.local_type(first_param),
+                                                             m.local_type(local_id),
+                                                             where_text + " dropped local "
+                                                             + m.local_name(local_id));
+                        }
+                    }
+                }
+            }
+            iid = iid + 1;
+        }
+        // per-block double-drop without an intervening re-assignment
+        let dropped_stamp = mv_i32_arr_alloc(m.local_count);
+        var block_stamp: i32 = 0;
+        var b: i32 = 1;
+        while (b <= m.block_count) {
+            self.focus_block(m, b);
+            if (m.block_is_removed( b)) {
+                b = b + 1;
+                continue;
+            }
+            block_stamp = block_stamp + 1;
+            var i = m.block_first_instr(b);
+            while (i != mir_id_invalid()) {
+                let k = m.instr_kind(i);
+                if (k == mir_instr_drop()) {
+                    let l = self.strict_drop_local_of_instr(m, i);
+                    if (l != mir_id_invalid()) {
+                        if (mv_i32_get(dropped_stamp, l) == block_stamp) {
+                            self.record_strict(mv_strict_cat_drop(),
+                                               "block #" + self.id_text(b)
+                                               + " drops local " + m.local_name(l)
+                                               + " (#" + self.id_text(l) + ") twice without re-assignment");
+                        }
+                        mv_i32_set(dropped_stamp, l, block_stamp);
+                    }
+                } else if (k == mir_instr_assign() || k == mir_instr_foreach_bind()) {
+                    let place = m.instr_place(i);
+                    if (place >= 1 && place <= m.place_count
+                        && m.place_kind(place) == mir_place_local()) {
+                        let l2 = m.place_local(place);
+                        if (l2 != mir_id_invalid() && mv_i32_get(dropped_stamp, l2) == block_stamp) {
+                            mv_i32_set(dropped_stamp, l2, 0);
+                        }
+                    }
+                }
+                i = m.instr_next(i);
+            }
+            b = b + 1;
+        }
+        // exit coverage: every local that is dropped somewhere must be
+        // dropped on every path that reaches a return
+        let local_checked = mv_i32_arr_alloc(m.local_count);
+        let memo_val = mv_i32_arr_alloc(m.block_count);
+        let memo_stamp = mv_i32_arr_alloc(m.block_count);
+        var stamp: i32 = 0;
+        iid = 1;
+        while (iid <= m.instr_count) {
+            self.focus_instr(m, iid);
+            if (mir_unit_instr_owner_is_removed(&m,  iid)) {
+                iid = iid + 1;
+                continue;
+            }
+            if (m.instr_kind(iid) == mir_instr_drop()) {
+                let l = self.strict_drop_local_of_instr(m, iid);
+                if (l != mir_id_invalid() && mv_i32_get(local_checked, l) == 0) {
+                    mv_i32_set(local_checked, l, 1);
+                    let fid = m.instr_function(iid);
+                    var saw_live = false;
+                    var live_block: i32 = 1;
+                    while (live_block <= m.block_count) {
+                        if (!m.block_is_removed( live_block)
+                            && m.block_function(live_block) == fid
+                            && self.strict_block_contains_storage_live_of(m, live_block, l)) {
+                            saw_live = true;
+                            stamp = stamp + 1;
+                            if (self.strict_drop_escape(m, fid, live_block, l, stamp, memo_val, memo_stamp)) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "function #" + self.id_text(fid)
+                                                   + " (" + m.function_name(fid)
+                                                   + ") has a return path from local storage_live that never drops local "
+                                                   + m.local_name(l) + " (#" + self.id_text(l) + ")");
+                            }
+                        }
+                        live_block = live_block + 1;
+                    }
+                    if (!saw_live) {
+                        let entry = m.function_first_block(fid);
+                        if (entry != mir_id_invalid()) {
+                            stamp = stamp + 1;
+                            if (self.strict_drop_escape(m, fid, entry, l, stamp, memo_val, memo_stamp)) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "function #" + self.id_text(fid)
+                                                   + " (" + m.function_name(fid)
+                                                   + ") has a return path that never drops local "
+                                                   + m.local_name(l) + " (#" + self.id_text(l) + ")");
+                            }
+                        }
+                    }
+                }
+            }
+            iid = iid + 1;
+        }
+    }
+}

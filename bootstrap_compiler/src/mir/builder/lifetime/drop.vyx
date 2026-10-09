@@ -1,0 +1,192 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn hir_local_has_drop(self, hir_local_id: i32) -> bool {
+        if (hir_local_id == hir_id_invalid()) { return false; }
+        if (hir_unit_local_drop_function(self.h, hir_local_id) != hir_id_invalid()) { return true; }
+        return self.hir_local_is_dci_stub_drop(hir_local_id);
+    }
+
+    public fn dci_stub_spec_field(self, line: string, index: i32) -> string {
+        var cur: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i <= line.len) {
+            var split = false;
+            if (i == line.len) { split = true; }
+            else if (line.charAt(i) == 9) { split = true; }
+            if (split) {
+                if (cur == index) { return line.substring(start, i); }
+                cur = cur + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public fn dci_stub_type_names_match(self, a: string, b: string) -> bool {
+        if (a == b) { return true; }
+        let aa = mir_builder_last_path_segment(policy_generic_call_base(a));
+        let bb = mir_builder_last_path_segment(policy_generic_call_base(b));
+        return aa.len > 0 && bb.len > 0 && aa == bb;
+    }
+
+    public fn hir_type_text_is_dci_stub_class(self, type_text: string) -> bool {
+        if (type_text.len == 0) { return false; }
+        let rows = hir_unit_dci_stub_specs(self.h);
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i <= rows.len) {
+            var split = false;
+            if (i == rows.len) { split = true; }
+            else if (rows.charAt(i) == 10) { split = true; }
+            if (split) {
+                let line = rows.substring(start, i).trim();
+                if (self.dci_stub_spec_field(line, 0) == "class"
+                    && self.dci_stub_type_names_match(self.dci_stub_spec_field(line, 1), type_text)) {
+                    return true;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn hir_local_is_dci_stub_drop(self, hir_local_id: i32) -> bool {
+        if (hir_local_id == hir_id_invalid()) { return false; }
+        if ((self.h.local_flags(hir_local_id) & hir_local_flag_auto_drop()) == 0) { return false; }
+        return self.hir_type_text_is_dci_stub_class(self.type_text(self.h.local_type(hir_local_id)));
+    }
+
+    public fn drop_stack_find(self, hir_local_id: i32) -> rawptr {
+        var cur = self.drop_stack_head;
+        while (cur != null) {
+            if (ast_read_i32(cur) == hir_local_id) { return cur; }
+            cur = ast_read_rawptr(ptr_offset(cur, 8));
+        }
+        return null;
+    }
+
+    public fn drop_stack_local_active(self, hir_local_id: i32) -> bool {
+        let node = self.drop_stack_find(hir_local_id);
+        if (node == null) { return false; }
+        return ast_read_i32(ptr_offset(node, 4)) != 0;
+    }
+
+    public fn drop_stack_set_active(self, hir_local_id: i32, active: bool) {
+        let node = self.drop_stack_find(hir_local_id);
+        if (node == null) { return; }
+        if (active) { ast_write_i32(ptr_offset(node, 4), 1); }
+        else { ast_write_i32(ptr_offset(node, 4), 0); }
+    }
+
+    public fn drop_stack_snapshot(self) -> rawptr {
+        var cur = self.drop_stack_head;
+        var head: rawptr = null;
+        while (cur != null) {
+            let node = mir_profile_malloc(24);
+            if (node != null) {
+                memset(node, 0, 24);
+                ast_write_rawptr(node, cur);
+                ast_write_i32(ptr_offset(node, 8), ast_read_i32(ptr_offset(cur, 4)));
+                ast_write_rawptr(ptr_offset(node, 16), head);
+                head = node;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 8));
+        }
+        return head;
+    }
+
+    public fn drop_stack_restore_activity(self, snapshot: rawptr) {
+        var cur = snapshot;
+        while (cur != null) {
+            let stack_node = ast_read_rawptr(cur);
+            if (stack_node != null) {
+                ast_write_i32(ptr_offset(stack_node, 4), ast_read_i32(ptr_offset(cur, 8)));
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 16));
+        }
+    }
+
+    public fn drop_stack_push(self, hir_local_id: i32) {
+        if (!self.hir_local_has_drop(hir_local_id)) { return; }
+        if (self.drop_stack_find(hir_local_id) != null) {
+            self.drop_stack_set_active(hir_local_id, true);
+            return;
+        }
+        let node = mir_profile_malloc(16);
+        if (node == null) { return; }
+        memset(node, 0, 16);
+        ast_write_i32(node, hir_local_id);
+        ast_write_i32(ptr_offset(node, 4), 1);
+        ast_write_rawptr(ptr_offset(node, 8), self.drop_stack_head);
+        self.drop_stack_head = node;
+    }
+
+    public fn emit_drop_for_hir_local(self, hir_local_id: i32, source_stmt_id: i32, source_expr_id: i32, close_local: bool) {
+        if (hir_local_id == hir_id_invalid() || self.current_block_terminated()) { return; }
+        if (!self.drop_stack_local_active(hir_local_id)) { return; }
+        let place_id = mir_i32_map_get(self.place_map, hir_local_id);
+        let dci_stub_drop = self.hir_local_is_dci_stub_drop(hir_local_id);
+        let drop_hir_fn = hir_unit_local_drop_function(self.h, hir_local_id);
+        var drop_mir_fn = mir_id_invalid();
+        if (!dci_stub_drop && drop_hir_fn != hir_id_invalid()) {
+            drop_mir_fn = self.ensure_function_shell_for_hir(drop_hir_fn);
+        }
+        if (drop_mir_fn == mir_id_invalid() && !dci_stub_drop) { return; }
+        var drop_target_kind = mir_target_function();
+        if (drop_mir_fn == mir_id_invalid()) { drop_target_kind = mir_target_none(); }
+        self.unit.add_instr(
+                           self.current_function_id,
+                           self.current_block_id,
+                           mir_instr_drop(),
+                           self.h.local_type(hir_local_id),
+                           place_id,
+                           mir_id_invalid(),
+                           mir_id_invalid(),
+                           mir_id_invalid(),
+                           drop_target_kind,
+                           drop_mir_fn,
+                           source_stmt_id,
+                           source_expr_id,
+                           0,
+                           hir_local_id,
+                           self.h.local_name(hir_local_id));
+        if (close_local) { self.drop_stack_set_active(hir_local_id, false); }
+    }
+
+    public fn emit_drops_from_oldest_until(self, cur: rawptr, mark: rawptr, source_stmt_id: i32) {
+        if (cur == null || cur == mark || self.current_block_terminated()) { return; }
+        let next = ast_read_rawptr(ptr_offset(cur, 8));
+        self.emit_drops_from_oldest_until(next, mark, source_stmt_id);
+        if (self.current_block_terminated()) { return; }
+        let hir_local_id = ast_read_i32(cur);
+        self.emit_drop_for_hir_local(hir_local_id, source_stmt_id, hir_id_invalid(), true);
+    }
+
+    public fn emit_drops_until(self, mark: rawptr, source_stmt_id: i32) {
+        self.emit_drops_from_oldest_until(self.drop_stack_head, mark, source_stmt_id);
+        self.drop_stack_head = mark;
+    }
+
+    public fn emit_all_drops(self, source_stmt_id: i32) {
+        self.emit_drops_until(null, source_stmt_id);
+    }
+}

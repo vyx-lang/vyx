@@ -1,0 +1,266 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn sync_from_hir(self, h: HirUnit) {
+        let profile_level = vyx_bootstrap_profile_level();
+        if (profile_level > 1) { print("[mir-build] sync-from-hir-enter"); }
+        self.h = h;
+        self.unit.types = self.h.types;
+        self.unit.set_reflection_manifest( hir_unit_reflection_manifest(self.h));
+        self.unit.set_reflection_name_map( hir_unit_reflection_name_map(self.h));
+        self.unit.set_foreign_cpp_includes( hir_unit_foreign_cpp_includes(self.h));
+        self.unit.set_dci_stub_specs( hir_unit_dci_stub_specs(self.h));
+        self.unit.set_interface_supers( hir_unit_interface_supers(self.h));
+        if (profile_level > 1) { print("[mir-build] sync-static-enter"); }
+        self.build_static_items();
+        if (profile_level > 1) { print("[mir-build] sync-function-table-enter"); }
+        self.build_function_table();
+        if (profile_level > 1) { print("[mir-build] sync-layouts-enter"); }
+        if (!self.has_hir_codegen_builder) {
+            self.build_field_layouts();
+            self.build_variant_layouts();
+        }
+        if (profile_level > 1) { print("[mir-build] sync-from-hir-leave"); }
+    }
+
+    public fn refresh_from_codegen_builder(self) {
+        if (!self.has_hir_codegen_builder) { return; }
+        let before_items = self.h.item_count;
+        let before_types = self.h.types.count;
+        self.sync_from_hir(hir_codegen_builder_handle_unit(self.hir_codegen_builder));
+        if (self.h.item_count != before_items || self.h.types.count != before_types) {
+            self.reset_layout_indexes_for_current_hir();
+        }
+    }
+
+    public fn refresh_hir_view_from_codegen_builder(self) {
+        if (!self.has_hir_codegen_builder) { return; }
+        self.h = hir_codegen_builder_handle_unit(self.hir_codegen_builder);
+        self.unit.types = self.h.types;
+        self.unit.set_reflection_manifest( hir_unit_reflection_manifest(self.h));
+        self.unit.set_reflection_name_map( hir_unit_reflection_name_map(self.h));
+        self.unit.set_foreign_cpp_includes( hir_unit_foreign_cpp_includes(self.h));
+        self.unit.set_dci_stub_specs( hir_unit_dci_stub_specs(self.h));
+        self.unit.set_interface_supers( hir_unit_interface_supers(self.h));
+    }
+
+    public fn clear_codegen_local_maps_after_mark(self, local_mark: i32) {
+        var local_id = local_mark + 1;
+        while (local_id <= self.h.local_count) {
+            mir_i32_map_put(self.local_map, local_id, mir_id_invalid());
+            mir_i32_map_put(self.place_map, local_id, mir_id_invalid());
+            local_id = local_id + 1;
+        }
+    }
+
+    public fn cleanup_hir_codegen_scope(self, hir_function_id: i32, stmt_mark: i32, expr_mark: i32, local_mark: i32) {
+        if (!self.has_hir_codegen_builder) { return; }
+        self.clear_codegen_local_maps_after_mark(local_mark);
+        hir_codegen_builder_handle_finish_function_codegen(self.hir_codegen_builder,
+                                                           hir_function_id,
+                                                           stmt_mark,
+                                                           expr_mark,
+                                                           local_mark);
+        self.refresh_hir_view_from_codegen_builder();
+        if (hir_function_id > 0 && (hir_function_id % 64) == 0) {
+            vyx_rt_heap_trim();
+        }
+    }
+
+    public fn resolve_new_hir_codegen_facts(self) -> bool {
+        if (!self.has_hir_codegen_builder) { return true; }
+        var hunit = hir_codegen_builder_handle_unit(self.hir_codegen_builder);
+        let resolve_left = hir_semantic_resolve_unit_silent(hunit);
+        if (resolve_left > 0) {
+            self.hir_codegen_error_count = self.hir_codegen_error_count + resolve_left;
+            self.report_error("HIR materialization left "
+                              + policy_i64_to_string(resolve_left as i64)
+                              + " unresolved semantic targets");
+            hir_codegen_builder_handle_set_unit(self.hir_codegen_builder, hunit);
+            self.refresh_from_codegen_builder();
+            return false;
+        }
+        let ownership_errors = hir_ownership_resolve_unit_silent(hunit);
+        if (ownership_errors > 0) {
+            self.hir_codegen_error_count = self.hir_codegen_error_count + ownership_errors;
+            self.report_error("HIR materialization produced "
+                              + policy_i64_to_string(ownership_errors as i64)
+                              + " ownership errors");
+            hir_codegen_builder_handle_set_unit(self.hir_codegen_builder, hunit);
+            self.refresh_from_codegen_builder();
+            return false;
+        }
+        hir_codegen_builder_handle_set_unit(self.hir_codegen_builder, hunit);
+        self.refresh_from_codegen_builder();
+        return true;
+    }
+
+    fn bind_dci_lifecycle_after_materialize(self, hunit: HirUnit, hir_function_id: i32) -> i32 {
+        if (self.dci_lifecycle_skip) { return 0; }
+        if (!mir_unit_has_dci_abi(&self.unit)) {
+            self.dci_lifecycle_skip = true;
+            return 0;
+        }
+        if (self.dci_lifecycle_root == null) {
+            let path = mir_unit_dci_abi_path(&self.unit);
+            if (dci_path_list_count(path.clone()) > 0) {
+                let loaded = dci_load_contract_bundle(path.clone());
+                if (loaded.roots == null) {
+                    var detail = loaded.message;
+                    if (detail.len == 0) { detail = "unknown DCIB error"; }
+                    self.report_error_at_hir_function(hir_function_id,
+                                                      "invalid DCI ABI contract: " + detail);
+                    return 1;
+                }
+                self.dci_lifecycle_root = loaded.roots;
+            } else {
+                let text = mir_unit_dci_abi_text(&self.unit);
+                if (text.len == 0) {
+                    self.dci_lifecycle_skip = true;
+                    return 0;
+                }
+                let parsed = cJSON_Parse(text.c_str());
+                if (parsed == null) {
+                    self.report_error_at_hir_function(hir_function_id, "invalid DCI ABI JSON");
+                    return 1;
+                }
+                let bundle = cJSON_CreateArray();
+                if (bundle == null || cJSON_AddItemToArray(bundle, parsed) == 0) {
+                    if (bundle != null) { cJSON_Delete(bundle); }
+                    else { cJSON_Delete(parsed); }
+                    self.report_error_at_hir_function(hir_function_id,
+                                                      "out of memory while loading DCI ABI JSON");
+                    return 1;
+                }
+                self.dci_lifecycle_root = bundle;
+            }
+        }
+        var errors: i32 = 0;
+        var i: i32 = 0;
+        let n = dci_bundle_count(self.dci_lifecycle_root);
+        while (i < n) {
+            let root = dci_bundle_root_at(self.dci_lifecycle_root, i);
+            if (!dci_lifecycle_binding_is_declaration(root)) {
+                errors = errors + hir_bind_dci_lifecycle_contract_root_borrowed(hunit, root);
+            }
+            i = i + 1;
+        }
+        return errors;
+    }
+
+    public fn ensure_hir_function_body_for_codegen(self, hir_function_id: i32, stmt_mark: i32, expr_mark: i32) -> bool {
+        if (hir_function_id == hir_id_invalid()) { return false; }
+        if (self.hir_function_has_executable_body(hir_function_id)) { return true; }
+        if (!self.has_hir_codegen_builder) { return false; }
+        let timing_enabled = mir_builder_env_enabled("VYX_MIR_BODY_TIMING");
+        var timing_total_start: i64 = 0;
+        var timing_mark: i64 = 0;
+        var timing_materialize_ms: i64 = 0;
+        var timing_refresh_1_ms: i64 = 0;
+        var timing_prepare_ms: i64 = 0;
+        var timing_refresh_2_ms: i64 = 0;
+        var timing_ownership_ms: i64 = 0;
+        var timing_set_ms: i64 = 0;
+        var timing_refresh_3_ms: i64 = 0;
+        if (timing_enabled) {
+            timing_total_start = vyx_bootstrap_now_ms();
+            timing_mark = timing_total_start;
+        }
+        let materialized = hir_codegen_builder_handle_materialize_function_body(self.hir_codegen_builder, hir_function_id);
+        if (timing_enabled) {
+            let now_materialize = vyx_bootstrap_now_ms();
+            timing_materialize_ms = now_materialize - timing_mark;
+            timing_mark = now_materialize;
+        }
+        self.refresh_from_codegen_builder();
+        if (timing_enabled) {
+            let now_refresh_1 = vyx_bootstrap_now_ms();
+            timing_refresh_1_ms = now_refresh_1 - timing_mark;
+            timing_mark = now_refresh_1;
+        }
+        if (!materialized || self.h.function_body(hir_function_id) == hir_id_invalid()) {
+            return self.hir_function_has_executable_body(hir_function_id);
+        }
+        hir_codegen_builder_handle_prepare_materialized_facts(self.hir_codegen_builder, hir_function_id);
+        if (timing_enabled) {
+            let now_prepare = vyx_bootstrap_now_ms();
+            timing_prepare_ms = now_prepare - timing_mark;
+            timing_mark = now_prepare;
+        }
+        self.refresh_hir_view_from_codegen_builder();
+        if (timing_enabled) {
+            let now_refresh_2 = vyx_bootstrap_now_ms();
+            timing_refresh_2_ms = now_refresh_2 - timing_mark;
+            timing_mark = now_refresh_2;
+        }
+        var hunit = self.h;
+        let lifecycle_errors = self.bind_dci_lifecycle_after_materialize(hunit, hir_function_id);
+        if (lifecycle_errors > 0) {
+            self.hir_codegen_error_count = self.hir_codegen_error_count + lifecycle_errors;
+            self.report_error_at_hir_function(
+                hir_function_id,
+                "HIR materialization produced "
+                + policy_i64_to_string(lifecycle_errors as i64)
+                + " DCI lifecycle errors");
+            hir_codegen_builder_handle_set_unit(self.hir_codegen_builder, hunit);
+            self.refresh_from_codegen_builder();
+            return false;
+        }
+        let ownership_errors = hir_ownership_resolve_unit_range_silent(hunit,
+                                                                       expr_mark,
+                                                                       stmt_mark);
+        if (timing_enabled) {
+            let now_ownership = vyx_bootstrap_now_ms();
+            timing_ownership_ms = now_ownership - timing_mark;
+            timing_mark = now_ownership;
+        }
+        hir_codegen_builder_handle_set_unit(self.hir_codegen_builder, hunit);
+        if (timing_enabled) {
+            let now_set = vyx_bootstrap_now_ms();
+            timing_set_ms = now_set - timing_mark;
+            timing_mark = now_set;
+        }
+        if (ownership_errors > 0) {
+            self.hir_codegen_error_count = self.hir_codegen_error_count + ownership_errors;
+            self.refresh_from_codegen_builder();
+            return false;
+        }
+        self.refresh_from_codegen_builder();
+        if (timing_enabled) {
+            let now_refresh_3 = vyx_bootstrap_now_ms();
+            timing_refresh_3_ms = now_refresh_3 - timing_mark;
+            let timing_total = now_refresh_3 - timing_total_start;
+            if (timing_total >= mir_builder_slow_body_threshold_ms()) {
+                print("[mir-hir-materialize-timing] fn=" + self.h.function_name(hir_function_id)
+                      + " hir=" + mir_builder_i32_text(hir_function_id)
+                      + " total=" + policy_i64_to_string(timing_total)
+                      + " materialize=" + policy_i64_to_string(timing_materialize_ms)
+                      + " refresh1=" + policy_i64_to_string(timing_refresh_1_ms)
+                      + " prepare=" + policy_i64_to_string(timing_prepare_ms)
+                      + " refresh2=" + policy_i64_to_string(timing_refresh_2_ms)
+                      + " ownership=" + policy_i64_to_string(timing_ownership_ms)
+                      + " set=" + policy_i64_to_string(timing_set_ms)
+                      + " refresh3=" + policy_i64_to_string(timing_refresh_3_ms)
+                      + " hlocals=" + mir_builder_i32_text(self.h.local_count)
+                      + " hstmts=" + mir_builder_i32_text(self.h.stmt_count)
+                      + " hexprs=" + mir_builder_i32_text(self.h.expr_count));
+            }
+        }
+        return self.hir_function_has_executable_body(hir_function_id);
+    }
+}

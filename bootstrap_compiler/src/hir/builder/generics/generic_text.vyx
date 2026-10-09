@@ -1,0 +1,707 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Generic text for the HIR builder. See README.md.
+
+fn hir_builder_decl_template_head(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    let gp = decl_get_generic_params(d);
+    if (gp.len == 0) { return false; }
+    if (gp.charAt(0) == 124) { return false; }
+    if (hir_builder_meta_is_full_concrete_spec(gp)) { return false; }
+    return true;
+}
+
+fn hir_builder_generic_name_looks_like_placeholder(name: string) -> bool {
+    if (name.len == 0) { return false; }
+    let c = name.charAt(0);
+    return c >= 65 && c <= 90;
+}
+
+fn hir_builder_is_primitive_str_name(name: string) -> bool {
+    return name == "str" || name == "string" || name == "__String";
+}
+
+fn hir_builder_concrete_generic_name(name: string) -> bool {
+    if (policy_primitive_type_kind(name) != 0) { return true; }
+    if (hir_builder_is_primitive_str_name(name)) { return true; }
+    if (name.len > 0 && !hir_builder_generic_name_looks_like_placeholder(name)) { return true; }
+    return false;
+}
+
+fn hir_builder_meta_is_full_concrete_spec(meta: string) -> bool {
+    if (meta.len == 0 || meta.charAt(0) == 124) { return false; }
+    var saw: bool = false;
+    let n = meta.len;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= n) {
+        if (i == n || meta.charAt(i) == 44 || meta.charAt(i) == 124) {
+            let part = meta.substring(start, i);
+            if (part.len == 0) { return false; }
+            if (!hir_builder_concrete_generic_name(part)) { return false; }
+            saw = true;
+            if (i < n && meta.charAt(i) == 124) { return saw; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return saw;
+}
+
+fn hir_builder_decl_template_params(d: rawptr) -> string {
+    if (d == null) { return ""; }
+    let gp = decl_get_generic_params(d);
+    if (hir_builder_meta_is_full_concrete_spec(gp)) { return ""; }
+    return hir_builder_generic_head(gp);
+}
+
+fn hir_builder_decl_concrete_spec_args(d: rawptr) -> string {
+    if (d == null) { return ""; }
+    let gp = decl_get_generic_params(d);
+    if (!hir_builder_meta_is_full_concrete_spec(gp)) { return ""; }
+    return hir_builder_generic_head(gp);
+}
+
+fn hir_builder_body_ready(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_string_contains(decl_get_meta(d), "|hir_facts_resolved");
+}
+
+fn hir_builder_body_resolved(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    let meta = decl_get_meta(d);
+    return hir_builder_string_contains(meta, "|hir_facts_resolved")
+        || hir_builder_string_contains(meta, "|body_resolved");
+}
+
+fn hir_builder_generic_head(gp: string) -> string {
+    if (gp.len == 0) { return ""; }
+    var i: i32 = 0;
+    while (i < gp.len) {
+        if (gp.charAt(i) == 124) {
+            return gp.substring(0, i);
+        }
+        i = i + 1;
+    }
+    return gp;
+}
+
+fn hir_builder_peel_handle_type_text(text: string) -> string {
+    var cur = text;
+    var depth: i32 = 0;
+    while (depth < 4 && cur.len > 0) {
+        let base = policy_generic_call_base(cur.clone());
+        if (base != "ref" && base != "mutref" && base != "ptr") { return cur; }
+        let inner = policy_generic_arg_at(policy_generic_call_args(cur.clone()), 0);
+        if (inner.len == 0) { return cur; }
+        cur = inner;
+        depth = depth + 1;
+    }
+    return cur;
+}
+
+fn hir_builder_generic_param_canonical(raw: string) -> string {
+    if (raw.len == 0) { return ""; }
+    var i: i32 = 0;
+    while (i < raw.len) {
+        if (raw.charAt(i) == 94) {
+            return raw.substring(0, i);
+        }
+        i = i + 1;
+    }
+    return raw;
+}
+
+fn hir_builder_generic_param_at(params: string, idx: i32) -> string {
+    return hir_builder_generic_param_canonical(policy_generic_param_at(params, idx));
+}
+
+fn hir_builder_const_arg_for_param(params: string, args: string, name: string) -> string {
+    var idx: i32 = 0;
+    while (idx < 64) {
+        let p = hir_builder_generic_param_at(params, idx);
+        if (p.len == 0) { return ""; }
+        if (p == name) { return policy_generic_arg_at(args, idx); }
+        idx = idx + 1;
+    }
+    return "";
+}
+
+fn hir_builder_const_expr_known(e: rawptr, params: string, args: string) -> bool {
+    if (e == null) { return false; }
+    let k = expr_get_kind(e);
+    if (k == ex_INT_LIT()) { return !hir_builder_lit_is_float(expr_get_str_val(e)); }
+    if (k == ex_IDENT()) {
+        let a = hir_builder_const_arg_for_param(params, args, expr_get_name(e));
+        return hir_builder_string_is_i64_lit(a);
+    }
+    if (k == ex_UNARY() && expr_get_op(e) == tk_MINUS()) {
+        return hir_builder_const_expr_known(expr_get_lhs(e), params, args);
+    }
+    if (k == ex_BIN()) {
+        return hir_builder_const_expr_known(expr_get_lhs(e), params, args)
+            && hir_builder_const_expr_known(expr_get_rhs(e), params, args);
+    }
+    return false;
+}
+
+fn hir_builder_const_expr_value(e: rawptr, params: string, args: string) -> i64 {
+    if (e == null) { return 0; }
+    let k = expr_get_kind(e);
+    if (k == ex_INT_LIT()) {
+        if (hir_builder_lit_is_float(expr_get_str_val(e))) { return 0; }
+        return expr_get_int_val(e);
+    }
+    if (k == ex_IDENT()) {
+        return hir_builder_parse_i64_lit(hir_builder_const_arg_for_param(params, args, expr_get_name(e)));
+    }
+    if (k == ex_UNARY() && expr_get_op(e) == tk_MINUS()) {
+        return 0 - hir_builder_const_expr_value(expr_get_lhs(e), params, args);
+    }
+    if (k == ex_BIN()) {
+        let lhs = hir_builder_const_expr_value(expr_get_lhs(e), params, args);
+        let rhs = hir_builder_const_expr_value(expr_get_rhs(e), params, args);
+        let op = expr_get_op(e);
+        if (op == tk_PLUS()) { return lhs + rhs; }
+        if (op == tk_MINUS()) { return lhs - rhs; }
+        if (op == tk_STAR()) { return lhs * rhs; }
+        if (op == tk_SLASH()) {
+            if (rhs == 0) { return 0; }
+            return lhs / rhs;
+        }
+        if (op == tk_PERCENT()) {
+            if (rhs == 0) { return 0; }
+            return lhs % rhs;
+        }
+        if (op == tk_EQEQ()) {
+            if (lhs == rhs) { return 1; }
+            return 0;
+        }
+        if (op == tk_NEQ()) {
+            if (lhs != rhs) { return 1; }
+            return 0;
+        }
+        if (op == tk_LT()) {
+            if (lhs < rhs) { return 1; }
+            return 0;
+        }
+        if (op == tk_LE()) {
+            if (lhs <= rhs) { return 1; }
+            return 0;
+        }
+        if (op == tk_GT()) {
+            if (lhs > rhs) { return 1; }
+            return 0;
+        }
+        if (op == tk_GE()) {
+            if (lhs >= rhs) { return 1; }
+            return 0;
+        }
+    }
+    return 0;
+}
+
+fn hir_builder_type_expr_text(e: rawptr) -> string {
+    if (e == null) { return ""; }
+    let k = expr_get_kind(e);
+    if (k == ex_INT_LIT()) { return policy_i64_to_string(expr_get_int_val(e)); }
+    if (k == ex_IDENT()) { return expr_get_name(e); }
+    if (k == ex_BOOL_LIT()) {
+        if (expr_get_int_val(e) == 0) { return "false"; }
+        return "true";
+    }
+    if (k == ex_BIN()) {
+        return hir_builder_type_expr_text(expr_get_lhs(e))
+            + "#" + policy_i64_to_string(expr_get_op(e) as i64)
+            + "#" + hir_builder_type_expr_text(expr_get_rhs(e));
+    }
+    if (k == ex_UNARY()) {
+        return "u" + policy_i64_to_string(expr_get_op(e) as i64)
+            + "(" + hir_builder_type_expr_text(expr_get_lhs(e)) + ")";
+    }
+    let name = expr_get_name(e);
+    if (name.len > 0) {
+        return "expr" + policy_i64_to_string(k as i64) + ":" + name;
+    }
+    return "expr" + policy_i64_to_string(k as i64);
+}
+
+fn hir_builder_const_expr_contains_param(e: rawptr, param: string) -> bool {
+    if (e == null || param.len == 0) { return false; }
+    let k = expr_get_kind(e);
+    if (k == ex_IDENT()) { return expr_get_name(e) == param; }
+    if (k == ex_UNARY()) {
+        return hir_builder_const_expr_contains_param(expr_get_lhs(e), param);
+    }
+    if (k == ex_BIN()) {
+        return hir_builder_const_expr_contains_param(expr_get_lhs(e), param)
+            || hir_builder_const_expr_contains_param(expr_get_rhs(e), param);
+    }
+    return false;
+}
+
+fn hir_builder_const_expr_has_template_atom(e: rawptr) -> bool {
+    if (e == null) { return false; }
+    let k = expr_get_kind(e);
+    if (k == ex_IDENT()) {
+        return hir_builder_type_name_has_template_atom(expr_get_name(e));
+    }
+    if (k == ex_UNARY()) {
+        return hir_builder_const_expr_has_template_atom(expr_get_lhs(e));
+    }
+    if (k == ex_BIN()) {
+        return hir_builder_const_expr_has_template_atom(expr_get_lhs(e))
+            || hir_builder_const_expr_has_template_atom(expr_get_rhs(e));
+    }
+    return false;
+}
+
+fn hir_builder_generic_contains(params: string, name: string) -> bool {
+    if (params.len == 0 || name.len == 0) { return false; }
+    var i: i32 = 0;
+    while (i < 64) {
+        let p = hir_builder_generic_param_at(params, i);
+        if (p.len == 0) { return false; }
+        if (p == name) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn hir_builder_append_csv(base: string, next: string) -> string {
+    if (next.len == 0) { return base; }
+    if (base.len == 0) { return next; }
+    return base + "," + next;
+}
+
+fn hir_builder_generic_arg_count(args: string) -> i32 {
+    var count: i32 = 0;
+    while (count < 256) {
+        let part = policy_generic_arg_at(args, count);
+        if (part.len == 0) { return count; }
+        count = count + 1;
+    }
+    return count;
+}
+
+fn hir_builder_generic_param_count(params: string) -> i32 {
+    var count: i32 = 0;
+    while (count < 256) {
+        let part = hir_builder_generic_param_at(params, count);
+        if (part.len == 0) { return count; }
+        count = count + 1;
+    }
+    return count;
+}
+
+fn hir_builder_env_args_cover_params(params: string, args: string) -> bool {
+    if (params.len == 0) { return true; }
+    var i: i32 = 0;
+    while (i < 256) {
+        let param = hir_builder_generic_param_at(params, i);
+        if (param.len == 0) { return true; }
+        if (policy_generic_arg_at(args, i).len == 0) { return false; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn hir_builder_generic_params_have_template_atom(params: string) -> bool {
+    if (params.len == 0) { return false; }
+    var i: i32 = 0;
+    while (i < 256) {
+        let part = hir_builder_generic_param_at(params, i);
+        if (part.len == 0) { return false; }
+        if (hir_builder_type_name_has_template_atom(part)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn hir_builder_variadic_param(param: rawptr) -> bool {
+    if (param == null) { return false; }
+    // Variadic-ness is decided solely by the parser's `|variadic` marker,
+    // mirroring the legacy codegen's decl_is_variadic_param (flag bit 32).
+    // A name-based "args" heuristic used to live here and hijacked ordinary
+    // params that happened to be called `args`: the pack path then expanded
+    // them to zero locals, leaving body references with an empty LocalId.
+    return hir_builder_string_contains(decl_get_generic_params(param), "|variadic");
+}
+
+fn hir_builder_c_varargs_param(param: rawptr) -> bool {
+    if (param == null) { return false; }
+    if (decl_get_name(param) == "__c_varargs") { return true; }
+    return hir_builder_string_contains(decl_get_generic_params(param), "|c_varargs");
+}
+
+fn hir_builder_decl_has_c_varargs(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    var param = decl_get_params(d);
+    while (param != null) {
+        if (hir_builder_c_varargs_param(param)) { return true; }
+        param = decl_get_next(param);
+    }
+    return false;
+}
+
+fn hir_builder_arg_expr_at(args: rawptr, want_idx: i32) -> rawptr {
+    var idx: i32 = 0;
+    var cur = args;
+    while (cur != null) {
+        if (idx == want_idx) { return stmt_get_init(cur); }
+        idx = idx + 1;
+        cur = stmt_get_next(cur);
+    }
+    return null;
+}
+
+fn hir_builder_type_ref_name(ty: rawptr) -> string {
+    if (ty == null) { return ""; }
+    let k = tref_get_kind(ty);
+    if (k == ty_CLASS()) { return tref_get_name(ty); }
+    if (k == ty_STRING()) { return "str"; }
+    if (k == ty_I32()) { return "i32"; }
+    if (k == ty_I64()) { return "i64"; }
+    if (k == ty_BOOL()) { return "bool"; }
+    if (k == ty_CHAR()) { return "char"; }
+    if (k == ty_RAWPTR()) { return "rawptr"; }
+    if (k == ty_F32()) { return "f32"; }
+    if (k == ty_F64()) { return "f64"; }
+    if (k == ty_I8()) { return "i8"; }
+    if (k == ty_I16()) { return "i16"; }
+    if (k == ty_U8()) { return "u8"; }
+    if (k == ty_U16()) { return "u16"; }
+    if (k == ty_U32()) { return "u32"; }
+    if (k == ty_U64()) { return "u64"; }
+    if (k == ty_ISIZE()) { return "isize"; }
+    if (k == ty_USIZE()) { return "usize"; }
+    return tref_get_name(ty);
+}
+
+fn hir_builder_param_pack_type_name(param: rawptr) -> string {
+    if (param == null) { return ""; }
+    return hir_builder_generic_param_canonical(hir_builder_type_ref_name(decl_get_ty(param)));
+}
+
+fn hir_builder_last_path_segment(name: string) -> string {
+    if (name.len == 0) { return ""; }
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i < name.len) {
+        if (name.charAt(i) == 46) { start = i + 1; }
+        i = i + 1;
+    }
+    if (start == 0) { return name; }
+    return name.substring(start, name.len);
+}
+
+/// Length of the `generic_params` marker name that starts at `i`, or 0 when
+/// `i` is not the `|` of a `|name:` marker.
+///
+/// Markers are the only `|` that may follow the `|baseargs:` payload, and the
+/// payload itself is free to contain `|`: it separates a base's name from its
+/// arguments (`|baseargs:Sink|i32`).  So "the next `|`" is *not* the end of the
+/// segment and a plain character scan would stop after `Sink` -- finding
+/// nothing.  Every marker name is `[a-z_]+` (`kind`, `impl`, `where`, `attrs`,
+/// `extern_abi`, ...), which distinguishes them from a type text such as `i32`
+/// or `Vec<i32>`.
+fn hir_builder_gp_marker_len_at(gp: string, i: i32) -> i32 {
+    if (i < 0 || i >= gp.len) { return 0; }
+    if (gp.charAt(i) != 124) { return 0; }
+    var j = i + 1;
+    while (j < gp.len) {
+        let c = gp.charAt(j);
+        if (c == 58) { break; }
+        if (c != 95 && (c < 97 || c > 122)) { return 0; }
+        j = j + 1;
+    }
+    if (j >= gp.len || j == i + 1) { return 0; }
+    return j - i - 1;
+}
+
+/// Template arguments of a base clause, as captured by the parser into the
+/// trailing `|baseargs:` segment (see `parse_decl_suffix_markers`).
+///
+///     `class VyxHost : native.Sink<i32>`  ->  `|baseargs:Sink|i32`
+///
+/// Returns "" when the base was spelled without arguments, which is the
+/// ordinary case for every non-template foreign base.  The key is the base's
+/// *last* segment so a fully qualified base clause and the declaration it
+/// resolves to agree on which entry applies.
+fn hir_builder_base_clause_args(gp: string, base_name: string) -> string {
+    let prefix = "|baseargs:";
+    let pos = hir_builder_index_of(gp, prefix);
+    if (pos < 0) { return ""; }
+    let seg_start = pos + prefix.len;
+    var seg_end = gp.len;
+    var scan = seg_start;
+    while (scan < gp.len) {
+        if (hir_builder_gp_marker_len_at(gp, scan) > 0) { seg_end = scan; break; }
+        scan = scan + 1;
+    }
+    if (seg_end <= seg_start) { return ""; }
+    let key = hir_builder_last_path_segment(base_name);
+    if (key.len == 0) { return ""; }
+    var item_start = seg_start;
+    var i = seg_start;
+    while (i <= seg_end) {
+        if (i == seg_end || gp.charAt(i) == 59) {
+            let item = gp.substring(item_start, i);
+            var bar: i32 = -1;
+            var j: i32 = 0;
+            while (j < item.len) {
+                if (item.charAt(j) == 124) { bar = j; break; }
+                j = j + 1;
+            }
+            if (bar > 0 && item.substring(0, bar) == key) {
+                return item.substring(bar + 1, item.len);
+            }
+            item_start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn hir_builder_token_char(c: i32) -> bool {
+    if (c >= 48 && c <= 57) { return true; }
+    if (c >= 65 && c <= 90) { return true; }
+    if (c >= 97 && c <= 122) { return true; }
+    return c == 95;
+}
+
+/// Substitute whole identifier tokens of a type text through a params/args
+/// environment (`T` -> `i32`).  Token-wise, so `T` never matches inside
+/// `TDebug`, and substituting `T,U -> U,T` cannot clobber itself.
+fn hir_builder_substitute_env_in_type_text(text: string, params: string, args: string) -> string {
+    if (text.len == 0 || params.len == 0 || args.len == 0) { return text; }
+    var out = "";
+    var i: i32 = 0;
+    while (i < text.len) {
+        if (!hir_builder_token_char(text.charAt(i))) {
+            out = out + text.substring(i, i + 1);
+            i = i + 1;
+            continue;
+        }
+        var j = i;
+        while (j < text.len && hir_builder_token_char(text.charAt(j))) { j = j + 1; }
+        let token = text.substring(i, j);
+        var replacement = "";
+        var pi: i32 = 0;
+        while (pi < 64) {
+            let param_name = policy_generic_arg_at(params, pi);
+            if (param_name.len == 0) { break; }
+            if (param_name == token) {
+                replacement = policy_generic_arg_at(args, pi);
+                break;
+            }
+            pi = pi + 1;
+        }
+        if (replacement.len > 0) { out = out + replacement; } else { out = out + token; }
+        i = j;
+    }
+    return out;
+}
+
+fn hir_builder_type_base_name(name: string) -> string {
+    if (name.len == 0) { return ""; }
+    let base = policy_generic_call_base(name);
+    if (base.len > 0) { return hir_builder_last_path_segment(base); }
+    return hir_builder_last_path_segment(name);
+}
+
+fn hir_builder_type_owner_match_key(name: string) -> string {
+    let base = hir_builder_type_base_name(name);
+    if (hir_builder_is_primitive_str_name(base)) { return "string"; }
+    return base;
+}
+
+fn hir_builder_str_lang_owner_names_match(a: string, b: string) -> bool {
+    if (a.len == 0 || b.len == 0) { return false; }
+    if (hir_builder_type_owner_names_match(a, b)) { return true; }
+    let a_last = hir_builder_last_path_segment(hir_builder_type_base_name(a));
+    let b_last = hir_builder_last_path_segment(hir_builder_type_base_name(b));
+    if (a_last.len == 0 || b_last.len == 0) { return false; }
+    let a_str = hir_builder_is_primitive_str_name(a_last) || a_last == "String";
+    let b_str = hir_builder_is_primitive_str_name(b_last) || b_last == "String";
+    return a_str && b_str;
+}
+
+fn hir_builder_type_owner_names_match(a: string, b: string) -> bool {
+    if (a.len == 0 || b.len == 0) { return false; }
+    if (a == b) { return true; }
+    return hir_builder_type_owner_match_key(a) == hir_builder_type_owner_match_key(b);
+}
+
+fn hir_builder_trait_match_key(name: string) -> string {
+    let last = hir_builder_last_path_segment(policy_generic_call_base(name));
+    if (last == "Hash") { return "Hashable"; }
+    return last;
+}
+
+fn hir_builder_trait_names_match(a: string, b: string) -> bool {
+    if (a.len == 0 || b.len == 0) { return false; }
+    if (a == b || policy_type_name_equal(a, b)) { return true; }
+    return hir_builder_trait_match_key(a) == hir_builder_trait_match_key(b);
+}
+
+fn hir_builder_impl_trait_at(meta: string, wanted_index: i32) -> string {
+    if (meta.len == 0 || wanted_index < 0) { return ""; }
+    let prefix = "|impl:";
+    var pos = hir_builder_index_of(meta, prefix);
+    if (pos < 0) { return ""; }
+    var start = pos + prefix.len;
+    var index: i32 = 0;
+    var i = start;
+    while (i <= meta.len) {
+        if (i == meta.len || meta.charAt(i) == 44 || meta.charAt(i) == 124) {
+            let item = meta.substring(start, i);
+            if (item.len > 0) {
+                if (index == wanted_index) { return item; }
+                index = index + 1;
+            }
+            start = i + 1;
+            if (i < meta.len && meta.charAt(i) == 124) { return ""; }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn hir_builder_type_text_is_awaitable(name: string) -> bool {
+    let base = hir_builder_type_base_name(name);
+    return base == "Task" || base == "Promise";
+}
+
+fn hir_builder_task_type_text_for_payload(payload: string) -> string {
+    var inner = payload;
+    if (inner.len == 0 || inner == "void") { inner = "i32"; }
+    return "Task::<" + inner + ">";
+}
+
+fn hir_builder_owner_args_for_params(owner_params: string, owner_type_name: string) -> string {
+    if (owner_params.len == 0 || owner_type_name.len == 0) { return ""; }
+    let type_args = policy_generic_call_args(owner_type_name.clone());
+    var out = "";
+    var type_arg_index: i32 = 0;
+    var i: i32 = 0;
+    while (i < 64) {
+        let param_name = hir_builder_generic_param_at(owner_params, i);
+        if (param_name.len == 0) { return out; }
+        var arg_name = "";
+        if (param_name == "Self") {
+            arg_name = owner_type_name;
+        } else {
+            arg_name = policy_generic_arg_at(type_args, type_arg_index);
+            type_arg_index = type_arg_index + 1;
+        }
+        if (arg_name.len == 0) { return ""; }
+        out = hir_builder_append_csv(out, arg_name);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hir_builder_generic_params_prefix(params: string, count: i32) -> string {
+    if (params.len == 0 || count <= 0) { return ""; }
+    var out = "";
+    var i: i32 = 0;
+    while (i < count) {
+        let p = hir_builder_generic_param_at(params, i);
+        if (p.len == 0) { return out; }
+        out = hir_builder_append_csv(out, p);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hir_builder_generic_params_after(params: string, count: i32) -> string {
+    if (params.len == 0) { return ""; }
+    var out = "";
+    var i: i32 = count;
+    while (i < 64) {
+        let p = hir_builder_generic_param_at(params, i);
+        if (p.len == 0) { return out; }
+        out = hir_builder_append_csv(out, p);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hir_builder_params_with_args(params: string, args: string) -> string {
+    if (params.len == 0 || args.len == 0) { return ""; }
+    var out = "";
+    var i: i32 = 0;
+    while (i < 64) {
+        let p = hir_builder_generic_param_at(params, i);
+        if (p.len == 0) { return out; }
+        let a = policy_generic_arg_at(args, i);
+        if (a.len > 0) { out = hir_builder_append_csv(out, p); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hir_builder_template_params_matching_owner_text(pattern: string, owner_type_name: string) -> string {
+    if (pattern.len == 0 || owner_type_name.len == 0) { return ""; }
+    let pattern_args = policy_generic_call_args(pattern);
+    let owner_args = policy_generic_call_args(owner_type_name);
+    if (pattern_args.len == 0 || owner_args.len == 0) { return ""; }
+    let pattern_base = policy_generic_call_base(pattern);
+    let owner_base = policy_generic_call_base(owner_type_name);
+    if (!policy_type_name_equal(pattern_base, owner_base)) { return ""; }
+    var out = "";
+    var i: i32 = 0;
+    while (i < 64) {
+        let p = policy_generic_arg_at(pattern_args, i);
+        let a = policy_generic_arg_at(owner_args, i);
+        if (p.len == 0 || a.len == 0) { return out; }
+        if (hir_builder_type_name_has_template_atom(p)) {
+            out = hir_builder_append_csv(out, hir_builder_generic_param_canonical(p));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hir_builder_env_key(params: string, args: string) -> string {
+    if (params.len == 0 && args.len == 0) { return ""; }
+    return hir_builder_generic_head(params) + "=>" + args;
+}
+
+fn hir_builder_function_instance_name(base: string, owner_type: string, params: string, args: string) -> string {
+    var raw = base;
+    if (owner_type.len > 0) { raw = owner_type + "::" + base; }
+    let env = hir_builder_env_key(params, args);
+    if (env.len > 0) { raw = raw.clone() + "::" + env; }
+    return "mir2$" + policy_mangle_part(raw);
+}
+
+/// Link name for a DCI open-generic instance: `<base>__<arg1>_<arg2>...`
+/// with each argument mangled.  Unlike the `mir2$` instance names this is a
+/// valid flat C symbol — the Active Adapter materializes the native
+/// entrypoint under exactly this name, so no `mir2$` unmasking pass is ever
+/// needed and the requests sidecar can name it directly.
+fn hir_builder_foreign_dci_instance_name(base: string, args: string) -> string {
+    var out = base + "__";
+    var i: i32 = 0;
+    while (i < 64) {
+        let arg = policy_generic_arg_at(args, i);
+        if (arg.len == 0) { break; }
+        if (i > 0) { out = out + "_"; }
+        out = out + policy_mangle_part(arg);
+        i = i + 1;
+    }
+    return out;
+}

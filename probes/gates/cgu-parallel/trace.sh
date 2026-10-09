@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-SRC="$ROOT/bootstrap_compiler/src/codegen/llvm_lower.vyx"
+SRC="$ROOT/bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx"
 fail=0
 
 need() {

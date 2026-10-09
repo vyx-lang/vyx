@@ -1,0 +1,658 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Overload resolution for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn call_type_match_score(self, param_type: string, actual_type: string) -> i32 {
+        if (param_type.len == 0 || actual_type.len == 0) { return -1; }
+        if (param_type == actual_type || policy_type_name_equal(param_type, actual_type)) { return 8; }
+        let param_dyn_trait = self.dyn_interface_name_from_type_text(param_type);
+        if (param_dyn_trait.len > 0
+            && self.type_text_satisfies_dyn_trait(actual_type, param_dyn_trait)) {
+            return 5;
+        }
+        let param_base = hir_builder_type_base_name(param_type);
+        let actual_base = hir_builder_type_base_name(actual_type);
+        if (param_base.len > 0
+            && actual_base.len > 0
+            && param_base == actual_base
+            && policy_generic_call_args(param_type.clone()) == policy_generic_call_args(actual_type.clone())) {
+            return 6;
+        }
+        if ((param_type == "i64" && actual_type == "i32")
+            || (param_type == "i32" && actual_type == "i64")
+            || (param_type == "u64" && actual_type == "u32")
+            || (param_type == "u32" && actual_type == "u64")) {
+            return 2;
+        }
+        if (hir_builder_is_primitive_str_name(param_type)
+            && hir_builder_is_primitive_str_name(actual_type)) {
+            return 6;
+        }
+        return -1;
+    }
+
+    fn method_decl_score_for_call(self,
+                                         call_expr: rawptr,
+                                         call_expr_id: i32,
+                                         method_decl: rawptr,
+                                         owner_type_name: string) -> i32 {
+        if (call_expr_id == hir_id_invalid()
+            || method_decl == null
+            || owner_type_name.len == 0
+            || decl_get_kind(method_decl) != de_METHOD()) {
+            return -1;
+        }
+        var owner_decl = self.method_owner_decl_for_type_text(method_decl,
+                                                              owner_type_name,
+                                                              self.raw_class_decl_for_type_text(owner_type_name));
+        if (owner_decl == null) { return -1; }
+        var owner_params = hir_builder_decl_template_params(owner_decl);
+        var method_params = hir_builder_decl_template_params(method_decl);
+        let owner_type_args = policy_generic_call_args(owner_type_name.clone());
+        if (owner_params.len == 0 && owner_type_args.len > 0) {
+            let template_owner = self.raw_template_class_decl_for_type_text(owner_type_name);
+            if (template_owner != null) {
+                let template_params = hir_builder_decl_template_params(template_owner);
+                if (template_params.len > 0) { owner_params = template_params; }
+            }
+        }
+        if (owner_params.len == 0 && owner_type_args.len > 0) {
+            let ret_owner_params = hir_builder_template_params_matching_owner_text(hir_builder_type_ref_name(decl_get_ty(method_decl)),
+                                                                                  owner_type_name);
+            if (ret_owner_params.len > 0
+                && hir_builder_generic_param_count(ret_owner_params) == hir_builder_generic_arg_count(owner_type_args)
+                && !hir_builder_generic_contains(ret_owner_params, "Self")) {
+                owner_params = ret_owner_params;
+            }
+        }
+        if (owner_params.len == 0 && owner_type_args.len > 0 && method_params.len > 0) {
+            let owner_arg_count = hir_builder_generic_arg_count(owner_type_args);
+            let derived_owner_params = hir_builder_generic_params_prefix(method_params, owner_arg_count);
+            if (hir_builder_generic_param_count(derived_owner_params) == owner_arg_count
+                && !hir_builder_generic_contains(derived_owner_params, "Self")) {
+                owner_params = derived_owner_params;
+                method_params = hir_builder_generic_params_after(method_params, owner_arg_count);
+            }
+        }
+        if (method_params.len == 0) {
+            method_params = hir_builder_inferred_decl_template_params_except(method_decl, owner_params);
+        }
+        let owner_args = hir_builder_owner_args_for_params(owner_params, owner_type_name);
+        var explicit_method_args = self.resolve_explicit_generic_args_for_call(call_expr);
+        if (explicit_method_args.len == 0) {
+            explicit_method_args = self.resolve_explicit_generic_args_for_hir_call(call_expr_id);
+        }
+        let bindings = self.infer_hir_call_bindings(call_expr_id,
+                                                    method_decl,
+                                                    owner_params,
+                                                    owner_args,
+                                                    method_params,
+                                                    explicit_method_args);
+        let method_args = self.args_for_hir_call_params(call_expr_id,
+                                                        method_decl,
+                                                        method_params,
+                                                        explicit_method_args,
+                                                        bindings);
+        bindings.dispose();
+        var env_params = owner_params;
+        var env_args = owner_args;
+        env_params = hir_builder_append_csv(env_params, method_params);
+        env_args = hir_builder_append_csv(env_args, method_args);
+        var param = decl_get_params(method_decl);
+        if (param != null && decl_get_name(param) == "self") {
+            param = decl_get_next(param);
+        }
+        var arg_id = self.hir_method_call_first_arg(call_expr_id);
+        var score: i32 = 0;
+        while (param != null) {
+            if (hir_builder_variadic_param(param)) { return score; }
+            if (arg_id == hir_id_invalid()) { return -1; }
+            let param_type_id = self.type_id_from_ref_env(decl_get_ty(param), env_params, env_args);
+            let actual_type_id = self.unit.expr_type(arg_id);
+            if (!self.type_id_is_valid(param_type_id) || !self.type_id_is_valid(actual_type_id)) { return -1; }
+            let param_text = hir_type_table_text(self.unit.types, param_type_id);
+            let actual_text = hir_type_table_text(self.unit.types, actual_type_id);
+            let part = self.call_type_match_score(param_text, actual_text);
+            if (part < 0) { return -1; }
+            score = score + part;
+            param = decl_get_next(param);
+            arg_id = self.hir_method_call_next_arg(call_expr_id, arg_id);
+        }
+        if (arg_id != hir_id_invalid()) { return -1; }
+        return score;
+    }
+
+    fn call_type_id_match_score(self, param_type_id: i32, actual_type_id: i32) -> i32 {
+        if (!self.type_id_is_valid(param_type_id) || !self.type_id_is_valid(actual_type_id)) {
+            return -1;
+        }
+        let param_text = hir_type_table_text(self.unit.types, param_type_id);
+        let actual_text = hir_type_table_text(self.unit.types, actual_type_id);
+        return self.call_type_match_score(param_text, actual_text);
+    }
+
+    fn hir_function_arg_score_for_call(self,
+                                             call_expr_id: i32,
+                                             callee_expr_id: i32,
+                                             function_id: i32) -> i32 {
+        if (call_expr_id == hir_id_invalid()
+            || callee_expr_id == hir_id_invalid()
+            || function_id == hir_id_invalid()
+            || self.unit.expr_kind(call_expr_id) != ex_CALL()) {
+            return -1;
+        }
+        var param_local = self.next_source_param_local(self.unit.function_first_local(function_id));
+        if (self.local_is_constructor_abi_self(function_id, param_local)) {
+            param_local = self.next_source_param_local(self.unit.local_next(param_local));
+        } else if (self.unit.expr_kind(callee_expr_id) == ex_MEMBER()
+            && param_local != hir_id_invalid()
+            && (self.unit.local_flags(param_local) & hir_local_flag_self_receiver()) != 0) {
+            let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+            if (owner_expr_id != hir_id_invalid()
+                && self.unit.expr_sem_kind(owner_expr_id) != expr_sem_CLASS()) {
+                param_local = self.next_source_param_local(self.unit.local_next(param_local));
+            }
+        }
+        var arg_id = self.unit.expr_first_arg(call_expr_id);
+        var score: i32 = 0;
+        while (arg_id != hir_id_invalid()) {
+            if (param_local == hir_id_invalid()) { return -1; }
+            let part = self.call_type_id_match_score(self.unit.local_type(param_local),
+                                                     self.unit.expr_type(arg_id));
+            if (part < 0) { return -1; }
+            score = score + part;
+            arg_id = self.unit.expr_next_arg(arg_id);
+            param_local = self.next_source_param_local(self.unit.local_next(param_local));
+        }
+        if (param_local != hir_id_invalid()) { return -1; }
+        return score;
+    }
+
+    fn ensure_reachable_function_body_by_id(self, function_id: i32) {
+        if (function_id == hir_id_invalid()) { return; }
+        if (self.unit.function_body(function_id) != hir_id_invalid()) { return; }
+        var raw_decl = hir_pointer_map_raw_for_function(self.decl_map,function_id);
+        if (raw_decl == null) {
+            raw_decl = self.function_instances.decl_for_function(function_id);
+        }
+        if (raw_decl != null) {
+            self.ensure_reachable_function_body(raw_decl, function_id, false);
+        }
+    }
+
+    // A package interface can be reached through more than one import path.
+    // Those AST declarations have distinct addresses, but represent one ABI
+    // declaration when their source module, owner, signature, and symbol
+    // discriminator agree. Keep real source overloads and versioned imports
+    // distinct; only collapse duplicate imported interface shells here.
+    fn imported_method_candidates_share_abi(self,
+                                            left_fn: i32,
+                                            right_fn: i32,
+                                            owner_type_name: string) -> bool {
+        if (left_fn == hir_id_invalid()
+            || right_fn == hir_id_invalid()
+            || owner_type_name.len == 0) {
+            return false;
+        }
+        let left_decl = hir_pointer_map_raw_for_function(self.decl_map, left_fn);
+        let right_decl = hir_pointer_map_raw_for_function(self.decl_map, right_fn);
+        if (left_decl == null
+            || right_decl == null
+            || !self.decl_effectively_imported(left_decl)
+            || !self.decl_effectively_imported(right_decl)
+            || decl_get_is_static(left_decl) != decl_get_is_static(right_decl)
+            || !hir_builder_decl_signature_matches(left_decl, right_decl)) {
+            return false;
+        }
+        let left_owner = hir_raw_owner_map_get(self.decl_owner_map, left_decl);
+        let right_owner = hir_raw_owner_map_get(self.decl_owner_map, right_decl);
+        if (left_owner == null
+            || right_owner == null
+            || !self.raw_owner_decl_matches_type_exact(left_owner, owner_type_name)
+            || !self.raw_owner_decl_matches_type_exact(right_owner, owner_type_name)) {
+            return false;
+        }
+        let left_module = hir_builder_decl_source_module(left_decl);
+        let right_module = hir_builder_decl_source_module(right_decl);
+        // Shallow project interfaces do not carry a `from:` marker.  Two
+        // empty source markers therefore still identify the same ABI once
+        // owner, signature, and discriminator have matched above. Distinct
+        // non-empty module/version markers remain distinct candidates.
+        if (left_module != right_module) { return false; }
+        return hir_builder_decl_symbol_discriminator(left_decl, left_owner)
+            == hir_builder_decl_symbol_discriminator(right_decl, right_owner);
+    }
+
+    fn best_hir_method_function_for_call_with_static_mode(self,
+                                                          owner_type_name: string,
+                                                          method_name: string,
+                                                          call_expr_id: i32,
+                                                          callee_expr_id: i32,
+                                                          filter_static: bool,
+                                                          want_static: bool) -> i32 {
+        if (owner_type_name.len == 0
+            || method_name.len == 0
+            || call_expr_id == hir_id_invalid()
+            || callee_expr_id == hir_id_invalid()) {
+            return hir_id_invalid();
+        }
+        let cached = self.closed_method_instance_for_owner_method(owner_type_name, method_name);
+        if (cached != hir_id_invalid()) {
+            self.ensure_reachable_function_body_by_id(cached);
+            // Owner/name caches intentionally erase overload and parameter-pack
+            // shape. Reuse the cached instance only when it matches this exact
+            // call; otherwise continue scoring the closed sibling instances.
+            if (self.hir_function_arg_score_for_call(call_expr_id,
+                                                     callee_expr_id,
+                                                     cached) >= 0) {
+                return cached;
+            }
+        }
+        if (policy_generic_call_args(owner_type_name.clone()).len > 0) {
+            return hir_id_invalid();
+        }
+        var best_fn = hir_id_invalid();
+        var best_score: i32 = -1;
+        var tied: bool = false;
+        var item_id: i32 = 1;
+        while (item_id <= self.unit.item_count) {
+            if (self.unit.item_kind(item_id) == hir_item_method()
+                && self.owner_item_matches_type(self.unit.item_owner(item_id), owner_type_name)
+                && self.function_name_matches_method(self.unit.item_name(item_id), method_name)) {
+                let fn_id = self.unit.item_function(item_id);
+                let static_mode_matches = !filter_static
+                    || self.hir_function_matches_static_use(fn_id, want_static);
+                if (fn_id != hir_id_invalid()
+                    && static_mode_matches
+                    && self.function_candidate_has_exact_owner_type(fn_id, owner_type_name)
+                    && self.function_candidate_covers_owner_type(fn_id, owner_type_name)
+                    && !self.function_has_open_template_types(fn_id)) {
+                    let score = self.hir_function_arg_score_for_call(call_expr_id,
+                                                                     callee_expr_id,
+                                                                     fn_id);
+                    if (score > best_score) {
+                        best_score = score;
+                        best_fn = fn_id;
+                        tied = false;
+                    } else if (score == best_score && score >= 0) {
+                        let candidate_decl =
+                            hir_pointer_map_raw_for_function(self.decl_map,
+                                                             fn_id);
+                        let best_decl =
+                            hir_pointer_map_raw_for_function(self.decl_map,
+                                                             best_fn);
+                        if (self.imported_method_candidates_share_abi(fn_id,
+                                                                     best_fn,
+                                                                     owner_type_name)) {
+                            item_id = item_id + 1;
+                            continue;
+                        }
+                        let candidate_module =
+                            hir_builder_decl_source_module(candidate_decl);
+                        let best_module =
+                            hir_builder_decl_source_module(best_decl);
+                        if (policy_module_base(candidate_module)
+                                == policy_module_base(best_module)
+                            && policy_module_variant(candidate_module)
+                                == policy_module_variant(best_module)
+                            && policy_module_version(candidate_module).len > 0
+                            && policy_module_version(best_module).len > 0) {
+                            let version_cmp = policy_semver_compare(
+                                policy_module_version(candidate_module),
+                                policy_module_version(best_module));
+                            if (version_cmp > 0) {
+                                best_fn = fn_id;
+                                tied = false;
+                            } else if (version_cmp == 0
+                                && candidate_decl != best_decl) {
+                                tied = true;
+                            }
+                        } else {
+                            tied = true;
+                        }
+                    }
+                }
+            }
+            item_id = item_id + 1;
+        }
+        if (best_score < 0 || tied) { return hir_id_invalid(); }
+        self.ensure_reachable_function_body_by_id(best_fn);
+        return best_fn;
+    }
+
+    fn best_hir_method_function_for_call(self,
+                                               owner_type_name: string,
+                                               method_name: string,
+                                               call_expr_id: i32,
+                                               callee_expr_id: i32) -> i32 {
+        return self.best_hir_method_function_for_call_with_static_mode(owner_type_name,
+                                                                        method_name,
+                                                                        call_expr_id,
+                                                                        callee_expr_id,
+                                                                        false,
+                                                                        false);
+    }
+
+    fn best_hir_static_method_function_for_call(self,
+                                                      owner_type_name: string,
+                                                      method_name: string,
+                                                      call_expr_id: i32,
+                                                      callee_expr_id: i32) -> i32 {
+        return self.best_hir_method_function_for_call_with_static_mode(owner_type_name,
+                                                                        method_name,
+                                                                        call_expr_id,
+                                                                        callee_expr_id,
+                                                                        true,
+                                                                        true);
+    }
+
+    fn hir_function_matches_static_use(self, fn_id: i32, want_static: bool) -> bool {
+        if (fn_id == hir_id_invalid()) { return false; }
+        let raw_decl = hir_pointer_map_raw_for_function(self.decl_map, fn_id);
+        if (raw_decl != null && decl_get_kind(raw_decl) == de_METHOD()) {
+            return hir_builder_method_decl_matches_static_use(raw_decl, want_static);
+        }
+        var local_id = self.unit.function_first_local(fn_id);
+        while (local_id != hir_id_invalid()) {
+            if ((self.unit.local_flags(local_id) & hir_local_flag_param()) != 0
+                && self.unit.local_name(local_id) == "self") {
+                return !want_static;
+            }
+            local_id = self.unit.local_next(local_id);
+        }
+        return want_static;
+    }
+
+    // Sema can preserve a value-initialization `new` builtin when class layout
+    // preparation makes the raw inherited member chain incomplete.  A direct
+    // owner with one registered static candidate is nevertheless unambiguous;
+    // recover that stable HIR identity and let its normal body scheduling path
+    // materialize the declaration.
+    fn unique_registered_direct_static_method_function(self,
+                                                             owner_type_name: string,
+                                                             method_name: string) -> i32 {
+        if (owner_type_name.len == 0 || method_name.len == 0) {
+            return hir_id_invalid();
+        }
+        var candidate = hir_id_invalid();
+        var item_id: i32 = 1;
+        while (item_id <= self.unit.item_count) {
+            if (self.unit.item_kind(item_id) == hir_item_method()
+                && self.function_name_matches_method(self.unit.item_name(item_id), method_name)
+                && self.owner_item_matches_type_exact(self.unit.item_owner(item_id), owner_type_name)) {
+                let fn_id = self.unit.item_function(item_id);
+                if (fn_id != hir_id_invalid()
+                    && self.hir_function_matches_static_use(fn_id, true)
+                    && self.function_candidate_has_exact_owner_type(fn_id, owner_type_name)
+                    && self.function_candidate_covers_owner_type(fn_id, owner_type_name)
+                    && !self.function_has_open_template_types(fn_id)) {
+                    if (candidate != hir_id_invalid() && candidate != fn_id) {
+                        return hir_id_invalid();
+                    }
+                    candidate = fn_id;
+                }
+            }
+            item_id = item_id + 1;
+        }
+        if (candidate != hir_id_invalid()) {
+            self.ensure_reachable_function_body_by_id(candidate);
+        }
+        return candidate;
+    }
+
+    fn raw_best_method_decl_in_class_for_call(self,
+                                                     class_decl: rawptr,
+                                                     method_name: string,
+                                                     want_static: bool,
+                                                     call_expr: rawptr,
+                                                     call_expr_id: i32,
+                                                     owner_type_name: string) -> rawptr {
+        if (class_decl == null || method_name.len == 0) { return null; }
+        var best: rawptr = null;
+        var best_score: i32 = -1;
+        var member = decl_get_members(class_decl);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_method_name_matches_lookup(decl_get_name(member), method_name)
+                && hir_builder_method_decl_matches_static_use(member, want_static)) {
+                let score = self.method_decl_score_for_call(call_expr,
+                                                            call_expr_id,
+                                                            member,
+                                                            owner_type_name);
+                if (score > best_score) {
+                    best_score = score;
+                    best = member;
+                }
+            }
+            member = decl_get_next(member);
+        }
+        return best;
+    }
+
+    fn raw_method_decl_for_call_on_class_tree(self,
+                                                    class_decl: rawptr,
+                                                    method_name: string,
+                                                    want_static: bool,
+                                                    call_expr: rawptr,
+                                                    call_expr_id: i32,
+                                                    owner_type_name: string,
+                                                    depth: i32) -> rawptr {
+        if (class_decl == null || method_name.len == 0 || depth > 32) { return null; }
+        let direct = self.raw_best_method_decl_in_class_for_call(class_decl,
+                                                                 method_name,
+                                                                 want_static,
+                                                                 call_expr,
+                                                                 call_expr_id,
+                                                                 owner_type_name);
+        if (direct != null) { return direct; }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(class_decl, parent_i);
+            if (parent_decl == null) { return null; }
+            let found = self.raw_method_decl_for_call_on_class_tree(parent_decl,
+                                                                      method_name,
+                                                                      want_static,
+                                                                      call_expr,
+                                                                      call_expr_id,
+                                                                      owner_type_name,
+                                                                      depth + 1);
+            if (found != null) { return found; }
+            parent_i = parent_i + 1;
+        }
+        return null;
+    }
+
+    fn raw_method_decl_for_call_by_owner_item_scan(self,
+                                                          owner_type_name: string,
+                                                          method_name: string,
+                                                          want_static: bool,
+                                                          call_expr: rawptr,
+                                                          call_expr_id: i32) -> rawptr {
+        if (owner_type_name.len == 0 || method_name.len == 0 || call_expr_id == hir_id_invalid()) {
+            return null;
+        }
+        var best: rawptr = null;
+        var best_score: i32 = -1;
+        var tied: bool = false;
+        var item_id: i32 = 1;
+        while (item_id <= self.unit.item_count) {
+            if (self.unit.item_kind(item_id) == hir_item_method()
+                && self.unit.item_name(item_id) == method_name
+                && self.owner_item_matches_type(self.unit.item_owner(item_id), owner_type_name)) {
+                let raw = hir_pointer_map_raw_for_item(self.decl_map,item_id);
+                if (raw != null
+                    && decl_get_kind(raw) == de_METHOD()
+                    && hir_builder_method_decl_matches_static_use(raw, want_static)) {
+                    let score = self.method_decl_score_for_call(call_expr,
+                                                                call_expr_id,
+                                                                raw,
+                                                                owner_type_name);
+                    if (score > best_score) {
+                        best_score = score;
+                        best = raw;
+                        tied = false;
+                    } else if (score == best_score && score >= 0) {
+                        tied = true;
+                    }
+                }
+            }
+            item_id = item_id + 1;
+        }
+        if (best_score < 0 || tied) { return null; }
+        return best;
+    }
+
+    fn raw_method_decl_scan_cache_key(self,
+                                             method_name: string,
+                                             want_static: bool,
+                                             call_expr_id: i32) -> string {
+        return self.method_call_target_cache_key(method_name,
+                                                 want_static,
+                                                 "",
+                                                 call_expr_id);
+    }
+
+    fn raw_method_decl_for_call_by_owner_item_scan_cached(self,
+                                                                 owner_type_name: string,
+                                                                 method_name: string,
+                                                                 want_static: bool,
+                                                                 call_expr: rawptr,
+                                                                 call_expr_id: i32) -> rawptr {
+        let cache_key = self.raw_method_decl_scan_cache_key(method_name,
+                                                            want_static,
+                                                            call_expr_id);
+        if (cache_key.len > 0) {
+            let cached = hir_pair_raw_map_get(self.raw_method_call_decl_cache,owner_type_name, cache_key);
+            if (cached != null) { return cached; }
+            if (hir_pair_id_map_get(self.raw_method_call_decl_miss_cache,owner_type_name, cache_key) != hir_id_invalid()) {
+                return null;
+            }
+        }
+        let out = self.raw_method_decl_for_call_by_owner_item_scan(owner_type_name,
+                                                                   method_name,
+                                                                   want_static,
+                                                                   call_expr,
+                                                                   call_expr_id);
+        if (cache_key.len > 0) {
+            if (out != null) {
+                self.raw_method_call_decl_cache = hir_pair_raw_map_put(self.raw_method_call_decl_cache,owner_type_name, cache_key, out);
+            } else {
+                self.raw_method_call_decl_miss_cache = hir_pair_id_map_put(self.raw_method_call_decl_miss_cache,owner_type_name, cache_key, 1);
+            }
+        }
+        return out;
+    }
+
+    fn raw_method_decl_for_call_expr(self, call_expr: rawptr, call_expr_id: i32, callee_expr_id: i32) -> rawptr {
+        var hot_start: i64 = 0;
+        let hot_timing = hir_builder_env_enabled("VYX_HIR_HOT_TIMING");
+        if (hot_timing) { hot_start = vyx_bootstrap_now_ms(); }
+        if (call_expr_id == hir_id_invalid()
+            || callee_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) {
+            return null;
+        }
+        let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+        if (owner_expr_id == hir_id_invalid()) { return null; }
+        var raw_callee = call_expr;
+        if (call_expr != null && expr_get_kind(call_expr) == ex_CALL()) {
+            raw_callee = expr_get_lhs(call_expr);
+        }
+        let owner_type_name = self.member_owner_type_name(raw_callee, owner_expr_id);
+        if (owner_type_name.len == 0 || self.type_text_has_open_template_atom(owner_type_name)) { return null; }
+        let member_name = policy_versioned_generic_call_base(self.unit.expr_name(callee_expr_id).clone());
+        if (member_name.len == 0) { return null; }
+        var want_static: bool = false;
+        if (self.unit.expr_sem_kind(owner_expr_id) == expr_sem_CLASS()) { want_static = true; }
+        let dyn_iface_name = self.dyn_interface_name_from_type_text(owner_type_name);
+        if (!want_static && dyn_iface_name.len > 0) {
+            let iface_member = self.raw_interface_method_decl_on_trait(self.raw_interface_decl_for_trait_name(dyn_iface_name),
+                                                                       member_name,
+                                                                       0);
+            if (iface_member != null) {
+                if (hot_timing) { self.profile_ms_raw_method_call = self.profile_ms_raw_method_call + (vyx_bootstrap_now_ms() - hot_start); }
+                return iface_member;
+            }
+        }
+        if (raw_callee != null && expr_get_kind(raw_callee) == ex_MEMBER()) {
+            let semantic_method = self.semantic_method_decl_for_member_ast(raw_callee,
+                                                                           owner_type_name,
+                                                                           member_name,
+                                                                           want_static);
+            if (semantic_method != null) {
+                if (hot_timing) { self.profile_ms_raw_method_call = self.profile_ms_raw_method_call + (vyx_bootstrap_now_ms() - hot_start); }
+                return semantic_method;
+            }
+            let versioned_method = self.raw_versioned_method_decl_for_call(
+                owner_type_name,
+                member_name,
+                expr_get_name(raw_callee),
+                want_static,
+                call_expr,
+                call_expr_id);
+            if (versioned_method != null) {
+                if (hot_timing) {
+                    self.profile_ms_raw_method_call =
+                        self.profile_ms_raw_method_call
+                        + (vyx_bootstrap_now_ms() - hot_start);
+                }
+                return versioned_method;
+            }
+        }
+        let class_decl = self.raw_class_decl_for_type_text(owner_type_name);
+        let method_decl = self.raw_method_decl_for_call_on_class_tree(class_decl,
+                                                                      member_name,
+                                                                      want_static,
+                                                                      call_expr,
+                                                                      call_expr_id,
+                                                                      owner_type_name,
+                                                                      0);
+        if (method_decl != null) {
+            if (hot_timing) { self.profile_ms_raw_method_call = self.profile_ms_raw_method_call + (vyx_bootstrap_now_ms() - hot_start); }
+            return method_decl;
+        }
+        let item_scanned_method = self.raw_method_decl_for_call_by_owner_item_scan_cached(owner_type_name,
+                                                                                          member_name,
+                                                                                          want_static,
+                                                                                          call_expr,
+                                                                                          call_expr_id);
+        if (item_scanned_method != null) {
+            if (hot_timing) { self.profile_ms_raw_method_call = self.profile_ms_raw_method_call + (vyx_bootstrap_now_ms() - hot_start); }
+            return item_scanned_method;
+        }
+        let template_method_decl = self.raw_template_method_decl_for_call_type_text(owner_type_name,
+                                                                                   member_name,
+                                                                                   want_static,
+                                                                                   call_expr,
+                                                                                   call_expr_id);
+        if (template_method_decl != null) {
+            if (hot_timing) { self.profile_ms_raw_method_call = self.profile_ms_raw_method_call + (vyx_bootstrap_now_ms() - hot_start); }
+            return template_method_decl;
+        }
+        let impl_method_decl = self.concrete_impl_method_decl(member_name, owner_type_name);
+        if (impl_method_decl != null
+            && hir_builder_method_decl_matches_static_use(impl_method_decl, want_static)) {
+            if (hot_timing) { self.profile_ms_raw_method_call = self.profile_ms_raw_method_call + (vyx_bootstrap_now_ms() - hot_start); }
+            return impl_method_decl;
+        }
+        if (!want_static) {
+            let iface_default = self.raw_interface_default_method_decl_for_type_text(owner_type_name, member_name);
+            if (hot_timing) { self.profile_ms_raw_method_call = self.profile_ms_raw_method_call + (vyx_bootstrap_now_ms() - hot_start); }
+            return iface_default;
+        }
+        if (hot_timing) { self.profile_ms_raw_method_call = self.profile_ms_raw_method_call + (vyx_bootstrap_now_ms() - hot_start); }
+        return null;
+    }
+}

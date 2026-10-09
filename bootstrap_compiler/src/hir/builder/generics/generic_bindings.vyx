@@ -1,0 +1,250 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Generic bindings for the HIR builder. See README.md.
+
+class HirGenericBindingMap {
+    public head: rawptr
+
+    public static fn create() -> HirGenericBindingMap {
+        return HirGenericBindingMap { head: null };
+    }
+
+    fn dispose(self) {
+        var cur = self.head;
+        while (cur != null) {
+            let next = ast_read_rawptr(ptr_offset(cur, 32));
+            let name_ptr = ast_read_rawptr(cur);
+            let value_ptr = ast_read_rawptr(ptr_offset(cur, 16));
+            if (name_ptr != null) { free(name_ptr); }
+            if (value_ptr != null) { free(value_ptr); }
+            free(cur);
+            cur = next;
+        }
+        self.head = null;
+    }
+
+    fn bind(self, name: string, value: string) {
+        if (name.len == 0 || value.len == 0) { return; }
+        var cur = self.head;
+        while (cur != null) {
+            let np = ast_read_rawptr(cur);
+            let nl = ast_read_i64(ptr_offset(cur, 8));
+            if (hir_builder_c_string_equals(np, nl, name)) {
+                // `value` may itself be a view of this node's current
+                // allocation. Duplicate it before releasing that storage.
+                let new_value = ast_dup_c_string(value);
+                if (new_value == null) { return; }
+                let old_value = ast_read_rawptr(ptr_offset(cur, 16));
+                if (old_value != null) { free(old_value); }
+                ast_write_rawptr(ptr_offset(cur, 16), new_value);
+                ast_write_i64(ptr_offset(cur, 24), value.len);
+                return;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 32));
+        }
+        let node = hir_profile_malloc(40);
+        if (node == null) { return; }
+        memset(node, 0, 40);
+        ast_write_rawptr(node, ast_dup_c_string(name));
+        ast_write_i64(ptr_offset(node, 8), name.len);
+        ast_write_rawptr(ptr_offset(node, 16), ast_dup_c_string(value));
+        ast_write_i64(ptr_offset(node, 24), value.len);
+        ast_write_rawptr(ptr_offset(node, 32), self.head);
+        self.head = node;
+    }
+
+    fn lookup(self, name: string) -> string {
+        if (name.len == 0) { return ""; }
+        var cur = self.head;
+        while (cur != null) {
+            let np = ast_read_rawptr(cur);
+            let nl = ast_read_i64(ptr_offset(cur, 8));
+            if (hir_builder_c_string_equals(np, nl, name)) {
+                let vp = ast_read_rawptr(ptr_offset(cur, 16));
+                let vl = ast_read_i64(ptr_offset(cur, 24));
+                // Bindings are scratch state and are disposed immediately
+                // after generic argument selection. Never let an instance
+                // key retain a borrowed view into this map.
+                if (vp != null && vl > 0) { return from_cstr_view_len(vp, vl).clone(); }
+                return "";
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 32));
+        }
+        return "";
+    }
+}
+
+fn hir_generic_binding_map_dispose(map: HirGenericBindingMap) -> HirGenericBindingMap {
+    var cur = map.head;
+    while (cur != null) {
+        let next = ast_read_rawptr(ptr_offset(cur, 32));
+        let name_ptr = ast_read_rawptr(cur);
+        let value_ptr = ast_read_rawptr(ptr_offset(cur, 16));
+        if (name_ptr != null) { free(name_ptr); }
+        if (value_ptr != null) { free(value_ptr); }
+        free(cur);
+        cur = next;
+    }
+    map.head = null;
+    return map;
+}
+
+class HirPackBindings {
+    public head: rawptr
+
+    public static fn create() -> HirPackBindings {
+        return HirPackBindings { head: null };
+    }
+
+    fn restore(self, saved_head: rawptr) {
+        self.head = saved_head;
+    }
+
+    fn drop_to(self, saved_head: rawptr) {
+        var cur = self.head;
+        while (cur != null && cur != saved_head) {
+            let next = ast_read_rawptr(ptr_offset(cur, 32));
+            let name_ptr = ast_read_rawptr(cur);
+            let locals_buf = ast_read_rawptr(ptr_offset(cur, 16));
+            if (name_ptr != null) { free(name_ptr); }
+            if (locals_buf != null) { free(locals_buf); }
+            free(cur);
+            cur = next;
+        }
+        self.head = saved_head;
+    }
+
+    fn bind(self, name: string, locals_buf: rawptr, count: i32) {
+        if (name.len == 0 || count < 0) { return; }
+        var cur = self.head;
+        while (cur != null) {
+            let np = ast_read_rawptr(cur);
+            let nl = ast_read_i64(ptr_offset(cur, 8));
+            if (hir_builder_c_string_equals(np, nl, name)) {
+                let old_buf = ast_read_rawptr(ptr_offset(cur, 16));
+                if (old_buf != null && old_buf != locals_buf) { free(old_buf); }
+                ast_write_rawptr(ptr_offset(cur, 16), locals_buf);
+                ast_write_i32(ptr_offset(cur, 24), count);
+                return;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 32));
+        }
+        let node = hir_profile_malloc(40);
+        if (node == null) { return; }
+        memset(node, 0, 40);
+        ast_write_rawptr(node, ast_dup_c_string(name));
+        ast_write_i64(ptr_offset(node, 8), name.len);
+        ast_write_rawptr(ptr_offset(node, 16), locals_buf);
+        ast_write_i32(ptr_offset(node, 24), count);
+        ast_write_rawptr(ptr_offset(node, 32), self.head);
+        self.head = node;
+    }
+
+    fn find(self, name: string) -> rawptr {
+        if (name.len == 0) { return null; }
+        var cur = self.head;
+        while (cur != null) {
+            let np = ast_read_rawptr(cur);
+            let nl = ast_read_i64(ptr_offset(cur, 8));
+            if (hir_builder_c_string_equals(np, nl, name)) { return cur; }
+            cur = ast_read_rawptr(ptr_offset(cur, 32));
+        }
+        return null;
+    }
+
+    fn count(self, name: string) -> i32 {
+        let node = self.find(name);
+        if (node == null) { return 0; }
+        return ast_read_i32(ptr_offset(node, 24));
+    }
+
+    fn local_at(self, name: string, idx: i32) -> i32 {
+        let node = self.find(name);
+        if (node == null || idx < 0) { return hir_id_invalid(); }
+        let count = ast_read_i32(ptr_offset(node, 24));
+        if (idx >= count) { return hir_id_invalid(); }
+        let locals_buf = ast_read_rawptr(ptr_offset(node, 16));
+        if (locals_buf == null) { return hir_id_invalid(); }
+        return ast_read_i32(ptr_offset(locals_buf, idx * 4));
+    }
+}
+
+fn hir_pack_bindings_restore(bindings: HirPackBindings, saved_head: rawptr) -> HirPackBindings {
+    bindings.head = saved_head;
+    return bindings;
+}
+
+fn hir_pack_bindings_drop_to(bindings: HirPackBindings, saved_head: rawptr) -> HirPackBindings {
+    bindings.drop_to(saved_head);
+    return bindings;
+}
+
+fn hir_pack_bindings_bind(bindings: HirPackBindings, name: string, locals_buf: rawptr, count: i32) -> HirPackBindings {
+    if (name.len == 0 || count < 0) { return bindings; }
+    var cur = bindings.head;
+    while (cur != null) {
+        let np = ast_read_rawptr(cur);
+        let nl = ast_read_i64(ptr_offset(cur, 8));
+        if (hir_builder_c_string_equals(np, nl, name)) {
+            let old_buf = ast_read_rawptr(ptr_offset(cur, 16));
+            if (old_buf != null && old_buf != locals_buf) { free(old_buf); }
+            ast_write_rawptr(ptr_offset(cur, 16), locals_buf);
+            ast_write_i32(ptr_offset(cur, 24), count);
+            return bindings;
+        }
+        cur = ast_read_rawptr(ptr_offset(cur, 32));
+    }
+    let node = hir_profile_malloc(40);
+    if (node == null) { return bindings; }
+    memset(node, 0, 40);
+    ast_write_rawptr(node, ast_dup_c_string(name));
+    ast_write_i64(ptr_offset(node, 8), name.len);
+    ast_write_rawptr(ptr_offset(node, 16), locals_buf);
+    ast_write_i32(ptr_offset(node, 24), count);
+    ast_write_rawptr(ptr_offset(node, 32), bindings.head);
+    bindings.head = node;
+    return bindings;
+}
+
+fn hir_pack_bindings_find(bindings: HirPackBindings, name: string) -> rawptr {
+    if (name.len == 0) { return null; }
+    var cur = bindings.head;
+    while (cur != null) {
+        let np = ast_read_rawptr(cur);
+        let nl = ast_read_i64(ptr_offset(cur, 8));
+        if (hir_builder_c_string_equals(np, nl, name)) { return cur; }
+        cur = ast_read_rawptr(ptr_offset(cur, 32));
+    }
+    return null;
+}
+
+fn hir_pack_bindings_count(bindings: HirPackBindings, name: string) -> i32 {
+    let node = hir_pack_bindings_find(bindings, name);
+    if (node == null) { return 0; }
+    return ast_read_i32(ptr_offset(node, 24));
+}
+
+fn hir_pack_bindings_local_at(bindings: HirPackBindings, name: string, idx: i32) -> i32 {
+    let node = hir_pack_bindings_find(bindings, name);
+    if (node == null || idx < 0) { return hir_id_invalid(); }
+    let count = ast_read_i32(ptr_offset(node, 24));
+    if (idx >= count) { return hir_id_invalid(); }
+    let locals_buf = ast_read_rawptr(ptr_offset(node, 16));
+    if (locals_buf == null) { return hir_id_invalid(); }
+    return ast_read_i32(ptr_offset(locals_buf, idx * 4));
+}
+
+fn hir_pack_bindings_dispose(bindings: HirPackBindings) -> HirPackBindings {
+    return hir_pack_bindings_drop_to(bindings, null);
+}

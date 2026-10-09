@@ -1,0 +1,1054 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Declarations for the HIR builder. See README.md.
+
+fn hir_builder_decl_imported(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_string_contains(decl_get_meta(d), "|imported");
+}
+
+// Versioned `.vyi` AST graph declarations carry executable generic bodies and
+// private helper dependencies.  They remain imported for visibility/ODR, but
+// unlike a signature-only interface they are an authoritative body source for
+// AOT monomorphisation.
+fn hir_builder_decl_template_artifact(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_string_contains(decl_get_meta(d), "|template-artifact");
+}
+
+fn hir_builder_decl_from_std_module(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    let meta = decl_get_meta(d);
+    return hir_builder_string_contains(meta, "|from:std.")
+        || hir_builder_string_contains(meta, "|from:std|");
+}
+
+fn hir_builder_decl_source_module(d: rawptr) -> string {
+    if (d == null) { return ""; }
+    if (decl_has_source_module(d)) { return decl_get_source_module(d); }
+    let meta = decl_get_meta(d);
+    let artifact_needle = "artifact-module-name:";
+    let artifact_at = meta.indexOf(artifact_needle);
+    if (artifact_at >= 0) {
+        let start = artifact_at + artifact_needle.len;
+        var end = start;
+        while (end < meta.len && meta.charAt(end) != 124) { end = end + 1; }
+        if (end > start) { return meta.substring(start, end); }
+    }
+    let needle = "|from:";
+    var i: i32 = 0;
+    while (i + needle.len <= meta.len) {
+        if (meta.substring(i, i + needle.len) == needle) {
+            let start = i + needle.len;
+            var end = start;
+            while (end < meta.len && meta.charAt(end) != 124) {
+                end = end + 1;
+            }
+            if (end > start) { return meta.substring(start, end); }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// An imported version can intentionally retain the exact same language ABI
+/// as another version.  Keep both the declaration's source module and its
+/// physical owner module: migration merges can re-home a historical clone
+/// beneath the newest class while retaining the old source marker.
+/// Project-local crate members (from `--project-unit-sources`) also need a
+/// module discriminator so same-named functions in different modules do
+/// not collide inside one LLVM module.
+fn hir_builder_decl_symbol_discriminator(d: rawptr, owner_decl: rawptr) -> string {
+    // An interface-recorded `@[source(...)]` attribute is authoritative: the
+    // producing DLL embedded that discriminator in its symbols, and the
+    // consuming compile (whose decls are plain |imported|, not
+    // |project-local|) must reproduce the same segment for the link to bind.
+    let stamped = policy_meta_attribute_value(decl_get_meta(d), "source");
+    if (stamped.len > 0) { return "source=" + stamped; }
+    let source_module = hir_builder_decl_source_module(d);
+    let owner_module = hir_builder_decl_source_module(owner_decl);
+    if (policy_module_version(source_module).len == 0
+        && policy_module_version(owner_module).len == 0) {
+        if (d != null
+            && hir_builder_string_contains(decl_get_meta(d), "|project-local")
+            && source_module.len > 0) {
+            return "source=" + source_module;
+        }
+        return "";
+    }
+    return "source=" + source_module + "|owner=" + owner_module;
+}
+
+fn hir_builder_decl_has_attr(d: rawptr, attr: string) -> bool {
+    if (d == null || attr.len == 0) { return false; }
+    return hir_builder_string_contains(decl_get_meta(d), attr);
+}
+
+fn hir_builder_index_of(hay: string, needle: string) -> i32 {
+    if (needle.len == 0) { return 0; }
+    if (hay.len < needle.len) { return -1; }
+    var i: i32 = 0;
+    while (i + needle.len <= hay.len) {
+        var j: i32 = 0;
+        var same: bool = true;
+        while (j < needle.len && same) {
+            if (hay.charAt(i + j) != needle.charAt(j)) { same = false; }
+            j = j + 1;
+        }
+        if (same) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn hir_builder_decl_has_exact_attr(d: rawptr, attr: string) -> bool {
+    if (d == null || attr.len == 0) { return false; }
+    let meta = decl_get_meta(d);
+    if (!hir_builder_string_contains(meta, "|attrs:")) { return false; }
+    if (hir_builder_index_of(meta, "@[" + attr + "]") >= 0) { return true; }
+    if (hir_builder_index_of(meta, "@[" + attr + "(") >= 0) { return true; }
+    if (hir_builder_index_of(meta, "@" + attr + "(") >= 0) { return true; }
+    if (hir_builder_index_of(meta, "@" + attr + ",") >= 0) { return true; }
+    if (hir_builder_index_of(meta, "@" + attr + "|") >= 0) { return true; }
+    return meta.endsWith("@" + attr);
+}
+
+fn hir_builder_decl_attr_value(d: rawptr, attr: string) -> string {
+    if (d == null || attr.len == 0) { return ""; }
+    let meta = decl_get_meta(d);
+    if (!hir_builder_string_contains(meta, "|attrs:")) { return ""; }
+    var pat = "@[" + attr + "(";
+    var pos = hir_builder_index_of(meta, pat);
+    if (pos < 0) {
+        pat = "@" + attr + "(";
+        pos = hir_builder_index_of(meta, pat);
+    }
+    if (pos < 0) { return ""; }
+    let start = pos + pat.len;
+    var i = start;
+    var depth: i32 = 1;
+    while (i < meta.len) {
+        let ch = meta.charAt(i);
+        if (ch == 40) {
+            depth = depth + 1;
+        } elif (ch == 41) {
+            depth = depth - 1;
+            if (depth == 0) { return meta.substring(start, i); }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// The source spelling of a field replaced by a field-level migration.
+/// A migrated field is one storage slot: the historical spelling is only a
+/// lookup alias and must never materialize as a second HIR/MIR layout field.
+fn hir_builder_field_migrate_from_field(d: rawptr) -> string {
+    if (d == null || decl_get_kind(d) != de_FIELD()) { return ""; }
+    // Historical field aliases are a lowering consequence of a validated
+    // MOSP migrate.collect result.  Sema may inspect the source spelling for
+    // diagnostics, but HIR must not materialize an alias from unvalidated
+    // metadata alone.
+    if (!hir_builder_string_contains(decl_get_meta(d), "|effect:migrate|")) { return ""; }
+    let args = hir_builder_decl_attr_value(d, "migrate");
+    if (args.len == 0) { return ""; }
+    return policy_strip_quoted_string(
+        policy_named_argument_value(args, "fromField"));
+}
+
+/// True when `d` carries `@[discard(...)]` — a *tombstone*.
+///
+/// A discarded symbol is deliberately body-less: the annotation records
+/// "this name stopped existing in this version", and the declaration
+/// survives purely so version resolution can still resolve the historical
+/// spelling (`add4@1.0.0["_1"]`) for callers that pin an older version.
+/// It is metadata about a removal, never a definition, so demanding a
+/// function body from one is a category error.
+///
+/// `Sema.report_discarded_callable` already turns every actual *use* into a
+/// precise diagnostic pointing at that historical spelling; what must never
+/// happen is the codegen reachability sweep asking a tombstone for a body.
+fn hir_builder_decl_is_discarded(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    let meta = decl_get_meta(d);
+    if (meta.len == 0) { return false; }
+    return hir_builder_string_contains(meta, "@[discard(")
+        || hir_builder_string_contains(meta, "@discard(");
+}
+
+fn hir_builder_decl_is_assoc_const(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return (decl_get_generic_flags(d) & 8) != 0;
+}
+
+fn hir_builder_decl_is_assoc_type(d: rawptr) -> bool {
+    if (d == null || decl_get_kind(d) != de_FIELD()) { return false; }
+    return (decl_get_generic_flags(d) & 16) != 0;
+}
+
+fn hir_builder_decl_is_layout_field(d: rawptr) -> bool {
+    if (d == null || decl_get_kind(d) != de_FIELD()) { return false; }
+    if (hir_builder_decl_is_assoc_const(d) || hir_builder_decl_is_assoc_type(d)) { return false; }
+    return true;
+}
+
+fn hir_builder_decl_is_variadic_param(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return (decl_get_generic_flags(d) & 32) != 0;
+}
+
+fn hir_builder_count_non_variadic_params(params: rawptr) -> i32 {
+    var n: i32 = 0;
+    var cur = params;
+    while (cur != null) {
+        if (!hir_builder_decl_is_variadic_param(cur)) { n = n + 1; }
+        cur = decl_get_next(cur);
+    }
+    return n;
+}
+
+fn hir_builder_reflect_kind_for_type_name(name: string) -> string {
+    if (name.len == 0) { return "class"; }
+    let prim = policy_primitive_type_kind(name);
+    if (prim == 11) { return "bool"; }
+    if (prim == 13) { return "string"; }
+    if (name == "Range") { return "range"; }
+    if (prim == 16 || prim == 17) { return "float"; }
+    if (prim == 1 || prim == 2 || prim == 3 || prim == 4 || prim == 5
+        || prim == 6 || prim == 7 || prim == 8 || prim == 9 || prim == 10) {
+        return "int";
+    }
+    if (prim == 14 || prim == 15) { return name; }
+    return "class";
+}
+
+fn hir_builder_reflect_symbol_id(symbol_name: string) -> i64 {
+    var h: i64 = 1125899907;
+    var i: i32 = 0;
+    while (i < symbol_name.len) {
+        h = ((h * 131) + (symbol_name.charAt(i) as i64)) % 2147483647;
+        if (h < 0) { h = -h; }
+        i = i + 1;
+    }
+    if (h == 0) { return 1; }
+    return h;
+}
+
+fn hir_builder_method_decl_has_receiver(method_decl: rawptr) -> bool {
+    if (method_decl == null) { return false; }
+    let first_param = decl_get_params(method_decl);
+    return first_param != null && decl_get_name(first_param) == "self";
+}
+
+fn hir_builder_self_receiver_is_owning(param: rawptr) -> bool {
+    if (param == null || decl_get_name(param) != "self") { return false; }
+    let markers = decl_get_generic_params(param);
+    return hir_builder_string_contains(markers, "|receiver:own_mut")
+        || hir_builder_string_contains(markers, "|receiver:own");
+}
+
+fn hir_builder_self_receiver_mode_flags(param: rawptr) -> i32 {
+    if (param == null || decl_get_name(param) != "self") { return 0; }
+    let markers = decl_get_generic_params(param);
+    if (hir_builder_string_contains(markers, "|receiver:own_mut")
+        || hir_builder_string_contains(markers, "|receiver:own")) {
+        return hir_local_flag_move_arg();
+    }
+    if (hir_builder_string_contains(markers, "|receiver:shared")) {
+        return hir_local_flag_self_shared_ref();
+    }
+    if (hir_builder_string_contains(markers, "|receiver:mut")) {
+        return hir_local_flag_self_mut_ref();
+    }
+    return hir_local_flag_self_compat();
+}
+
+fn hir_builder_method_decl_has_synthetic_impl_self(method_decl: rawptr) -> bool {
+    if (method_decl == null) { return false; }
+    return hir_builder_string_contains(decl_get_meta(method_decl), "|impl_synthetic_self");
+}
+
+fn hir_builder_method_decl_matches_static_use(method_decl: rawptr, want_static: bool) -> bool {
+    if (method_decl == null) { return false; }
+    if (want_static) {
+        if (decl_get_is_static(method_decl)) { return true; }
+        if (hir_builder_method_decl_has_synthetic_impl_self(method_decl)) { return true; }
+        return !hir_builder_method_decl_has_receiver(method_decl);
+    }
+    return !decl_get_is_static(method_decl);
+}
+
+fn hir_builder_specialized_symbol_from_args(base: string, args: string) -> string {
+    var out = base + "__";
+    var idx: i32 = 0;
+    while (idx < 64) {
+        let arg = policy_generic_arg_at(args, idx);
+        if (arg.len == 0) { return out; }
+        if (idx > 0) { out = out.clone() + "_"; }
+        let mangled_arg = policy_mangle_part(arg);
+        out = out.clone() + mangled_arg;
+        idx = idx + 1;
+    }
+    return out;
+}
+
+fn hir_builder_method_symbol_segment(method_name: string) -> string {
+    var i: i32 = 0;
+    while (i < method_name.len) {
+        let c = method_name.charAt(i);
+        let is_digit = c >= 48 && c <= 57;
+        let is_upper = c >= 65 && c <= 90;
+        let is_lower = c >= 97 && c <= 122;
+        if (!(is_digit || is_upper || is_lower || c == 95)) {
+            return policy_mangle_part(method_name);
+        }
+        i = i + 1;
+    }
+    return method_name;
+}
+
+fn hir_builder_primitive_method_symbol_base(class_base: string, method_name: string) -> string {
+    var prim = class_base;
+    let last = hir_builder_last_path_segment(class_base);
+    let method_segment = hir_builder_method_symbol_segment(method_name);
+    if (policy_primitive_type_kind(prim) == 0 && policy_primitive_type_kind(last) != 0) {
+        prim = last;
+    }
+    if (policy_primitive_type_kind(prim) != 0) {
+        return "__vyx_prim_" + policy_mangle_part(prim) + "_" + method_segment;
+    }
+    return class_base + "_" + method_segment;
+}
+
+fn hir_builder_class_method_symbol_name(class_name: string, method_name: string) -> string {
+    var base = class_name;
+    var args: string = "";
+    if (policy_generic_call_has_args(class_name) != 0) {
+        base = policy_generic_call_base(class_name);
+        args = policy_generic_call_args(class_name);
+    }
+    let flat = hir_builder_primitive_method_symbol_base(base, method_name);
+    if (args.len == 0) { return flat; }
+    return hir_builder_specialized_symbol_from_args(flat, args);
+}
+
+fn hir_builder_decl_is_task_callable(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    let meta = decl_get_meta(d);
+    // MOSP Effect owns async/task authorization.  Sema has already validated
+    // the handler schema and stamped this marker for a planned callback;
+    // accepting it here makes the result observable by the real coroutine
+    // lowering instead of leaving async as a planner-only fact.
+    if (hir_builder_string_contains(meta, "|effect:async|")) { return true; }
+    // Keep old markers for imported artifacts, but do not let a raw source
+    // attribute bypass MOSP's validated async/task handler.  Sema prepares
+    // this marker before HIR construction; malformed or unregistered attrs
+    // therefore cannot silently turn a function into a coroutine.
+    let has_async_attr = hir_builder_string_contains(meta, "|attrs:async")
+        || hir_builder_string_contains(meta, "|attrs:task")
+        || hir_builder_string_contains(meta, "@[async")
+        || hir_builder_string_contains(meta, "@async")
+        || hir_builder_string_contains(meta, "@[task")
+        || hir_builder_string_contains(meta, "@task");
+    if (has_async_attr) { return false; }
+    if (hir_builder_string_contains(meta, "|marker:async")) { return true; }
+    if (hir_builder_string_contains(meta, "|marker:task")) { return true; }
+    return false;
+}
+
+fn hir_builder_decl_signature_matches(a: rawptr, b: rawptr) -> bool {
+    if (a == null || b == null) { return false; }
+    if (decl_get_kind(a) != decl_get_kind(b)) { return false; }
+    if (decl_get_name(a) != decl_get_name(b)) { return false; }
+    if (hir_builder_decl_template_params(a) != hir_builder_decl_template_params(b)) {
+        return false;
+    }
+    if (hir_builder_type_ref_name(decl_get_ty(a)) != hir_builder_type_ref_name(decl_get_ty(b))) {
+        return false;
+    }
+    var pa = decl_get_params(a);
+    var pb = decl_get_params(b);
+    while (pa != null && pb != null) {
+        if (hir_builder_type_ref_name(decl_get_ty(pa)) != hir_builder_type_ref_name(decl_get_ty(pb))) {
+            return false;
+        }
+        pa = decl_get_next(pa);
+        pb = decl_get_next(pb);
+    }
+    return pa == null && pb == null;
+}
+
+fn hir_builder_decl_specialization_shape_matches(a: rawptr, b: rawptr) -> bool {
+    if (a == null || b == null) { return false; }
+    if (decl_get_kind(a) != decl_get_kind(b)) { return false; }
+    if (decl_get_name(a) != decl_get_name(b)) { return false; }
+    if (decl_get_is_static(a) != decl_get_is_static(b)) { return false; }
+    return hir_builder_decl_param_count(a) == hir_builder_decl_param_count(b);
+}
+
+fn hir_builder_decl_param_count(d: rawptr) -> i32 {
+    var count: i32 = 0;
+    var p = decl_get_params(d);
+    while (p != null) {
+        count = count + 1;
+        p = decl_get_next(p);
+    }
+    return count;
+}
+
+fn hir_builder_item_kind_from_decl(d: rawptr) -> i32 {
+    let k = decl_get_kind(d);
+    // A source-level MOSP Effect declaration is a compile-time fact producer.
+    // Sema has already bound and validated it in EffectPlan; it has no value,
+    // type, body, or symbol and must never become a HIR/codegen item.
+    if (k == de_EFFECT()) { return hir_id_invalid(); }
+    if (k == de_FN()) { return hir_item_function(); }
+    if (k == de_EXTERN_FN()) { return hir_item_extern_function(); }
+    if (k == de_CLASS()) {
+        if (hir_builder_string_contains(decl_get_generic_params(d), "|kind:interface")) {
+            return hir_item_interface();
+        }
+        return hir_item_class();
+    }
+    if (k == de_ENUM()) { return hir_item_enum(); }
+    if (k == de_FIELD()) {
+        if (hir_builder_string_contains(decl_get_generic_params(d), "|kind:assoc_const")) {
+            return hir_item_const();
+        }
+        return hir_item_field();
+    }
+    if (k == de_METHOD()) { return hir_item_method(); }
+    if (k == de_VARIANT()) { return hir_item_variant(); }
+    if (k == de_CONST()) { return hir_item_const(); }
+    if (k == de_GLOBAL_VAR()) { return hir_item_global(); }
+    if (k == de_TYPE_ALIAS()) { return hir_item_type_alias(); }
+    if (k == de_MODULE()) { return hir_item_module(); }
+    return hir_item_module();
+}
+
+fn hir_builder_decl_is_assoc_const_member(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    if (decl_get_kind(d) != de_FIELD()) { return false; }
+    return hir_builder_string_contains(decl_get_generic_params(d), "|kind:assoc_const");
+}
+
+fn hir_builder_stmt_kind_from_ast(k: i32) -> i32 {
+    if (k == st_EXPR()) { return hir_stmt_expr(); }
+    if (k == st_LET()) { return hir_stmt_let(); }
+    if (k == st_VAR()) { return hir_stmt_var(); }
+    if (k == st_IF()) { return hir_stmt_if(); }
+    if (k == st_WHILE()) { return hir_stmt_while(); }
+    if (k == st_BREAK()) { return hir_stmt_break(); }
+    if (k == st_CONTINUE()) { return hir_stmt_continue(); }
+    if (k == st_RETURN()) { return hir_stmt_return(); }
+    if (k == st_BLOCK()) { return hir_stmt_block(); }
+    if (k == st_FOR()) { return hir_stmt_for(); }
+    if (k == st_FOREACH()) { return hir_stmt_foreach(); }
+    if (k == st_MATCH()) { return hir_stmt_match(); }
+    if (k == st_DEFER()) { return hir_stmt_defer(); }
+    if (k == st_STATIC_ASSERT()) { return hir_stmt_static_assert(); }
+    return hir_stmt_expr();
+}
+
+impl HirUnitBuilder {
+    fn register_decl_chain_with_owner(self, head: rawptr, owner_item_id: i32, owner_decl: rawptr) -> i32 {
+        var cur = head;
+        var first_member = hir_id_invalid();
+        var last_member = hir_id_invalid();
+        while (cur != null) {
+            // First-wins: an `impl` block decl shares (and reaches) the target
+            // class's spliced member chain; re-walking it must not steal
+            // ownership from the class decl registered earlier.
+            if (owner_decl != null
+                && hir_raw_owner_map_get(self.decl_owner_map,cur) == null) {
+                self.decl_owner_map = hir_raw_owner_map_put(self.decl_owner_map,cur, owner_decl);
+            }
+            let item_id = self.register_decl(cur, owner_item_id);
+            if (item_id != hir_id_invalid()) {
+                if (first_member == hir_id_invalid()) {
+                    first_member = item_id;
+                }
+                if (last_member != hir_id_invalid()) {
+                    self.unit.set_item_next_sibling(last_member, item_id);
+                }
+                last_member = item_id;
+            }
+            cur = decl_get_next(cur);
+        }
+        return first_member;
+    }
+
+    fn register_decl_chain(self, head: rawptr, owner_item_id: i32) -> i32 {
+        return self.register_decl_chain_with_owner(head, owner_item_id, null);
+    }
+
+    // A constructor keeps its identity after instantiation, but the closed
+    // instance is filed under the mangled `mir2$…` item name, so the plain
+    // name test only ever matches the un-instantiated declaration. The
+    // function-level flag is what carries "is a constructor" across
+    // instantiation; the name test stays as the pre-flag fallback.
+    fn index_raw_class_decl(self, d: rawptr, item_name: string) {
+        if (d == null) { return; }
+        let k = decl_get_kind(d);
+        if (k != de_CLASS() && k != de_ENUM()) { return; }
+        // Any new class/enum registration may change raw-text scan results;
+        // advance the version so the text-keyed scan caches re-validate.
+        self.raw_class_index_version = self.raw_class_index_version + 1;
+        self.invalidate_materialization_resolution_caches();
+        let raw_name = decl_get_name(d);
+        if (raw_name.len > 0) {
+            self.index_raw_class_name_key(raw_name, d);
+            let raw_base = hir_builder_type_base_name(raw_name);
+            if (raw_base.len > 0) {
+                self.index_raw_class_name_key(raw_base, d);
+            }
+        }
+        if (item_name.len > 0) {
+            self.index_raw_class_name_key(item_name, d);
+            let item_base = hir_builder_type_base_name(item_name);
+            if (item_base.len > 0) {
+                self.index_raw_class_name_key(item_base, d);
+            }
+        }
+        var base = hir_builder_type_base_name(item_name);
+        if (base.len == 0) { base = hir_builder_type_base_name(raw_name); }
+        if (base.len == 0) { return; }
+        let params = hir_builder_decl_template_params(d);
+        let item_args = policy_generic_call_args(item_name.clone());
+        let raw_args = policy_generic_call_args(raw_name.clone());
+        let members_have_template = self.decl_members_have_template_type(d);
+        if (params.len > 0 && (members_have_template || (item_args.len == 0 && raw_args.len == 0))) {
+            self.raw_class_template = hir_raw_name_map_put(self.raw_class_template,base, d);
+        }
+        if (!members_have_template) {
+            if (item_args.len > 0) {
+                self.raw_class_concrete = hir_raw_name_map_put(self.raw_class_concrete,item_name, d);
+                self.raw_class_concrete = hir_raw_name_map_put(self.raw_class_concrete,base + "::<" + item_args + ">", d);
+            }
+            let head_args = hir_builder_generic_head(decl_get_generic_params(d));
+            if (head_args.len > 0 && head_args != params) {
+                self.raw_class_concrete = hir_raw_name_map_put(self.raw_class_concrete,base + "::<" + head_args + ">", d);
+            }
+        }
+    }
+
+    fn index_raw_class_name_key(self, key: string, d: rawptr) {
+        if (key.len == 0 || d == null) { return; }
+        let existing = hir_raw_name_map_get(self.raw_class_exact,key);
+        if (existing == null || existing == d) {
+            self.raw_class_exact = hir_raw_name_map_put(self.raw_class_exact,key, d);
+            return;
+        }
+        if (hir_builder_decl_imported(existing) && hir_builder_decl_imported(d)) {
+            let existing_layout_exact = string_contains(decl_get_meta(existing), "|layout-exact|");
+            let new_layout_exact = string_contains(decl_get_meta(d), "|layout-exact|");
+            if (new_layout_exact && !existing_layout_exact) {
+                self.raw_class_exact = hir_raw_name_map_put(self.raw_class_exact,key, d);
+                return;
+            }
+            if (existing_layout_exact && !new_layout_exact) { return; }
+            if (existing_layout_exact && new_layout_exact) {
+                // Sema only appends another exact declaration when it carries
+                // a richer layout, so the later indexed declaration wins.
+                self.raw_class_exact = hir_raw_name_map_put(self.raw_class_exact,key, d);
+                return;
+            }
+        }
+        let existing_priority = hir_builder_raw_decl_external_priority(existing);
+        let new_priority = hir_builder_raw_decl_external_priority(d);
+        if (new_priority < existing_priority) {
+            self.raw_class_exact = hir_raw_name_map_put(self.raw_class_exact,key, d);
+        }
+    }
+
+    fn index_registered_type_atom(self, item_kind: i32, item_name: string) {
+        if (item_name.len == 0) { return; }
+        if (item_kind != hir_item_class()
+            && item_kind != hir_item_enum()
+            && item_kind != hir_item_interface()
+            && item_kind != hir_item_type_alias()) {
+            return;
+        }
+        self.registered_type_atoms = hir_string_set_add(self.registered_type_atoms,item_name);
+        let base = hir_builder_type_base_name(item_name);
+        if (base.len > 0) {
+            self.registered_type_atoms = hir_string_set_add(self.registered_type_atoms,base);
+            let last_base = hir_builder_last_path_segment(base);
+            if (last_base.len > 0) {
+                self.registered_type_atoms = hir_string_set_add(self.registered_type_atoms,last_base);
+            }
+        }
+        let last = hir_builder_last_path_segment(item_name);
+        if (last.len > 0) {
+            self.registered_type_atoms = hir_string_set_add(self.registered_type_atoms,last);
+        }
+    }
+
+    fn preindex_raw_type_decls(self, head: rawptr) {
+        var cur = head;
+        while (cur != null) {
+            let k = decl_get_kind(cur);
+            if (k == de_CLASS() || k == de_ENUM()) {
+                var item_name = decl_get_name(cur);
+                let spec_args = hir_builder_decl_concrete_spec_args(cur);
+                if (spec_args.len > 0 && policy_generic_call_has_args(item_name.clone()) == 0) {
+                    item_name = item_name + "::<" + spec_args + ">";
+                }
+                self.index_raw_class_decl(cur, item_name);
+                self.index_registered_type_atom(hir_builder_item_kind_from_decl(cur), item_name);
+                self.preindex_raw_type_decls(decl_get_members(cur));
+            } else if (k == de_EXTERN_FN()) {
+                self.preindex_raw_type_decls(decl_get_members(cur));
+            }
+            cur = decl_get_next(cur);
+        }
+    }
+
+    fn index_method_function(self, item_kind: i32, owner_item_id: i32, method_name: string, fn_id: i32) {
+        if (item_kind != hir_item_method()
+            || owner_item_id == hir_id_invalid()
+            || method_name.len == 0
+            || fn_id == hir_id_invalid()) {
+            return;
+        }
+        let owner_name = self.unit.item_name(owner_item_id);
+        if (owner_name.len == 0) { return; }
+        self.method_function_index = hir_pair_id_map_put(self.method_function_index,owner_name, method_name, fn_id);
+        let owner_base = hir_builder_type_base_name(owner_name);
+        if (owner_base.len > 0) {
+            self.method_function_index = hir_pair_id_map_put(self.method_function_index,owner_base, method_name, fn_id);
+            let owner_last = hir_builder_last_path_segment(owner_base);
+            if (owner_last.len > 0) {
+                self.method_function_index = hir_pair_id_map_put(self.method_function_index,owner_last, method_name, fn_id);
+            }
+        }
+        let last_name = hir_builder_last_path_segment(owner_name);
+        if (last_name.len > 0) {
+            self.method_function_index = hir_pair_id_map_put(self.method_function_index,last_name, method_name, fn_id);
+        }
+    }
+
+    fn index_free_function(self, item_kind: i32, function_name: string, fn_id: i32) {
+        if ((item_kind != hir_item_function() && item_kind != hir_item_extern_function())
+            || function_name.len == 0
+            || fn_id == hir_id_invalid()) {
+            return;
+        }
+        self.free_function_index = hir_name_id_map_put_first(self.free_function_index,function_name, fn_id);
+        let base = policy_generic_call_base(function_name.clone());
+        if (base.len > 0) {
+            self.free_function_index = hir_name_id_map_put_first(self.free_function_index,base, fn_id);
+            let last_base = hir_builder_last_path_segment(base);
+            if (last_base.len > 0) {
+                self.free_function_index = hir_name_id_map_put_first(self.free_function_index,last_base, fn_id);
+            }
+        }
+        let last = hir_builder_last_path_segment(function_name);
+        if (last.len > 0) {
+            self.free_function_index = hir_name_id_map_put_first(self.free_function_index,last, fn_id);
+        }
+    }
+
+    fn index_value_item(self, item_kind: i32, item_name: string, item_id: i32) {
+        if ((item_kind != hir_item_const() && item_kind != hir_item_global())
+            || item_name.len == 0
+            || item_id == hir_id_invalid()
+            || self.unit.item_owner(item_id) != hir_id_invalid()) {
+            return;
+        }
+        let module_name = self.unit.item_source_module(item_id);
+        let key = "decl|" + module_name + "|" + item_name;
+        self.value_item_index = hir_name_id_map_put_first(self.value_item_index,key, item_id);
+    }
+
+    fn index_field_item(self,
+                        item_kind: i32,
+                        owner_item_id: i32,
+                        field_name: string,
+                        field_item_id: i32,
+                        raw_field: rawptr) {
+        if (item_kind != hir_item_field()
+            || owner_item_id == hir_id_invalid()
+            || field_name.len == 0
+            || field_item_id == hir_id_invalid()) {
+            return;
+        }
+        let owner_name = self.unit.item_name(owner_item_id);
+        if (owner_name.len == 0) { return; }
+        self.field_index = hir_pair_id_map_put(self.field_index,owner_name, field_name, field_item_id);
+        let owner_base = hir_builder_type_base_name(owner_name);
+        if (owner_base.len > 0) {
+            self.field_index = hir_pair_id_map_put(self.field_index,owner_base, field_name, field_item_id);
+            let owner_last = hir_builder_last_path_segment(owner_base);
+            if (owner_last.len > 0) {
+                self.field_index = hir_pair_id_map_put(self.field_index,owner_last, field_name, field_item_id);
+            }
+        }
+        let last_name = hir_builder_last_path_segment(owner_name);
+        if (last_name.len > 0) {
+            self.field_index = hir_pair_id_map_put(self.field_index,last_name, field_name, field_item_id);
+        }
+        let migrated_name = hir_builder_field_migrate_from_field(raw_field);
+        if (migrated_name.len > 0 && migrated_name != field_name) {
+            self.field_index = hir_pair_id_map_put(self.field_index,owner_name, migrated_name, field_item_id);
+            if (owner_base.len > 0) {
+                self.field_index = hir_pair_id_map_put(self.field_index,owner_base, migrated_name, field_item_id);
+                let owner_last2 = hir_builder_last_path_segment(owner_base);
+                if (owner_last2.len > 0) {
+                    self.field_index = hir_pair_id_map_put(self.field_index,owner_last2, migrated_name, field_item_id);
+                }
+            }
+            if (last_name.len > 0) {
+                self.field_index = hir_pair_id_map_put(self.field_index,last_name, migrated_name, field_item_id);
+            }
+        }
+    }
+
+    fn append_interface_super_edges_for_decl(self, d: rawptr, item_name: string) {
+        if (d == null || item_name.len == 0) { return; }
+        if ((decl_get_generic_flags(d) & 2) == 0
+            && !hir_builder_string_contains(decl_get_generic_params(d), "|kind:interface")) {
+            return;
+        }
+        let gp = decl_get_generic_params(d);
+        var idx: i32 = 0;
+        var rows = hir_unit_interface_supers(self.unit);
+        while (idx < 64) {
+            let super_name = hir_builder_impl_trait_at(gp, idx);
+            if (super_name.len == 0) { break; }
+            rows = rows + item_name + ">" + super_name + ";";
+            idx = idx + 1;
+        }
+        self.unit.set_interface_supers(rows);
+    }
+
+    fn apply_function_codegen_attr_flags(self, d: rawptr, fn_id: i32) {
+        if (d == null || fn_id == hir_id_invalid()) { return; }
+        if (hir_builder_decl_has_exact_attr(d, "inline")) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_inline_hint());
+        }
+        if (hir_builder_decl_has_exact_attr(d, "noinline")) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_noinline());
+        }
+        if (hir_builder_decl_has_exact_attr(d, "cold")) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_cold());
+        }
+        if (hir_builder_decl_has_exact_attr(d, "hot")) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_hot());
+        }
+        var exported = false;
+        if (hir_builder_decl_has_exact_attr(d, "no_mangle")) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_no_mangle());
+            exported = true;
+        }
+        if (hir_builder_decl_has_exact_attr(d, "export")
+            || hir_builder_string_contains(decl_get_meta(d), "|marker:export")) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_no_mangle());
+            exported = true;
+        }
+        // `dci_export` is an Effect-owned ABI export request.  Sema stamps
+        // the declaration tree only after validating the handler and its
+        // arguments; consuming that compiler-owned marker here gives the
+        // request a concrete AOT boundary without treating the raw attribute
+        // spelling as authorization.  DCI exports must be externally
+        // addressable and reachable even when no Vyx call edge keeps them
+        // alive, exactly like an ordinary C ABI export.
+        if (hir_builder_string_contains(decl_get_meta(d), "|effect:dci_export|")) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_no_mangle());
+            exported = true;
+        }
+        var c_symbol = hir_builder_strip_c_symbol_name(hir_builder_decl_attr_value(d, "link_name"));
+        if (c_symbol.len == 0) {
+            c_symbol = hir_builder_strip_c_symbol_name(hir_builder_decl_attr_value(d, "export_name"));
+        }
+        if (c_symbol.len == 0
+            && hir_builder_string_contains(decl_get_meta(d), "|effect:dci_export|")) {
+            // `symbol="..."` is the DCI export sidecar's declared external
+            // name.  Carry the same validated value into the native symbol
+            // discriminator so the artifact and the emitted AOT symbol do
+            // not diverge.
+            c_symbol = hir_builder_strip_c_symbol_name(
+                hir_builder_decl_attr_value(d, "dci_export"));
+        }
+        if (c_symbol.len > 0) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_no_mangle());
+            exported = true;
+            let existing = self.unit.function_symbol_discriminator(fn_id);
+            var disc = "csym:" + c_symbol;
+            if (existing.len > 0 && !existing.startsWith("csym:")) {
+                disc = disc + "|" + existing;
+            }
+            self.unit.set_function_symbol_discriminator(fn_id, disc);
+        }
+        if (exported && decl_get_body(d) != null) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_codegen_root());
+        }
+        // MOSP's `retain` effect is a real reachability contract.  Sema has
+        // already validated the handler schema and argument policy; carrying
+        // the compiler-owned authorization marker into HIR turns the result into
+        // a code-generation root.  This is the lowering boundary that prevents
+        // drop-aware DCE from discarding an otherwise uncalled function.
+        if (hir_builder_string_contains(decl_get_meta(d), "|effect:retain|")
+            && decl_get_body(d) != null) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_codegen_root());
+        }
+        if (hir_builder_decl_has_exact_attr(d, "cuda_kernel")) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_cuda_kernel());
+        }
+        if (hir_builder_decl_has_c_varargs(d)) {
+            self.unit.add_function_flags(fn_id, hir_function_flag_c_varargs());
+        }
+    }
+
+    fn register_decl(self, d: rawptr, owner_item_id: i32) -> i32 {
+        if (d == null) { return hir_id_invalid(); }
+        if (decl_get_kind(d) == de_EFFECT()) { return hir_id_invalid(); }
+        let existing = hir_pointer_map_item(self.decl_map,d);
+        if (existing != hir_id_invalid()) { return existing; }
+        let item_kind = hir_builder_item_kind_from_decl(d);
+        var item_name = decl_get_name(d);
+        var type_id = self.type_id_from_ref(decl_get_ty(d));
+        if (decl_get_kind(d) == de_CLASS() || decl_get_kind(d) == de_ENUM()) {
+            let spec_args = hir_builder_decl_concrete_spec_args(d);
+            if (spec_args.len > 0) {
+                if (policy_generic_call_has_args(item_name.clone()) == 0) {
+                    item_name = item_name + "::<" + spec_args + ">";
+                }
+                type_id = self.type_id_from_text(item_name);
+            } else if (type_id == hir_id_invalid()) {
+                type_id = self.type_id_from_text(item_name);
+            }
+            if (hir_builder_decl_is_value_type_record(d)) {
+                self.unit.types.add_flags(type_id, hir_type_flag_value_struct());
+            }
+            if (hir_builder_decl_is_foreign_dci(d)) {
+                self.unit.types.add_flags(type_id, hir_type_flag_foreign_dci());
+            }
+            if (hir_builder_decl_has_repr_c(d) || hir_builder_decl_is_packed(d)) {
+                self.unit.types.add_flags(type_id, hir_type_flag_repr_c());
+            }
+            if (hir_builder_decl_is_packed(d)) {
+                self.unit.types.add_flags(type_id, hir_type_flag_repr_packed());
+            }
+            let repr_align = hir_builder_decl_repr_align(d);
+            if (repr_align > 0) {
+                self.unit.types.add_flags(type_id, hir_type_flag_repr_align(repr_align as i32));
+            }
+        }
+        if (decl_get_kind(d) == de_FN()
+            || decl_get_kind(d) == de_METHOD()
+            || decl_get_kind(d) == de_EXTERN_FN()) {
+            type_id = self.canonical_function_return_type_id(d);
+        }
+        let item_id = self.unit.add_item(item_kind, item_name, type_id, owner_item_id);
+        self.unit.set_item_source_module(item_id, self.decl_source_module(d));
+        self.apply_storage_item_flags(d, item_id, false);
+        if (hir_builder_decl_is_foreign_dci(d)) {
+            self.unit.add_item_flags(item_id, hir_item_flag_foreign_dci());
+        }
+        if (decl_get_kind(d) == de_CLASS()) {
+            self.append_interface_super_edges_for_decl(d, item_name);
+        }
+        var fn_id = hir_id_invalid();
+        if (decl_get_kind(d) == de_FN()
+            || decl_get_kind(d) == de_METHOD()
+            || decl_get_kind(d) == de_EXTERN_FN()) {
+            var ret_type = type_id;
+            if (ret_type == hir_id_invalid()) {
+                ret_type = self.unit.types.intern_type_ref(null);
+            }
+            fn_id = self.unit.add_function(item_id, decl_get_name(d), ret_type);
+            if (self.decl_is_foreign_import(d)) {
+                self.unit.add_function_flags(fn_id, hir_function_flag_imported_body());
+            }
+            if (hir_builder_decl_is_task_callable(d)) {
+                self.unit.add_function_flags(fn_id, hir_function_flag_async_task());
+            }
+            if (hir_builder_decl_is_foreign_dci_native(d)) {
+                self.unit.add_function_flags(fn_id,
+                                            hir_function_flag_foreign_dci()
+                                            | hir_function_flag_declaration_only());
+                if (hir_builder_decl_is_foreign_dci_ctor(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_ctor());
+                }
+                if (hir_builder_decl_is_foreign_dci_dtor(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_dtor());
+                }
+                if (hir_builder_decl_is_foreign_dci_const_method(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_const_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_virtual_method(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_virtual_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_override_method(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_override_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_final_method(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_final_method());
+                }
+            }
+            if (hir_builder_decl_is_foreign_dci(d)) {
+                if (hir_builder_decl_is_foreign_dci_virtual_method(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_virtual_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_override_method(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_override_method());
+                }
+                if (hir_builder_decl_is_foreign_dci_final_method(d)) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_final_method());
+                }
+            }
+            let raw_owner_decl = hir_raw_owner_map_get(self.decl_owner_map,d);
+            self.unit.set_function_symbol_discriminator(fn_id,
+                hir_builder_decl_symbol_discriminator(d, raw_owner_decl));
+            self.apply_function_codegen_attr_flags(d, fn_id);
+            // A *generic* stub class is not a stub class at declaration level:
+            // its base is only known once the class closes, and its overrides
+            // keep the class's open parameters here (`consume(x: T) -> T`).
+            // Marking them `codegen_root` at this point makes a function that
+            // `hir_verify` must treat as closed while carrying an open `T`.
+            // The closed override is materialized per instance instead
+            // (`record_dci_stub_class_instance`).
+            if (raw_owner_decl != null
+                && hir_builder_decl_template_params(raw_owner_decl).len == 0
+                && self.class_decl_requires_dci_stub(raw_owner_decl, 0)) {
+                if (hir_builder_decl_has_marker(d, "virtual")) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_virtual_method());
+                }
+                if (hir_builder_decl_has_marker(d, "override")) {
+                    self.unit.add_function_flags(fn_id,
+                                                hir_function_flag_foreign_dci_override_method()
+                                                | hir_function_flag_codegen_root());
+                }
+                if (hir_builder_decl_has_marker(d, "final")) {
+                    self.unit.add_function_flags(fn_id, hir_function_flag_foreign_dci_final_method());
+                }
+            }
+            if (item_kind == hir_item_method() && owner_item_id != hir_id_invalid()) {
+                self.add_function_param_locals_with_owner(fn_id, d, self.unit.item_name(owner_item_id));
+            } else {
+                self.add_function_param_locals(fn_id, d);
+            }
+        }
+        var target_kind = hir_target_item();
+        if (item_kind == hir_item_function()
+            || item_kind == hir_item_method()
+            || item_kind == hir_item_extern_function()) {
+            target_kind = hir_target_function();
+        } else if (item_kind == hir_item_field()) {
+            target_kind = hir_target_field();
+        } else if (item_kind == hir_item_variant()) {
+            target_kind = hir_target_variant();
+        }
+        self.decl_map = hir_pointer_map_put(self.decl_map,d, item_id, fn_id, target_kind);
+        self.index_registered_type_atom(item_kind, item_name);
+        self.index_raw_class_decl(d, item_name);
+        self.index_method_function(item_kind, owner_item_id, item_name, fn_id);
+        self.index_free_function(item_kind, item_name, fn_id);
+        self.index_value_item(item_kind, item_name, item_id);
+        self.index_field_item(item_kind, owner_item_id, item_name, item_id, d);
+        if (fn_id != hir_id_invalid()) {
+            self.ensure_async_runtime_methods_for_task_return(fn_id);
+        }
+        if (item_kind == hir_item_variant()) {
+            self.set_variant_payload_metadata(item_id, d, "", "");
+        }
+        if (item_kind == hir_item_const() || item_kind == hir_item_global()) {
+            self.build_value_item_init_for_env(d, item_id, "", "");
+        }
+        if (decl_get_kind(d) == de_CLASS() || decl_get_kind(d) == de_ENUM()) {
+            var first = hir_id_invalid();
+            var last = hir_id_invalid();
+            if (decl_get_kind(d) == de_CLASS()) {
+                var parent_i: i32 = 0;
+                while (parent_i < 16) {
+                    let parent_decl = self.class_nth_layout_parent(d, parent_i);
+                    if (parent_decl == null) { break; }
+                    let parent_field_count = self.count_class_fields(parent_decl);
+                    var parent_field_index: i32 = 0;
+                    while (parent_field_index < parent_field_count) {
+                        let inherited_field = self.class_layout_field_at(parent_decl, parent_field_index);
+                        if (inherited_field != null && hir_builder_decl_is_layout_field(inherited_field)) {
+                            let inherited_item = self.unit.add_item(hir_item_field(),
+                                                                   decl_get_name(inherited_field),
+                                                                   self.type_id_from_ref(decl_get_ty(inherited_field)),
+                                                                   item_id);
+                            self.index_field_item(hir_item_field(),
+                                                  item_id,
+                                                  decl_get_name(inherited_field),
+                                                  inherited_item,
+                                                  inherited_field);
+                            if (first == hir_id_invalid()) { first = inherited_item; }
+                            if (last != hir_id_invalid()) {
+                                self.unit.set_item_next_sibling(last, inherited_item);
+                            }
+                            last = inherited_item;
+                        }
+                        parent_field_index = parent_field_index + 1;
+                    }
+                    parent_i = parent_i + 1;
+                }
+            }
+            // `impl` blocks parse as de_CLASS decls whose members are spliced
+            // into the target class's member chain by sema; walking that chain
+            // with the impl decl as owner would mislabel every class member
+            // (the impl decl is not a template head), breaking generic field
+            // instance resolution. Register without claiming ownership.
+            var member_owner_decl = d;
+            if (hir_builder_string_contains(decl_get_generic_params(d), "|kind:impl")) {
+                member_owner_decl = null;
+            }
+            let own_first = self.register_decl_chain_with_owner(decl_get_members(d), item_id, member_owner_decl);
+            if (first == hir_id_invalid()) {
+                first = own_first;
+            } else if (last != hir_id_invalid() && own_first != hir_id_invalid()) {
+                self.unit.set_item_next_sibling(last, own_first);
+            }
+            self.unit.set_item_first_member(item_id, first);
+            self.assign_member_ordinals(item_id);
+            // Mark fields of template-head classes so the verifier can reject
+            // template-field bindings reached from closed generic contexts.
+            // Impl-block decls are never template heads, so the shared spliced
+            // member chain is only flagged once, by the real class decl.
+            if (hir_builder_decl_template_head(d)) {
+                var template_member = first;
+                while (template_member != hir_id_invalid()) {
+                    if (self.unit.item_kind(template_member) == hir_item_field()) {
+                        self.unit.add_item_flags(template_member,
+                                                hir_item_flag_template_member());
+                    }
+                    template_member = self.unit.item_next_sibling(template_member);
+                }
+                // Register the template params themselves as structurally
+                // open type atoms (covers multi-character params that the
+                // single-uppercase-letter text heuristic cannot see).
+                let template_params = hir_builder_decl_template_params(d);
+                var template_param_index: i32 = 0;
+                while (template_param_index < 256) {
+                    let template_param = hir_builder_generic_param_at(template_params, template_param_index);
+                    if (template_param.len == 0) { break; }
+                    let template_param_type = self.type_id_from_text(template_param);
+                    if (template_param_type != hir_id_invalid()) {
+                        self.unit.types.add_flags(template_param_type, hir_type_flag_open());
+                    }
+                    template_param_index = template_param_index + 1;
+                }
+            }
+        } else if (decl_get_kind(d) == de_EXTERN_FN() && decl_get_members(d) != null) {
+            self.register_decl_chain_with_owner(decl_get_members(d), hir_id_invalid(), null);
+        }
+        return item_id;
+    }
+}

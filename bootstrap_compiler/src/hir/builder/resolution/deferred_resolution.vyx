@@ -1,0 +1,537 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Deferred resolution for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn resolve_member_expr_from_hir(self, expr_id: i32) -> bool {
+        if (expr_id == hir_id_invalid()) { return false; }
+        if (self.unit.expr_kind(expr_id) != ex_MEMBER()) { return false; }
+        let existing_target_kind = self.unit.expr_target_kind(expr_id);
+        if (existing_target_kind != hir_target_none()
+            && existing_target_kind != hir_target_field()
+            && existing_target_kind != hir_target_builtin()
+            && existing_target_kind != hir_target_function()
+            && existing_target_kind != hir_target_variant()) {
+            return false;
+        }
+        // Initial AST semantic metadata represents a member without a raw
+        // declaration target as a builtin.  Keep resolving that provisional
+        // form: after generic instantiation its receiver can expose a real
+        // field, associated value, or method.  Other resolved target kinds
+        // are already authoritative.
+        if (existing_target_kind != hir_target_none()
+            && existing_target_kind != hir_target_builtin()
+            && self.unit.expr_target_id(expr_id) != hir_id_invalid()) {
+            return false;
+        }
+        // Preserve an already-registered builtin unless this pass can replace
+        // it with a concrete field/value/method. Re-running builtin fallback
+        // resolution reports a mutation on every fixed-point iteration, which
+        // keeps HIR closure alive indefinitely for large modules.
+        let builtin_needs_concrete_replacement = existing_target_kind == hir_target_builtin()
+                                                 && self.unit.expr_target_id(expr_id) != hir_id_invalid();
+        let lhs_expr_id = self.unit.expr_lhs(expr_id);
+        if (lhs_expr_id == hir_id_invalid()) { return false; }
+        let member_name = policy_generic_call_base(self.unit.expr_name(expr_id).clone());
+        if (member_name.len == 0) { return false; }
+        let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(lhs_expr_id));
+        if (!self.type_id_is_valid(owner_type_id)) { return false; }
+        var owner_type_name = self.member_lookup_type_name(owner_type_id);
+        if (owner_type_name.len == 0) { return false; }
+        if (policy_generic_call_args(owner_type_name.clone()).len > 0
+            && !self.type_text_has_open_template_atom(owner_type_name)) {
+            self.ensure_concrete_type_text_ready(owner_type_name);
+        }
+        let member_value_item = self.member_value_item_id_for_type_and_name(owner_type_id, member_name);
+        if (member_value_item != hir_id_invalid()) {
+            self.unit.set_expr_type(expr_id, self.unit.item_type(member_value_item));
+            let value_kind = self.unit.item_kind(member_value_item);
+            var value_sem = expr_sem_CONST();
+            if (value_kind == hir_item_global()) { value_sem = expr_sem_GLOBAL(); }
+            self.unit.set_expr_semantic(expr_id,
+                                       value_sem,
+                                       hir_target_item(),
+                                       member_value_item);
+            return true;
+        }
+        var field_item = self.field_id_for_type_and_name(owner_type_id, member_name);
+        if (field_item == hir_id_invalid()) {
+            let resolved_owner_type = self.type_id_from_text(owner_type_name);
+            if (resolved_owner_type != hir_id_invalid()) {
+                field_item = self.field_id_for_type_and_name(resolved_owner_type, member_name);
+            }
+        }
+        if (field_item == hir_id_invalid()
+            && !self.type_text_has_open_template_atom(owner_type_name)) {
+            // A concrete cross-module class reached only through a
+            // declaration-only method shell may not have had its field layout
+            // registered in this unit yet. Streaming body materialization no
+            // longer eagerly registers such owners, so register the concrete
+            // owner decl on demand and retry the field lookup before falling
+            // back to a builtin member. Without this a `let x = obj.method()`
+            // whose return type is an imported class leaves every `x.field`
+            // access stuck as an unlowerable builtin.
+            self.ensure_concrete_type_text_ready(owner_type_name);
+            field_item = self.field_id_for_type_and_name(owner_type_id, member_name);
+            if (field_item == hir_id_invalid()) {
+                let reready_owner_type = self.type_id_from_text(owner_type_name);
+                if (reready_owner_type != hir_id_invalid()) {
+                    field_item = self.field_id_for_type_and_name(reready_owner_type, member_name);
+                }
+            }
+        }
+        if (field_item != hir_id_invalid()) {
+            self.unit.set_expr_type(expr_id, self.unit.item_type(field_item));
+            self.unit.set_expr_semantic(expr_id,
+                                       expr_sem_FIELD(),
+                                       hir_target_field(),
+                                       field_item);
+            return true;
+        }
+        let dyn_iface_name = self.dyn_interface_name_from_type_text(owner_type_name);
+        if (dyn_iface_name.len > 0) {
+            let dyn_method_fn = self.method_function_target_by_owner_type_and_method(dyn_iface_name, member_name);
+            if (dyn_method_fn != hir_id_invalid()) {
+                self.unit.set_expr_type(expr_id, self.function_type_id(dyn_method_fn));
+                self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), dyn_method_fn);
+                return true;
+            }
+        }
+        if (self.resolve_tuple_builtin_member_expr(expr_id, owner_type_id, member_name)) { return true; }
+        var method_owner_type = owner_type_name;
+        var method_fn = hir_id_invalid();
+        let want_static = self.unit.expr_sem_kind(lhs_expr_id) == expr_sem_CLASS();
+        method_fn = self.ensure_method_instance_for_explicit_member_expr(method_owner_type,
+                                                                         member_name,
+                                                                         expr_id,
+                                                                         want_static);
+        if (method_fn == hir_id_invalid()) {
+            method_fn = self.closed_method_target_for_type_text(method_owner_type,
+                                                                member_name,
+                                                                null,
+                                                                hir_id_invalid(),
+                                                                null,
+                                                                want_static);
+        }
+        if (method_fn == hir_id_invalid()) {
+            let payload_owner_type = self.heap_indirect_member_owner_type_text(owner_type_name, member_name);
+            if (payload_owner_type.len > 0) {
+                var payload_method_fn = self.closed_method_target_for_type_text(payload_owner_type,
+                                                                                member_name,
+                                                                                null,
+                                                                                hir_id_invalid(),
+                                                                                null,
+                                                                                false);
+                if (payload_method_fn != hir_id_invalid()) {
+                    method_owner_type = payload_owner_type;
+                    method_fn = payload_method_fn;
+                }
+            }
+        }
+        if (method_fn != hir_id_invalid()) {
+            self.unit.set_expr_type(expr_id, self.function_type_id(method_fn));
+            self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), method_fn);
+            return true;
+        }
+        if (builtin_needs_concrete_replacement) { return false; }
+        if (self.resolve_default_new_member_expr(expr_id, owner_type_name, member_name)) { return true; }
+        if (self.resolve_string_builtin_member_expr(expr_id, owner_type_name, member_name)) { return true; }
+        if (self.resolve_primitive_builtin_member_expr(expr_id, owner_type_name, member_name)) { return true; }
+        return false;
+    }
+
+    public fn resolve_deferred_member_exprs_once(self) -> bool {
+        var changed = false;
+        let expr_limit = self.unit.expr_count;
+        // Expression records are allocated before their children. Resolve in
+        // reverse ID order so a member/call observes its freshly resolved
+        // receiver and arguments during the same convergence round.
+        var expr_id: i32 = expr_limit;
+        while (expr_id >= 1) {
+            if (self.resolve_member_expr_from_hir(expr_id)) { changed = true; }
+            expr_id = expr_id - 1;
+        }
+        expr_id = expr_limit;
+        while (expr_id >= 1) {
+            if (self.resolve_call_expr_from_hir(expr_id)) { changed = true; }
+            expr_id = expr_id - 1;
+        }
+        if (self.refresh_deferred_match_patterns_once()) { changed = true; }
+        if (self.refresh_inferred_local_types_once()) { changed = true; }
+        return changed;
+    }
+
+    // A match scrutinee can be a direct call whose concrete return type is
+    // closed only after deferred call resolution. The first body build must
+    // still create the arm scopes, so revisit those arms once the scrutinee is
+    // typed and repair both the variant target and payload-binding local type.
+    // This keeps lazy body materialization independent of the order in which
+    // a call target and its result type become available.
+    fn refresh_deferred_match_pattern_bind_types(self,
+                                                 pattern_expr_id: i32,
+                                                 subject_type_id: i32) -> bool {
+        if (pattern_expr_id == hir_id_invalid() || !self.type_id_is_valid(subject_type_id)) {
+            return false;
+        }
+        let subject_type_text = hir_type_table_text(self.unit.types, subject_type_id);
+        if (subject_type_text.len == 0 || self.type_text_has_open_template_atom(subject_type_text)) {
+            return false;
+        }
+        let pattern_kind = self.unit.expr_kind(pattern_expr_id);
+        if (pattern_kind != ex_CALL()) { return false; }
+        let variant_expr_id = self.unit.expr_lhs(pattern_expr_id);
+        if (variant_expr_id == hir_id_invalid()
+            || self.unit.expr_target_kind(variant_expr_id) != hir_target_variant()) {
+            return false;
+        }
+        let variant_name = policy_generic_call_base(self.unit.expr_name(variant_expr_id).clone());
+        if (variant_name.len == 0) { return false; }
+        let variant_decl = self.raw_member_decl_for_type_text(subject_type_text, variant_name);
+        if (variant_decl == null || decl_get_kind(variant_decl) != de_VARIANT()) { return false; }
+        var changed = false;
+        var arg_expr_id = self.unit.expr_first_arg(pattern_expr_id);
+        var arg_index: i32 = 0;
+        while (arg_expr_id != hir_id_invalid()) {
+            let param_type = self.variant_param_type_id_for_owner(subject_type_id,
+                                                                    variant_decl,
+                                                                    arg_index);
+            if (self.type_id_is_valid(param_type)) {
+                if (self.unit.expr_type(arg_expr_id) != param_type) {
+                    self.unit.set_expr_type(arg_expr_id, param_type);
+                    changed = true;
+                }
+                if (self.unit.expr_target_kind(arg_expr_id) == hir_target_local()) {
+                    let local_id = self.unit.expr_target_id(arg_expr_id);
+                    if (local_id != hir_id_invalid()
+                        && self.unit.local_type(local_id) != param_type) {
+                        self.unit.set_local_type(local_id, param_type);
+                        changed = true;
+                    }
+                }
+            }
+            arg_expr_id = self.unit.expr_next_arg(arg_expr_id);
+            arg_index = arg_index + 1;
+        }
+        return changed;
+    }
+
+    fn refresh_deferred_match_patterns_once(self) -> bool {
+        var changed = false;
+        var stmt_id: i32 = 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            if (self.unit.stmt_kind(stmt_id) == hir_stmt_match()) {
+                let subject_expr_id = self.unit.stmt_expr(stmt_id);
+                let subject_type_id = self.unit.expr_type(subject_expr_id);
+                if (self.type_id_is_valid(subject_type_id)) {
+                    var arm_stmt_id = self.unit.stmt_child(stmt_id);
+                    var guard: i32 = 0;
+                    while (arm_stmt_id != hir_id_invalid()
+                        && guard <= self.unit.stmt_count + 2) {
+                        let pattern_expr_id = self.unit.stmt_expr(arm_stmt_id);
+                        if (pattern_expr_id != hir_id_invalid()) {
+                            let before_pattern_type = self.unit.expr_type(pattern_expr_id);
+                            let before_pattern_target = self.unit.expr_target_id(pattern_expr_id);
+                            let before_callee = self.unit.expr_lhs(pattern_expr_id);
+                            var before_callee_type = hir_id_invalid();
+                            var before_callee_target = hir_id_invalid();
+                            if (before_callee != hir_id_invalid()) {
+                                before_callee_type = self.unit.expr_type(before_callee);
+                                before_callee_target = self.unit.expr_target_id(before_callee);
+                            }
+                            self.resolve_expected_variant_expr(pattern_expr_id, subject_type_id);
+                            if (before_pattern_type != self.unit.expr_type(pattern_expr_id)
+                                || before_pattern_target != self.unit.expr_target_id(pattern_expr_id)
+                                || (before_callee != hir_id_invalid()
+                                    && (before_callee_type != self.unit.expr_type(before_callee)
+                                        || before_callee_target != self.unit.expr_target_id(before_callee)))) {
+                                changed = true;
+                            }
+                            if (self.refresh_deferred_match_pattern_bind_types(pattern_expr_id,
+                                                                                subject_type_id)) {
+                                changed = true;
+                            }
+                        }
+                        arm_stmt_id = self.unit.stmt_next(arm_stmt_id);
+                        guard = guard + 1;
+                    }
+                }
+            }
+            stmt_id = stmt_id + 1;
+        }
+        return changed;
+    }
+
+    // A `let` initializer may be a member whose field target becomes known
+    // only in deferred member resolution. Preserve that type on the local and
+    // on already-created local references before MIR is built.
+    fn refresh_inferred_local_types_once(self) -> bool {
+        var changed = false;
+        var stmt_id: i32 = 1;
+        while (stmt_id <= self.unit.stmt_count) {
+            let kind = self.unit.stmt_kind(stmt_id);
+            if ((kind == hir_stmt_let() || kind == hir_stmt_var())
+                && !self.type_id_is_valid(self.unit.stmt_type(stmt_id))) {
+                let local_id = self.unit.stmt_local(stmt_id);
+                var local_type = hir_id_invalid();
+                if (local_id != hir_id_invalid()) {
+                    local_type = self.unit.local_type(local_id);
+                }
+                // An inferred local has no user-written type to preserve. Its
+                // initializer may initially have a plausible but wrong type
+                // while deferred member/call resolution is incomplete (for
+                // example an unresolved `.clone()` can look like `str`). Once
+                // the initializer closes, keep the local synchronized with it;
+                // accepting only invalid/void placeholders leaves a stale ABI
+                // type in MIR and can pass a `%__String` to a pointer call.
+                if (local_id != hir_id_invalid()) {
+                    let inferred = self.closed_expr_type_for_local(self.unit.stmt_expr(stmt_id));
+                    if (self.type_id_is_valid(inferred)
+                        && hir_type_table_kind(self.unit.types, inferred) != ty_VOID()
+                        && local_type != inferred) {
+                        self.unit.set_local_type(local_id, inferred);
+                        changed = true;
+                    }
+                }
+            }
+            stmt_id = stmt_id + 1;
+        }
+        var expr_id: i32 = 1;
+        while (expr_id <= self.unit.expr_count) {
+            if (self.unit.expr_sem_kind(expr_id) == expr_sem_LOCAL()) {
+                let expr_type = self.unit.expr_type(expr_id);
+                let local_id = self.unit.expr_target_id(expr_id);
+                if (local_id != hir_id_invalid()) {
+                    let local_type = self.unit.local_type(local_id);
+                    if (self.type_id_is_valid(local_type)
+                        && hir_type_table_kind(self.unit.types, local_type) != ty_VOID()
+                        && expr_type != local_type) {
+                        self.unit.set_expr_type(expr_id, local_type);
+                        changed = true;
+                    }
+                }
+            } else if (!self.type_id_is_valid(self.unit.expr_type(expr_id))) {
+                let target_kind = self.unit.expr_target_kind(expr_id);
+                let target_id = self.unit.expr_target_id(expr_id);
+                if ((target_kind == hir_target_field() || target_kind == hir_target_item())
+                    && target_id != hir_id_invalid()) {
+                    let item_type = self.unit.item_type(target_id);
+                    if (self.type_id_is_valid(item_type)) {
+                        self.unit.set_expr_type(expr_id, item_type);
+                        changed = true;
+                    }
+                } else if (target_kind == hir_target_function()
+                           && target_id != hir_id_invalid()) {
+                    let function_type = self.function_type_id(target_id);
+                    if (self.type_id_is_valid(function_type)) {
+                        self.unit.set_expr_type(expr_id, function_type);
+                        changed = true;
+                    }
+                }
+            }
+            expr_id = expr_id + 1;
+        }
+        // A resolved field can expose a concrete array after its index
+        // expression was originally built. Recover array element types before
+        // evaluating binary results that consume those indexed values.
+        expr_id = 1;
+        while (expr_id <= self.unit.expr_count) {
+            if (self.unit.expr_kind(expr_id) == ex_INDEX()) {
+                let lhs_type = self.unit.expr_type(self.unit.expr_lhs(expr_id));
+                var indexed_type = lhs_type;
+                if (self.type_id_is_valid(lhs_type)) {
+                    let lhs_kind = hir_type_table_kind(self.unit.types, lhs_type);
+                    if (lhs_kind == ty_REF() || lhs_kind == ty_MUTREF() || lhs_kind == ty_PTR()) {
+                        let pointee = hir_type_table_elem(self.unit.types, lhs_type);
+                        if (self.type_id_is_valid(pointee)) { indexed_type = pointee; }
+                    }
+                }
+                if (self.type_id_is_valid(indexed_type)
+                    && hir_type_table_kind(self.unit.types, indexed_type) == ty_ARRAY()) {
+                    let before_type = self.unit.expr_type(expr_id);
+                    self.resolve_index_expr_type_after_children(null, expr_id);
+                    if (before_type != self.unit.expr_type(expr_id)) { changed = true; }
+                }
+            }
+            expr_id = expr_id + 1;
+        }
+        // Member and index resolution can make the operands of an already-built
+        // binary expression concrete. Re-run the normal binary result rule
+        // before the next local-inference round so `let n = self.len - self.pos`
+        // becomes a typed local rather than an unresolved MIR place.
+        expr_id = 1;
+        while (expr_id <= self.unit.expr_count) {
+            if (self.unit.expr_kind(expr_id) == ex_BIN()) {
+                let before_type = self.unit.expr_type(expr_id);
+                self.resolve_binary_expr_type_after_children(expr_id);
+                if (before_type != self.unit.expr_type(expr_id)) { changed = true; }
+            }
+            expr_id = expr_id + 1;
+        }
+        return changed;
+    }
+
+    fn call_expr_needs_deferred_resolution(self, expr_id: i32) -> bool {
+        if (expr_id == hir_id_invalid()) { return false; }
+        if (self.unit.expr_kind(expr_id) != ex_CALL()) { return false; }
+        if (self.call_expr_member_callee_owner_mismatch(expr_id)) { return true; }
+        // A member begins as a provisional builtin when its raw declaration
+        // is not available yet.  Deferred member resolution can later close
+        // that callee to a real method, but the enclosing call may already
+        // have copied the provisional builtin semantic and result type.
+        // Re-resolve precisely this disagreement so the call follows the
+        // authoritative callee instead of reaching MIR as a builtin with a
+        // method target/value type from a different resolution generation.
+        let callee_expr_id = self.unit.expr_lhs(expr_id);
+        if (self.unit.expr_target_kind(expr_id) == hir_target_builtin()
+            && callee_expr_id != hir_id_invalid()
+            && self.unit.expr_target_kind(callee_expr_id) == hir_target_function()) {
+            return true;
+        }
+        if (!self.type_id_is_valid(self.unit.expr_type(expr_id))) { return true; }
+        let sem_kind = self.unit.expr_sem_kind(expr_id);
+        if (sem_kind == expr_sem_INDIRECT_FN()) {
+            if (callee_expr_id != hir_id_invalid()
+                && self.unit.expr_kind(callee_expr_id) == ex_MEMBER()
+                && self.unit.expr_target_kind(callee_expr_id) == hir_target_function()
+                && self.unit.expr_target_id(callee_expr_id) != hir_id_invalid()) {
+                return true;
+            }
+            return false;
+        }
+        let target_kind = self.unit.expr_target_kind(expr_id);
+        let target_id = self.unit.expr_target_id(expr_id);
+        if (target_kind == hir_target_none()) { return true; }
+        if (target_kind == hir_target_function()) {
+            if (target_id == hir_id_invalid()) { return true; }
+            if (self.function_has_open_template_types(target_id)) { return true; }
+        }
+        return false;
+    }
+
+    fn call_expr_member_callee_owner_mismatch(self, expr_id: i32) -> bool {
+        if (expr_id == hir_id_invalid() || self.unit.expr_kind(expr_id) != ex_CALL()) { return false; }
+        let callee_expr_id = self.unit.expr_lhs(expr_id);
+        if (callee_expr_id == hir_id_invalid() || self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) { return false; }
+        if (self.unit.expr_target_kind(callee_expr_id) != hir_target_function()) { return false; }
+        let target_id = self.unit.expr_target_id(callee_expr_id);
+        if (target_id == hir_id_invalid()) { return true; }
+        let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+        if (owner_expr_id == hir_id_invalid()) { return false; }
+        if (self.unit.expr_sem_kind(owner_expr_id) == expr_sem_CLASS()) { return false; }
+        let owner_type_id = self.member_lookup_type_id(self.unit.expr_type(owner_expr_id));
+        if (!self.type_id_is_valid(owner_type_id)) { return false; }
+        let owner_type_text = self.member_lookup_type_name(owner_type_id);
+        if (owner_type_text.len == 0 || self.type_text_has_open_template_atom(owner_type_text)) { return false; }
+        let target_owner_type = hir_unit_function_owner_type(self.unit, target_id);
+        if (target_owner_type.len == 0) { return false; }
+        if (target_owner_type == owner_type_text) { return false; }
+        return !policy_type_name_equal(target_owner_type, owner_type_text);
+    }
+
+    fn resolve_call_expr_from_hir(self, expr_id: i32) -> bool {
+        if (!self.call_expr_needs_deferred_resolution(expr_id)) { return false; }
+        let callee_expr_id = self.unit.expr_lhs(expr_id);
+        if (callee_expr_id == hir_id_invalid()) { return false; }
+        var callee_sem = self.unit.expr_sem_kind(callee_expr_id);
+        if (!self.call_semantic_can_follow_callee(callee_sem)
+            && self.unit.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            let method_fn = self.concrete_method_target_for_call_expr(null,
+                                                                      expr_id,
+                                                                      callee_expr_id,
+                                                                      null);
+            if (method_fn != hir_id_invalid()) {
+                self.unit.set_expr_semantic(callee_expr_id,
+                                           expr_sem_METHOD(),
+                                           hir_target_function(),
+                                           method_fn);
+                let method_type = self.function_type_id(method_fn);
+                if (method_type != hir_id_invalid()) {
+                    self.unit.set_expr_type(callee_expr_id, method_type);
+                }
+                callee_sem = expr_sem_METHOD();
+            }
+        }
+        if (!self.call_semantic_can_follow_callee(callee_sem)
+            && !self.expr_type_is_function_value(callee_expr_id)) {
+            return false;
+        }
+        let before_sem = self.unit.expr_sem_kind(expr_id);
+        let before_target_kind = self.unit.expr_target_kind(expr_id);
+        let before_target_id = self.unit.expr_target_id(expr_id);
+        let before_type = self.unit.expr_type(expr_id);
+        self.resolve_call_expr_after_children(null, expr_id, callee_expr_id);
+        return before_sem != self.unit.expr_sem_kind(expr_id)
+            || before_target_kind != self.unit.expr_target_kind(expr_id)
+            || before_target_id != self.unit.expr_target_id(expr_id)
+            || before_type != self.unit.expr_type(expr_id);
+    }
+
+    fn resolve_deferred_member_exprs(self) {
+        self.profile_build_phase("deferred-members-enter");
+        var changed = self.resolve_deferred_member_exprs_once();
+        var guard: i32 = 0;
+        while (changed && guard < 8) {
+            self.materialize_reachable_function_bodies();
+            self.materialize_concrete_type_items();
+            changed = self.resolve_deferred_member_exprs_once();
+            guard = guard + 1;
+        }
+        self.profile_build_phase("deferred-members-leave");
+    }
+
+    fn drain_codegen_hir_until_stable(self) {
+        self.profile_build_phase("drain-enter");
+        var changed = true;
+        var round: i32 = 0;
+        while (changed) {
+            round = round + 1;
+            self.profile_build_phase("drain-round-" + self.i32_text(round) + "-enter");
+            let before_items = self.unit.item_count;
+            let before_functions = self.unit.function_count;
+            let before_locals = self.unit.local_count;
+            let before_stmts = self.unit.stmt_count;
+            let before_exprs = self.unit.expr_count;
+            let before_types = self.unit.types.count;
+            self.profile_build_phase("drain-round-" + self.i32_text(round) + "-before-reachable");
+            self.materialize_reachable_function_bodies();
+            self.profile_build_phase("drain-round-" + self.i32_text(round) + "-after-reachable");
+            self.profile_build_phase("drain-round-" + self.i32_text(round) + "-before-concrete");
+            self.materialize_concrete_type_items();
+            self.profile_build_phase("drain-round-" + self.i32_text(round) + "-after-concrete");
+            self.profile_build_phase("drain-round-" + self.i32_text(round) + "-before-deferred");
+            self.resolve_deferred_member_exprs();
+            self.profile_build_phase("drain-round-" + self.i32_text(round) + "-after-deferred");
+            changed = self.unit.item_count != before_items
+                || self.unit.function_count != before_functions
+                || self.unit.local_count != before_locals
+                || self.unit.stmt_count != before_stmts
+                || self.unit.expr_count != before_exprs
+                || self.unit.types.count != before_types;
+            self.profile_build_phase("drain-round-" + self.i32_text(round) + "-leave");
+        }
+        self.profile_build_phase("drain-leave");
+    }
+
+    public fn finalize_codegen_hir(self) {
+        self.profile_build_phase("finalize-enter");
+        self.drain_codegen_hir_until_stable();
+        self.profile_build_phase("finalize-after-drain-1");
+        self.finalize_foreign_cpp_metadata();
+        self.finalize_reflection_metadata();
+        self.profile_build_phase("finalize-after-reflection");
+        self.drain_codegen_hir_until_stable();
+        self.finalize_foreign_cpp_metadata();
+        self.profile_build_phase("finalize-leave");
+    }
+}

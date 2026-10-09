@@ -1,0 +1,527 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn function_name_matches_method_direct(self, function_name: string, method_name: string) -> bool {
+        if (function_name == method_name) { return true; }
+        if (method_name.len == 0) { return false; }
+        if (mir_builder_method_marker_matches(function_name, "::" + method_name)) { return true; }
+        if (mir_builder_string_contains(function_name, "_3A_3A" + method_name + "_3A_3A")) { return true; }
+        let encoded_method = mir_builder_symbol_segment_for_name(method_name);
+        if (encoded_method != method_name) {
+            return mir_builder_string_contains(function_name, "_3A_3A" + encoded_method + "_3A_3A");
+        }
+        return false;
+    }
+
+    public fn function_name_matches_method(self, function_name: string, method_name: string) -> bool {
+        if (self.function_name_matches_method_direct(function_name, method_name)) { return true; }
+        let legacy = policy_operator_legacy_method_name(method_name);
+        if (legacy.len > 0 && self.function_name_matches_method_direct(function_name, legacy)) { return true; }
+        let symbol = policy_operator_symbol_method_name(method_name);
+        if (symbol.len > 0 && self.function_name_matches_method_direct(function_name, symbol)) { return true; }
+        return false;
+    }
+
+    public fn function_has_executable_body(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.function_has_open_template_types(function_id)) { return false; }
+        if (self.unit.function_first_block(function_id) != mir_id_invalid()) { return true; }
+        if (self.unit.function_item_kind(function_id) == hir_item_extern_function()) { return true; }
+        if ((self.unit.function_flags( function_id) & hir_function_flag_foreign_dci()) != 0) {
+            return true;
+        }
+        if (self.function_is_imported_callable_declaration(function_id)) {
+            return true;
+        }
+        let hir_fn = self.unit.function_hir_id(function_id);
+        if (hir_fn == hir_id_invalid()) { return false; }
+        return self.h.function_body(hir_fn) != hir_id_invalid();
+    }
+
+    public fn hir_function_can_materialize_executable_body(self, hir_fn: i32) -> bool {
+        if (hir_fn == hir_id_invalid()) { return false; }
+        if (hir_fn < 1 || hir_fn > self.h.function_count) { return false; }
+        if (self.hir_function_has_open_template_types(hir_fn)) { return false; }
+        if (self.h.function_body(hir_fn) != hir_id_invalid()) { return true; }
+        if (!self.has_hir_codegen_builder) { return false; }
+        if ((hir_unit_function_flags(self.h, hir_fn) & hir_function_flag_declaration_only()) != 0) {
+            return false;
+        }
+        let item_id = self.h.function_item(hir_fn);
+        if (item_id == hir_id_invalid()) { return false; }
+        let owner_item = self.h.item_owner(item_id);
+        if (owner_item != hir_id_invalid()
+            && self.h.item_kind(owner_item) == hir_item_interface()) {
+            return false;
+        }
+        return true;
+    }
+
+    /// True when the HIR builder could rebuild this function's body from its
+    /// source declaration after the body has been released.  Unlike
+    /// `hir_function_can_materialize_executable_body` this is a property of the
+    /// function's provenance, so it stays true while the body is still present
+    /// and stays false for a body that was synthesized inline (a lambda's
+    /// `closure$N` function) and therefore cannot be rebuilt at all.
+    public fn hir_function_body_is_recoverable(self, hir_fn: i32) -> bool {
+        if (!self.has_hir_codegen_builder) { return false; }
+        if (hir_fn == hir_id_invalid()) { return false; }
+        return hir_codegen_builder_handle_function_body_is_recoverable(self.hir_codegen_builder, hir_fn);
+    }
+
+    public fn function_can_reach_executable_body(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.function_has_executable_body(function_id)) { return true; }
+        return self.hir_function_can_materialize_executable_body(self.unit.function_hir_id(function_id));
+    }
+
+    public fn function_is_imported_callable_declaration(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.unit.function_first_block(function_id) != mir_id_invalid()) { return false; }
+        if ((self.unit.function_flags( function_id) & hir_function_flag_imported_body()) == 0) { return false; }
+        let name = self.unit.function_name(function_id);
+        if (name.len >= 5 && name.substring(0, 5) == "mir2$") { return false; }
+        if (self.unit.function_generic_args( function_id).len > 0) { return false; }
+        return true;
+    }
+
+    public fn record_layout_prefix_compatible(self, derived_type_id: i32, prefix_type_id: i32) -> bool {
+        if (derived_type_id == hir_id_invalid() || prefix_type_id == hir_id_invalid()) { return false; }
+        if (self.type_ids_equivalent(derived_type_id, prefix_type_id)) { return true; }
+        if (hir_type_table_kind(self.h.types, derived_type_id) != ty_CLASS()
+            || hir_type_table_kind(self.h.types, prefix_type_id) != ty_CLASS()) {
+            return false;
+        }
+        let derived_count = self.unit.field_count_for_type( derived_type_id);
+        let prefix_count = self.unit.field_count_for_type( prefix_type_id);
+        if (derived_count <= 0 || prefix_count <= 0 || prefix_count > derived_count) { return false; }
+        var idx: i32 = 0;
+        while (idx < prefix_count) {
+            let derived_field = self.unit.field_id_for_type_index( derived_type_id, idx);
+            let prefix_field = self.unit.field_id_for_type_index( prefix_type_id, idx);
+            if (derived_field == hir_id_invalid() || prefix_field == hir_id_invalid()) { return false; }
+            if (self.unit.field_name( derived_field) != self.unit.field_name( prefix_field)) {
+                return false;
+            }
+            if (!self.type_ids_equivalent(self.unit.field_type( derived_field),
+                                          self.unit.field_type( prefix_field))) {
+                return false;
+            }
+            idx = idx + 1;
+        }
+        return true;
+    }
+
+    public fn function_receiver_specificity_for_owner_type(self, hir_fn: i32, owner_type_id: i32) -> i32 {
+        if (hir_fn == hir_id_invalid() || owner_type_id == hir_id_invalid()) { return 0; }
+        let first_local = self.h.function_first_local(hir_fn);
+        if (first_local == hir_id_invalid()) { return 0; }
+        if ((self.h.local_flags(first_local) & hir_local_flag_self_receiver()) == 0) { return 0; }
+        let self_type = self.h.local_type(first_local);
+        if (self.type_ids_equivalent(owner_type_id, self_type)) { return 3; }
+        if (self.record_layout_prefix_compatible(owner_type_id, self_type)) { return 1; }
+        return 0;
+    }
+
+    public fn inherited_function_target_by_owner_type_and_method(self, owner_type: string, method_name: string) -> i32 {
+        if (owner_type.len == 0 || method_name.len == 0) { return mir_id_invalid(); }
+        let owner_type_id = self.type_id_by_text(owner_type);
+        if (owner_type_id == hir_id_invalid()) { return mir_id_invalid(); }
+        var best_match = mir_id_invalid();
+        var best_specificity: i32 = 0;
+        var hir_fn: i32 = 1;
+        while (hir_fn <= self.h.function_count) {
+            if (self.function_name_matches_method(self.h.function_name(hir_fn), method_name)
+                && !self.hir_function_has_open_template_types(hir_fn)) {
+                let specificity = self.function_receiver_specificity_for_owner_type(hir_fn, owner_type_id);
+                if (specificity > best_specificity) {
+                    let candidate = self.ensure_function_shell_for_hir_quiet(hir_fn);
+                    if (candidate != mir_id_invalid() && self.function_can_reach_executable_body(candidate)) {
+                        best_match = candidate;
+                        best_specificity = specificity;
+                    }
+                }
+            }
+            hir_fn = hir_fn + 1;
+        }
+        if (best_match != mir_id_invalid()) {
+            self.owner_method_function_index = mir_pair_id_map_put(self.owner_method_function_index,owner_type, method_name, best_match);
+            self.mark_function_reachable(best_match);
+        }
+        return best_match;
+    }
+
+    public fn function_has_open_template_types(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        let hir_fn = self.unit.function_hir_id(function_id);
+        if (hir_fn == hir_id_invalid()) { return false; }
+        return self.hir_function_has_open_template_types(hir_fn);
+    }
+
+    // Recover a static member only when its owner/name/arity identify one
+    // imported declaration unambiguously.  Normal calls retain their exact
+    // Sema-selected HIR target; this is solely the delayed-materialization
+    // fallback for legacy call nodes whose target field stayed empty.
+    public fn static_method_target_by_owner_type_and_call(self,
+                                                              owner_type: string,
+                                                              method_name: string,
+                                                              call_expr_id: i32) -> i32 {
+        if (owner_type.len == 0 || method_name.len == 0 || call_expr_id == hir_id_invalid()) {
+            return mir_id_invalid();
+        }
+        var arg_count: i32 = 0;
+        var arg_id = self.h.expr_first_arg(call_expr_id);
+        while (arg_id != hir_id_invalid()) {
+            arg_count = arg_count + 1;
+            arg_id = self.h.expr_next_arg(arg_id);
+        }
+        var selected_match = mir_id_invalid();
+        var hir_fn: i32 = 1;
+        while (hir_fn <= self.h.function_count) {
+            if (self.owner_type_text_for_hir_function(hir_fn) == owner_type
+                && self.function_name_matches_method(self.h.function_name(hir_fn), method_name)
+                && !self.hir_function_has_open_template_types(hir_fn)) {
+                let first_local = self.h.function_first_local(hir_fn);
+                let has_self = first_local != hir_id_invalid()
+                    && (self.h.local_flags(first_local) & hir_local_flag_self_receiver()) != 0;
+                if (!has_self) {
+                    var param_count: i32 = 0;
+                    var local_id = first_local;
+                    while (local_id != hir_id_invalid()) {
+                        if ((self.h.local_flags(local_id) & hir_local_flag_param()) != 0) {
+                            param_count = param_count + 1;
+                        }
+                        local_id = self.h.local_next(local_id);
+                    }
+                    if (param_count == arg_count) {
+                        let candidate = self.ensure_function_shell_for_hir_quiet(hir_fn);
+                        if (candidate != mir_id_invalid()) {
+                            if (selected_match != mir_id_invalid() && selected_match != candidate) {
+                                return mir_id_invalid();
+                            }
+                            selected_match = candidate;
+                        }
+                    }
+                }
+            }
+            hir_fn = hir_fn + 1;
+        }
+        return selected_match;
+    }
+
+    public fn method_call_candidate_score(self,
+                                          hir_fn: i32,
+                                          owner_type: string,
+                                          call_expr_id: i32,
+                                          want_static: bool) -> i32 {
+        if (hir_fn == hir_id_invalid()
+            || owner_type.len == 0
+            || call_expr_id == hir_id_invalid()
+            || self.hir_function_has_open_template_types(hir_fn)) {
+            return -1;
+        }
+        let candidate_owner = self.owner_type_text_for_hir_function(hir_fn);
+        var score: i32 = 0;
+        if (candidate_owner == owner_type) {
+            score = 64;
+        } elif (candidate_owner.len > 0 && policy_type_name_equal(candidate_owner, owner_type)) {
+            score = 48;
+        } else {
+            return -1;
+        }
+
+        let first_local = self.h.function_first_local(hir_fn);
+        let has_self = first_local != hir_id_invalid()
+            && (self.h.local_flags(first_local) & hir_local_flag_self_receiver()) != 0;
+        // Partial-module peer interfaces can lose the original receiver
+        // semantic on a chained call (for example
+        // `AppSurface.card(...).padding(...).child(...)`).  In that case
+        // `want_static` may be inferred from the owner expression shape
+        // rather than the resolved callable and can incorrectly match the
+        // opposite calling convention.  Keep both candidates in the
+        // ranking, preferring the convention indicated by Sema instead of
+        // discarding the only valid imported declaration.
+        if (want_static != has_self) {
+            score = score + 8;
+        } else {
+            score = score + 1;
+        }
+
+        var param = first_local;
+        if (has_self) {
+            let owner_type_id = self.type_id_by_text(owner_type);
+            if (owner_type_id != hir_id_invalid()) {
+                let self_type_id = self.h.local_type(first_local);
+                if (self.type_ids_equivalent(owner_type_id, self_type_id)) {
+                    score = score + 16;
+                }
+            }
+            param = self.h.local_next(param);
+        }
+
+        let first_arg = self.h.expr_first_arg(call_expr_id);
+        let has_named_args = self.hir_arg_chain_has_named_arg(first_arg);
+        var positional_arg = first_arg;
+        var matched_params: i32 = 0;
+        while (param != hir_id_invalid()) {
+            if ((self.h.local_flags(param) & hir_local_flag_param()) == 0) {
+                param = self.h.local_next(param);
+                continue;
+            }
+            var arg = hir_id_invalid();
+            if (has_named_args) {
+                arg = self.hir_named_arg_for_param(first_arg, self.h.local_name(param));
+                if (arg == hir_id_invalid()) {
+                    arg = self.next_positional_hir_arg(positional_arg);
+                    if (arg != hir_id_invalid()) {
+                        positional_arg = self.h.expr_next_arg(arg);
+                    }
+                }
+            } else {
+                arg = positional_arg;
+                if (arg != hir_id_invalid()) {
+                    positional_arg = self.h.expr_next_arg(arg);
+                }
+            }
+            if (arg == hir_id_invalid()) { return -1; }
+            let arg_type = self.h.expr_type(arg);
+            let param_type = self.h.local_type(param);
+            if (arg_type == param_type) {
+                score = score + 16;
+            } elif (arg_type != hir_id_invalid()
+                    && param_type != hir_id_invalid()
+                    && self.type_ids_equivalent(arg_type, param_type)) {
+                score = score + 12;
+            } elif (arg_type != hir_id_invalid()
+                    && param_type != hir_id_invalid()
+                    && self.type_is_dyn_trait(param_type)
+                    && self.type_text_matches_dyn_trait(self.type_text(arg_type), param_type)) {
+                score = score + 4;
+            } else {
+                // Sema has already accepted this call.  Deferred partial-module
+                // recovery only ranks duplicate imported declarations; literal
+                // coercions and other implicit conversions need not have made
+                // the HIR argument type identical to the formal type yet.
+                score = score + 1;
+            }
+            matched_params = matched_params + 1;
+            param = self.h.local_next(param);
+        }
+
+        var arg_count: i32 = 0;
+        var arg_cursor = first_arg;
+        while (arg_cursor != hir_id_invalid()) {
+            arg_count = arg_count + 1;
+            arg_cursor = self.h.expr_next_arg(arg_cursor);
+        }
+        if (arg_count != matched_params) { return -1; }
+
+        let call_type = self.h.expr_type(call_expr_id);
+        let return_type = self.h.function_return_type(hir_fn);
+        if (call_type != hir_id_invalid()
+            && return_type != hir_id_invalid()
+            && hir_type_table_kind(self.h.types, call_type) != ty_VOID()) {
+            if (call_type == return_type) {
+                score = score + 8;
+            } elif (self.type_ids_equivalent(call_type, return_type)) {
+                score = score + 4;
+            }
+        }
+        return score;
+    }
+
+    public fn imported_method_target_by_owner_type_and_call(self,
+                                                             owner_type: string,
+                                                             method_name: string,
+                                                             call_expr_id: i32,
+                                                             want_static: bool) -> i32 {
+        if (owner_type.len == 0 || method_name.len == 0 || call_expr_id == hir_id_invalid()) {
+            return mir_id_invalid();
+        }
+        var best_fn = hir_id_invalid();
+        var best_score: i32 = -1;
+        var hir_fn: i32 = 1;
+        while (hir_fn <= self.h.function_count) {
+            if (self.function_name_matches_method(self.h.function_name(hir_fn), method_name)) {
+                let score = self.method_call_candidate_score(hir_fn,
+                                                             owner_type,
+                                                             call_expr_id,
+                                                             want_static);
+                if (score > best_score) {
+                    best_fn = hir_fn;
+                    best_score = score;
+                }
+            }
+            hir_fn = hir_fn + 1;
+        }
+        if (best_fn == hir_id_invalid()) { return mir_id_invalid(); }
+        return self.ensure_function_shell_for_hir_quiet(best_fn);
+    }
+
+    // Last-resort recovery for a chained peer call whose receiver type was
+    // erased to void/rawptr (or another primitive placeholder).  The method
+    // name plus the already-checked argument signature is still sufficient in
+    // the partial-module HIR; prefer the highest scoring instance declaration.
+    public fn imported_method_target_by_name_and_call(self,
+                                                       method_name: string,
+                                                       call_expr_id: i32) -> i32 {
+        if (method_name.len == 0 || call_expr_id == hir_id_invalid()) { return mir_id_invalid(); }
+        var best_fn = hir_id_invalid();
+        var best_score: i32 = -1;
+        var hir_fn: i32 = 1;
+        while (hir_fn <= self.h.function_count) {
+            if (self.function_name_matches_method(self.h.function_name(hir_fn), method_name)
+                && !self.hir_function_has_open_template_types(hir_fn)) {
+                let first_local = self.h.function_first_local(hir_fn);
+                let has_self = first_local != hir_id_invalid()
+                    && (self.h.local_flags(first_local) & hir_local_flag_self_receiver()) != 0;
+                if (has_self) {
+                    var param = self.h.local_next(first_local);
+                    let first_arg = self.h.expr_first_arg(call_expr_id);
+                    var arg = first_arg;
+                    var score: i32 = 0;
+                    var ok = true;
+                    while (param != hir_id_invalid()) {
+                        if ((self.h.local_flags(param) & hir_local_flag_param()) != 0) {
+                            if (arg == hir_id_invalid()) { ok = false; break; }
+                            let arg_type = self.h.expr_type(arg);
+                            let param_type = self.h.local_type(param);
+                            if (arg_type == param_type) { score = score + 16; }
+                            elif (arg_type != hir_id_invalid() && param_type != hir_id_invalid()
+                                  && self.type_ids_equivalent(arg_type, param_type)) { score = score + 12; }
+                            else { score = score + 1; }
+                            arg = self.h.expr_next_arg(arg);
+                        }
+                        param = self.h.local_next(param);
+                    }
+                    if (ok && arg == hir_id_invalid()) {
+                        if (score > best_score) {
+                            best_fn = hir_fn;
+                            best_score = score;
+                        }
+                    }
+                }
+            }
+            hir_fn = hir_fn + 1;
+        }
+        if (best_fn == hir_id_invalid()) { return mir_id_invalid(); }
+        return self.ensure_function_shell_for_hir_quiet(best_fn);
+    }
+
+    public fn function_target_by_owner_type_and_method(self, owner_type: string, method_name: string) -> i32 {
+        if (owner_type.len == 0 || method_name.len == 0) { return mir_id_invalid(); }
+        let cached = mir_pair_id_map_get(self.owner_method_function_index,owner_type, method_name);
+        if (cached != mir_id_invalid() && self.function_can_reach_executable_body(cached)) {
+            self.mark_function_reachable(cached);
+            return cached;
+        }
+        let indexed = self.indexed_method_target(owner_type, method_name);
+        if (indexed != mir_id_invalid() && self.function_can_reach_executable_body(indexed)) {
+            self.owner_method_function_index = mir_pair_id_map_put(self.owner_method_function_index,owner_type, method_name, indexed);
+            self.mark_function_reachable(indexed);
+            return indexed;
+        }
+        var first_match = mir_id_invalid();
+        var fn_id: i32 = 1;
+        while (fn_id <= self.unit.function_count) {
+            if (self.unit.function_owner_type(fn_id) == owner_type
+                && self.function_name_matches_method(self.unit.function_name(fn_id), method_name)) {
+                if (first_match == mir_id_invalid()) { first_match = fn_id; }
+                if (self.function_can_reach_executable_body(fn_id)) {
+                    self.owner_method_function_index = mir_pair_id_map_put(self.owner_method_function_index,owner_type, method_name, fn_id);
+                    self.mark_function_reachable(fn_id);
+                    return fn_id;
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        var hir_fn: i32 = 1;
+        while (hir_fn <= self.h.function_count) {
+            if (self.owner_type_text_for_hir_function(hir_fn) == owner_type
+                && self.function_name_matches_method(self.h.function_name(hir_fn), method_name)
+                && !self.hir_function_has_open_template_types(hir_fn)) {
+                let candidate = self.ensure_function_shell_for_hir_quiet(hir_fn);
+                if (candidate != mir_id_invalid()) {
+                    if (first_match == mir_id_invalid()) { first_match = candidate; }
+                    if (self.function_can_reach_executable_body(candidate)) {
+                        self.owner_method_function_index = mir_pair_id_map_put(self.owner_method_function_index,owner_type, method_name, candidate);
+                        self.mark_function_reachable(candidate);
+                        return candidate;
+                    }
+                }
+            }
+            hir_fn = hir_fn + 1;
+        }
+        return self.inherited_function_target_by_owner_type_and_method(owner_type, method_name);
+    }
+
+    public fn executable_method_target_by_receiver_type(self, receiver_type_id: i32, method_name: string) -> i32 {
+        if (receiver_type_id == mir_id_invalid() || method_name.len == 0) { return mir_id_invalid(); }
+        let receiver_text = self.resolve_type_text_in_function(self.current_function_id,
+                                                               self.type_text(receiver_type_id));
+        if (receiver_text.len == 0) { return mir_id_invalid(); }
+        let owner_match = self.function_target_by_owner_type_and_method(receiver_text, method_name);
+        if (owner_match != mir_id_invalid()) { return owner_match; }
+        return mir_id_invalid();
+    }
+
+    public fn executable_method_target_by_receiver_expr(self, receiver_expr_id: i32, method_name: string) -> i32 {
+        if (receiver_expr_id == hir_id_invalid() || method_name.len == 0) { return mir_id_invalid(); }
+        if (self.h.expr_sem_kind(receiver_expr_id) == expr_sem_CLASS()) {
+            let owner_text = self.resolve_type_text_in_function(self.current_function_id,
+                                                                self.h.expr_name(receiver_expr_id));
+            if (owner_text.len > 0) {
+                let owner_match = self.function_target_by_owner_type_and_method(owner_text, method_name);
+                if (owner_match != mir_id_invalid()) { return owner_match; }
+            }
+        }
+        return self.executable_method_target_by_receiver_type(self.h.expr_type(receiver_expr_id), method_name);
+    }
+
+    public fn executable_method_target_for_call(self, call_expr_id: i32, target_fn: i32) -> i32 {
+        if (target_fn != mir_id_invalid()
+            && self.unit.function_owner_item_kind(target_fn) != hir_item_interface()) {
+            let target_hir_fn = self.unit.function_hir_id(target_fn);
+            if (target_hir_fn == hir_id_invalid()
+                || !self.hir_function_has_open_template_types(target_hir_fn)) {
+                if (self.function_can_reach_executable_body(target_fn)) {
+                    return target_fn;
+                }
+            }
+        }
+        let callee_expr = self.h.expr_lhs(call_expr_id);
+        if (callee_expr == hir_id_invalid()) { return target_fn; }
+        if (self.h.expr_kind(callee_expr) != ex_MEMBER()) { return target_fn; }
+        let receiver_expr = self.h.expr_lhs(callee_expr);
+        if (receiver_expr == hir_id_invalid()) { return target_fn; }
+        let method_name = self.h.expr_name(callee_expr);
+        let resolved = self.executable_method_target_by_receiver_expr(receiver_expr, method_name);
+        if (resolved == mir_id_invalid()) { return target_fn; }
+        if (target_fn == mir_id_invalid()) { return resolved; }
+        if (self.unit.function_owner_item_kind(target_fn) == hir_item_interface()
+            && self.unit.function_owner_item_kind(resolved) != hir_item_interface()
+            && self.function_can_reach_executable_body(resolved)) {
+            return resolved;
+        }
+        if (!self.function_can_reach_executable_body(target_fn)
+            && self.function_can_reach_executable_body(resolved)) {
+            return resolved;
+        }
+        return target_fn;
+    }
+}

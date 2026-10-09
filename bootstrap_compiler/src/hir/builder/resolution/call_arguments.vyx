@@ -1,0 +1,305 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Call arguments for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn prepare_arg_expr_for_list(self, arg_expr_id: i32) {
+        if (arg_expr_id == hir_id_invalid()) { return; }
+        self.unit.set_expr_next_arg(arg_expr_id, hir_id_invalid());
+    }
+
+    fn append_arg_expr(self, owner_expr_id: i32, first_arg: i32, last_arg: i32, next_arg: i32) -> i32 {
+        if (next_arg == hir_id_invalid()) { return last_arg; }
+        self.prepare_arg_expr_for_list(next_arg);
+        if (first_arg == hir_id_invalid()) {
+            self.unit.set_expr_first_arg(owner_expr_id, next_arg);
+        }
+        if (last_arg != hir_id_invalid()) {
+            self.unit.set_expr_next_arg(last_arg, next_arg);
+        }
+        return next_arg;
+    }
+
+    fn build_arg_cells(self, owner_expr_id: i32, head: rawptr) {
+        var first_arg = hir_id_invalid();
+        var last_arg = hir_id_invalid();
+        var cur = head;
+        while (cur != null) {
+            let raw_arg_expr = stmt_get_init(cur);
+            if (raw_arg_expr != null && expr_get_kind(raw_arg_expr) == ex_IDENT()) {
+                let expanded_name = expr_get_name(raw_arg_expr);
+                if (expanded_name.len > 3 && expanded_name.endsWith("...")) {
+                    let pack_name = expanded_name.substring(0, expanded_name.len - 3);
+                    if (hir_pack_bindings_find(self.pack_bindings, pack_name) != null) {
+                        let pack_count = hir_pack_bindings_count(self.pack_bindings, pack_name);
+                        var pack_index: i32 = 0;
+                        while (pack_index < pack_count) {
+                            let local_id = hir_pack_bindings_local_at(self.pack_bindings, pack_name, pack_index);
+                            let expanded_arg = self.build_pack_local_read_expr(raw_arg_expr, local_id);
+                            if (expanded_arg != hir_id_invalid()) {
+                                self.unit.set_expr_arg_name(expanded_arg, stmt_get_name(cur));
+                                last_arg = self.append_arg_expr(owner_expr_id,
+                                                                first_arg,
+                                                                last_arg,
+                                                                expanded_arg);
+                                if (first_arg == hir_id_invalid()) { first_arg = expanded_arg; }
+                            }
+                            pack_index = pack_index + 1;
+                        }
+                        cur = stmt_get_next(cur);
+                        continue;
+                    }
+                }
+            }
+            let arg_expr = self.build_expr(raw_arg_expr);
+            if (arg_expr != hir_id_invalid()) {
+                self.prepare_arg_expr_for_list(arg_expr);
+                self.unit.set_expr_arg_name(arg_expr, stmt_get_name(cur));
+                if (first_arg == hir_id_invalid()) {
+                    first_arg = arg_expr;
+                    self.unit.set_expr_first_arg(owner_expr_id, arg_expr);
+                }
+                if (last_arg != hir_id_invalid()) {
+                    self.unit.set_expr_next_arg(last_arg, arg_expr);
+                }
+                last_arg = arg_expr;
+            }
+            cur = stmt_get_next(cur);
+        }
+    }
+
+    fn last_arg_expr(self, owner_expr_id: i32) -> i32 {
+        var cur = self.unit.expr_first_arg(owner_expr_id);
+        var last = hir_id_invalid();
+        var guard: i32 = 0;
+        while (cur != hir_id_invalid() && guard <= self.unit.expr_count + 2) {
+            last = cur;
+            cur = self.unit.expr_next_arg(cur);
+            guard = guard + 1;
+        }
+        return last;
+    }
+
+    fn hir_call_named_arg_for_param(self, first_arg_id: i32, param_name: string) -> i32 {
+        if (param_name.len == 0) { return hir_id_invalid(); }
+        var cur = first_arg_id;
+        var guard: i32 = 0;
+        while (cur != hir_id_invalid() && guard <= self.unit.expr_count + 2) {
+            if (hir_unit_expr_arg_name(self.unit, cur) == param_name) { return cur; }
+            cur = self.unit.expr_next_arg(cur);
+            guard = guard + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    fn next_positional_call_arg(self, start_arg_id: i32) -> i32 {
+        var cur = start_arg_id;
+        var guard: i32 = 0;
+        while (cur != hir_id_invalid() && guard <= self.unit.expr_count + 2) {
+            if (hir_unit_expr_arg_name(self.unit, cur).len == 0) { return cur; }
+            cur = self.unit.expr_next_arg(cur);
+            guard = guard + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    fn append_default_call_arg(self,
+                                      owner_expr_id: i32,
+                                      param_name: string,
+                                      default_stmt: rawptr,
+                                      first_arg_id: i32,
+                                      last_arg_id: i32) -> i32 {
+        if (default_stmt == null) { return last_arg_id; }
+        let default_expr = stmt_get_init(default_stmt);
+        if (default_expr == null) { return last_arg_id; }
+        let default_arg_id = self.build_expr(default_expr);
+        if (default_arg_id == hir_id_invalid()) { return last_arg_id; }
+        self.unit.set_expr_arg_name(default_arg_id, param_name);
+        return self.append_arg_expr(owner_expr_id, first_arg_id, last_arg_id, default_arg_id);
+    }
+
+    fn materialize_default_call_args(self, owner_expr_id: i32, raw_target: rawptr) {
+        if (owner_expr_id == hir_id_invalid() || raw_target == null) { return; }
+        var first_arg = self.unit.expr_first_arg(owner_expr_id);
+        var last_arg = self.last_arg_expr(owner_expr_id);
+        var positional = first_arg;
+        var param = decl_get_params(raw_target);
+        while (param != null) {
+            let param_name = decl_get_name(param);
+            if (param_name != "self") {
+                var has_arg = false;
+                if (self.hir_call_named_arg_for_param(first_arg, param_name) != hir_id_invalid()) {
+                    has_arg = true;
+                } else {
+                    let positional_arg = self.next_positional_call_arg(positional);
+                    if (positional_arg != hir_id_invalid()) {
+                        has_arg = true;
+                        positional = self.unit.expr_next_arg(positional_arg);
+                    }
+                }
+                if (!has_arg && decl_get_body(param) != null) {
+                    last_arg = self.append_default_call_arg(owner_expr_id,
+                                                            param_name,
+                                                            decl_get_body(param),
+                                                            first_arg,
+                                                            last_arg);
+                    if (first_arg == hir_id_invalid()) {
+                        first_arg = self.unit.expr_first_arg(owner_expr_id);
+                    }
+                }
+            }
+            param = decl_get_next(param);
+        }
+    }
+
+    fn next_source_param_local(self, local_id: i32) -> i32 {
+        var cur = local_id;
+        while (cur != hir_id_invalid()) {
+            let flags = self.unit.local_flags(cur);
+            if ((flags & hir_local_flag_param()) != 0) { return cur; }
+            if ((flags & hir_local_flag_capture()) == 0) { return hir_id_invalid(); }
+            cur = self.unit.local_next(cur);
+        }
+        return hir_id_invalid();
+    }
+
+    fn materialize_dyn_call_arg_impls(self,
+                                             call_expr_id: i32,
+                                             callee_expr_id: i32,
+                                             target_fn: i32) {
+        if (call_expr_id == hir_id_invalid() || target_fn == hir_id_invalid()) { return; }
+        var param_local = self.next_source_param_local(self.unit.function_first_local(target_fn));
+        if (self.local_is_constructor_abi_self(target_fn, param_local)) {
+            param_local = self.next_source_param_local(self.unit.local_next(param_local));
+        } else if (callee_expr_id != hir_id_invalid()
+            && self.unit.expr_kind(callee_expr_id) == ex_MEMBER()
+            && param_local != hir_id_invalid()
+            && (self.unit.local_flags(param_local) & hir_local_flag_self_receiver()) != 0) {
+            let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+            if (owner_expr_id != hir_id_invalid()
+                && self.unit.expr_sem_kind(owner_expr_id) != expr_sem_CLASS()) {
+                param_local = self.next_source_param_local(self.unit.local_next(param_local));
+            }
+        }
+        var arg_expr = self.unit.expr_first_arg(call_expr_id);
+        while (arg_expr != hir_id_invalid() && param_local != hir_id_invalid()) {
+            self.materialize_dyn_expected_arg_impl(arg_expr, self.unit.local_type(param_local));
+            arg_expr = self.unit.expr_next_arg(arg_expr);
+            param_local = self.next_source_param_local(self.unit.local_next(param_local));
+        }
+    }
+
+    fn apply_function_call_arg_expected_types(self,
+                                                    call_expr_id: i32,
+                                                    callee_expr_id: i32,
+                                                    target_fn: i32) {
+        if (call_expr_id == hir_id_invalid()
+            || target_fn == hir_id_invalid()
+            || self.unit.expr_kind(call_expr_id) != ex_CALL()) {
+            return;
+        }
+        var param_local = self.next_source_param_local(self.unit.function_first_local(target_fn));
+        if (self.local_is_constructor_abi_self(target_fn, param_local)) {
+            param_local = self.next_source_param_local(self.unit.local_next(param_local));
+        } else if (callee_expr_id != hir_id_invalid()
+            && self.unit.expr_kind(callee_expr_id) == ex_MEMBER()
+            && param_local != hir_id_invalid()
+            && (self.unit.local_flags(param_local) & hir_local_flag_self_receiver()) != 0) {
+            let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
+            if (owner_expr_id != hir_id_invalid()
+                && self.unit.expr_sem_kind(owner_expr_id) != expr_sem_CLASS()) {
+                param_local = self.next_source_param_local(self.unit.local_next(param_local));
+            }
+        }
+        var arg_expr = self.unit.expr_first_arg(call_expr_id);
+        while (arg_expr != hir_id_invalid() && param_local != hir_id_invalid()) {
+            self.apply_expected_expr_type(arg_expr, self.unit.local_type(param_local));
+            arg_expr = self.unit.expr_next_arg(arg_expr);
+            param_local = self.next_source_param_local(self.unit.local_next(param_local));
+        }
+    }
+
+    fn function_type_param_type_id(self, fn_type_id: i32, idx: i32) -> i32 {
+        if (!self.type_id_is_valid(fn_type_id) || idx < 0) { return hir_id_invalid(); }
+        let kind = hir_type_table_kind(self.unit.types, fn_type_id);
+        if (kind != ty_FN() && kind != ty_CFN()) { return hir_id_invalid(); }
+        let text = hir_type_table_text(self.unit.types, fn_type_id);
+        var open_idx: i32 = -1;
+        if (text.len >= 3 && text.substring(0, 3) == "fn(") {
+            open_idx = 2;
+        } elif (text.len >= 4 && text.substring(0, 4) == "cfn(") {
+            open_idx = 3;
+        } elif (text.len >= 10 && text.substring(0, 10) == "unsafe fn(") {
+            open_idx = 9;
+        }
+        if (open_idx < 0) { return hir_id_invalid(); }
+        let close_idx = self.fn_type_text_close_paren(text, open_idx);
+        if (close_idx < 0) { return hir_id_invalid(); }
+        let params_text = text.substring(open_idx + 1, close_idx);
+        let param_text = policy_generic_arg_at(params_text, idx);
+        if (param_text.len == 0) { return hir_id_invalid(); }
+        let resolved = self.resolve_type_text_in_current_env(param_text);
+        if (resolved.len == 0) { return hir_id_invalid(); }
+        return self.type_id_from_text(resolved);
+    }
+
+    fn apply_function_value_call_arg_expected_types(self, call_expr_id: i32, fn_type_id: i32) {
+        if (call_expr_id == hir_id_invalid()
+            || self.unit.expr_kind(call_expr_id) != ex_CALL()
+            || !self.type_id_is_valid(fn_type_id)) {
+            return;
+        }
+        var arg = self.unit.expr_first_arg(call_expr_id);
+        var idx: i32 = 0;
+        while (arg != hir_id_invalid()) {
+            let param_type = self.function_type_param_type_id(fn_type_id, idx);
+            if (self.type_id_is_valid(param_type)) {
+                self.apply_expected_expr_type(arg, param_type);
+            }
+            arg = self.unit.expr_next_arg(arg);
+            idx = idx + 1;
+        }
+    }
+
+    fn build_struct_arg_cells(self, owner_expr_id: i32, owner_type_id: i32, head: rawptr) {
+        if (self.type_id_is_valid(owner_type_id)) {
+            self.ensure_concrete_type_text_ready(hir_type_table_text(self.unit.types, owner_type_id));
+        }
+        var first_arg = hir_id_invalid();
+        var last_arg = hir_id_invalid();
+        var cur = head;
+        while (cur != null) {
+            self.profile_struct_field_phase("field-enter", owner_type_id, stmt_get_name(cur), hir_id_invalid());
+            let arg_expr = self.build_expr(stmt_get_init(cur));
+            if (arg_expr != hir_id_invalid()) {
+                self.prepare_arg_expr_for_list(arg_expr);
+                let field_id = self.field_id_for_type_and_name(owner_type_id, stmt_get_name(cur));
+                if (field_id != hir_id_invalid()) {
+                    self.unit.set_expr_aggregate_field(arg_expr, field_id);
+                    self.apply_expected_expr_type(arg_expr, self.unit.item_type(field_id));
+                }
+                self.profile_struct_field_phase("field-leave", owner_type_id, stmt_get_name(cur), arg_expr);
+                if (first_arg == hir_id_invalid()) {
+                    first_arg = arg_expr;
+                    self.unit.set_expr_first_arg(owner_expr_id, arg_expr);
+                }
+                if (last_arg != hir_id_invalid()) {
+                    self.unit.set_expr_next_arg(last_arg, arg_expr);
+                }
+                last_arg = arg_expr;
+            }
+            cur = stmt_get_next(cur);
+        }
+    }
+}

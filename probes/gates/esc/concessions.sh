@@ -5,8 +5,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-SEMA="$ROOT/bootstrap_compiler/src/core/sema.vyx"
-POL="$ROOT/bootstrap_compiler/src/core/policy.vyx"
+SEMA="$ROOT/bootstrap_compiler/src/core/sema/sema.vyx"
+POL="$ROOT/bootstrap_compiler/src/core/sema/policy.vyx"
 fail=0
 
 need() {

@@ -8,7 +8,7 @@ Run from the repository root on Windows:
 
 This is a **unit extraction gate**. The runner extracts current production
 functions and their `build_*` dependencies verbatim from
-`bootstrap_compiler/src/core/build_system.vyx`, `build_action.vyx`, and
+`bootstrap_compiler/src/core/project/build_system.vyx`, `build_action.vyx`, and
 `build_resources.vyx`, appends Vyx assertions, compiles
 them with the SDK compiler built from current source, and executes the result.
 It does not emulate the implementation in PowerShell or Python. The script only creates fixtures,

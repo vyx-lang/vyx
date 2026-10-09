@@ -476,7 +476,7 @@ if ($comptimeRun.Exit -ne 0) { throw "comptime Effect AOT run failed: exit $($co
 # rows) in addition to the compiler boundary above.
 $manifestDir = Join-Path $outRoot 'manifest-api'
 New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
-Copy-Item -LiteralPath (Join-Path $repo 'bootstrap_compiler/src/core/effect_manifest.vyx') `
+Copy-Item -LiteralPath (Join-Path $repo 'bootstrap_compiler/src/core/facts/effect_manifest.vyx') `
     -Destination (Join-Path $manifestDir 'effect_manifest.vyx')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/manifest_api.vyx') `
     -Destination (Join-Path $manifestDir 'main.vyx')
@@ -517,7 +517,7 @@ foreach ($token in $requiredTokens) {
 # with a source-qualified EFFECT-CYCLE diagnostic before sealing.
 $cycleDir = Join-Path $outRoot 'effect-cycle'
 New-Item -ItemType Directory -Force -Path $cycleDir | Out-Null
-Copy-Item -LiteralPath (Join-Path $repo 'bootstrap_compiler/src/core/effect_manifest.vyx') `
+Copy-Item -LiteralPath (Join-Path $repo 'bootstrap_compiler/src/core/facts/effect_manifest.vyx') `
     -Destination (Join-Path $cycleDir 'effect_manifest.vyx')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/effect_cycle.vyx') `
     -Destination (Join-Path $cycleDir 'main.vyx')
@@ -641,7 +641,7 @@ Clear-EffectManifestEnv
 # This covers boundaries that an end-to-end positive project cannot prove.
 $attrApiDir = Join-Path $outRoot 'attribute-source-api'
 New-Item -ItemType Directory -Force -Path $attrApiDir | Out-Null
-Copy-Item -LiteralPath (Join-Path $repo 'bootstrap_compiler/src/core/effect_attributes.vyx') `
+Copy-Item -LiteralPath (Join-Path $repo 'bootstrap_compiler/src/core/facts/effect_attributes.vyx') `
     -Destination (Join-Path $attrApiDir 'effect_attributes.vyx')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/attribute_source_api.vyx') `
     -Destination (Join-Path $attrApiDir 'main.vyx')

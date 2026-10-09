@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-SRC="$ROOT/bootstrap_compiler/src/core/build_system.vyx"
+SRC="$ROOT/bootstrap_compiler/src/core/project/build_system.vyx"
 fail=0
 
 if ! grep -q 'let crate_compile_vyx = mir_codegen_enabled && !mir_partition_enabled' "$SRC"; then
@@ -26,7 +26,7 @@ if ! grep -q 'compile_uses_project_unit_sources = true' "$SRC"; then
   echo "FAIL: crate compile does not force --project-unit-sources"
   fail=1
 fi
-HIR="$ROOT/bootstrap_compiler/src/hir/hir_builder.vyx"
+HIR="$ROOT/bootstrap_compiler/src/hir/builder/declarations/declaration_scopes.vyx"
 if ! grep -q 'fn decl_is_foreign_import' "$HIR"; then
   echo "FAIL: missing crate-member vs foreign-import split"
   fail=1

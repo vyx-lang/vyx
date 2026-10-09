@@ -4,9 +4,9 @@
 [语言表面](语言表面_ZH.md) · [编译器架构](COMPILER_ZH.md)
 
 **依据：** 当前 `bootstrap_compiler/` 自举编译器源码。
-本文按 `src/core/lexer.vyx`、`src/core/policy.vyx`、`src/core/parser.vyx`、
-`src/core/sema.vyx`、`src/core/diag.vyx`、`src/core/main.vyx`、
-`src/hir/hir_builder.vyx` 整理。早期 C++ Host 的版本清单与示例不代表当前编译器行为。
+本文按 `src/core/syntax/lexer.vyx`、`src/core/sema/policy.vyx`、`src/core/syntax/parser.vyx`、
+`src/core/sema/sema.vyx`、`src/core/syntax/diag.vyx`、`src/core/driver/main.vyx`、
+`src/hir/builder/hir_builder.vyx` 整理。早期 C++ Host 的版本清单与示例不代表当前编译器行为。
 
 教程提供可运行示例；[编译器架构](COMPILER_ZH.md)说明 HIR、MIR 与 LLVM 的处理位置。
 若文档与从当前源码新构建的 SDK 编译器行为冲突，应按编译器与测试修正文档。

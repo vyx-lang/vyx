@@ -1,0 +1,298 @@
+module bootstrap.mir_verify;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_verify.MirVerifier {
+    public fn strict_collect_scope_local_slots(self,
+                                               m: MirUnit,
+                                               scope: MirFunctionVerifyScope,
+                                               slots: MirScopedLocalSlots) -> i32 {
+        var local_id = m.function_first_local(scope.function_id);
+        var slot: i32 = 0;
+        while (local_id != mir_id_invalid()) {
+            self.focus_local(m, local_id);
+            if (local_id < 1 || local_id > m.local_count || m.local_record(local_id) == null) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "function #" + self.id_text(scope.function_id)
+                                   + " local chain references invalid local #" + self.id_text(local_id));
+                return slot;
+            }
+            if (m.local_function(local_id) != scope.function_id) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "local #" + self.id_text(local_id)
+                                   + " is linked from function #" + self.id_text(scope.function_id)
+                                   + " but owned by function #" + self.id_text(m.local_function(local_id)));
+                return slot;
+            }
+            if (!slots.put(local_id, slot)) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "cannot allocate strict local slot for local #" + self.id_text(local_id));
+                return slot;
+            }
+            slot = slot + 1;
+            if (slot > m.local_count + 1) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "local chain for function #" + self.id_text(scope.function_id)
+                                   + " contains a cycle");
+                return slot;
+            }
+            local_id = m.local_next(local_id);
+        }
+        return slot;
+    }
+
+    public fn strict_drop_escape_scope(self,
+                                       m: MirUnit,
+                                       scope: MirFunctionVerifyScope,
+                                       block_id: i32,
+                                       local_id: i32,
+                                       stamp: i32,
+                                       memo_value: rawptr,
+                                       memo_stamp: rawptr) -> bool {
+        let block_slot = scope.block_slot(m, block_id);
+        if (block_slot == mir_id_invalid()
+            || m.block_function(block_id) != scope.function_id) {
+            return false;
+        }
+        if (mv_i32_get(memo_stamp, block_slot) == stamp) {
+            return mv_i32_get(memo_value, block_slot) == 2;
+        }
+        mv_i32_set(memo_stamp, block_slot, stamp);
+        mv_i32_set(memo_value, block_slot, 1);
+        if (self.strict_block_closes_local(m, block_id, local_id)) { return false; }
+        let term = m.block_term_kind(block_id);
+        if (term == mir_term_return()) {
+            mv_i32_set(memo_value, block_slot, 2);
+            return true;
+        }
+        if (term == mir_term_unreachable()) { return false; }
+        let successor_count = self.strict_block_succ_total(m, block_id);
+        var ordinal: i32 = 0;
+        while (ordinal < successor_count) {
+            let successor = self.strict_block_succ_at(m, block_id, ordinal);
+            if (self.strict_drop_escape_scope(m,
+                                              scope,
+                                              successor,
+                                              local_id,
+                                              stamp,
+                                              memo_value,
+                                              memo_stamp)) {
+                mv_i32_set(memo_value, block_slot, 2);
+                return true;
+            }
+            ordinal = ordinal + 1;
+        }
+        return false;
+    }
+
+    public fn strict_scope_local_slot(self,
+                                      m: MirUnit,
+                                      scope: MirFunctionVerifyScope,
+                                      slots: MirScopedLocalSlots,
+                                      instr_id: i32,
+                                      where_text: string) -> i32 {
+        let local_id = self.strict_drop_local_of_instr(m, instr_id);
+        if (local_id == mir_id_invalid()) {
+            self.record_strict(mv_strict_cat_drop(), where_text + " has no local place operand");
+            return -1;
+        }
+        let slot = slots.get(local_id);
+        if (slot < 0) {
+            self.record_strict(mv_strict_cat_owner(),
+                               where_text + " local #" + self.id_text(local_id)
+                               + " is not in function #" + self.id_text(scope.function_id)
+                               + " local chain");
+        }
+        return slot;
+    }
+
+    public fn strict_check_drops_scope(self,
+                                       m: MirUnit,
+                                       scope: MirFunctionVerifyScope) {
+        let slots = MirScopedLocalSlots.create(m.function_local_count(scope.function_id));
+        let local_count = self.strict_collect_scope_local_slots(m, scope, slots);
+        let dropped_stamp = mv_i32_arr_alloc(local_count);
+        let checked = mv_i32_arr_alloc(local_count);
+        let block_span = m.block_count - scope.block_mark;
+        let memo_value = mv_i32_arr_alloc(block_span);
+        let memo_stamp = mv_i32_arr_alloc(block_span);
+
+        // Structural closure of every active drop in this body range.
+        var instr_id = scope.instr_mark + 1;
+        while (instr_id <= m.instr_count) {
+            self.focus_instr(m, instr_id);
+            if (!mir_unit_instr_owner_is_removed(&m,  instr_id)
+                && m.instr_function(instr_id) == scope.function_id
+                && m.instr_kind(instr_id) == mir_instr_drop()) {
+                let where_text = "drop instr #" + self.id_text(instr_id)
+                    + " in function #" + self.id_text(scope.function_id);
+                let local_id = self.strict_drop_local_of_instr(m, instr_id);
+                self.strict_scope_local_slot(m, scope, slots, instr_id, where_text);
+                if (local_id != mir_id_invalid()) {
+                    if (m.instr_target_kind(instr_id) == mir_target_none()
+                        && m.instr_target_id(instr_id) == mir_id_invalid()) {
+                        // DCI stub-owned C++ objects lower through the type's
+                        // destroy stub rather than a MIR function target.
+                    } else if (m.instr_target_kind(instr_id) != mir_target_function()) {
+                        self.record_strict(mv_strict_cat_drop(),
+                                           where_text + " target is not a function (kind "
+                                           + self.id_text(m.instr_target_kind(instr_id)) + ")");
+                    } else {
+                        let target = m.instr_target_id(instr_id);
+                        if (target >= 1 && target <= m.function_count) {
+                            let first_param = self.strict_first_param(m, target);
+                            let param_count = self.strict_param_count_from(m, first_param);
+                            if (param_count != 1) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   where_text + " target " + m.function_name(target)
+                                                   + " is not unary fn(T): param count "
+                                                   + self.id_text(param_count));
+                            } else {
+                                self.strict_report_type_relation(m,
+                                                                 mv_strict_cat_drop(),
+                                                                 m.local_type(first_param),
+                                                                 m.local_type(local_id),
+                                                                 where_text + " dropped local "
+                                                                 + m.local_name(local_id));
+                            }
+                        }
+                    }
+                }
+            }
+            instr_id = instr_id + 1;
+        }
+
+        // Per-block double-drop without a direct re-assignment. The stamp
+        // arrays are indexed by dense scope-local slots, never global IDs.
+        var block_stamp: i32 = 0;
+        var block_id = m.function_first_block(scope.function_id);
+        var block_guard: i32 = 0;
+        while (block_id != mir_id_invalid() && block_guard <= block_span + 1) {
+            self.focus_block(m, block_id);
+            if (!scope.block_in_range(m, block_id)) {
+                self.record_strict(mv_strict_cat_owner(),
+                                   "function #" + self.id_text(scope.function_id)
+                                   + " block chain escapes strict body scope at #" + self.id_text(block_id));
+                break;
+            }
+            if (!m.block_is_removed( block_id)) {
+                block_stamp = block_stamp + 1;
+                var current_instr = m.block_first_instr(block_id);
+                while (current_instr != mir_id_invalid()) {
+                    let kind = m.instr_kind(current_instr);
+                    if (kind == mir_instr_drop()) {
+                        let slot = self.strict_scope_local_slot(m,
+                                                                 scope,
+                                                                 slots,
+                                                                 current_instr,
+                                                                 "drop instr #" + self.id_text(current_instr));
+                        if (slot >= 0) {
+                            if (mv_i32_get(dropped_stamp, slot) == block_stamp) {
+                                let local_id = self.strict_drop_local_of_instr(m, current_instr);
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "block #" + self.id_text(block_id)
+                                                   + " drops local " + m.local_name(local_id)
+                                                   + " (#" + self.id_text(local_id)
+                                                   + ") twice without re-assignment");
+                            }
+                            mv_i32_set(dropped_stamp, slot, block_stamp);
+                        }
+                    } else if (kind == mir_instr_assign() || kind == mir_instr_foreach_bind()) {
+                        let place_id = m.instr_place(current_instr);
+                        if (place_id >= 1 && place_id <= m.place_count
+                            && m.place_kind(place_id) == mir_place_local()) {
+                            let slot2 = slots.get(m.place_local(place_id));
+                            if (slot2 >= 0 && mv_i32_get(dropped_stamp, slot2) == block_stamp) {
+                                mv_i32_set(dropped_stamp, slot2, 0);
+                            }
+                        }
+                    }
+                    current_instr = m.instr_next(current_instr);
+                }
+            }
+            block_id = m.block_next(block_id);
+            block_guard = block_guard + 1;
+        }
+
+        // Every local that has an explicit drop must close on every return
+        // path from its storage-live point (or the entry if none exists).
+        var stamp: i32 = 0;
+        instr_id = scope.instr_mark + 1;
+        while (instr_id <= m.instr_count) {
+            self.focus_instr(m, instr_id);
+            if (!mir_unit_instr_owner_is_removed(&m,  instr_id)
+                && m.instr_function(instr_id) == scope.function_id
+                && m.instr_kind(instr_id) == mir_instr_drop()) {
+                let local_id = self.strict_drop_local_of_instr(m, instr_id);
+                let slot = self.strict_scope_local_slot(m,
+                                                         scope,
+                                                         slots,
+                                                         instr_id,
+                                                         "drop instr #" + self.id_text(instr_id));
+                if (slot >= 0 && mv_i32_get(checked, slot) == 0) {
+                    mv_i32_set(checked, slot, 1);
+                    var saw_live = false;
+                    block_id = m.function_first_block(scope.function_id);
+                    block_guard = 0;
+                    while (block_id != mir_id_invalid() && block_guard <= block_span + 1) {
+                        if (!scope.block_in_range(m, block_id)) { break; }
+                        if (!m.block_is_removed( block_id)
+                            && self.strict_block_contains_storage_live_of(m, block_id, local_id)) {
+                            saw_live = true;
+                            stamp = stamp + 1;
+                            if (self.strict_drop_escape_scope(m,
+                                                              scope,
+                                                              block_id,
+                                                              local_id,
+                                                              stamp,
+                                                              memo_value,
+                                                              memo_stamp)) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "function #" + self.id_text(scope.function_id)
+                                                   + " (" + m.function_name(scope.function_id)
+                                                   + ") has a return path from local storage_live that never drops local "
+                                                   + m.local_name(local_id) + " (#"
+                                                   + self.id_text(local_id) + ")");
+                            }
+                        }
+                        block_id = m.block_next(block_id);
+                        block_guard = block_guard + 1;
+                    }
+                    if (!saw_live) {
+                        let entry = m.function_first_block(scope.function_id);
+                        if (entry != mir_id_invalid()) {
+                            stamp = stamp + 1;
+                            if (self.strict_drop_escape_scope(m,
+                                                              scope,
+                                                              entry,
+                                                              local_id,
+                                                              stamp,
+                                                              memo_value,
+                                                              memo_stamp)) {
+                                self.record_strict(mv_strict_cat_drop(),
+                                                   "function #" + self.id_text(scope.function_id)
+                                                   + " (" + m.function_name(scope.function_id)
+                                                   + ") has a return path that never drops local "
+                                                   + m.local_name(local_id) + " (#"
+                                                   + self.id_text(local_id) + ")");
+                            }
+                        }
+                    }
+                }
+            }
+            instr_id = instr_id + 1;
+        }
+
+        if (dropped_stamp != null) { free(dropped_stamp); }
+        if (checked != null) { free(checked); }
+        if (memo_value != null) { free(memo_value); }
+        if (memo_stamp != null) { free(memo_stamp); }
+        slots.dispose();
+    }
+}

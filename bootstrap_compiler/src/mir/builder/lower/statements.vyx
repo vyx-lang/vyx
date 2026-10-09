@@ -1,0 +1,188 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn lower_stmt(self, stmt_id: i32) {
+        if (stmt_id == hir_id_invalid() || self.current_block_terminated()) { return; }
+        let k = self.h.stmt_kind(stmt_id);
+        if (k == hir_stmt_expr()) {
+            let expr_id = self.h.stmt_expr(stmt_id);
+            if (expr_id != hir_id_invalid() && self.h.expr_kind(expr_id) == ex_FAIL()) {
+                let return_type = self.h.function_return_type(self.current_hir_function_id);
+                let ret_value = self.lower_expr_as(expr_id, return_type);
+                self.deactivate_moved_source_expr_except(expr_id, hir_id_invalid());
+                let materialized_ret = self.materialize_return_value(ret_value, return_type, stmt_id, expr_id);
+                self.emit_function_exit(stmt_id);
+                self.terminate_current(mir_term_return(), materialized_ret, mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), stmt_id);
+                return;
+            }
+            let expr_id2 = self.h.stmt_expr(stmt_id);
+            let v = self.lower_expr(expr_id2);
+            // A direct assignment emits its store during lower_expr and must
+            // not be evaluated again. A void assignment overload, however,
+            // has no result store to force evaluation: its call is the only
+            // effect (for example Instance.rebindRaw). Keep that call as an
+            // Eval instruction exactly once.
+            if (self.h.expr_kind(expr_id2) != ex_ASSIGN()) {
+                self.emit_eval_value(v, stmt_id, expr_id2);
+            } else if (self.h.expr_target_kind(expr_id2) == hir_target_function()
+                       && hir_type_table_kind(self.h.types, self.h.expr_type(expr_id2)) == ty_VOID()) {
+                self.emit_eval_value(v, stmt_id, expr_id2);
+            }
+            return;
+        }
+        if (k == hir_stmt_let() || k == hir_stmt_var()) {
+            let init_value = self.lower_expr_as(self.h.stmt_expr(stmt_id), self.h.stmt_type(stmt_id));
+            let local_place = mir_i32_map_get(self.place_map, self.h.stmt_local(stmt_id));
+            self.unit.add_instr(
+                               self.current_function_id,
+                               self.current_block_id,
+                               mir_instr_storage_live(),
+                               self.h.stmt_type(stmt_id),
+                               local_place,
+                               mir_id_invalid(),
+                               mir_id_invalid(),
+                               mir_id_invalid(),
+                               mir_target_none(),
+                               mir_id_invalid(),
+                               stmt_id,
+                               self.h.stmt_expr(stmt_id),
+                               0,
+                               self.h.stmt_local(stmt_id),
+                               self.h.stmt_name(stmt_id));
+            self.drop_stack_push(self.h.stmt_local(stmt_id));
+            self.storage_stack_push(self.h.stmt_local(stmt_id));
+            self.emit_assign(local_place, init_value, stmt_id, self.h.stmt_expr(stmt_id));
+            self.deactivate_assignment_source(self.h.stmt_expr(stmt_id), self.h.stmt_type(stmt_id), self.h.stmt_local(stmt_id));
+            return;
+        }
+        if (k == hir_stmt_return()) {
+            let return_type = self.h.function_return_type(self.current_hir_function_id);
+            var ret_value = mir_id_invalid();
+            if (self.return_expr_needs_awaitable_ready(return_type, self.h.stmt_expr(stmt_id))) {
+                ret_value = self.lower_awaitable_ready_return(self.h.stmt_expr(stmt_id), return_type);
+            } else {
+                ret_value = self.lower_expr_as(self.h.stmt_expr(stmt_id), return_type);
+            }
+            self.deactivate_moved_source_expr_except(self.h.stmt_expr(stmt_id), hir_id_invalid());
+            ret_value = self.materialize_return_value(ret_value, return_type, stmt_id, self.h.stmt_expr(stmt_id));
+            self.emit_function_exit(stmt_id);
+            self.terminate_current(mir_term_return(), ret_value, mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), stmt_id);
+            return;
+        }
+        if (k == hir_stmt_block()) {
+            let saved_drop_stack = self.drop_stack_head;
+            let saved_defer_stack = self.defer_stack_head;
+            let saved_storage_stack = self.storage_stack_head;
+            let saved_unsafe_depth = self.unsafe_depth;
+            if (self.h.stmt_aux(stmt_id) == stmt_flag_unsafe_block()) {
+                self.unsafe_depth = self.unsafe_depth + 1;
+            }
+            self.lower_stmt_chain(self.h.stmt_child(stmt_id));
+            if (self.h.stmt_aux(stmt_id) == stmt_flag_unsafe_block()) {
+                self.unsafe_depth = saved_unsafe_depth;
+            }
+            if (!self.current_block_terminated()) {
+                self.emit_scope_exit_until(saved_defer_stack,
+                                           saved_drop_stack,
+                                           saved_storage_stack,
+                                           stmt_id);
+            } else {
+                self.drop_stack_head = saved_drop_stack;
+                self.defer_stack_head = saved_defer_stack;
+                self.storage_stack_head = saved_storage_stack;
+            }
+            return;
+        }
+        if (k == hir_stmt_if()) {
+            if (self.try_lower_static_if_stmt(stmt_id)) { return; }
+            self.lower_if_stmt(stmt_id);
+            return;
+        }
+        if (k == hir_stmt_while()) {
+            self.lower_while_stmt(stmt_id);
+            return;
+        }
+        if (k == hir_stmt_for()) {
+            self.lower_for_stmt(stmt_id);
+            return;
+        }
+        if (k == hir_stmt_foreach()) {
+            self.lower_foreach_stmt(stmt_id);
+            return;
+        }
+        if (k == hir_stmt_match()) {
+            self.lower_match_stmt(stmt_id);
+            return;
+        }
+        if (k == hir_stmt_break()) {
+            var target = self.break_target_block_id;
+            var drop_mark = self.break_drop_mark;
+            var defer_mark = self.break_defer_mark;
+            var storage_mark = self.break_storage_mark;
+            let name = self.h.stmt_name(stmt_id);
+            if (name.len > 0) {
+                let frame = self.find_labeled_loop(name);
+                if (frame != null) {
+                    target = ast_read_i32(ptr_offset(frame, 16));
+                    drop_mark = ast_read_rawptr(ptr_offset(frame, 24));
+                    defer_mark = ast_read_rawptr(ptr_offset(frame, 40));
+                    storage_mark = ast_read_rawptr(ptr_offset(frame, 56));
+                }
+            }
+            if (target != mir_id_invalid()) {
+                self.emit_scope_exit_until(defer_mark, drop_mark, storage_mark, stmt_id);
+                self.terminate_current_goto(target);
+            }
+            else { self.terminate_current(mir_term_unreachable(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), stmt_id); }
+            return;
+        }
+        if (k == hir_stmt_continue()) {
+            var target = self.continue_target_block_id;
+            var drop_mark = self.continue_drop_mark;
+            var defer_mark = self.continue_defer_mark;
+            var storage_mark = self.continue_storage_mark;
+            let name = self.h.stmt_name(stmt_id);
+            if (name.len > 0) {
+                let frame = self.find_labeled_loop(name);
+                if (frame != null) {
+                    target = ast_read_i32(ptr_offset(frame, 20));
+                    drop_mark = ast_read_rawptr(ptr_offset(frame, 32));
+                    defer_mark = ast_read_rawptr(ptr_offset(frame, 48));
+                    storage_mark = ast_read_rawptr(ptr_offset(frame, 64));
+                }
+            }
+            if (target != mir_id_invalid()) {
+                self.emit_scope_exit_until(defer_mark, drop_mark, storage_mark, stmt_id);
+                self.terminate_current_goto(target);
+            }
+            else { self.terminate_current(mir_term_unreachable(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), stmt_id); }
+            return;
+        }
+        if (k == hir_stmt_defer()) {
+            self.defer_stack_push(stmt_id);
+            return;
+        }
+        if (k == hir_stmt_static_assert()) {
+            let cond = self.lower_expr(self.h.stmt_cond(stmt_id));
+            self.unit.add_instr( self.current_function_id, self.current_block_id, mir_instr_static_assert(),
+                               self.h.stmt_type(stmt_id), mir_id_invalid(), cond, mir_id_invalid(), mir_id_invalid(),
+                               mir_target_none(), mir_id_invalid(), stmt_id, self.h.stmt_cond(stmt_id), 0, 0, self.h.stmt_name(stmt_id));
+            return;
+        }
+    }
+}

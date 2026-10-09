@@ -196,5 +196,5 @@ vyxc build --target vyxc-dap
 
 Build instructions and runtime requirements are in the
 [compiler README](../bootstrap_compiler/README.md).
-The active implementations are [lsp_main.vyx](../bootstrap_compiler/src/core/lsp_main.vyx)
-and [dap_main.vyx](../bootstrap_compiler/src/core/dap_main.vyx).
+The active implementations are [lsp_main.vyx](../bootstrap_compiler/src/core/tooling/lsp_main.vyx)
+and [dap_main.vyx](../bootstrap_compiler/src/core/tooling/dap_main.vyx).

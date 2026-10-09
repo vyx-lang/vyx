@@ -1,0 +1,973 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn function_is_async_task_callable(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        return (mir_unit_function_flags(&self.m, function_id) & hir_function_flag_async_task()) != 0;
+    }
+
+    public fn async_local_is_pc(self, local_id: i32) -> bool {
+        if (local_id == mir_id_invalid()) { return false; }
+        return self.m.local_name(local_id).startsWith("__async_pc");
+    }
+
+    public fn async_local_is_frame_slot(self, function_id: i32, local_id: i32) -> bool {
+        if (!self.function_is_async_task_callable(function_id)) { return false; }
+        if (self.local_is_capture(local_id)) { return false; }
+        return true;
+    }
+
+    public fn async_ctx_param_field(self, idx: i32) -> i32 {
+        return 2 + idx;
+    }
+
+    // Body rebuilds can reuse HIR-backed locals, including named variables.
+    // A reused local has a live place in the rebuilt body; older copies and
+    // generated temporaries do not. Dropping a reused named local from the
+    // frame puts it on the worker's stack across suspension.
+    public fn async_local_precedes_current_body(self, local_id: i32) -> bool {
+        return self.async_local_precedes_body_mark(local_id, self.current_body_local_first);
+    }
+
+    // Same question against an explicit body mark, for walks that run outside
+    // the body they describe (the collect walk, whose mark travels in the
+    // slice).
+    public fn async_local_precedes_body_mark(self, local_id: i32, body_mark: i32) -> bool {
+        if (local_id == mir_id_invalid()) { return true; }
+        if (body_mark <= 0) { return false; }
+        if (local_id > body_mark) { return false; }
+        if (self.m.local_hir_id(local_id) == hir_id_invalid()) { return true; }
+        let place = self.m.local_place(local_id);
+        if (place == mir_id_invalid() || place > self.m.place_count) { return true; }
+        return self.m.place_kind(place) != mir_place_local()
+            || self.m.place_local(place) != local_id
+            || self.m.place_function(place) != self.m.local_function(local_id);
+    }
+
+    public fn async_frame_temp_ordinal(self, function_id: i32, local_id: i32) -> i32 {
+        var ord: i32 = 0;
+        var cur = self.m.function_first_local(function_id);
+        while (cur != mir_id_invalid()) {
+            if (!self.local_is_source_param(cur)
+                && !self.local_is_capture(cur)
+                && !self.async_local_is_pc(cur)
+                && !self.async_local_precedes_current_body(cur)) {
+                if (cur == local_id) { return ord; }
+                ord = ord + 1;
+            }
+            cur = self.m.local_next(cur);
+        }
+        return -1;
+    }
+
+    public fn async_ctx_field_for_local(self, function_id: i32, local_id: i32) -> i32 {
+        if (self.async_local_is_pc(local_id)) { return 1; }
+        if (self.local_is_source_param(local_id)) {
+            // Parameters keep one chain entry per source parameter across
+            // rebuilds -- the builder's local map hands the same MIR local back
+            // -- so this walk needs no freshness filter, unlike the temporary
+            // arm below. Spawn initializes these frame fields once. A mutable
+            // parameter must keep subsequent assignments across suspension.
+            var seen: i32 = 0;
+            var cur = self.m.function_first_local(function_id);
+            while (cur != mir_id_invalid()) {
+                if (self.local_is_source_param(cur)) {
+                    if (cur == local_id) { return self.async_ctx_param_field(seen); }
+                    seen = seen + 1;
+                }
+                cur = self.m.local_next(cur);
+            }
+            return -1;
+        }
+        if (self.async_local_precedes_current_body(local_id)) { return -1; }
+        let ord = self.async_frame_temp_ordinal(function_id, local_id);
+        if (ord < 0) {
+            // Not a stale local, so the chain is genuinely broken: keep the
+            // hard failure the caller relied on before stale locals were
+            // skipped.
+            self.report_error("async temporary " + self.m.local_name(local_id)
+                              + " is not in the local chain of "
+                              + self.m.function_name(function_id));
+            return -1;
+        }
+        return 2 + self.function_source_param_count(function_id) + ord;
+    }
+
+    public fn async_runtime_function(self, name: string) -> i32 {
+        let fn_id = self.function_by_exact_name(name);
+        if (fn_id == mir_id_invalid()) { return mir_id_invalid(); }
+        if (!self.declare_function_signature(fn_id)) { return mir_id_invalid(); }
+        return fn_id;
+    }
+
+    public fn async_runtime_call0(self, name: string) -> rawptr {
+        let fn_id = self.async_runtime_function(name);
+        if (fn_id == mir_id_invalid()) { return null; }
+        let fn_value = llvm_mir_map_get(self.function_values, fn_id);
+        let fn_type = llvm_mir_map_get(self.function_types, fn_id);
+        if (fn_value == null || fn_type == null) { return null; }
+        return vyx_rt_build_call(self.mod, fn_type, fn_value, null, 0, name.c_str(), name.len as u64);
+    }
+
+    public fn async_runtime_call1(self, name: string, arg: rawptr) -> rawptr {
+        let fn_id = self.async_runtime_function(name);
+        if (fn_id == mir_id_invalid() || arg == null) { return null; }
+        let fn_value = llvm_mir_map_get(self.function_values, fn_id);
+        let fn_type = llvm_mir_map_get(self.function_types, fn_id);
+        if (fn_value == null || fn_type == null) { return null; }
+        return vyx_rt_build_call1(self.mod, fn_type, fn_value, arg, name.c_str(), name.len as u64);
+    }
+
+    public fn async_pc_local_for_function(self, function_id: i32) -> i32 {
+        var local = self.m.function_first_local(function_id);
+        while (local != mir_id_invalid()) {
+            if (self.async_local_is_pc(local)) { return local; }
+            local = self.m.local_next(local);
+        }
+        return mir_id_invalid();
+    }
+
+    public fn async_type_text_is_awaitable(self, text: string) -> bool {
+        if (text.len == 0) { return false; }
+        let base = policy_generic_call_base(text.clone());
+        var probe = base;
+        if (probe.len == 0) { probe = text; }
+        let last = self.last_path_segment(probe);
+        return last == "Task" || last == "Promise";
+    }
+
+    public fn async_payload_type_for_task_type(self, task_type_id: i32) -> i32 {
+        if (task_type_id == mir_id_invalid()) { return mir_id_invalid(); }
+        let text = llvm_mir_type_text(&self.m, task_type_id);
+        if (!self.async_type_text_is_awaitable(text)) { return mir_id_invalid(); }
+        let args = policy_generic_call_args(text.clone());
+        var payload = policy_generic_arg_at(args, 0);
+        if (payload.len == 0 || payload == "void") { payload = "i32"; }
+        return self.type_id_by_text(payload);
+    }
+
+    public fn function_by_exact_name(self, name: string) -> i32 {
+        if (name.len == 0) { return mir_id_invalid(); }
+        var first_match = mir_id_invalid();
+        var fn_id: i32 = 1;
+        while (fn_id <= self.m.function_count) {
+            if (self.m.function_name(fn_id) == name) {
+                if (first_match == mir_id_invalid()) { first_match = fn_id; }
+                if (self.function_can_be_declared(fn_id)
+                    && (self.m.function_first_block(fn_id) != mir_id_invalid()
+                        || mir_unit_function_item_kind(&self.m, fn_id) == hir_item_extern_function())) {
+                    return fn_id;
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        if (first_match != mir_id_invalid() && self.function_can_be_declared(first_match)) {
+            return first_match;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn async_method_for_receiver_type(self, receiver_type_id: i32, method_name: string) -> i32 {
+        if (receiver_type_id == mir_id_invalid() || method_name.len == 0) { return mir_id_invalid(); }
+        let receiver_text = llvm_mir_type_text(&self.m, receiver_type_id);
+        var fn_id: i32 = 1;
+        while (fn_id <= self.m.function_count) {
+            if (self.function_can_be_declared(fn_id)
+                && self.function_name_matches_method(self.m.function_name(fn_id), method_name)) {
+                let owner_text = self.m.function_owner_type(fn_id);
+                if (owner_text == receiver_text || self.type_text_equivalent(owner_text, receiver_text)) {
+                    return fn_id;
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        var best_match = mir_id_invalid();
+        var best_specificity: i32 = 0;
+        fn_id = 1;
+        while (fn_id <= self.m.function_count) {
+            if (self.function_can_be_declared(fn_id)
+                && self.function_name_matches_method(self.m.function_name(fn_id), method_name)) {
+                let specificity = self.receiver_method_specificity(receiver_type_id, fn_id);
+                if (specificity > best_specificity) {
+                    best_match = fn_id;
+                    best_specificity = specificity;
+                }
+            }
+            fn_id = fn_id + 1;
+        }
+        return best_match;
+    }
+
+    // The async context struct doubles as the coroutine frame: [state:ptr,
+    // pc:i32], then the source parameters, then one slot per *temporary* local of
+    // the target function.  Those temporary slots are derived from the callee's
+    // locals, but under CGU every unit materialises only its own bodies, so the
+    // unit that spawns a task cannot see the callee body and derives a context
+    // shorter than the one the callee's own unit uses.  The spawn then allocates
+    // a frame smaller than the callee writes into (observed as heap corruption
+    // when the process exits).  The collect-only walk is the one point that
+    // materialises every body once, so record the temporary-slot layout there --
+    // type ids are stable across units because the MIR type table is -- and
+    // replay it in every unit.  Layout: [temp_count, (type_id, force_ptr)*n].
+    // `local_from` is the mark the collect walk froze for this body, so the
+    // record holds that build's own temporaries even if the arena still carries
+    // locals from an earlier round.
+    public fn async_ctx_record_temp_specs(self, function_id: i32, local_from: i32) {
+        if (function_id == mir_id_invalid()) { return; }
+        if (self.async_ctx_temp_specs == null) { return; }
+        if (!self.function_is_async_task_callable(function_id)) { return; }
+        if (llvm_mir_map_get(self.async_ctx_temp_specs, function_id) != null) { return; }
+        var temp_count: i32 = 0;
+        var scan = self.m.function_first_local(function_id);
+        while (scan != mir_id_invalid()) {
+            if (!self.local_is_source_param(scan)
+                && !self.local_is_capture(scan)
+                && !self.async_local_is_pc(scan)
+                && !self.async_local_precedes_body_mark(scan, local_from)) {
+                temp_count = temp_count + 1;
+            }
+            scan = self.m.local_next(scan);
+        }
+        let spec = malloc(((1 + temp_count * 2) * 4) as u64);
+        if (spec == null) { return; }
+        ast_write_i32(spec, temp_count);
+        var idx: i32 = 0;
+        scan = self.m.function_first_local(function_id);
+        while (scan != mir_id_invalid()) {
+            if (!self.local_is_source_param(scan)
+                && !self.local_is_capture(scan)
+                && !self.async_local_is_pc(scan)
+                && !self.async_local_precedes_body_mark(scan, local_from)) {
+                let base = (1 + idx * 2) * 4;
+                ast_write_i32(ptr_offset(spec, base), self.local_effective_type(scan));
+                var force_ptr: i32 = 0;
+                if (self.local_is_self_pointer_abi_slot(function_id, scan)) { force_ptr = 1; }
+                ast_write_i32(ptr_offset(spec, base + 4), force_ptr);
+                idx = idx + 1;
+            }
+            scan = self.m.local_next(scan);
+        }
+        llvm_mir_map_put(self.async_ctx_temp_specs, function_id, spec);
+        if (policy_phase_summary_enabled()) {
+            print("[async-ctx] record fn=" + policy_i64_to_string(function_id as i64)
+                  + " name=" + self.m.function_name(function_id)
+                  + " params=" + policy_i64_to_string(self.function_source_param_count(function_id) as i64)
+                  + " temps=" + policy_i64_to_string(temp_count as i64));
+        }
+    }
+
+    public fn get_or_create_async_context_type(self, target_fn: i32) -> rawptr {
+        if (target_fn == mir_id_invalid()) { return null; }
+        let cached = llvm_mir_map_get(self.async_context_types, target_fn);
+        if (cached != null) { return cached; }
+        let param_count = self.function_source_param_count(target_fn);
+        // Prefer the layout recorded by the collect-only walk: in an emit unit
+        // that does not own `target_fn` the body is not materialised, so
+        // scanning locals here would under-count and hand the spawn a frame that
+        // is too small.  The scan stays as the fallback for non-CGU builds and
+        // for any function the collect walk did not reach.
+        let temp_spec = llvm_mir_map_get(self.async_ctx_temp_specs, target_fn);
+        var temp_count: i32 = 0;
+        if (temp_spec != null) {
+            temp_count = ast_read_i32(temp_spec);
+        } else {
+            var scan = self.m.function_first_local(target_fn);
+            while (scan != mir_id_invalid()) {
+                if (!self.local_is_source_param(scan)
+                    && !self.local_is_capture(scan)
+                    && !self.async_local_is_pc(scan)) {
+                    temp_count = temp_count + 1;
+                }
+                scan = self.m.local_next(scan);
+            }
+        }
+        let field_count = param_count + 2 + temp_count;
+        if (policy_phase_summary_enabled()) {
+            var src_kind: string = "scan";
+            if (temp_spec != null) { src_kind = "spec"; }
+            print("[async-ctx] create cgu=" + policy_i64_to_string(self.cgu_emit_index as i64)
+                  + " fn=" + policy_i64_to_string(target_fn as i64)
+                  + " " + src_kind
+                  + " params=" + policy_i64_to_string(param_count as i64)
+                  + " temps=" + policy_i64_to_string(temp_count as i64)
+                  + " fields=" + policy_i64_to_string(field_count as i64));
+        }
+        let fields = malloc((field_count * 8) as u64);
+        if (fields == null) {
+            self.report_error("cannot allocate async context field list for " + self.m.function_name(target_fn));
+            return null;
+        }
+        ast_write_rawptr(fields, self.ty_ptr);
+        ast_write_rawptr(ptr_offset(fields, 8), self.ty_i32);
+        var idx: i32 = 0;
+        while (idx < param_count) {
+            let param_type = self.function_source_param_type(target_fn, idx);
+            var field_ty = self.lower_type(param_type);
+            if (self.source_param_uses_self_pointer_abi(target_fn, idx)) { field_ty = self.ty_ptr; }
+            if (field_ty == null) {
+                free(fields);
+                self.report_error("cannot lower async parameter storage for " + self.m.function_name(target_fn));
+                return null;
+            }
+            ast_write_rawptr(ptr_offset(fields, (idx + 2) * 8), field_ty);
+            idx = idx + 1;
+        }
+        var temp_idx: i32 = 0;
+        if (temp_spec != null) {
+            while (temp_idx < temp_count) {
+                let spec_base = (1 + temp_idx * 2) * 4;
+                let recorded_type = ast_read_i32(ptr_offset(temp_spec, spec_base));
+                let recorded_force_ptr = ast_read_i32(ptr_offset(temp_spec, spec_base + 4));
+                var temp_ty = self.lower_type(recorded_type);
+                if (recorded_force_ptr != 0) { temp_ty = self.ty_ptr; }
+                if (temp_ty == null) { temp_ty = self.ty_ptr; }
+                ast_write_rawptr(ptr_offset(fields, (2 + param_count + temp_idx) * 8), temp_ty);
+                temp_idx = temp_idx + 1;
+            }
+        } else {
+            var scan_local = self.m.function_first_local(target_fn);
+            while (scan_local != mir_id_invalid()) {
+                if (!self.local_is_source_param(scan_local)
+                    && !self.local_is_capture(scan_local)
+                    && !self.async_local_is_pc(scan_local)) {
+                    let effective_type = self.local_effective_type(scan_local);
+                    var temp_ty = self.lower_type(effective_type);
+                    if (self.local_is_self_pointer_abi_slot(target_fn, scan_local)) { temp_ty = self.ty_ptr; }
+                    if (temp_ty == null) { temp_ty = self.ty_ptr; }
+                    ast_write_rawptr(ptr_offset(fields, (2 + param_count + temp_idx) * 8), temp_ty);
+                    temp_idx = temp_idx + 1;
+                }
+                scan_local = self.m.local_next(scan_local);
+            }
+        }
+        let name = self.function_symbol_name(target_fn) + "_async_ctx";
+        let st = vyx_rt_struct_ty_named(self.mod, name.c_str(), name.len as u64);
+        if (st == null) {
+            free(fields);
+            self.report_error("cannot create async context type for " + self.m.function_name(target_fn));
+            return null;
+        }
+        if (vyx_rt_struct_ty_set_body(self.mod, st, fields, field_count as u64, 0) != 0) {
+            free(fields);
+            self.report_error("cannot finalize async context type for " + self.m.function_name(target_fn));
+            return null;
+        }
+        free(fields);
+        llvm_mir_map_put(self.async_context_types, target_fn, st);
+        return st;
+    }
+
+    public fn async_store_task_state(self, task_obj: rawptr, task_type_id: i32, state: rawptr) -> bool {
+        if (task_obj == null || state == null || task_type_id == mir_id_invalid()) { return false; }
+        let state_addr = self.record_field_addr_for_type(task_obj, task_type_id, "state");
+        if (state_addr == null) { return false; }
+        vyx_rt_build_store(self.mod, state, state_addr);
+        return true;
+    }
+
+    public fn async_worker_call_method1(self,
+                                        method_fn: i32,
+                                        receiver: rawptr,
+                                        receiver_type: i32,
+                                        name: string) -> rawptr {
+        if (method_fn == mir_id_invalid() || receiver == null) { return null; }
+        // await_value may return an aggregate through hidden sret storage.
+        // Use the normal ABI call path so a missing argument cannot silently
+        // omit the await/resolve sequence and leave the outer task pending.
+        return self.lower_static_one_arg_raw_call(method_fn, receiver, receiver_type, name);
+    }
+
+    public fn async_worker_call_resolve(self,
+                                        resolve_fn: i32,
+                                        task_obj: rawptr,
+                                        task_type_id: i32,
+                                        payload: rawptr,
+                                        payload_type_id: i32) -> bool {
+        if (resolve_fn == mir_id_invalid() || task_obj == null || payload == null) { return false; }
+        if (!self.declare_function_signature(resolve_fn)) { return false; }
+        let fn_value = llvm_mir_map_get(self.function_values, resolve_fn);
+        let fn_type = llvm_mir_map_get(self.function_types, resolve_fn);
+        if (fn_value == null || fn_type == null) { return false; }
+        let self_param_type = self.function_source_param_type(resolve_fn, 0);
+        let payload_param_type = self.function_source_param_type(resolve_fn, 1);
+        var self_arg = task_obj;
+        if (self_param_type != mir_id_invalid()) {
+            self_arg = self.cast_value(task_obj, task_type_id, self_param_type);
+        }
+        var payload_arg = payload;
+        if (payload_param_type != mir_id_invalid()) {
+            payload_arg = self.cast_value(payload, payload_type_id, payload_param_type);
+        }
+        if (self_arg == null || payload_arg == null
+            || self.function_llvm_param_count(resolve_fn) != 2) {
+            self.report_error("cannot lower async resolve arguments for " + self.m.function_name(resolve_fn));
+            return false;
+        }
+        if (self.source_param_uses_native_byval_abi(resolve_fn, 1)) {
+            let storage_ty = self.lower_storage_type(payload_param_type);
+            var slot: rawptr = null;
+            if (storage_ty != null) {
+                slot = vyx_rt_build_alloca(self.mod, storage_ty, "async.payload.byval".c_str(), 19);
+            }
+            if (slot == null) {
+                self.report_error("cannot allocate async payload storage for " + self.m.function_name(resolve_fn));
+                return false;
+            }
+            let alignment = self.native_aggregate_align_bytes(payload_param_type);
+            if (alignment > 0) { vyx_rt_set_alignment(self.mod, slot, alignment as i32); }
+            vyx_rt_build_store(self.mod, payload_arg, slot);
+            payload_arg = slot;
+        }
+        let args = malloc(16);
+        if (args == null) {
+            self.report_error("cannot allocate async resolve call args");
+            return false;
+        }
+        ast_write_rawptr(args, self_arg);
+        ast_write_rawptr(ptr_offset(args, 8), payload_arg);
+        var call = self.build_abi_call(fn_type, fn_value, args, 2, "", resolve_fn);
+        if (call != null && !self.apply_native_c_aggregate_abi_attrs(resolve_fn, call)) { call = null; }
+        free(args);
+        if (call == null) {
+            self.report_error("cannot build async resolve call for " + self.m.function_name(resolve_fn)
+                              + ": " + self.runtime_last_error());
+            return false;
+        }
+        return true;
+    }
+
+    public fn ensure_async_worker_for_function(self,
+                                               target_fn: i32,
+                                               task_type_id: i32,
+                                               payload_type_id: i32) -> rawptr {
+        if (target_fn == mir_id_invalid()) { return null; }
+        let cached = llvm_mir_map_get(self.async_worker_values, target_fn);
+        if (cached != null) { return cached; }
+        if (self.function_hidden_env_param_count(target_fn) > 0) {
+            self.report_error("async closure env calls are not supported yet for " + self.m.function_name(target_fn));
+            return null;
+        }
+        let ctx_ty = self.get_or_create_async_context_type(target_fn);
+        if (ctx_ty == null) { return null; }
+        if (!self.declare_function_signature(target_fn)) {
+            self.report_error("cannot declare async body function " + self.m.function_name(target_fn));
+            return null;
+        }
+        let await_fn = self.async_method_for_receiver_type(task_type_id, "await_value");
+        let resolve_fn = self.async_method_for_receiver_type(task_type_id, "resolve");
+        let drop_fn = self.async_method_for_receiver_type(task_type_id, "drop");
+        if (await_fn == mir_id_invalid() || resolve_fn == mir_id_invalid()) {
+            self.report_error("async lowering cannot resolve Task await/resolve for "
+                      + llvm_mir_type_text(&self.m, task_type_id));
+            return null;
+        }
+        self.declare_function_signature(await_fn);
+        self.declare_function_signature(resolve_fn);
+        if (drop_fn != mir_id_invalid()) { self.declare_function_signature(drop_fn); }
+
+        let pbuf = malloc(8);
+        if (pbuf == null) {
+            self.report_error("cannot allocate async worker type buffer");
+            return null;
+        }
+        ast_write_rawptr(pbuf, self.ty_ptr);
+        let worker_fty = vyx_rt_fn_type(self.mod, self.ty_i32, pbuf, 1, 0);
+        free(pbuf);
+        if (worker_fty == null) {
+            self.report_error("cannot build async worker type for " + self.m.function_name(target_fn));
+            return null;
+        }
+        let worker_name = self.function_symbol_name(target_fn) + "_async_worker";
+        let worker_fn = vyx_rt_add_function(self.mod,
+                                            worker_name.c_str(),
+                                            worker_name.len as u64,
+                                            worker_fty);
+        if (worker_fn == null) {
+            self.report_error("cannot create async worker " + worker_name);
+            return null;
+        }
+        vyx_rt_set_linkage(self.mod, worker_fn, 1);
+        llvm_mir_map_put(self.async_worker_values, target_fn, worker_fn);
+        llvm_mir_map_put(self.async_worker_types, target_fn, worker_fty);
+
+        let saved_function_id = self.current_function_id;
+        let saved_function_value = self.current_function_value;
+        let saved_entry_block = self.current_entry_block;
+        let saved_block = vyx_rt_get_insert_block(self.mod);
+
+        self.current_function_id = target_fn;
+        self.current_function_value = worker_fn;
+        self.current_entry_block = null;
+
+        let entry_bb = vyx_rt_append_block(self.mod,
+                                           worker_fn,
+                                           "entry".c_str(),
+                                           5);
+        if (entry_bb == null) {
+            self.report_error("cannot create async worker entry for " + self.m.function_name(target_fn));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            self.current_function_id = saved_function_id;
+            self.current_function_value = saved_function_value;
+            self.current_entry_block = saved_entry_block;
+            return worker_fn;
+        }
+        vyx_rt_position_at_end(self.mod, entry_bb);
+
+        let ctx_param = vyx_rt_get_param(self.mod, worker_fn, 0);
+        let zero32 = vyx_rt_const_int(self.mod, self.ty_i32, 0, 1);
+        let one32 = vyx_rt_const_int(self.mod, self.ty_i32, 1, 1);
+        self.async_runtime_call1("vio_async_frame_set", ctx_param);
+        let state_ptr = vyx_rt_build_gep2(self.mod,
+                                          ctx_ty,
+                                          ctx_param,
+                                          zero32,
+                                          zero32,
+                                          "async.state.ptr".c_str(),
+                                          15);
+        let state = vyx_rt_build_load(self.mod,
+                                      self.ty_ptr,
+                                      state_ptr,
+                                      "async.state".c_str(),
+                                      11);
+        let param_count = self.function_source_param_count(target_fn);
+        var body_args: rawptr = null;
+        if (param_count > 0) {
+            body_args = malloc((param_count * 8) as u64);
+            if (body_args == null) {
+                self.report_error("cannot allocate async worker body args for " + self.m.function_name(target_fn));
+            }
+        }
+        var idx: i32 = 0;
+        while (idx < param_count && body_args != null) {
+            let param_type = self.function_source_param_type(target_fn, idx);
+            var param_ll = self.lower_type(param_type);
+            if (self.source_param_uses_self_pointer_abi(target_fn, idx)) { param_ll = self.ty_ptr; }
+            let field_ptr = vyx_rt_build_gep2(self.mod,
+                                              ctx_ty,
+                                              ctx_param,
+                                              zero32,
+                                              vyx_rt_const_int(self.mod, self.ty_i32, (idx + 2) as i64, 1),
+                                              "async.arg.ptr".c_str(),
+                                              13);
+            var arg_value = field_ptr;
+            // The frame stores logical values; the native signature can pass
+            // aggregate parameters indirectly through byval storage.
+            if (!self.source_param_uses_native_byval_abi(target_fn, idx)) {
+                arg_value = vyx_rt_build_load(self.mod,
+                                               param_ll,
+                                               field_ptr,
+                                               "async.arg".c_str(),
+                                               9);
+            }
+            if (arg_value == null) {
+                self.report_error("cannot lower async worker parameter #" + policy_i64_to_string(idx as i64)
+                                  + " for " + self.m.function_name(target_fn));
+            }
+            ast_write_rawptr(ptr_offset(body_args, idx * 8), arg_value);
+            idx = idx + 1;
+        }
+        let body_fn = llvm_mir_map_get(self.function_values, target_fn);
+        let body_fty = llvm_mir_map_get(self.function_types, target_fn);
+        var inner_task: rawptr = null;
+        if (body_fn != null && body_fty != null && (param_count == 0 || body_args != null)) {
+            inner_task = self.build_abi_call(body_fty, body_fn, body_args, param_count as u64,
+                                             "async.inner", target_fn);
+            if (inner_task != null && !self.apply_native_c_aggregate_abi_attrs(target_fn, inner_task)) {
+                inner_task = null;
+            }
+            if (inner_task == null) {
+                self.report_error("cannot build async body call for " + self.m.function_name(target_fn)
+                                  + ": " + self.runtime_last_error());
+            }
+        } else {
+            self.report_error("async worker cannot resolve body function " + self.m.function_name(target_fn));
+        }
+        if (body_args != null) { free(body_args); }
+
+        let pending = self.async_runtime_call0("vio_async_take_pending");
+        let pend_bb = vyx_rt_append_block(self.mod, worker_fn, "async.pending".c_str(), 13);
+        let ready_bb = vyx_rt_append_block(self.mod, worker_fn, "async.ready".c_str(), 11);
+        if (pending == null || pend_bb == null || ready_bb == null) {
+            self.report_error("async worker cannot split pending/ready for " + self.m.function_name(target_fn));
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            self.current_function_id = saved_function_id;
+            self.current_function_value = saved_function_value;
+            self.current_entry_block = saved_entry_block;
+            return worker_fn;
+        }
+        let is_pend = vyx_rt_build_icmp(self.mod,
+                                        llvm_mir_icmp_ne(),
+                                        pending,
+                                        zero32,
+                                        "async.pend".c_str(),
+                                        10);
+        vyx_rt_build_cond_br(self.mod, is_pend, pend_bb, ready_bb);
+        vyx_rt_position_at_end(self.mod, pend_bb);
+        vyx_rt_build_ret(self.mod, zero32);
+        vyx_rt_position_at_end(self.mod, ready_bb);
+
+        let task_storage_ty = self.class_record_storage_ty(task_type_id);
+        var inner_self: rawptr = inner_task;
+        if (inner_task != null && task_storage_ty != null) {
+            let inner_slot = vyx_rt_build_alloca(self.mod,
+                                                 task_storage_ty,
+                                                 "async.inner.task".c_str(),
+                                                 16);
+            if (inner_slot != null) {
+                vyx_rt_build_store(self.mod, inner_task, inner_slot);
+                inner_self = inner_slot;
+            }
+        }
+        var payload: rawptr = null;
+        if (inner_self != null) {
+            payload = self.async_worker_call_method1(await_fn,
+                                                     inner_self,
+                                                     task_type_id,
+                                                     "async.payload");
+        }
+        var outer_task = null;
+        if (task_storage_ty != null) {
+            outer_task = vyx_rt_build_alloca(self.mod,
+                                             task_storage_ty,
+                                             "async.outer.task".c_str(),
+                                             16);
+        }
+        if (outer_task != null && self.async_store_task_state(outer_task, task_type_id, state)) {
+            if (payload != null) {
+                self.async_worker_call_resolve(resolve_fn,
+                                               outer_task,
+                                               task_type_id,
+                                               payload,
+                                               payload_type_id);
+            }
+        } else {
+            self.report_error("async worker cannot materialize outer task for "
+                      + llvm_mir_type_text(&self.m, task_type_id));
+        }
+        if (inner_self != null && drop_fn != mir_id_invalid()) {
+            self.async_worker_call_method1(drop_fn,
+                                           inner_self,
+                                           task_type_id,
+                                           "");
+        }
+        if (self.builtin_free_fn != null && self.builtin_free_fty != null && ctx_param != null) {
+            vyx_rt_build_call1(self.mod,
+                               self.builtin_free_fty,
+                               self.builtin_free_fn,
+                               ctx_param,
+                               llvm_mir_empty_name(),
+                               0);
+        }
+        vyx_rt_build_ret(self.mod, one32);
+
+        self.current_function_id = saved_function_id;
+        self.current_function_value = saved_function_value;
+        self.current_entry_block = saved_entry_block;
+        if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+        return worker_fn;
+    }
+
+    public fn lower_async_task_call(self, value_id: i32, target_fn: i32) -> rawptr {
+        if (target_fn == mir_id_invalid()) { return null; }
+        if (self.function_hidden_env_param_count(target_fn) > 0) {
+            self.report_error_at_value(value_id,
+                                       "async closure env calls are not supported yet for `"
+                                       + self.m.function_name(target_fn)
+                                       + "`");
+            return null;
+        }
+        let task_type_id = self.value_effective_type(value_id);
+        let payload_type_id = self.async_payload_type_for_task_type(task_type_id);
+        if (payload_type_id == mir_id_invalid()) {
+            self.report_error_at_value(value_id,
+                                       "async call target does not return Task/Promise: `"
+                                       + self.m.function_name(target_fn)
+                                       + "`");
+            return null;
+        }
+        let state_new_fn = self.function_by_exact_name("vio_promise_state_new");
+        let run_fn = self.function_by_exact_name("vio_sched_spawn");
+        let reject_fn = self.function_by_exact_name("vio_promise_state_reject");
+        if (state_new_fn == mir_id_invalid() || run_fn == mir_id_invalid() || reject_fn == mir_id_invalid()) {
+            self.report_error_at_value(value_id,
+                                       "async lowering requires std.vio promise/run helpers");
+            return null;
+        }
+        if (!self.declare_function_signature(state_new_fn)
+            || !self.declare_function_signature(run_fn)
+            || !self.declare_function_signature(reject_fn)) {
+            self.report_error_at_value(value_id,
+                                       "cannot declare async runtime helpers");
+            return null;
+        }
+        let state_new_value = llvm_mir_map_get(self.function_values, state_new_fn);
+        let state_new_type = llvm_mir_map_get(self.function_types, state_new_fn);
+        let run_value = llvm_mir_map_get(self.function_values, run_fn);
+        let run_type = llvm_mir_map_get(self.function_types, run_fn);
+        let reject_value = llvm_mir_map_get(self.function_values, reject_fn);
+        let reject_type = llvm_mir_map_get(self.function_types, reject_fn);
+        if (state_new_value == null || state_new_type == null
+            || run_value == null || run_type == null
+            || reject_value == null || reject_type == null) {
+            self.report_error_at_value(value_id,
+                                       "cannot resolve async runtime helper symbols");
+            return null;
+        }
+        let ctx_ty = self.get_or_create_async_context_type(target_fn);
+        if (ctx_ty == null) { return null; }
+        let worker_fn = self.ensure_async_worker_for_function(target_fn, task_type_id, payload_type_id);
+        if (worker_fn == null) { return null; }
+
+        let state = vyx_rt_build_call(self.mod,
+                                      state_new_type,
+                                      state_new_value,
+                                      null,
+                                      0,
+                                      "async.state".c_str(),
+                                      11);
+        if (state == null) {
+            self.report_error_at_value(value_id, "cannot create async promise state");
+            return null;
+        }
+        var ctx_size = vyx_rt_type_alloc_size(self.mod, ctx_ty);
+        if (ctx_size <= 0) { ctx_size = ((self.function_source_param_count(target_fn) + 2) * 8) as i64; }
+        let ctx = self.malloc_bytes_value(ctx_size, "async.ctx");
+        if (ctx == null) { return null; }
+        let zero32 = vyx_rt_const_int(self.mod, self.ty_i32, 0, 1);
+        let state_ptr = vyx_rt_build_gep2(self.mod,
+                                          ctx_ty,
+                                          ctx,
+                                          zero32,
+                                          zero32,
+                                          "async.ctx.state".c_str(),
+                                          15);
+        vyx_rt_build_store(self.mod, state, state_ptr);
+        let pc_ptr = vyx_rt_build_gep2(self.mod,
+                                         ctx_ty,
+                                         ctx,
+                                         zero32,
+                                         vyx_rt_const_int(self.mod, self.ty_i32, 1, 1),
+                                         "async.ctx.pc".c_str(),
+                                         12);
+        vyx_rt_build_store(self.mod, zero32, pc_ptr);
+
+        let source_argc = self.call_arg_count(value_id);
+        let receiver_id = self.direct_call_receiver(value_id);
+        var receiver_argc: i32 = 0;
+        if (receiver_id != mir_id_invalid()) { receiver_argc = 1; }
+        var implicit_self_argc: i32 = 0;
+        if (receiver_argc == 0 && self.source_param_uses_self_pointer_abi(target_fn, 0)
+            && self.function_is_native_constructor(target_fn)) {
+            implicit_self_argc = 1;
+        }
+        var out_param_idx: i32 = 0;
+        if (receiver_argc > 0) {
+            let receiver_type = self.function_source_param_type(target_fn, 0);
+            var receiver_val: rawptr = null;
+            if (self.m.value_kind(receiver_id) == mir_value_target_ref()
+                && self.m.value_target_kind(receiver_id) == mir_target_hir_item()
+                && !self.m.static_exists(self.m.value_target_id(receiver_id))) {
+                receiver_val = self.default_value_for_type(receiver_type);
+            } else if (self.source_param_uses_self_pointer_abi(target_fn, 0)) {
+                if (self.m.value_kind(receiver_id) == mir_value_target_ref()
+                    && self.m.value_target_kind(receiver_id) == mir_target_hir_item()
+                    && self.m.static_exists(self.m.value_target_id(receiver_id))) {
+                    receiver_val = self.lower_static_self_receiver_address(receiver_id, receiver_type);
+                } else {
+                    receiver_val = self.lower_self_receiver_address(receiver_id, receiver_type);
+                }
+            } else {
+                receiver_val = self.lower_value_as(receiver_id, receiver_type);
+            }
+            if (receiver_val == null) {
+                self.report_error_at_value(value_id,
+                                           "cannot lower async receiver for `"
+                                           + self.m.function_name(target_fn)
+                                           + "`");
+                return null;
+            }
+            let receiver_ptr = vyx_rt_build_gep2(self.mod,
+                                                 ctx_ty,
+                                                 ctx,
+                                                 zero32,
+                                                 vyx_rt_const_int(self.mod, self.ty_i32, 2, 1),
+                                                 "async.ctx.arg".c_str(),
+                                                 13);
+            vyx_rt_build_store(self.mod, receiver_val, receiver_ptr);
+            out_param_idx = 1;
+        }
+        if (implicit_self_argc > 0) {
+            // Async spawn stores the receiver into a heap ctx consumed by a
+            // worker after this frame returns, so the constructor receiver must
+            // outlive the caller frame: keep the owning heap allocation here.
+            let ctor_receiver_type = self.function_source_param_type(target_fn, 0);
+            let ctor_self_val = self.lower_class_pointer_aggregate_value_with_type(mir_id_invalid(), ctor_receiver_type);
+            if (ctor_self_val != null) {
+                let ctor_ptr = vyx_rt_build_gep2(self.mod,
+                                                 ctx_ty,
+                                                 ctx,
+                                                 zero32,
+                                                 vyx_rt_const_int(self.mod, self.ty_i32, 2, 1),
+                                                 "async.ctx.arg".c_str(),
+                                                 13);
+                vyx_rt_build_store(self.mod, ctor_self_val, ctor_ptr);
+                out_param_idx = 1;
+            }
+        }
+        var i: i32 = 0;
+        while (i < source_argc) {
+            let arg_id = self.call_arg_at(value_id, i);
+            let param_index = i + receiver_argc + implicit_self_argc;
+            let param_type = self.function_source_param_type(target_fn, param_index);
+            if (param_type == mir_id_invalid()) {
+                self.report_error("cannot resolve async argument parameter #"
+                          + policy_i64_to_string(param_index as i64)
+                          + " for " + self.m.function_name(target_fn));
+                return null;
+            }
+            let arg_val = self.lower_value_as(arg_id, param_type);
+            if (arg_val == null) {
+                self.report_error("cannot lower async argument #"
+                          + policy_i64_to_string(i as i64)
+                          + " for " + self.m.function_name(target_fn));
+                return null;
+            }
+            let arg_ptr = vyx_rt_build_gep2(self.mod,
+                                            ctx_ty,
+                                            ctx,
+                                            zero32,
+                                            vyx_rt_const_int(self.mod, self.ty_i32, (out_param_idx + 2) as i64, 1),
+                                            "async.ctx.arg".c_str(),
+                                            13);
+            vyx_rt_build_store(self.mod, arg_val, arg_ptr);
+            out_param_idx = out_param_idx + 1;
+            i = i + 1;
+        }
+
+        let worker_addr = vyx_rt_build_ptr_to_int(self.mod,
+                                                  worker_fn,
+                                                  self.ty_i64,
+                                                  "async.worker".c_str(),
+                                                  12);
+        let run_rc = vyx_rt_build_call2(self.mod,
+                                        run_type,
+                                        run_value,
+                                        worker_addr,
+                                        ctx,
+                                        "async.run".c_str(),
+                                        9);
+        if (run_rc == null) {
+            self.report_error_at_value(value_id, "cannot spawn async worker");
+            return null;
+        }
+        let failed = vyx_rt_build_icmp(self.mod,
+                                       llvm_mir_icmp_ne(),
+                                       run_rc,
+                                       vyx_rt_const_int(self.mod, self.ty_i32, 0, 0),
+                                       "async.spawn.failed".c_str(),
+                                       18);
+        let reject_bb = vyx_rt_append_block(self.mod,
+                                            self.current_function_value,
+                                            "async.reject".c_str(),
+                                            12);
+        let ok_bb = vyx_rt_append_block(self.mod,
+                                        self.current_function_value,
+                                        "async.ok".c_str(),
+                                        8);
+        if (failed == null || reject_bb == null || ok_bb == null) {
+            self.report_error_at_value(value_id, "cannot build async spawn control flow");
+            return null;
+        }
+        vyx_rt_build_cond_br(self.mod, failed, reject_bb, ok_bb);
+        vyx_rt_position_at_end(self.mod, reject_bb);
+        let rc64 = vyx_rt_build_sext(self.mod, run_rc, self.ty_i64, llvm_mir_empty_name(), 0);
+        vyx_rt_build_call2(self.mod,
+                           reject_type,
+                           reject_value,
+                           state,
+                           rc64,
+                           llvm_mir_empty_name(),
+                           0);
+        if (self.builtin_free_fn != null && self.builtin_free_fty != null) {
+            vyx_rt_build_call1(self.mod,
+                               self.builtin_free_fty,
+                               self.builtin_free_fn,
+                               ctx,
+                               llvm_mir_empty_name(),
+                               0);
+        }
+        vyx_rt_build_br(self.mod, ok_bb);
+        vyx_rt_position_at_end(self.mod, ok_bb);
+
+        // Task/Promise is a native value struct (one rawptr field). Methods
+        // take `self` as a pointer to that struct, matching Task.ready():
+        // alloca + store state + load. Heap class-pointer objects would put
+        // the object address into `.state`, and await would treat the Task
+        // object as the promise state.
+        let task_ty = self.class_record_storage_ty(task_type_id);
+        if (task_ty == null) {
+            self.report_error_at_value(value_id,
+                                       "cannot materialize async task result for "
+                                       + llvm_mir_type_text(&self.m, task_type_id));
+            return null;
+        }
+        if (self.type_is_class_pointer_abi(task_type_id)) {
+            let task_obj = self.build_zeroed_class_object(task_type_id);
+            if (task_obj == null) { return null; }
+            if (!self.async_store_task_state(task_obj, task_type_id, state)) {
+                self.report_error_at_value(value_id,
+                                           "cannot materialize async task result for "
+                                           + llvm_mir_type_text(&self.m, task_type_id));
+                return null;
+            }
+            return task_obj;
+        }
+        let task_slot = vyx_rt_build_alloca(self.mod,
+                                            task_ty,
+                                            "async.task".c_str(),
+                                            10);
+        if (task_slot == null) { return null; }
+        if (!self.async_store_task_state(task_slot, task_type_id, state)) {
+            self.report_error_at_value(value_id,
+                                       "cannot materialize async task result for "
+                                       + llvm_mir_type_text(&self.m, task_type_id));
+            return null;
+        }
+        let task_val = vyx_rt_build_load(self.mod,
+                                         task_ty,
+                                         task_slot,
+                                         "async.task.val".c_str(),
+                                         14);
+        if (task_val == null) { return null; }
+        return task_val;
+    }
+
+    public fn lower_async_yield_terminator(self, block_id: i32) {
+        let function_id = self.current_function_id;
+        let pc_local = self.async_pc_local_for_function(function_id);
+        let slot = llvm_mir_map_get(self.local_slots, pc_local);
+        let aux = self.m.block_term_aux(block_id);
+        if (slot != null) {
+            vyx_rt_build_store(self.mod,
+                               vyx_rt_const_int(self.mod, self.ty_i32, aux as i64, 0),
+                               slot);
+        } else {
+            self.report_error("async yield missing __async_pc slot in "
+                      + self.m.function_name(function_id));
+        }
+        self.async_runtime_call0("vio_async_pending_set");
+        let ret_type = self.m.function_return_type(function_id);
+        if (llvm_mir_type_kind(&self.m, ret_type) == ty_VOID()) {
+            vyx_rt_build_ret_void(self.mod);
+            return;
+        }
+        let dummy = self.default_value_for_type(ret_type);
+        if (dummy == null) {
+            self.report_error("cannot lower async yield dummy return in block #"
+                      + policy_i64_to_string(block_id as i64));
+            return;
+        }
+        self.emit_return_value(function_id, dummy);
+    }
+}

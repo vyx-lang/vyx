@@ -1,0 +1,1032 @@
+module bootstrap.mir_model;
+
+use bootstrap.ast;
+use bootstrap.hir_ids;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, n: u64) -> rawptr;
+    fn memset(dst: rawptr, val: i32, n: u64) -> rawptr;
+    fn vyx_forget_string_len(s: rawptr);
+}
+
+/// Function record layout extends the legacy 112-byte payload with the stable
+/// symbol discriminator at 112..127.  It is propagated from HIR provenance
+/// and distinguishes ABI-identical bodies from different module versions.
+fn mir_function_record_size() -> i32 { return 128; }
+/// Block/local/instruction records carry a stable 16-byte SourceLoc tail.
+/// HIR bodies are streamed and released before codegen finishes, so keeping
+/// only HIR ids here is insufficient for debuggers and the MIR2CPP backend.
+fn mir_block_record_size() -> i32 { return 72; }
+fn mir_local_record_size() -> i32 { return 72; }
+fn mir_field_record_size() -> i32 { return 40; }
+fn mir_variant_record_size() -> i32 { return 56; }
+/// Static records carry the declaring module as a stable namespace key.
+/// HIR item ids are local to each compilation and cannot identify globals.
+/// The 80-byte payload keeps all string pointer/i64-length pairs intact;
+/// storage ownership flags occupy the i32 at 80, followed by padding.
+fn mir_static_record_size() -> i32 { return 88; }
+fn mir_place_record_size() -> i32 { return 56; }
+/// Value record layout keeps the legacy 0..103 fields and appends a 16-byte
+/// SourceLoc tail at 104..119 copied from the originating HIR expr.
+fn mir_value_record_size() -> i32 { return 120; }
+fn mir_instr_record_size() -> i32 { return 96; }
+fn mir_case_record_size() -> i32 { return 56; }
+
+fn mir_record_at(buf: rawptr, id: i32, size: i32) -> rawptr {
+    if (buf == null || id <= 0) { return null; }
+    return ptr_offset(buf, (id - 1) * size);
+}
+
+fn mir_write_string(rec: rawptr, ptr_off: i32, len_off: i32, text: string) {
+    if (rec == null) { return; }
+    let slot = ptr_offset(rec, ptr_off);
+    let old_ptr = ast_read_rawptr(slot);
+    if (old_ptr != null) {
+        vyx_forget_string_len(old_ptr);
+        free(old_ptr);
+    }
+    if (text.len <= 0) {
+        ast_write_rawptr(slot, null);
+        ast_write_i64(ptr_offset(rec, len_off), 0);
+        return;
+    }
+    ast_write_rawptr(slot, ast_dup_c_string(text));
+    ast_write_i64(ptr_offset(rec, len_off), text.len);
+}
+
+fn mir_read_string(rec: rawptr, ptr_off: i32, len_off: i32) -> string {
+    if (rec == null) { return ""; }
+    let ptr = ast_read_rawptr(ptr_offset(rec, ptr_off));
+    let len = ast_read_i64(ptr_offset(rec, len_off));
+    if (ptr == null || len <= 0) { return ""; }
+    return from_cstr_view_len(ptr, len);
+}
+
+public class MirUnit {
+    public ids: MirIdAllocator
+    public types: HirTypeTable
+    public function_buf: rawptr
+    public function_count: i32
+    public function_cap: i32
+    public block_buf: rawptr
+    public block_count: i32
+    public block_cap: i32
+    public local_buf: rawptr
+    public local_count: i32
+    public local_cap: i32
+    public field_buf: rawptr
+    public field_count: i32
+    public field_cap: i32
+    public variant_buf: rawptr
+    public variant_count: i32
+    public variant_cap: i32
+    public static_buf: rawptr
+    public static_count: i32
+    public static_cap: i32
+    public place_buf: rawptr
+    public place_count: i32
+    public place_cap: i32
+    public value_buf: rawptr
+    public value_count: i32
+    public value_cap: i32
+    public instr_buf: rawptr
+    public instr_count: i32
+    public instr_cap: i32
+    public case_buf: rawptr
+    public case_count: i32
+    public case_cap: i32
+    public reflection_manifest: string
+    public reflection_name_map: string
+    public foreign_cpp_includes: string
+    public dci_stub_specs: string
+    public dci_abi_text: string
+    public dci_abi_path: string
+    public dci_abi_is_binary: bool
+    public interface_supers: string
+
+    // Return a by-value snapshot of this unit for read-only pass helpers.
+    // The MIR pass pipeline threads the unit as `&mut MirUnit` so that growth
+    // (add_value/add_instr) persists to the caller. Read-only helpers still
+    // take `MirUnit` by value; feeding them `*m` miscompiles under the
+    // self-host copy ABI (byval-deref of a mutref crashes), whereas a method
+    // that returns `self` lowers through the native C aggregate path: small
+    // (≤2 words, trivial) coerce / first-class struct; large via sret copy.
+    // Method `self` is always a pointer so field writes GEP the object.
+    // The snapshot shares this unit's heap tables (rawptr fields are copied
+    // by value), so
+    // in-place record edits by non-growth passes still persist through it.
+    public fn view(self) -> MirUnit { return self; }
+
+    public static fn create(types: HirTypeTable) -> MirUnit {
+        let fn_cap0: i32 = 256;
+        let block_cap0: i32 = 512;
+        let local_cap0: i32 = 1024;
+        let field_cap0: i32 = 1024;
+        let variant_cap0: i32 = 1024;
+        let static_cap0: i32 = 1024;
+        let place_cap0: i32 = 2048;
+        let value_cap0: i32 = 4096;
+        let instr_cap0: i32 = 4096;
+        let case_cap0: i32 = 512;
+        let fn_buf0 = malloc((fn_cap0 * mir_function_record_size()) as u64);
+        let block_buf0 = malloc((block_cap0 * mir_block_record_size()) as u64);
+        let local_buf0 = malloc((local_cap0 * mir_local_record_size()) as u64);
+        let field_buf0 = malloc((field_cap0 * mir_field_record_size()) as u64);
+        let variant_buf0 = malloc((variant_cap0 * mir_variant_record_size()) as u64);
+        let static_buf0 = malloc((static_cap0 * mir_static_record_size()) as u64);
+        let place_buf0 = malloc((place_cap0 * mir_place_record_size()) as u64);
+        let value_buf0 = malloc((value_cap0 * mir_value_record_size()) as u64);
+        let instr_buf0 = malloc((instr_cap0 * mir_instr_record_size()) as u64);
+        let case_buf0 = malloc((case_cap0 * mir_case_record_size()) as u64);
+        if (fn_buf0 != null) { memset(fn_buf0, 0, (fn_cap0 * mir_function_record_size()) as u64); }
+        if (block_buf0 != null) { memset(block_buf0, 0, (block_cap0 * mir_block_record_size()) as u64); }
+        if (local_buf0 != null) { memset(local_buf0, 0, (local_cap0 * mir_local_record_size()) as u64); }
+        if (field_buf0 != null) { memset(field_buf0, 0, (field_cap0 * mir_field_record_size()) as u64); }
+        if (variant_buf0 != null) { memset(variant_buf0, 0, (variant_cap0 * mir_variant_record_size()) as u64); }
+        if (static_buf0 != null) { memset(static_buf0, 0, (static_cap0 * mir_static_record_size()) as u64); }
+        if (place_buf0 != null) { memset(place_buf0, 0, (place_cap0 * mir_place_record_size()) as u64); }
+        if (value_buf0 != null) { memset(value_buf0, 0, (value_cap0 * mir_value_record_size()) as u64); }
+        if (instr_buf0 != null) { memset(instr_buf0, 0, (instr_cap0 * mir_instr_record_size()) as u64); }
+        if (case_buf0 != null) { memset(case_buf0, 0, (case_cap0 * mir_case_record_size()) as u64); }
+        return MirUnit {
+            ids: MirIdAllocator.create(),
+            types: types,
+            function_buf: fn_buf0,
+            function_count: 0,
+            function_cap: fn_cap0,
+            block_buf: block_buf0,
+            block_count: 0,
+            block_cap: block_cap0,
+            local_buf: local_buf0,
+            local_count: 0,
+            local_cap: local_cap0,
+            field_buf: field_buf0,
+            field_count: 0,
+            field_cap: field_cap0,
+            variant_buf: variant_buf0,
+            variant_count: 0,
+            variant_cap: variant_cap0,
+            static_buf: static_buf0,
+            static_count: 0,
+            static_cap: static_cap0,
+            place_buf: place_buf0,
+            place_count: 0,
+            place_cap: place_cap0,
+            value_buf: value_buf0,
+            value_count: 0,
+            value_cap: value_cap0,
+            instr_buf: instr_buf0,
+            instr_count: 0,
+            instr_cap: instr_cap0,
+            case_buf: case_buf0,
+            case_count: 0,
+            case_cap: case_cap0,
+            reflection_manifest: "",
+            reflection_name_map: "",
+            foreign_cpp_includes: "",
+            dci_stub_specs: "",
+            dci_abi_text: "",
+            dci_abi_path: "",
+            dci_abi_is_binary: false,
+            interface_supers: ""
+        };
+    }
+
+    public fn grow_table(self, old_buf: rawptr, old_count: i32, old_cap: i32, rec_size: i32, want_count: i32) -> rawptr {
+        if (want_count <= old_cap) { return old_buf; }
+        var new_cap = old_cap;
+        if (new_cap <= 0) { new_cap = 128; }
+        while (new_cap < want_count) { new_cap = new_cap * 2; }
+        let alloc_bytes = (new_cap as i64) * (rec_size as i64);
+        let new_buf = malloc(alloc_bytes as u64);
+        if (new_buf == null) { return old_buf; }
+        memset(new_buf, 0, alloc_bytes as u64);
+        if (old_buf != null && old_count > 0) {
+            let copy_bytes = (old_count as i64) * (rec_size as i64);
+            memcpy(new_buf, old_buf, copy_bytes as u64);
+        }
+        if (old_buf != null) { free(old_buf); }
+        return new_buf;
+    }
+
+}
+
+public fn mir_unit_function_first_block(m: &MirUnit, id: i32) -> i32 {
+    return m.function_first_block(id);
+}
+
+public fn mir_unit_block_next(m: &MirUnit, id: i32) -> i32 {
+    return m.block_next(id);
+}
+
+public fn mir_unit_add_function(m: &mut MirUnit, hir_function_id: i32, hir_item_id: i32, name: string, ret_type_id: i32) -> i32 {
+    return m.add_function(hir_function_id, hir_item_id, name, ret_type_id);
+}
+
+public fn mir_unit_set_function_generic_env(m: &mut MirUnit, function_id: i32, params: string, args: string, owner_type: string) {
+    m.set_function_generic_env(function_id, params, args, owner_type);
+}
+
+public fn mir_unit_set_function_symbol_discriminator(m: &mut MirUnit,
+                                                      function_id: i32,
+                                                      discriminator: string) {
+    m.set_function_symbol_discriminator(function_id, discriminator);
+}
+
+public fn mir_unit_set_function_item_kind(m: &mut MirUnit, function_id: i32, item_kind: i32) {
+    m.set_function_item_kind(function_id, item_kind);
+}
+
+public fn mir_unit_set_function_owner_item_kind(m: &mut MirUnit, function_id: i32, item_kind: i32) {
+    m.set_function_owner_item_kind(function_id, item_kind);
+}
+
+public fn mir_unit_set_function_flags(m: &mut MirUnit, function_id: i32, flags: i32) {
+    m.set_function_flags(function_id, flags);
+}
+
+public fn mir_unit_add_local_flags(m: &mut MirUnit, local_id: i32, flags: i32) {
+    m.add_local_flags(local_id, flags);
+}
+
+public fn mir_unit_remove_local_flags(m: &mut MirUnit, local_id: i32, flags: i32) {
+    m.remove_local_flags(local_id, flags);
+}
+
+public fn mir_unit_function_generic_params(m: &MirUnit, function_id: i32) -> string {
+    return mir_read_string(m.function_record(function_id), 48, 56);
+}
+
+public fn mir_unit_function_generic_args(m: &MirUnit, function_id: i32) -> string {
+    return mir_read_string(m.function_record(function_id), 64, 72);
+}
+
+public fn mir_unit_function_owner_type(m: &MirUnit, function_id: i32) -> string {
+    return mir_read_string(m.function_record(function_id), 80, 88);
+}
+
+public fn mir_unit_function_symbol_discriminator(m: &MirUnit, function_id: i32) -> string {
+    return mir_read_string(m.function_record(function_id), 112, 120);
+}
+
+public fn mir_unit_function_item_kind(m: &MirUnit, function_id: i32) -> i32 {
+    return m.function_item_kind(function_id);
+}
+
+public fn mir_unit_function_owner_item_kind(m: &MirUnit, function_id: i32) -> i32 {
+    return m.function_owner_item_kind(function_id);
+}
+
+public fn mir_unit_function_flags(m: &MirUnit, function_id: i32) -> i32 {
+    return m.function_flags(function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci(m: &MirUnit, function_id: i32) -> bool {
+    if (function_id == mir_id_invalid() || function_id <= 0 || function_id > m.function_count) { return false; }
+    return (m.function_flags(function_id) & hir_function_flag_foreign_dci()) != 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci_ctor(m: &MirUnit, function_id: i32) -> bool {
+    if (!mir_unit_function_is_foreign_dci(m, function_id)) { return false; }
+    return (m.function_flags(function_id) & hir_function_flag_foreign_dci_ctor()) != 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp_ctor(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_ctor(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci_dtor(m: &MirUnit, function_id: i32) -> bool {
+    if (!mir_unit_function_is_foreign_dci(m, function_id)) { return false; }
+    return (m.function_flags(function_id) & hir_function_flag_foreign_dci_dtor()) != 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp_dtor(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_dtor(m, function_id);
+}
+
+public fn mir_unit_type_is_foreign_dci(m: &MirUnit, type_id: i32) -> bool {
+    if (type_id == mir_id_invalid() || type_id <= 0 || type_id > m.types.count) { return false; }
+    return (hir_type_table_flags(m.types, type_id) & hir_type_flag_foreign_dci()) != 0;
+}
+
+public fn mir_unit_type_is_foreign_cpp(m: &MirUnit, type_id: i32) -> bool {
+    return mir_unit_type_is_foreign_dci(m, type_id);
+}
+
+public fn mir_unit_local_is_source_param(m: &MirUnit, local_id: i32) -> bool {
+    if (local_id == mir_id_invalid() || local_id <= 0 || local_id > m.local_count) { return false; }
+    return (m.local_flags(local_id) & mir_local_flag_param()) != 0;
+}
+
+public fn mir_unit_local_is_self_receiver_param(m: &MirUnit, local_id: i32) -> bool {
+    if (!mir_unit_local_is_source_param(m, local_id)) { return false; }
+    return (m.local_flags(local_id) & mir_local_flag_self_receiver()) != 0;
+}
+
+public fn mir_unit_function_param_count(m: &MirUnit, function_id: i32) -> i32 {
+    var out: i32 = 0;
+    var local = m.function_first_local(function_id);
+    while (local != mir_id_invalid()) {
+        if (mir_unit_local_is_source_param(m, local)) { out = out + 1; }
+        local = m.local_next(local);
+    }
+    return out;
+}
+
+public fn mir_unit_function_param_local_at(m: &MirUnit, function_id: i32, idx: i32) -> i32 {
+    var seen: i32 = 0;
+    var local = m.function_first_local(function_id);
+    while (local != mir_id_invalid()) {
+        if (mir_unit_local_is_source_param(m, local)) {
+            if (seen == idx) { return local; }
+            seen = seen + 1;
+        }
+        local = m.local_next(local);
+    }
+    return mir_id_invalid();
+}
+
+public fn mir_unit_function_param_type_at(m: &MirUnit, function_id: i32, idx: i32) -> i32 {
+    let local = mir_unit_function_param_local_at(m, function_id, idx);
+    if (local == mir_id_invalid()) { return mir_id_invalid(); }
+    return m.local_type(local);
+}
+
+public fn mir_unit_find_type_by_text(m: &MirUnit, text: string) -> i32 {
+    if (text.len == 0) { return mir_id_invalid(); }
+    var type_id: i32 = 1;
+    while (type_id <= m.types.count) {
+        if (hir_type_table_text(m.types, type_id) == text) { return type_id; }
+        type_id = type_id + 1;
+    }
+    return mir_id_invalid();
+}
+
+public fn mir_unit_foreign_dci_owner_type_id(m: &MirUnit, function_id: i32) -> i32 {
+    if (!mir_unit_function_is_foreign_dci(m, function_id)) { return mir_id_invalid(); }
+    let owner = m.function_owner_type(function_id);
+    if (owner.len > 0) {
+        let owner_id = mir_unit_find_type_by_text(m, owner);
+        if (owner_id != mir_id_invalid()) { return owner_id; }
+    }
+    let self_local = mir_unit_function_param_local_at(m, function_id, 0);
+    if (mir_unit_local_is_self_receiver_param(m, self_local)) {
+        let self_type = m.local_type(self_local);
+        if (mir_unit_type_is_foreign_dci(m, self_type)) { return self_type; }
+    }
+    if (mir_unit_function_is_foreign_dci_ctor(m, function_id)) {
+        let ret_type = m.function_return_type(function_id);
+        if (mir_unit_type_is_foreign_dci(m, ret_type)) { return ret_type; }
+    }
+    return mir_id_invalid();
+}
+
+public fn mir_unit_foreign_cpp_owner_type_id(m: &MirUnit, function_id: i32) -> i32 {
+    return mir_unit_foreign_dci_owner_type_id(m, function_id);
+}
+
+public fn mir_unit_foreign_dci_owner_type_text(m: &MirUnit, function_id: i32) -> string {
+    if (!mir_unit_function_is_foreign_dci(m, function_id)) { return ""; }
+    let owner = m.function_owner_type(function_id);
+    if (owner.len > 0) { return owner; }
+    let owner_id = mir_unit_foreign_dci_owner_type_id(m, function_id);
+    if (owner_id != mir_id_invalid()) { return hir_type_table_text(m.types, owner_id); }
+    return "";
+}
+
+public fn mir_unit_foreign_cpp_owner_type_text(m: &MirUnit, function_id: i32) -> string {
+    return mir_unit_foreign_dci_owner_type_text(m, function_id);
+}
+
+public fn mir_unit_function_has_self_receiver_param(m: &MirUnit, function_id: i32) -> bool {
+    let first = mir_unit_function_param_local_at(m, function_id, 0);
+    return mir_unit_local_is_self_receiver_param(m, first);
+}
+
+public fn mir_unit_function_is_foreign_dci_method(m: &MirUnit, function_id: i32) -> bool {
+    if (!mir_unit_function_is_foreign_dci(m, function_id)) { return false; }
+    if (mir_unit_function_is_foreign_dci_ctor(m, function_id)) { return true; }
+    if (mir_unit_function_is_foreign_dci_dtor(m, function_id)) { return true; }
+    return mir_unit_foreign_dci_owner_type_text(m, function_id).len > 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp_method(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_method(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci_instance_method(m: &MirUnit, function_id: i32) -> bool {
+    if (!mir_unit_function_is_foreign_dci_method(m, function_id)) { return false; }
+    if (mir_unit_function_is_foreign_dci_ctor(m, function_id)) { return false; }
+    return mir_unit_function_has_self_receiver_param(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_cpp_instance_method(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_instance_method(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci_static_method(m: &MirUnit, function_id: i32) -> bool {
+    if (!mir_unit_function_is_foreign_dci_method(m, function_id)) { return false; }
+    if (mir_unit_function_is_foreign_dci_ctor(m, function_id)) { return false; }
+    if (mir_unit_function_is_foreign_dci_dtor(m, function_id)) { return false; }
+    return !mir_unit_function_has_self_receiver_param(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_cpp_static_method(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_static_method(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci_const_method(m: &MirUnit, function_id: i32) -> bool {
+    if (!mir_unit_function_is_foreign_dci_instance_method(m, function_id)) { return false; }
+    return (m.function_flags(function_id) & hir_function_flag_foreign_dci_const_method()) != 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp_const_method(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_const_method(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci_virtual_method(m: &MirUnit, function_id: i32) -> bool {
+    return (m.function_flags(function_id) & hir_function_flag_foreign_dci_virtual_method()) != 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp_virtual_method(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_virtual_method(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci_override_method(m: &MirUnit, function_id: i32) -> bool {
+    return (m.function_flags(function_id) & hir_function_flag_foreign_dci_override_method()) != 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp_override_method(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_override_method(m, function_id);
+}
+
+public fn mir_unit_function_is_foreign_dci_final_method(m: &MirUnit, function_id: i32) -> bool {
+    return (m.function_flags(function_id) & hir_function_flag_foreign_dci_final_method()) != 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp_final_method(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_final_method(m, function_id);
+}
+
+public fn mir_unit_function_requires_dci_clang_stub(m: &MirUnit, function_id: i32) -> bool {
+    if (function_id == mir_id_invalid()) { return false; }
+    return false;
+}
+
+public fn mir_unit_function_is_foreign_dci_free_function(m: &MirUnit, function_id: i32) -> bool {
+    if (!mir_unit_function_is_foreign_dci(m, function_id)) { return false; }
+    if (mir_unit_function_is_foreign_dci_ctor(m, function_id)) { return false; }
+    if (mir_unit_function_is_foreign_dci_dtor(m, function_id)) { return false; }
+    return mir_unit_foreign_dci_owner_type_text(m, function_id).len == 0;
+}
+
+public fn mir_unit_function_is_foreign_cpp_free_function(m: &MirUnit, function_id: i32) -> bool {
+    return mir_unit_function_is_foreign_dci_free_function(m, function_id);
+}
+
+public fn mir_unit_add_block(m: &mut MirUnit, function_id: i32, source_stmt_id: i32) -> i32 {
+    return m.add_block(function_id, source_stmt_id);
+}
+
+public fn mir_unit_add_local(m: &mut MirUnit, function_id: i32, hir_local_id: i32, name: string, type_id: i32, flags: i32) -> i32 {
+    return m.add_local(function_id, hir_local_id, name, type_id, flags);
+}
+
+public fn mir_unit_set_local_place(m: &mut MirUnit, local_id: i32, place_id: i32) {
+    m.set_local_place(local_id, place_id);
+}
+
+public fn mir_unit_set_local_capture_source(m: &mut MirUnit, local_id: i32, source_local_id: i32) {
+    m.set_local_capture_source(local_id, source_local_id);
+}
+
+public fn mir_unit_set_local_capture_init_value(m: &mut MirUnit, local_id: i32, value_id: i32) {
+    m.set_local_capture_init_value(local_id, value_id);
+}
+
+public fn mir_unit_add_field_layout(m: &mut MirUnit,
+                                    field_id: i32,
+                                    owner_item_id: i32,
+                                    owner_type_id: i32,
+                                    type_id: i32,
+                                    field_index: i32,
+                                    name: string) -> i32 {
+    return m.add_field_layout(field_id, owner_item_id, owner_type_id, type_id, field_index, name);
+}
+
+public fn mir_unit_field_owner_type(m: &MirUnit, field_id: i32) -> i32 {
+    return m.field_owner_type(field_id);
+}
+
+public fn mir_unit_field_type(m: &MirUnit, field_id: i32) -> i32 {
+    return m.field_type(field_id);
+}
+
+public fn mir_unit_field_index(m: &MirUnit, field_id: i32) -> i32 {
+    return m.field_index(field_id);
+}
+
+public fn mir_unit_field_name(m: &MirUnit, field_id: i32) -> string {
+    return m.field_name(field_id);
+}
+
+public fn mir_unit_field_count_for_type(m: &MirUnit, type_id: i32) -> i32 {
+    return m.field_count_for_type(type_id);
+}
+
+public fn mir_unit_field_id_for_type_index(m: &MirUnit, type_id: i32, field_index: i32) -> i32 {
+    return m.field_id_for_type_index(type_id, field_index);
+}
+
+public fn mir_unit_add_variant_layout(m: &mut MirUnit,
+                                      variant_id: i32,
+                                      owner_item_id: i32,
+                                      owner_type_id: i32,
+                                      tag: i32,
+                                      name: string,
+                                      payload_types: string,
+                                      payload_count: i32) -> i32 {
+    return m.add_variant_layout(variant_id, owner_item_id, owner_type_id, tag, name, payload_types, payload_count);
+}
+
+public fn mir_unit_variant_owner_type(m: &MirUnit, variant_id: i32) -> i32 {
+    return m.variant_owner_type(variant_id);
+}
+
+public fn mir_unit_variant_tag(m: &MirUnit, variant_id: i32) -> i32 {
+    return m.variant_tag(variant_id);
+}
+
+public fn mir_unit_variant_name(m: &MirUnit, variant_id: i32) -> string {
+    return m.variant_name(variant_id);
+}
+
+public fn mir_unit_variant_payload_count(m: &MirUnit, variant_id: i32) -> i32 {
+    return m.variant_payload_count(variant_id);
+}
+
+public fn mir_unit_variant_payload_types(m: &MirUnit, variant_id: i32) -> string {
+    return m.variant_payload_types(variant_id);
+}
+
+public fn mir_unit_variant_count_for_type(m: &MirUnit, type_id: i32) -> i32 {
+    return m.variant_count_for_type(type_id);
+}
+
+public fn mir_unit_variant_id_for_type_tag(m: &MirUnit, type_id: i32, tag: i32) -> i32 {
+    return m.variant_id_for_type_tag(type_id, tag);
+}
+
+public fn mir_unit_variant_is_primary_for_type_tag(m: &MirUnit, variant_id: i32) -> bool {
+    return m.variant_is_primary_for_type_tag(variant_id);
+}
+
+public fn mir_unit_add_static_item(m: &mut MirUnit,
+                                   item_id: i32,
+                                   item_kind: i32,
+                                   name: string,
+                                   type_id: i32,
+                                   init_kind: i32,
+                                   init_target_kind: i32,
+                                   init_target_id: i32,
+                                   init_int: i64,
+                                   init_text: string,
+                                   module_name: string,
+                                   flags: i32) -> i32 {
+    return m.add_static_item(item_id, item_kind, name, type_id, init_kind, init_target_kind, init_target_id, init_int, init_text, module_name, flags);
+}
+
+public fn mir_unit_static_exists(m: &MirUnit, item_id: i32) -> bool { return m.static_exists(item_id); }
+public fn mir_unit_static_item_kind(m: &MirUnit, item_id: i32) -> i32 { return m.static_item_kind(item_id); }
+public fn mir_unit_static_type(m: &MirUnit, item_id: i32) -> i32 { return m.static_type(item_id); }
+public fn mir_unit_static_init_kind(m: &MirUnit, item_id: i32) -> i32 { return m.static_init_kind(item_id); }
+public fn mir_unit_static_init_target_kind(m: &MirUnit, item_id: i32) -> i32 { return m.static_init_target_kind(item_id); }
+public fn mir_unit_static_init_target_id(m: &MirUnit, item_id: i32) -> i32 { return m.static_init_target_id(item_id); }
+public fn mir_unit_static_init_int(m: &MirUnit, item_id: i32) -> i64 { return m.static_init_int(item_id); }
+public fn mir_unit_static_name(m: &MirUnit, item_id: i32) -> string { return m.static_name(item_id); }
+public fn mir_unit_static_init_text(m: &MirUnit, item_id: i32) -> string { return m.static_init_text(item_id); }
+public fn mir_unit_static_module_name(m: &MirUnit, item_id: i32) -> string { return m.static_module_name(item_id); }
+public fn mir_unit_static_flags(m: &MirUnit, item_id: i32) -> i32 { return m.static_flags(item_id); }
+
+public fn mir_unit_add_place(m: &mut MirUnit,
+                             function_id: i32,
+                             kind: i32,
+                             type_id: i32,
+                             local_id: i32,
+                             base_place_id: i32,
+                             field_id: i32,
+                             index_value_id: i32,
+                             source_expr_id: i32,
+                             name: string) -> i32 {
+    return m.add_place(function_id, kind, type_id, local_id, base_place_id, field_id, index_value_id, source_expr_id, name);
+}
+
+public fn mir_unit_add_value(m: &mut MirUnit,
+                             function_id: i32,
+                             kind: i32,
+                             type_id: i32,
+                             place_id: i32,
+                             target_kind: i32,
+                             target_id: i32,
+                             source_expr_id: i32,
+                             flags: i32,
+                             op: i32,
+                             int_value: i64,
+                             name: string,
+                             text: string) -> i32 {
+    return m.add_value(function_id, kind, type_id, place_id, target_kind, target_id, source_expr_id, flags, op, int_value, name, text);
+}
+
+public fn mir_unit_set_value_lhs(m: &mut MirUnit, value_id: i32, lhs_id: i32) { m.set_value_lhs(value_id, lhs_id); }
+public fn mir_unit_set_value_rhs(m: &mut MirUnit, value_id: i32, rhs_id: i32) { m.set_value_rhs(value_id, rhs_id); }
+public fn mir_unit_set_value_aux(m: &mut MirUnit, value_id: i32, aux_id: i32) { m.set_value_aux(value_id, aux_id); }
+public fn mir_unit_set_value_first_arg(m: &mut MirUnit, value_id: i32, arg_id: i32) { m.set_value_first_arg(value_id, arg_id); }
+public fn mir_unit_set_value_next_arg(m: &mut MirUnit, value_id: i32, next_id: i32) { m.set_value_next_arg(value_id, next_id); }
+public fn mir_unit_set_value_flags(m: &mut MirUnit, value_id: i32, flags: i32) { m.set_value_flags(value_id, flags); }
+public fn mir_unit_set_value_place(m: &mut MirUnit, value_id: i32, place_id: i32) -> bool {
+    return m.set_value_place(value_id, place_id);
+}
+public fn mir_unit_place_check_policy(m: &MirUnit, place_id: i32) -> i32 {
+    return m.place_check_policy(place_id);
+}
+
+public fn mir_unit_set_place_check_policy(m: &mut MirUnit, place_id: i32, policy: i32) -> bool {
+    return m.set_place_check_policy(place_id, policy);
+}
+public fn mir_unit_set_value_target(m: &mut MirUnit, value_id: i32, target_kind: i32, target_id: i32) { m.set_value_target(value_id, target_kind, target_id); }
+public fn mir_unit_set_value_aggregate_field(m: &mut MirUnit, value_id: i32, field_id: i32) { m.set_value_aggregate_field(value_id, field_id); }
+public fn mir_unit_value_aggregate_field(m: &MirUnit, value_id: i32) -> i32 { return m.value_aggregate_field(value_id); }
+public fn mir_unit_set_value_loc(m: &mut MirUnit, value_id: i32, line: i32, col: i32, end_line: i32, end_col: i32) {
+    m.set_value_loc(value_id, line, col, end_line, end_col);
+}
+public fn mir_unit_value_loc_ptr(m: &MirUnit, value_id: i32) -> rawptr { return m.value_loc_ptr(value_id); }
+public fn mir_unit_value_loc_line(m: &MirUnit, value_id: i32) -> i32 { return m.value_loc_line(value_id); }
+public fn mir_unit_value_loc_col(m: &MirUnit, value_id: i32) -> i32 { return m.value_loc_col(value_id); }
+public fn mir_unit_value_loc_end_line(m: &MirUnit, value_id: i32) -> i32 { return m.value_loc_end_line(value_id); }
+public fn mir_unit_value_loc_end_col(m: &MirUnit, value_id: i32) -> i32 { return m.value_loc_end_col(value_id); }
+
+public fn mir_unit_block_loc_ptr(m: &MirUnit, block_id: i32) -> rawptr { return m.block_loc_ptr(block_id); }
+public fn mir_unit_local_loc_ptr(m: &MirUnit, local_id: i32) -> rawptr { return m.local_loc_ptr(local_id); }
+public fn mir_unit_instr_loc_ptr(m: &MirUnit, instr_id: i32) -> rawptr { return m.instr_loc_ptr(instr_id); }
+
+fn mir_unit_diag_loc_valid(loc: rawptr) -> bool {
+    return loc != null && ast_read_i32(loc) > 0;
+}
+
+fn mir_unit_diag_loc_for_value_depth(m: &MirUnit, value_id: i32, depth: i32) -> rawptr {
+    if (depth > 16 || value_id < 1 || value_id > m.value_count) { return null; }
+    let rec = m.value_record(value_id);
+    if (rec == null || ast_read_i32(rec) != value_id) { return null; }
+    let direct = m.value_loc_ptr(value_id);
+    if (mir_unit_diag_loc_valid(direct)) { return direct; }
+    let place_loc = mir_unit_diag_loc_for_place_depth(m, m.value_place(value_id), depth + 1);
+    if (mir_unit_diag_loc_valid(place_loc)) { return place_loc; }
+    let lhs_loc = mir_unit_diag_loc_for_value_depth(m, m.value_lhs(value_id), depth + 1);
+    if (mir_unit_diag_loc_valid(lhs_loc)) { return lhs_loc; }
+    let rhs_loc = mir_unit_diag_loc_for_value_depth(m, m.value_rhs(value_id), depth + 1);
+    if (mir_unit_diag_loc_valid(rhs_loc)) { return rhs_loc; }
+    let aux_loc = mir_unit_diag_loc_for_value_depth(m, m.value_aux(value_id), depth + 1);
+    if (mir_unit_diag_loc_valid(aux_loc)) { return aux_loc; }
+    return mir_unit_diag_loc_for_value_depth(m, m.value_first_arg(value_id), depth + 1);
+}
+
+fn mir_unit_diag_loc_for_place_depth(m: &MirUnit, place_id: i32, depth: i32) -> rawptr {
+    if (depth > 16 || place_id < 1 || place_id > m.place_count) { return null; }
+    let rec = m.place_record(place_id);
+    if (rec == null || ast_read_i32(rec) != place_id) { return null; }
+    let kind = m.place_kind(place_id);
+    if (kind == mir_place_local()) {
+        let loc = m.local_loc_ptr(m.place_local(place_id));
+        if (mir_unit_diag_loc_valid(loc)) { return loc; }
+    }
+    let index_loc = mir_unit_diag_loc_for_value_depth(m, m.place_index_value(place_id), depth + 1);
+    if (mir_unit_diag_loc_valid(index_loc)) { return index_loc; }
+    return mir_unit_diag_loc_for_place_depth(m, m.place_base(place_id), depth + 1);
+}
+
+public fn mir_unit_diag_loc_for_value(m: &MirUnit, value_id: i32) -> rawptr {
+    return mir_unit_diag_loc_for_value_depth(m, value_id, 0);
+}
+
+public fn mir_unit_diag_loc_for_place(m: &MirUnit, place_id: i32) -> rawptr {
+    return mir_unit_diag_loc_for_place_depth(m, place_id, 0);
+}
+
+public fn mir_unit_diag_loc_for_local(m: &MirUnit, local_id: i32) -> rawptr {
+    if (local_id < 1 || local_id > m.local_count) { return null; }
+    let rec = m.local_record(local_id);
+    if (rec == null || ast_read_i32(rec) != local_id) { return null; }
+    let loc = m.local_loc_ptr(local_id);
+    if (mir_unit_diag_loc_valid(loc)) { return loc; }
+    return mir_unit_diag_loc_for_place_depth(m, m.local_place(local_id), 0);
+}
+
+public fn mir_unit_diag_loc_for_block(m: &MirUnit, block_id: i32) -> rawptr {
+    if (block_id < 1 || block_id > m.block_count) { return null; }
+    let rec = m.block_record(block_id);
+    if (rec == null || ast_read_i32(rec) != block_id) { return null; }
+    let loc = m.block_loc_ptr(block_id);
+    if (mir_unit_diag_loc_valid(loc)) { return loc; }
+    let term_loc = mir_unit_diag_loc_for_value_depth(m, m.block_term_value(block_id), 0);
+    if (mir_unit_diag_loc_valid(term_loc)) { return term_loc; }
+    let instr_loc = mir_unit_diag_loc_for_instr(m, m.block_first_instr(block_id));
+    if (mir_unit_diag_loc_valid(instr_loc)) { return instr_loc; }
+    return null;
+}
+
+public fn mir_unit_diag_loc_for_instr(m: &MirUnit, instr_id: i32) -> rawptr {
+    if (instr_id < 1 || instr_id > m.instr_count) { return null; }
+    let rec = m.instr_record(instr_id);
+    if (rec == null || ast_read_i32(rec) != instr_id) { return null; }
+    let loc = m.instr_loc_ptr(instr_id);
+    if (mir_unit_diag_loc_valid(loc)) { return loc; }
+    let value_loc = mir_unit_diag_loc_for_value_depth(m, m.instr_value(instr_id), 0);
+    if (mir_unit_diag_loc_valid(value_loc)) { return value_loc; }
+    let place_loc = mir_unit_diag_loc_for_place_depth(m, m.instr_place(instr_id), 0);
+    if (mir_unit_diag_loc_valid(place_loc)) { return place_loc; }
+    return null;
+}
+
+public fn mir_unit_diag_loc_for_function(m: &MirUnit, function_id: i32) -> rawptr {
+    if (function_id < 1 || function_id > m.function_count) { return null; }
+    let rec = m.function_record(function_id);
+    if (rec == null || ast_read_i32(rec) != function_id) { return null; }
+    let block_loc = mir_unit_diag_loc_for_block(m, m.function_first_block(function_id));
+    if (mir_unit_diag_loc_valid(block_loc)) { return block_loc; }
+    return mir_unit_diag_loc_for_local(m, m.function_first_local(function_id));
+}
+
+public fn mir_unit_diag_loc_for_case(m: &MirUnit, case_id: i32) -> rawptr {
+    if (case_id < 1 || case_id > m.case_count) { return null; }
+    let rec = m.case_record(case_id);
+    if (rec == null || ast_read_i32(rec) != case_id) { return null; }
+    let pattern_loc = mir_unit_diag_loc_for_value_depth(m, m.case_pattern_value(case_id), 0);
+    if (mir_unit_diag_loc_valid(pattern_loc)) { return pattern_loc; }
+    let guard_loc = mir_unit_diag_loc_for_value_depth(m, m.case_guard_value(case_id), 0);
+    if (mir_unit_diag_loc_valid(guard_loc)) { return guard_loc; }
+    return mir_unit_diag_loc_for_block(m, m.case_owner_block(case_id));
+}
+
+public fn mir_unit_diag_loc_for_type(m: &MirUnit, type_id: i32) -> rawptr {
+    if (type_id == mir_id_invalid()) { return null; }
+    var value_id: i32 = 1;
+    while (value_id <= m.value_count) {
+        if (m.value_type(value_id) == type_id) {
+            let loc = mir_unit_diag_loc_for_value_depth(m, value_id, 0);
+            if (mir_unit_diag_loc_valid(loc)) { return loc; }
+        }
+        value_id = value_id + 1;
+    }
+    var local_id: i32 = 1;
+    while (local_id <= m.local_count) {
+        if (m.local_type(local_id) == type_id) {
+            let loc2 = mir_unit_diag_loc_for_local(m, local_id);
+            if (mir_unit_diag_loc_valid(loc2)) { return loc2; }
+        }
+        local_id = local_id + 1;
+    }
+    var function_id: i32 = 1;
+    while (function_id <= m.function_count) {
+        if (m.function_return_type(function_id) == type_id) {
+            let loc3 = mir_unit_diag_loc_for_function(m, function_id);
+            if (mir_unit_diag_loc_valid(loc3)) { return loc3; }
+        }
+        function_id = function_id + 1;
+    }
+    return null;
+}
+
+public fn mir_unit_diag_loc_for_field(m: &MirUnit, field_id: i32) -> rawptr {
+    if (field_id == mir_id_invalid()) { return null; }
+    var place_id: i32 = 1;
+    while (place_id <= m.place_count) {
+        if (m.place_field(place_id) == field_id) {
+            let loc = mir_unit_diag_loc_for_place_depth(m, place_id, 0);
+            if (mir_unit_diag_loc_valid(loc)) { return loc; }
+        }
+        place_id = place_id + 1;
+    }
+    if (field_id >= 1 && field_id <= m.field_count) {
+        return mir_unit_diag_loc_for_type(m, m.field_owner_type(field_id));
+    }
+    return null;
+}
+
+public fn mir_unit_diag_first_loc(m: &MirUnit) -> rawptr {
+    var function_id: i32 = 1;
+    while (function_id <= m.function_count) {
+        let loc = mir_unit_diag_loc_for_function(m, function_id);
+        if (mir_unit_diag_loc_valid(loc)) { return loc; }
+        function_id = function_id + 1;
+    }
+    var value_id: i32 = 1;
+    while (value_id <= m.value_count) {
+        let loc2 = mir_unit_diag_loc_for_value_depth(m, value_id, 0);
+        if (mir_unit_diag_loc_valid(loc2)) { return loc2; }
+        value_id = value_id + 1;
+    }
+    return null;
+}
+
+public fn mir_unit_add_instr(m: &mut MirUnit,
+                             function_id: i32,
+                             block_id: i32,
+                             kind: i32,
+                             type_id: i32,
+                             place_id: i32,
+                             value_id: i32,
+                             lhs_value_id: i32,
+                             rhs_value_id: i32,
+                             target_kind: i32,
+                             target_id: i32,
+                             source_stmt_id: i32,
+                             source_expr_id: i32,
+                             flags: i32,
+                             aux: i32,
+                             name: string) -> i32 {
+    return m.add_instr(function_id, block_id, kind, type_id, place_id, value_id, lhs_value_id, rhs_value_id,
+                       target_kind, target_id, source_stmt_id, source_expr_id, flags, aux, name);
+}
+
+public fn mir_unit_set_instr_value(m: &mut MirUnit, instr_id: i32, value_id: i32) -> bool {
+    return m.set_instr_value(instr_id, value_id);
+}
+public fn mir_unit_clear_eval_instr_value(m: &mut MirUnit, instr_id: i32) -> bool {
+    return m.clear_eval_instr_value(instr_id);
+}
+
+public fn mir_unit_set_block_terminator(m: &mut MirUnit,
+                                        block_id: i32,
+                                        kind: i32,
+                                        value_id: i32,
+                                        target_block_id: i32,
+                                        false_block_id: i32,
+                                        first_case_id: i32,
+                                        aux: i32) {
+    m.set_block_terminator(block_id, kind, value_id, target_block_id, false_block_id, first_case_id, aux);
+}
+
+public fn mir_unit_set_function_block_chain(m: &mut MirUnit,
+                                            function_id: i32,
+                                            first_block_id: i32,
+                                            active_count: i32) -> bool {
+    return m.set_function_block_chain(function_id, first_block_id, active_count);
+}
+
+public fn mir_unit_set_block_next(m: &mut MirUnit, block_id: i32, next_block_id: i32) -> bool {
+    return m.set_block_next(block_id, next_block_id);
+}
+
+public fn mir_unit_set_block_flags(m: &mut MirUnit, block_id: i32, flags: i32) -> bool {
+    return m.set_block_flags(block_id, flags);
+}
+
+public fn mir_unit_tombstone_block(m: &mut MirUnit, block_id: i32) -> bool {
+    return m.tombstone_block(block_id);
+}
+
+public fn mir_unit_block_is_removed(m: &MirUnit, block_id: i32) -> bool {
+    if (block_id < 1 || block_id > m.block_count) { return false; }
+    return m.block_is_removed(block_id);
+}
+
+public fn mir_unit_instr_owner_is_removed(m: &MirUnit, instr_id: i32) -> bool {
+    if (instr_id < 1 || instr_id > m.instr_count) { return false; }
+    let owner = m.instr_block(instr_id);
+    return owner != mir_id_invalid() && mir_unit_block_is_removed(m, owner);
+}
+
+public fn mir_unit_case_owner_is_removed(m: &MirUnit, case_id: i32) -> bool {
+    if (case_id < 1 || case_id > m.case_count) { return false; }
+    let owner = m.case_owner_block(case_id);
+    return owner != mir_id_invalid() && mir_unit_block_is_removed(m, owner);
+}
+
+public fn mir_unit_case_is_active(m: &MirUnit, case_id: i32) -> bool {
+    if (case_id < 1 || case_id > m.case_count) { return false; }
+    let owner = m.case_owner_block(case_id);
+    if (owner == mir_id_invalid()
+        || mir_unit_block_is_removed(m, owner)
+        || m.block_term_kind(owner) != mir_term_match()) { return false; }
+    var current = m.block_term_first_case(owner);
+    var guard: i32 = 0;
+    while (current != mir_id_invalid()) {
+        if (current == case_id) { return true; }
+        current = m.case_next(current);
+        guard = guard + 1;
+        if (guard > m.case_count + 1) { return false; }
+    }
+    return false;
+}
+
+public fn mir_unit_add_case(m: &mut MirUnit,
+                            owner_block_id: i32,
+                            pattern_value_id: i32,
+                            guard_value_id: i32,
+                            target_block_id: i32,
+                            source_stmt_id: i32,
+                            text: string) -> i32 {
+    return m.add_case(owner_block_id, pattern_value_id, guard_value_id, target_block_id, source_stmt_id, text);
+}
+
+public fn mir_unit_set_case_target_block(m: &mut MirUnit,
+                                         case_id: i32,
+                                         target_block_id: i32) -> bool {
+    return m.set_case_target_block(case_id, target_block_id);
+}
+
+public fn mir_unit_set_case_next(m: &mut MirUnit, case_id: i32, next_id: i32) {
+    m.set_case_next(case_id, next_id);
+}
+
+public fn mir_unit_set_reflection_manifest(m: &mut MirUnit, manifest: string) {
+    m.set_reflection_manifest(manifest);
+}
+
+public fn mir_unit_reflection_manifest(m: &MirUnit) -> string {
+    return m.reflection_manifest;
+}
+
+public fn mir_unit_set_reflection_name_map(m: &mut MirUnit, name_map: string) {
+    m.set_reflection_name_map(name_map);
+}
+
+public fn mir_unit_set_foreign_cpp_includes(m: &mut MirUnit, includes: string) {
+    m.set_foreign_cpp_includes(includes);
+}
+
+public fn mir_unit_foreign_cpp_includes(m: &MirUnit) -> string {
+    return m.foreign_cpp_includes;
+}
+
+public fn mir_unit_set_dci_stub_specs(m: &mut MirUnit, specs: string) {
+    m.set_dci_stub_specs(specs);
+}
+
+public fn mir_unit_dci_stub_specs(m: &MirUnit) -> string {
+    return m.dci_stub_specs;
+}
+
+public fn mir_unit_set_dci_abi_text(m: &mut MirUnit, text: string) {
+    m.set_dci_abi_text(text);
+}
+
+public fn mir_unit_dci_abi_text(m: &MirUnit) -> string {
+    return m.dci_abi_text;
+}
+
+public fn mir_unit_set_dci_abi_source(m: &mut MirUnit,
+                                      text: string,
+                                      path: string,
+                                      is_binary: bool) {
+    m.set_dci_abi_source(text, path, is_binary);
+}
+
+public fn mir_unit_dci_abi_path(m: &MirUnit) -> string {
+    return m.dci_abi_path;
+}
+
+public fn mir_unit_dci_abi_is_binary(m: &MirUnit) -> bool {
+    return m.dci_abi_is_binary;
+}
+
+public fn mir_unit_has_dci_abi(m: &MirUnit) -> bool {
+    return m.dci_abi_text.len > 0 || m.dci_abi_path.len > 0;
+}
+
+public fn mir_unit_set_interface_supers(m: &mut MirUnit, supers: string) {
+    m.set_interface_supers(supers);
+}
+
+public fn mir_unit_interface_supers(m: &MirUnit) -> string {
+    return m.interface_supers;
+}
+
+public fn mir_unit_discard_recent_body_records(m: &mut MirUnit,
+                                               function_id: i32,
+                                               block_mark: i32,
+                                               local_mark: i32,
+                                               place_mark: i32,
+                                               value_mark: i32,
+                                               instr_mark: i32,
+                                               case_mark: i32) {
+    m.discard_recent_body_records(function_id,
+                                  block_mark,
+                                  local_mark,
+                                  place_mark,
+                                  value_mark,
+                                  instr_mark,
+                                  case_mark);
+}
+
+public fn mir_unit_reflection_name_map(m: &MirUnit) -> string {
+    return m.reflection_name_map;
+}

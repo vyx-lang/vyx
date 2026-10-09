@@ -5,7 +5,7 @@
 > **Documentation status (2026-09-02):** current self-host implementation reference.
 > The package/source-target, target-selection and triplet-link features below
 > describe the self-host implementation in
-> `bootstrap_compiler/src/core/build_system.vyx`. The frozen host toolchain does
+> `bootstrap_compiler/src/core/project/build_system.vyx`. The frozen host toolchain does
 > not consume self-host-only source packages.
 
 ## Scope and authority

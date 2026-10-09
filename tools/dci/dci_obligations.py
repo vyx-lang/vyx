@@ -356,7 +356,7 @@ def _effect_hash(value: str) -> int:
 
 def _effect_mix(seed: int, value: int) -> int:
     modulus = 2_147_483_647
-    # Keep this in lockstep with bootstrap_compiler/src/core/effect_manifest.vyx.
+    # Keep this in lockstep with bootstrap_compiler/src/core/facts/effect_manifest.vyx.
     # The manifest accumulator is intentionally additive so a parsed envelope
     # can rebuild the same fingerprint from its rows.
     result = (seed + value + 97) % modulus

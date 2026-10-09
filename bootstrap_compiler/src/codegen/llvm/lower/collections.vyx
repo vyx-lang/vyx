@@ -1,0 +1,945 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn type_is_std_vec_type(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        let text = llvm_mir_type_text(&self.m, type_id);
+        if (text.len == 0) { return false; }
+        var base = policy_generic_call_base(text.clone());
+        if (base.len == 0) { base = text; }
+        let last = self.last_path_segment(base);
+        if (last == "Vec") { return true; }
+        return text.contains("Vec<") || text.contains("Vec::<");
+    }
+
+    public fn vec_receiver_for_call(self, value_id: i32) -> i32 {
+        let receiver_id = self.receiver_for_builtin_call(value_id);
+        if (receiver_id == mir_id_invalid()) { return mir_id_invalid(); }
+        if (self.type_is_std_vec_type(self.value_effective_type(receiver_id))) { return receiver_id; }
+        return mir_id_invalid();
+    }
+
+    public fn foreign_dci_owner_type_id(self, function_id: i32) -> i32 {
+        let owner_id = mir_unit_foreign_dci_owner_type_id(&self.m, function_id);
+        if (owner_id != mir_id_invalid()) { return owner_id; }
+        let owner = mir_unit_foreign_dci_owner_type_text(&self.m, function_id);
+        if (owner.len > 0) { return self.type_id_by_text(owner); }
+        return mir_id_invalid();
+    }
+
+    public fn foreign_dci_owner_type_text(self, function_id: i32) -> string {
+        return mir_unit_foreign_dci_owner_type_text(&self.m, function_id);
+    }
+
+    public fn lower_vec_element_ptr_from_index(self,
+                                               receiver_id: i32,
+                                               index_v: rawptr,
+                                               label: string) -> rawptr {
+        if (receiver_id == mir_id_invalid() || index_v == null) { return null; }
+        let receiver_type = self.value_effective_type(receiver_id);
+        if (!self.type_is_std_vec_type(receiver_type)) { return null; }
+        let base_addr = self.lower_self_receiver_address(receiver_id, receiver_type);
+        if (base_addr == null) {
+            self.report_error("cannot lower Vec receiver address");
+            return null;
+        }
+        let data_v = self.load_record_field_from_addr(base_addr, receiver_type, "data");
+        let elem_size_v = self.load_record_field_from_addr(base_addr, receiver_type, "elem_size");
+        if (data_v == null || elem_size_v == null) {
+            self.report_error("cannot load Vec data/elem_size fields");
+            return null;
+        }
+        let byte_offset = vyx_rt_build_mul(self.mod,
+                                           index_v,
+                                           elem_size_v,
+                                           (label + ".off").c_str(),
+                                           (label + ".off").len as u64);
+        if (byte_offset == null) {
+            self.report_error("cannot compute Vec element byte offset");
+            return null;
+        }
+        return self.ptr_offset_bytes(data_v, byte_offset, label);
+    }
+
+    public fn lower_vec_get_unchecked_call(self, value_id: i32) -> rawptr {
+        if (self.call_arg_count(value_id) != 1) { return null; }
+        let receiver_id = self.vec_receiver_for_call(value_id);
+        if (receiver_id == mir_id_invalid()) { return null; }
+        let index_id = self.call_arg_at(value_id, 0);
+        let idx_v = self.int_value_to_bits(self.lower_value(index_id), self.m.value_type(index_id), 64);
+        let elem_ptr = self.lower_vec_element_ptr_from_index(receiver_id, idx_v, "mir.vec.get");
+        let elem_type = self.value_effective_type(value_id);
+        let elem_ty = self.lower_type(elem_type);
+        if (idx_v == null || elem_ptr == null || elem_ty == null) {
+            self.report_error("cannot lower Vec.get_unchecked fast path");
+            return null;
+        }
+        if (self.type_is_class_pointer_abi(elem_type)) {
+            return elem_ptr;
+        }
+        return vyx_rt_build_load(self.mod,
+                                 elem_ty,
+                                 elem_ptr,
+                                 "mir.vec.get.value".c_str(),
+                                 17);
+    }
+
+    public fn lower_vec_set_unchecked_call(self, value_id: i32) -> bool {
+        if (self.call_arg_count(value_id) != 2) { return false; }
+        let receiver_id = self.vec_receiver_for_call(value_id);
+        if (receiver_id == mir_id_invalid()) { return false; }
+        let index_id = self.call_arg_at(value_id, 0);
+        let value_arg_id = self.call_arg_at(value_id, 1);
+        let idx_v = self.int_value_to_bits(self.lower_value(index_id), self.m.value_type(index_id), 64);
+        let elem_ptr = self.lower_vec_element_ptr_from_index(receiver_id, idx_v, "mir.vec.set");
+        let value_type = self.value_effective_type(value_arg_id);
+        if (idx_v == null || elem_ptr == null) {
+            self.report_error("cannot lower Vec.set_unchecked fast path");
+            return true;
+        }
+        if (!self.copy_value_storage_to_addr(elem_ptr, value_arg_id, value_type, "Vec.set_unchecked")) {
+            return true;
+        }
+        return true;
+    }
+
+    public fn lower_vec_push_unchecked_call(self, value_id: i32) -> bool {
+        if (self.call_arg_count(value_id) != 1) { return false; }
+        let receiver_id = self.vec_receiver_for_call(value_id);
+        if (receiver_id == mir_id_invalid()) { return false; }
+        let receiver_type = self.value_effective_type(receiver_id);
+        let base_addr = self.lower_self_receiver_address(receiver_id, receiver_type);
+        let len_ptr = self.record_field_addr_for_type(base_addr, receiver_type, "len");
+        if (base_addr == null || len_ptr == null) {
+            self.report_error("cannot lower Vec.push_unchecked receiver");
+            return true;
+        }
+        let len_v = vyx_rt_build_load(self.mod,
+                                      self.ty_i64,
+                                      len_ptr,
+                                      "mir.vec.push.len".c_str(),
+                                      16);
+        let elem_ptr = self.lower_vec_element_ptr_from_index(receiver_id, len_v, "mir.vec.push");
+        let value_arg_id = self.call_arg_at(value_id, 0);
+        let value_type = self.value_effective_type(value_arg_id);
+        if (len_v == null || elem_ptr == null) {
+            self.report_error("cannot lower Vec.push_unchecked fast path");
+            return true;
+        }
+        if (!self.copy_value_storage_to_addr(elem_ptr, value_arg_id, value_type, "Vec.push_unchecked")) {
+            return true;
+        }
+        let new_len = vyx_rt_build_add(self.mod,
+                                       len_v,
+                                       vyx_rt_const_int(self.mod, self.ty_i64, 1, 0),
+                                       "mir.vec.push.newlen".c_str(),
+                                       19);
+        if (new_len == null) {
+            self.report_error("cannot update Vec len in push_unchecked fast path");
+            return true;
+        }
+        vyx_rt_build_store(self.mod, new_len, len_ptr);
+        return true;
+    }
+
+    public fn load_record_field_from_addr(self, record_addr: rawptr, type_id: i32, field_name: string) -> rawptr {
+        let field_id = self.field_id_for_type_name(type_id, field_name);
+        if (field_id == mir_id_invalid()) {
+            self.report_error("cannot resolve field `" + field_name + "` for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        let field_addr = self.record_field_addr_for_type(record_addr, type_id, field_name);
+        let field_type = mir_unit_field_type(&self.m, field_id);
+        let field_ll = self.lower_type(field_type);
+        if (field_addr == null || field_ll == null) {
+            self.report_error("cannot load field `" + field_name + "` for " + llvm_mir_type_text(&self.m, type_id));
+            return null;
+        }
+        return vyx_rt_build_load(self.mod,
+                                 field_ll,
+                                 field_addr,
+                                 field_name.c_str(),
+                                 field_name.len as u64);
+    }
+
+    public fn foreach_iterator_slot_for_value(self, value_id: i32) -> rawptr {
+        if (value_id == mir_id_invalid()) { return null; }
+        if (self.m.value_kind(value_id) == mir_value_read_place()) {
+            return self.lower_place_addr(self.m.value_place(value_id));
+        }
+        let cached = llvm_mir_map_get(self.foreach_iterator_slots, value_id);
+        if (cached != null) { return cached; }
+        let iter_type = self.m.value_type(value_id);
+        let iter_ll = self.lower_type(iter_type);
+        if (iter_ll == null) {
+            self.report_error("cannot lower foreach iterator type " + llvm_mir_type_text(&self.m, iter_type));
+            return null;
+        }
+        let slot = vyx_rt_build_alloca(self.mod, iter_ll, "mir.foreach.iter".c_str(), 16);
+        let value = self.lower_value_as(value_id, iter_type);
+        if (slot == null || value == null) {
+            self.report_error("cannot materialize foreach iterator value #"
+                      + policy_i64_to_string(value_id as i64));
+            return null;
+        }
+        vyx_rt_build_store(self.mod, value, slot);
+        llvm_mir_map_put(self.foreach_iterator_slots, value_id, slot);
+        return slot;
+    }
+
+    public fn foreach_method_for_iterator(self, iter_type: i32, method_name: string) -> i32 {
+        let method_fn = self.executable_method_for_receiver_type(iter_type, method_name);
+        if (method_fn == mir_id_invalid()) { return mir_id_invalid(); }
+        if (self.function_source_param_count(method_fn) != 1) { return mir_id_invalid(); }
+        return method_fn;
+    }
+
+    public fn lower_iterator_method_call_from_slot(self,
+                                                   method_fn: i32,
+                                                   iter_slot: rawptr,
+                                                   iter_type: i32,
+                                                   result_name: string) -> rawptr {
+        if (method_fn == mir_id_invalid() || iter_slot == null) { return null; }
+        if (self.function_hidden_env_param_count(method_fn) != 0) {
+            self.report_error("foreach iterator method has hidden environment: " + self.m.function_name(method_fn));
+            return null;
+        }
+        if (!self.declare_function_signature(method_fn)) {
+            self.report_error("cannot declare foreach iterator method " + self.m.function_name(method_fn));
+            return null;
+        }
+        let fn_value = llvm_mir_map_get(self.function_values, method_fn);
+        let fn_type = llvm_mir_map_get(self.function_types, method_fn);
+        if (fn_value == null || fn_type == null) {
+            self.report_error("cannot resolve foreach iterator method " + self.m.function_name(method_fn));
+            return null;
+        }
+        let receiver_type = self.function_source_param_type(method_fn, 0);
+        if (receiver_type == mir_id_invalid()) {
+            self.report_error("foreach iterator method has no receiver: " + self.m.function_name(method_fn));
+            return null;
+        }
+        let args = malloc(8);
+        if (args == null) {
+            self.report_error("cannot allocate foreach iterator call arguments");
+            return null;
+        }
+        var receiver_arg: rawptr = null;
+        if (self.source_param_uses_self_pointer_abi(method_fn, 0)) {
+            if (self.type_is_class_pointer_abi(iter_type)) {
+                receiver_arg = vyx_rt_build_load(self.mod,
+                                                 self.ty_ptr,
+                                                 iter_slot,
+                                                 "mir.foreach.iter.obj".c_str(),
+                                                 20);
+            } else {
+                receiver_arg = iter_slot;
+            }
+        } else {
+            let loaded = vyx_rt_build_load(self.mod,
+                                           self.lower_type(iter_type),
+                                           iter_slot,
+                                           llvm_mir_empty_name(),
+                                           0);
+            receiver_arg = self.cast_value(loaded, iter_type, receiver_type);
+        }
+        if (receiver_arg == null) {
+            free(args);
+            self.report_error("cannot lower foreach iterator receiver for " + self.m.function_name(method_fn));
+            return null;
+        }
+        ast_write_rawptr(args, receiver_arg);
+        var call_label = result_name;
+        if (llvm_mir_type_kind(&self.m, self.m.function_return_type(method_fn)) == ty_VOID()) { call_label = ""; }
+        let out = vyx_rt_build_call(self.mod,
+                                    fn_type,
+                                    fn_value,
+                                    args,
+                                    1,
+                                    call_label.c_str(),
+                                    call_label.len as u64);
+        free(args);
+        return out;
+    }
+
+    public fn type_is_standard_iterator_abi(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
+        let canonical_type = self.canonical_record_type_id(type_id);
+        let text = llvm_mir_type_text(&self.m, type_id);
+        if (policy_generic_call_has_args(text.clone()) == 0) { return false; }
+        if (self.last_path_segment(policy_generic_call_base(text.clone())) != "Iterator") { return false; }
+        let data_field = self.field_id_for_type_name(canonical_type, "data");
+        let len_field = self.field_id_for_type_name(canonical_type, "len");
+        let pos_field = self.field_id_for_type_name(canonical_type, "pos");
+        if (vyx_bootstrap_profile_level() > 2
+            && (data_field == mir_id_invalid()
+                || len_field == mir_id_invalid()
+                || pos_field == mir_id_invalid())) {
+            print("[llvm-iter-abi] type=" + text
+                  + " canonical=" + policy_i64_to_string(canonical_type as i64)
+                  + " data=" + policy_i64_to_string(data_field as i64)
+                  + " len=" + policy_i64_to_string(len_field as i64)
+                  + " pos=" + policy_i64_to_string(pos_field as i64));
+        }
+        return data_field != mir_id_invalid()
+            && len_field != mir_id_invalid()
+            && pos_field != mir_id_invalid();
+    }
+
+    public fn standard_iterator_payload_type(self, type_id: i32) -> i32 {
+        if (!self.type_is_standard_iterator_abi(type_id)) { return mir_id_invalid(); }
+        let text = llvm_mir_type_text(&self.m, type_id);
+        let args = policy_generic_call_args(text.clone());
+        let payload_text = policy_generic_arg_at(args, 0);
+        if (payload_text.len == 0) { return mir_id_invalid(); }
+        let payload_type = self.type_id_by_text(payload_text);
+        if (payload_type == mir_id_invalid()) {
+            self.report_error("cannot resolve Iterator payload type " + payload_text);
+        }
+        return payload_type;
+    }
+
+    public fn foreach_collection_type_id(self, type_id: i32) -> i32 {
+        var current = type_id;
+        var depth: i32 = 0;
+        while (current != mir_id_invalid() && depth <= self.m.types.count) {
+            let kind = llvm_mir_type_kind(&self.m, current);
+            if (kind != ty_REF() && kind != ty_MUTREF()) { return current; }
+            current = hir_type_table_elem(self.m.types, current);
+            depth = depth + 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn indexed_iterable_record_address(self, iter_value: i32) -> rawptr {
+        var iter_type = self.m.value_type(iter_value);
+        let kind = llvm_mir_type_kind(&self.m, iter_type);
+        if (kind == ty_REF() || kind == ty_MUTREF()) {
+            var handle = self.lower_value_as(iter_value, iter_type);
+            var depth: i32 = 0;
+            while (depth <= self.m.types.count) {
+                let elem = hir_type_table_elem(self.m.types, iter_type);
+                if (elem == mir_id_invalid() || handle == null) { return null; }
+                let bytes = self.value_storage_size(elem);
+                if (bytes <= 0) {
+                    self.report_error("cannot measure borrowed foreach collection " + llvm_mir_type_text(&self.m, elem));
+                    return null;
+                }
+                let address = self.pointer_checked_address(handle,
+                                                            vyx_rt_const_int(self.mod, self.ty_i64, 0, 0),
+                                                            bytes,
+                                                            0,
+                                                            "mir.foreach.borrow");
+                let elem_kind = llvm_mir_type_kind(&self.m, elem);
+                if (elem_kind != ty_REF() && elem_kind != ty_MUTREF()) { return address; }
+                if (address == null) { return null; }
+                handle = vyx_rt_build_load(self.mod, self.lower_type(elem), address, llvm_mir_empty_name(), 0);
+                iter_type = elem;
+                depth = depth + 1;
+            }
+            self.report_error("cyclic borrowed foreach collection type");
+            return null;
+        }
+        let slot = self.foreach_iterator_slot_for_value(iter_value);
+        if (slot == null) { return null; }
+        if (self.type_is_class_pointer_abi(iter_type)) {
+            return vyx_rt_build_load(self.mod, self.ty_ptr, slot, "mir.foreach.iter.obj".c_str(), 20);
+        }
+        return slot;
+    }
+
+    public fn type_is_standard_indexed_iterable_abi(self, type_id: i32) -> bool {
+        type_id = self.foreach_collection_type_id(type_id);
+        if (type_id == mir_id_invalid()) { return false; }
+        if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
+        let canonical_type = self.canonical_record_type_id(type_id);
+        let text = llvm_mir_type_text(&self.m, type_id);
+        let canonical_text = llvm_mir_type_text(&self.m, canonical_type);
+        if (policy_generic_call_has_args(text.clone()) == 0
+            && policy_generic_call_has_args(canonical_text.clone()) == 0) { return false; }
+        let base = self.last_path_segment(policy_generic_call_base(text.clone()));
+        if (base != "Vec") { return false; }
+        if (self.field_id_for_type_name(canonical_type, "data") == mir_id_invalid()) { return false; }
+        return self.field_id_for_type_name(canonical_type, "len") != mir_id_invalid();
+    }
+
+    public fn standard_indexed_iterable_payload_type(self, type_id: i32) -> i32 {
+        type_id = self.foreach_collection_type_id(type_id);
+        if (!self.type_is_standard_indexed_iterable_abi(type_id)) { return mir_id_invalid(); }
+        var text = llvm_mir_type_text(&self.m, type_id);
+        var args = policy_generic_call_args(text.clone());
+        if (args.len == 0) {
+            text = llvm_mir_type_text(&self.m, self.canonical_record_type_id(type_id));
+            args = policy_generic_call_args(text.clone());
+        }
+        let payload_text = policy_generic_arg_at(args, 0);
+        if (payload_text.len == 0) { return mir_id_invalid(); }
+        let payload_type = self.type_id_by_text(payload_text);
+        if (payload_type == mir_id_invalid()) {
+            self.report_error("cannot resolve iterable payload type " + payload_text);
+        }
+        return payload_type;
+    }
+
+    public fn lower_indexed_iterable_has_next(self,
+                                              iter_value: i32,
+                                              index_place: i32,
+                                              body_bb: rawptr,
+                                              exit_bb: rawptr) -> bool {
+        let iter_type = self.canonical_record_type_id(self.foreach_collection_type_id(self.m.value_type(iter_value)));
+        let iter_record_addr = self.indexed_iterable_record_address(iter_value);
+        let len_value = self.load_record_field_from_addr(iter_record_addr, iter_type, "len");
+        let index_addr = self.lower_place_addr(index_place);
+        let index_type = self.m.place_type(index_place);
+        let index_ll_ty = self.lower_type(index_type);
+        if (iter_record_addr == null || len_value == null || index_addr == null || index_ll_ty == null
+            || body_bb == null || exit_bb == null) {
+            self.report_error("cannot lower indexed foreach condition");
+            return false;
+        }
+        let index_value = vyx_rt_build_load(self.mod,
+                                            index_ll_ty,
+                                            index_addr,
+                                            "mir.foreach.index".c_str(),
+                                            17);
+        let in_range = vyx_rt_build_icmp(self.mod,
+                                         llvm_mir_icmp_slt(),
+                                         index_value,
+                                         len_value,
+                                         llvm_mir_empty_name(),
+                                         0);
+        if (index_value == null || in_range == null) {
+            self.report_error("cannot compare indexed foreach position");
+            return false;
+        }
+        vyx_rt_build_cond_br(self.mod, in_range, body_bb, exit_bb);
+        return true;
+    }
+
+    public fn advance_indexed_iterable(self, index_addr: rawptr, index_value: rawptr) -> bool {
+        if (index_addr == null || index_value == null) {
+            self.report_error("cannot advance indexed foreach position");
+            return false;
+        }
+        let next_pos = vyx_rt_build_add(self.mod,
+                                        index_value,
+                                        vyx_rt_const_int(self.mod, self.ty_i64, 1, 0),
+                                        llvm_mir_empty_name(),
+                                        0);
+        if (next_pos == null) {
+            self.report_error("cannot compute next indexed foreach position");
+            return false;
+        }
+        vyx_rt_build_store(self.mod, next_pos, index_addr);
+        return true;
+    }
+
+    public fn lower_indexed_iterable_bind_instr(self, instr_id: i32) -> bool {
+        let iter_value = self.m.instr_value(instr_id);
+        let iter_value_type = self.foreach_collection_type_id(self.m.value_type(iter_value));
+        let iter_type = self.canonical_record_type_id(iter_value_type);
+        let iter_record_addr = self.indexed_iterable_record_address(iter_value);
+        let index_place = self.m.instr_aux(instr_id);
+        let index_addr = self.lower_place_addr(index_place);
+        let index_type = self.m.place_type(index_place);
+        let index_ll_ty = self.lower_type(index_type);
+        let dst_place = self.m.instr_place(instr_id);
+        let dst_addr = self.lower_place_addr(dst_place);
+        let dst_type = self.m.place_type(dst_place);
+        let payload_type = self.standard_indexed_iterable_payload_type(iter_value_type);
+        let payload_ll = self.lower_type(payload_type);
+        if (iter_record_addr == null || index_addr == null || index_ll_ty == null
+            || dst_addr == null || payload_type == mir_id_invalid() || payload_ll == null) {
+            self.report_error("cannot lower indexed foreach bind in instr #"
+                      + policy_i64_to_string(instr_id as i64));
+            return false;
+        }
+        let data_value = self.load_record_field_from_addr(iter_record_addr, iter_type, "data");
+        var payload_size = self.load_record_field_from_addr(iter_record_addr, iter_type, "elem_size");
+        if (payload_size == null) {
+            payload_size = vyx_rt_const_int(self.mod,
+                                            self.ty_i64,
+                                            self.value_storage_size(payload_type),
+                                            0);
+        }
+        let index_value = vyx_rt_build_load(self.mod,
+                                            index_ll_ty,
+                                            index_addr,
+                                            "mir.foreach.index".c_str(),
+                                            17);
+        if (data_value == null || payload_size == null || index_value == null) {
+            self.report_error("cannot load indexed foreach element slot");
+            return false;
+        }
+        let byte_offset = vyx_rt_build_mul(self.mod,
+                                           index_value,
+                                           payload_size,
+                                           llvm_mir_empty_name(),
+                                           0);
+        let element_ptr = self.ptr_offset_bytes(data_value, byte_offset, "mir.foreach.elem");
+        if (byte_offset == null || element_ptr == null) {
+            self.report_error("cannot address indexed foreach element");
+            return false;
+        }
+        if (self.type_ids_compatible(payload_type, dst_type)) {
+            var dst_copy_addr = dst_addr;
+            if (self.type_is_class_pointer_abi(dst_type)) {
+                dst_copy_addr = self.ensure_class_object_addr_from_place_addr(dst_place, dst_addr, dst_type);
+            }
+            if (self.builtin_memcpy_fn == null || self.builtin_memcpy_fty == null) {
+                self.report_error("memcpy declaration is unavailable");
+                return false;
+            }
+            let copied = vyx_rt_build_call3(self.mod,
+                                            self.builtin_memcpy_fty,
+                                            self.builtin_memcpy_fn,
+                                            dst_copy_addr,
+                                            element_ptr,
+                                            payload_size,
+                                            llvm_mir_empty_name(),
+                                            0);
+            if (copied == null) {
+                self.report_error("cannot copy indexed foreach element");
+                return false;
+            }
+        } else {
+            let value_slot = vyx_rt_build_alloca(self.mod, payload_ll, "mir.foreach.elem.value".c_str(), 22);
+            if (value_slot == null || self.builtin_memcpy_fn == null || self.builtin_memcpy_fty == null) {
+                self.report_error("cannot allocate indexed foreach element storage");
+                return false;
+            }
+            let copied2 = vyx_rt_build_call3(self.mod,
+                                             self.builtin_memcpy_fty,
+                                             self.builtin_memcpy_fn,
+                                             value_slot,
+                                             element_ptr,
+                                             payload_size,
+                                             llvm_mir_empty_name(),
+                                             0);
+            let payload_value = vyx_rt_build_load(self.mod,
+                                                  payload_ll,
+                                                  value_slot,
+                                                  "mir.foreach.elem.value".c_str(),
+                                                  22);
+            let cast_value = self.cast_value(payload_value, payload_type, dst_type);
+            if (copied2 == null || payload_value == null || cast_value == null) {
+                self.report_error("cannot convert indexed foreach element");
+                return false;
+            }
+            vyx_rt_build_store(self.mod, cast_value, dst_addr);
+        }
+        return self.advance_indexed_iterable(index_addr, index_value);
+    }
+
+    public fn lower_standard_iterator_invalidation_check(self, iter_slot: rawptr, iter_type: i32) -> bool {
+        let canonical_type = self.canonical_record_type_id(iter_type);
+        if (self.field_id_for_type_name(canonical_type, "source_gen") == mir_id_invalid()
+            || self.field_id_for_type_name(canonical_type, "gen_snapshot") == mir_id_invalid()) {
+            return true;
+        }
+        let source_gen = self.load_record_field_from_addr(iter_slot, canonical_type, "source_gen");
+        let snapshot = self.load_record_field_from_addr(iter_slot, canonical_type, "gen_snapshot");
+        if (source_gen == null || snapshot == null) {
+            self.report_error("cannot lower Iterator invalidation guard");
+            return false;
+        }
+        let has_source = vyx_rt_build_icmp(self.mod,
+                                           llvm_mir_icmp_ne(),
+                                           source_gen,
+                                           vyx_rt_const_ptr_null(self.mod, self.ty_ptr),
+                                           llvm_mir_empty_name(),
+                                           0);
+        let check_bb = vyx_rt_append_block(self.mod,
+                                           self.current_function_value,
+                                           "mir.foreach.iter.check".c_str(),
+                                           22);
+        let fail_bb = vyx_rt_append_block(self.mod,
+                                          self.current_function_value,
+                                          "mir.foreach.iter.fail".c_str(),
+                                          21);
+        let cont_bb = vyx_rt_append_block(self.mod,
+                                          self.current_function_value,
+                                          "mir.foreach.iter.cont".c_str(),
+                                          21);
+        if (has_source == null || check_bb == null || fail_bb == null || cont_bb == null) {
+            self.report_error("cannot create Iterator invalidation guard blocks");
+            return false;
+        }
+        vyx_rt_build_cond_br(self.mod, has_source, check_bb, cont_bb);
+        vyx_rt_position_at_end(self.mod, check_bb);
+        let current_gen = vyx_rt_build_load(self.mod,
+                                            self.ty_i64,
+                                            source_gen,
+                                            "mir.foreach.gen".c_str(),
+                                            15);
+        let changed = vyx_rt_build_icmp(self.mod,
+                                        llvm_mir_icmp_ne(),
+                                        current_gen,
+                                        snapshot,
+                                        llvm_mir_empty_name(),
+                                        0);
+        if (current_gen == null || changed == null) {
+            self.report_error("cannot compare Iterator generation");
+            return false;
+        }
+        vyx_rt_build_cond_br(self.mod, changed, fail_bb, cont_bb);
+        vyx_rt_position_at_end(self.mod, fail_bb);
+        if (self.emit_printf_cstr_line(self.emit_str_ptr("Iterator invalidated: source container was modified during iteration")) == null) {
+            self.report_error("cannot emit Iterator invalidation diagnostic");
+            return false;
+        }
+        if (self.builtin_abort_fn == null || self.builtin_abort_fty == null) {
+            self.report_error("abort declaration is unavailable");
+            return false;
+        }
+        vyx_rt_build_call(self.mod, self.builtin_abort_fty, self.builtin_abort_fn, null, 0, llvm_mir_empty_name(), 0);
+        vyx_rt_build_unreachable(self.mod);
+        vyx_rt_position_at_end(self.mod, cont_bb);
+        return true;
+    }
+
+    public fn lower_standard_iterator_has_next(self, iter_value: i32, body_bb: rawptr, exit_bb: rawptr) -> bool {
+        let raw_iter_type = self.m.value_type(iter_value);
+        let iter_type = self.canonical_record_type_id(raw_iter_type);
+        let iter_slot = self.foreach_iterator_slot_for_value(iter_value);
+        var iter_record_addr = iter_slot;
+        if (iter_slot != null && self.type_is_class_pointer_abi(raw_iter_type)) {
+            iter_record_addr = vyx_rt_build_load(self.mod,
+                                                 self.ty_ptr,
+                                                 iter_slot,
+                                                 "mir.foreach.iter.obj".c_str(),
+                                                 20);
+        }
+        let pos_value = self.load_record_field_from_addr(iter_record_addr, iter_type, "pos");
+        let len_value = self.load_record_field_from_addr(iter_record_addr, iter_type, "len");
+        if (iter_slot == null || iter_record_addr == null || pos_value == null || len_value == null || body_bb == null || exit_bb == null) {
+            self.report_error("cannot lower Iterator foreach condition");
+            return false;
+        }
+        let in_range = vyx_rt_build_icmp(self.mod,
+                                         llvm_mir_icmp_slt(),
+                                         pos_value,
+                                         len_value,
+                                         llvm_mir_empty_name(),
+                                         0);
+        if (in_range == null) {
+            self.report_error("cannot compare Iterator position");
+            return false;
+        }
+        vyx_rt_build_cond_br(self.mod, in_range, body_bb, exit_bb);
+        return true;
+    }
+
+    public fn advance_standard_iterator(self, iter_slot: rawptr, iter_type: i32, pos_value: rawptr) -> bool {
+        let pos_addr = self.record_field_addr_for_type(iter_slot, iter_type, "pos");
+        if (pos_addr == null || pos_value == null) {
+            self.report_error("cannot advance Iterator position");
+            return false;
+        }
+        let next_pos = vyx_rt_build_add(self.mod,
+                                        pos_value,
+                                        vyx_rt_const_int(self.mod, self.ty_i64, 1, 0),
+                                        llvm_mir_empty_name(),
+                                        0);
+        if (next_pos == null) {
+            self.report_error("cannot compute next Iterator position");
+            return false;
+        }
+        vyx_rt_build_store(self.mod, next_pos, pos_addr);
+        return true;
+    }
+
+    public fn lower_standard_iterator_bind_instr(self, instr_id: i32) -> bool {
+        let iter_value = self.m.instr_value(instr_id);
+        let raw_iter_type = self.m.value_type(iter_value);
+        let iter_type = self.canonical_record_type_id(raw_iter_type);
+        let iter_slot = self.foreach_iterator_slot_for_value(iter_value);
+        var iter_record_addr = iter_slot;
+        if (iter_slot != null && self.type_is_class_pointer_abi(raw_iter_type)) {
+            iter_record_addr = vyx_rt_build_load(self.mod,
+                                                 self.ty_ptr,
+                                                 iter_slot,
+                                                 "mir.foreach.iter.obj".c_str(),
+                                                 20);
+        }
+        let dst_place = self.m.instr_place(instr_id);
+        let dst_addr = self.lower_place_addr(dst_place);
+        let dst_type = self.place_effective_type(dst_place);
+        let payload_type = self.standard_iterator_payload_type(raw_iter_type);
+        let payload_ll = self.lower_type(payload_type);
+        if (iter_slot == null || dst_addr == null || payload_type == mir_id_invalid() || payload_ll == null) {
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[llvm-iter-bind] instr=" + policy_i64_to_string(instr_id as i64)
+                      + " iter-type=" + llvm_mir_type_text(&self.m, iter_type)
+                      + " dst-type=" + llvm_mir_type_text(&self.m, dst_type)
+                      + " payload-type=" + llvm_mir_type_text(&self.m, payload_type)
+                      + " iter-slot=" + policy_i64_to_string((iter_slot != null) as i64)
+                      + " dst-addr=" + policy_i64_to_string((dst_addr != null) as i64)
+                      + " payload-valid=" + policy_i64_to_string((payload_type != mir_id_invalid()) as i64)
+                      + " payload-ll=" + policy_i64_to_string((payload_ll != null) as i64));
+            }
+            self.report_error("cannot lower Iterator foreach bind in instr #"
+                      + policy_i64_to_string(instr_id as i64));
+            return false;
+        }
+        if (!self.lower_standard_iterator_invalidation_check(iter_record_addr, iter_type)) { return false; }
+        let data_value = self.load_record_field_from_addr(iter_record_addr, iter_type, "data");
+        let pos_value = self.load_record_field_from_addr(iter_record_addr, iter_type, "pos");
+        if (data_value == null || pos_value == null) {
+            self.report_error("cannot load Iterator data slot");
+            return false;
+        }
+        let payload_size = vyx_rt_const_int(self.mod,
+                                            self.ty_i64,
+                                            self.value_storage_size(payload_type),
+                                            0);
+        let byte_offset = vyx_rt_build_mul(self.mod,
+                                           pos_value,
+                                           payload_size,
+                                           llvm_mir_empty_name(),
+                                           0);
+        let element_ptr = self.ptr_offset_bytes(data_value, byte_offset, "mir.foreach.elem");
+        if (byte_offset == null || element_ptr == null) {
+            self.report_error("cannot address Iterator element");
+            return false;
+        }
+        if (self.type_ids_compatible(payload_type, dst_type)) {
+            var dst_copy_addr = dst_addr;
+            if (self.type_is_class_pointer_abi(dst_type)) {
+                dst_copy_addr = self.ensure_class_object_addr_from_place_addr(dst_place, dst_addr, dst_type);
+            }
+            if (self.builtin_memcpy_fn == null || self.builtin_memcpy_fty == null) {
+                self.report_error("memcpy declaration is unavailable");
+                return false;
+            }
+            let copied = vyx_rt_build_call3(self.mod,
+                                            self.builtin_memcpy_fty,
+                                            self.builtin_memcpy_fn,
+                                            dst_copy_addr,
+                                            element_ptr,
+                                            payload_size,
+                                            llvm_mir_empty_name(),
+                                            0);
+            if (copied == null) {
+                self.report_error("cannot copy Iterator element");
+                return false;
+            }
+        } else {
+            let value_slot = vyx_rt_build_alloca(self.mod, payload_ll, "mir.foreach.elem.value".c_str(), 22);
+            if (value_slot == null || self.builtin_memcpy_fn == null || self.builtin_memcpy_fty == null) {
+                self.report_error("cannot allocate Iterator element storage");
+                return false;
+            }
+            let copied2 = vyx_rt_build_call3(self.mod,
+                                             self.builtin_memcpy_fty,
+                                             self.builtin_memcpy_fn,
+                                             value_slot,
+                                             element_ptr,
+                                             payload_size,
+                                             llvm_mir_empty_name(),
+                                             0);
+            let payload_value = vyx_rt_build_load(self.mod,
+                                                  payload_ll,
+                                                  value_slot,
+                                                  "mir.foreach.elem.value".c_str(),
+                                                  22);
+            let cast_value = self.cast_value(payload_value, payload_type, dst_type);
+            if (copied2 == null || payload_value == null || cast_value == null) {
+                self.report_error("cannot convert Iterator element");
+                return false;
+            }
+            vyx_rt_build_store(self.mod, cast_value, dst_addr);
+        }
+        return self.advance_standard_iterator(iter_record_addr, iter_type, pos_value);
+    }
+
+    public fn lower_method_iterator_has_next(self, iter_value: i32, body_bb: rawptr, exit_bb: rawptr) -> bool {
+        let iter_type = self.m.value_type(iter_value);
+        let method_fn = self.foreach_method_for_iterator(iter_type, "has_next");
+        if (method_fn == mir_id_invalid()) { return false; }
+        let iter_slot = self.foreach_iterator_slot_for_value(iter_value);
+        let result = self.lower_iterator_method_call_from_slot(method_fn, iter_slot, iter_type, "mir.foreach.has_next");
+        let cond = self.truthy_value(result, self.m.function_return_type(method_fn));
+        if (cond == null || body_bb == null || exit_bb == null) {
+            self.report_error("cannot lower foreach has_next call for " + llvm_mir_type_text(&self.m, iter_type));
+            return false;
+        }
+        vyx_rt_build_cond_br(self.mod, cond, body_bb, exit_bb);
+        return true;
+    }
+
+    public fn lower_method_iterator_bind_instr(self, instr_id: i32) -> bool {
+        let iter_value = self.m.instr_value(instr_id);
+        let iter_type = self.m.value_type(iter_value);
+        let method_fn = self.foreach_method_for_iterator(iter_type, "next");
+        if (method_fn == mir_id_invalid()) { return false; }
+        let iter_slot = self.foreach_iterator_slot_for_value(iter_value);
+        let option_type = self.m.function_return_type(method_fn);
+        if (!self.type_is_option_abi(option_type)) {
+            self.report_error("foreach next method must return Option, got "
+                      + llvm_mir_type_text(&self.m, option_type));
+            return false;
+        }
+        let next_value = self.lower_iterator_method_call_from_slot(method_fn, iter_slot, iter_type, "mir.foreach.next");
+        let payload_type = self.option_payload_type(option_type);
+        let payload = self.option_payload_value(next_value, option_type);
+        let dst_place = self.m.instr_place(instr_id);
+        let dst_addr = self.lower_place_addr(dst_place);
+        let dst_type = self.place_effective_type(dst_place);
+        let cast_payload = self.cast_value(payload, payload_type, dst_type);
+        if (next_value == null || payload_type == mir_id_invalid() || payload == null || dst_addr == null || cast_payload == null) {
+            if (vyx_bootstrap_profile_level() > 2) {
+                print("[llvm-iter-method-bind] instr=" + policy_i64_to_string(instr_id as i64)
+                      + " iter-type=" + llvm_mir_type_text(&self.m, iter_type)
+                      + " option-type=" + llvm_mir_type_text(&self.m, option_type)
+                      + " payload-type=" + llvm_mir_type_text(&self.m, payload_type)
+                      + " dst-type=" + llvm_mir_type_text(&self.m, dst_type));
+            }
+            self.report_error("cannot bind foreach next payload in instr #"
+                      + policy_i64_to_string(instr_id as i64));
+            return false;
+        }
+        vyx_rt_build_store(self.mod, cast_payload, dst_addr);
+        return true;
+    }
+
+    public fn lower_foreach_bind_instr(self, instr_id: i32) {
+        let iter_value = self.m.instr_value(instr_id);
+        if (!self.value_is_reflection_iterable(iter_value)) {
+            let iter_type = self.m.value_type(iter_value);
+            let method_fn = self.foreach_method_for_iterator(iter_type, "next");
+            let standard_iterator = self.type_is_standard_iterator_abi(iter_type);
+            let standard_indexed = self.type_is_standard_indexed_iterable_abi(iter_type);
+            if (vyx_bootstrap_profile_level() > 2) {
+                let canonical_type = self.canonical_record_type_id(iter_type);
+                print("[llvm-iter-dispatch] instr=" + policy_i64_to_string(instr_id as i64)
+                      + " type=" + llvm_mir_type_text(&self.m, iter_type)
+                      + " kind=" + policy_i64_to_string(llvm_mir_type_kind(&self.m, iter_type) as i64)
+                      + " canonical=" + llvm_mir_type_text(&self.m, canonical_type)
+                      + " method=" + policy_i64_to_string(method_fn as i64)
+                      + " standard=" + policy_i64_to_string(standard_iterator as i64)
+                      + " indexed=" + policy_i64_to_string(standard_indexed as i64));
+            }
+            if (standard_iterator) {
+                self.lower_standard_iterator_bind_instr(instr_id);
+                return;
+            }
+            if (standard_indexed) {
+                self.lower_indexed_iterable_bind_instr(instr_id);
+                return;
+            }
+            if (method_fn != mir_id_invalid() && self.lower_method_iterator_bind_instr(instr_id)) { return; }
+            self.report_error("cannot lower foreach bind for iterator type "
+                      + llvm_mir_type_text(&self.m, iter_type)
+                      + " in instr #" + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        let index_place = self.m.instr_aux(instr_id);
+        let index_addr = self.lower_place_addr(index_place);
+        let index_type = self.m.place_type(index_place);
+        let index_ll_ty = self.lower_type(index_type);
+        if (index_addr == null || index_ll_ty == null) {
+            self.report_error("cannot lower reflection foreach index for instr #"
+                      + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        let index_value = vyx_rt_build_load(self.mod,
+                                            index_ll_ty,
+                                            index_addr,
+                                            "mir.foreach.index".c_str(),
+                                            17);
+        let dst_place = self.m.instr_place(instr_id);
+        let dst_addr = self.lower_place_addr(dst_place);
+        let dst_type = self.m.place_type(dst_place);
+        let dst_kind = llvm_mir_type_kind(&self.m, dst_type);
+        let dst_bits = llvm_mir_int_bits_for_kind(dst_kind);
+        if (dst_addr == null || index_value == null) {
+            self.report_error("cannot bind reflection foreach value in instr #"
+                      + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        if (dst_bits <= 0) {
+            self.report_error("reflection foreach bind requires an integer destination, got "
+                      + llvm_mir_type_text(&self.m, dst_type));
+            return;
+        }
+        let cast_index = self.cast_value(index_value, index_type, dst_type);
+        if (cast_index == null) {
+            self.report_error("cannot cast reflection foreach index for instr #"
+                      + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        vyx_rt_build_store(self.mod, cast_index, dst_addr);
+        let next_index = vyx_rt_build_add(self.mod,
+                                          index_value,
+                                          vyx_rt_const_int(self.mod, index_ll_ty, 1, 0),
+                                          llvm_mir_empty_name(),
+                                          0);
+        if (next_index == null) {
+            self.report_error("cannot advance reflection foreach index for instr #"
+                      + policy_i64_to_string(instr_id as i64));
+            return;
+        }
+        vyx_rt_build_store(self.mod, next_index, index_addr);
+    }
+
+    public fn lower_foreach_next_terminator(self, block_id: i32) {
+        let iter_value = self.m.block_term_value(block_id);
+        let body_bb = llvm_mir_map_get(self.block_values, self.m.block_term_target(block_id));
+        let exit_bb = llvm_mir_map_get(self.block_values, self.m.block_term_false(block_id));
+        if (!self.value_is_reflection_iterable(iter_value)) {
+            if (self.type_is_standard_iterator_abi(self.m.value_type(iter_value))) {
+                self.lower_standard_iterator_has_next(iter_value, body_bb, exit_bb);
+                return;
+            }
+            if (self.type_is_standard_indexed_iterable_abi(self.m.value_type(iter_value))) {
+                self.lower_indexed_iterable_has_next(iter_value,
+                                                     self.m.block_term_aux(block_id),
+                                                     body_bb,
+                                                     exit_bb);
+                return;
+            }
+            if (self.lower_method_iterator_has_next(iter_value, body_bb, exit_bb)) { return; }
+            self.report_error("cannot lower foreach_next for iterator type "
+                      + llvm_mir_type_text(&self.m, self.m.value_type(iter_value))
+                      + " in block #" + policy_i64_to_string(block_id as i64));
+            return;
+        }
+        let item_count = self.reflection_iterable_count(iter_value);
+        if (item_count < 0) { return; }
+        let index_place = self.m.block_term_aux(block_id);
+        let index_addr = self.lower_place_addr(index_place);
+        let index_type = self.m.place_type(index_place);
+        let index_ll_ty = self.lower_type(index_type);
+        if (index_addr == null || index_ll_ty == null || body_bb == null || exit_bb == null) {
+            self.report_error("cannot lower reflection foreach_next in block #"
+                      + policy_i64_to_string(block_id as i64));
+            return;
+        }
+        let index_value = vyx_rt_build_load(self.mod,
+                                            index_ll_ty,
+                                            index_addr,
+                                            "mir.foreach.index".c_str(),
+                                            17);
+        if (index_value == null) {
+            self.report_error("cannot load reflection foreach index in block #"
+                      + policy_i64_to_string(block_id as i64));
+            return;
+        }
+        let limit_value = vyx_rt_const_int(self.mod, index_ll_ty, item_count as i64, 0);
+        let in_range = vyx_rt_build_icmp(self.mod,
+                                         llvm_mir_icmp_slt(),
+                                         index_value,
+                                         limit_value,
+                                         llvm_mir_empty_name(),
+                                         0);
+        if (in_range == null) {
+            self.report_error("cannot compare reflection foreach index in block #"
+                      + policy_i64_to_string(block_id as i64));
+            return;
+        }
+        vyx_rt_build_cond_br(self.mod, in_range, body_bb, exit_bb);
+    }
+}

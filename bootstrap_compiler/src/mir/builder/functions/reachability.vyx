@@ -1,0 +1,205 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn mark_function_reachable(self, function_id: i32) {
+        if (function_id == mir_id_invalid()) { return; }
+        if (function_id <= 0 || function_id > self.unit.function_count) {
+            return;
+        }
+        if (self.partition_codegen_roots
+            && self.current_function_id != mir_id_invalid()
+            && function_id != self.current_function_id
+            && (self.unit.function_flags( function_id) & hir_function_flag_codegen_root()) != 0
+            && !self.mir_function_is_emit_root(function_id)) {
+            return;
+        }
+        if (self.function_is_reachable(function_id)) { return; }
+        let node = mir_profile_malloc(16);
+        if (node == null) { return; }
+        memset(node, 0, 16);
+        ast_write_i32(node, function_id);
+        ast_write_rawptr(ptr_offset(node, 8), null);
+        if (self.reachable_function_queue_tail != null) {
+            ast_write_rawptr(ptr_offset(self.reachable_function_queue_tail, 8), node);
+        } else {
+            self.reachable_function_queue_head = node;
+        }
+        self.reachable_function_queue_tail = node;
+        mir_i32_map_put(self.reachable_function_map, function_id, 2);
+    }
+
+    // Call lowering normally records each direct callee immediately.  Keep a
+    // shared MIR-level closure pass as the authoritative backstop, however:
+    // synthesized HIR builder calls and function-value references may have a
+    // target reference without having passed through that direct-call path.
+    // Both streaming consumers invoke this while the exact body is live, so
+    // LLVM and MIR2CPP obtain an identical reachable-function closure without
+    // retaining any body records.
+    public fn enqueue_live_function_target_dependencies(self,
+                                                        first_value: i32,
+                                                        last_value: i32) {
+        var value_id = first_value;
+        while (value_id <= last_value && value_id <= self.unit.value_count) {
+            if (self.unit.value_target_kind(value_id) == mir_target_function()) {
+                let target = self.unit.value_target_id(value_id);
+                // Reachability is an edge property, not a prediction about
+                // whether the target currently has a materialized HIR body.
+                // `stream_function` decides whether it becomes a definition
+                // or remains an extern/declaration after asking the HIR
+                // builder.  Filtering here loses lazily materializable
+                // method bodies (notably compiler-internal builder methods).
+                if (target != mir_id_invalid()) { self.mark_function_reachable(target); }
+            }
+            value_id = value_id + 1;
+        }
+    }
+
+    public fn mark_function_lowered(self, function_id: i32) {
+        if (function_id == mir_id_invalid()) { return; }
+        mir_i32_map_put(self.lowered_function_map, function_id, 2);
+    }
+
+    public fn reset_function_codegen_marks(self, function_id: i32) {
+        if (function_id == mir_id_invalid()) { return; }
+        mir_i32_map_put(self.lowered_function_map, function_id, 0);
+        mir_i32_map_put(self.reachable_function_map, function_id, 0);
+    }
+
+    public fn drop_reachable_queue(self) {
+        var fn_id = self.pop_reachable_function();
+        while (fn_id != mir_id_invalid()) {
+            mir_i32_map_put(self.reachable_function_map, fn_id, 0);
+            fn_id = self.pop_reachable_function();
+        }
+    }
+
+    // A lazy HIR codegen request is intentionally retryable: resolving one
+    // concrete call can register the raw declaration for another closed
+    // instance.  Do not reinsert it into the current DFS (that would spin on
+    // a still-missing source); the next shared prepare round activates it
+    // after HIR reflection and concrete-type facts have been refreshed.
+    public fn defer_function_materialization_retry(self, function_id: i32) {
+        if (function_id == mir_id_invalid()) { return; }
+        if (function_id <= 0 || function_id > self.unit.function_count) { return; }
+        if (self.function_is_lowered(function_id)) { return; }
+        mir_i32_map_put(self.deferred_materialization_map, function_id, 1);
+    }
+
+    public fn activate_deferred_function_materializations(self) {
+        var function_id: i32 = 1;
+        while (function_id <= self.unit.function_count) {
+            if (mir_i32_map_get(self.deferred_materialization_map, function_id) == 1) {
+                mir_i32_map_put(self.deferred_materialization_map, function_id, 0);
+                // The original queue node was consumed before the failed
+                // materialization.  Clear its reachability mark so the normal
+                // queue insertion API owns the retry as well.
+                mir_i32_map_put(self.reachable_function_map, function_id, 0);
+                self.mark_function_reachable(function_id);
+            }
+            function_id = function_id + 1;
+        }
+    }
+
+    public fn report_unresolved_deferred_function_materializations(self) -> i32 {
+        var errors: i32 = 0;
+        var function_id: i32 = 1;
+        while (function_id <= self.unit.function_count) {
+            if (mir_i32_map_get(self.deferred_materialization_map, function_id) == 1) {
+                let hir_fn = self.unit.function_hir_id(function_id);
+                self.report_error_at_hir_function(
+                    hir_fn,
+                    "reachable function body was still unavailable after streaming deferred retries: "
+                    + self.unit.function_name(function_id));
+                mir_i32_map_put(self.deferred_materialization_map, function_id, 2);
+                errors = errors + 1;
+            }
+            function_id = function_id + 1;
+        }
+        return errors;
+    }
+
+    public fn pending_deferred_materializations(self) -> i32 {
+        var pending: i32 = 0;
+        var function_id: i32 = 1;
+        while (function_id <= self.unit.function_count) {
+            if (mir_i32_map_get(self.deferred_materialization_map, function_id) == 1) {
+                pending = pending + 1;
+            }
+            function_id = function_id + 1;
+        }
+        return pending;
+    }
+
+    public fn function_is_reachable(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (function_id <= 0 || function_id > self.unit.function_count) { return false; }
+        return mir_i32_map_get(self.reachable_function_map, function_id) == 2;
+    }
+
+    public fn function_is_lowered(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (function_id <= 0 || function_id > self.unit.function_count) { return false; }
+        return mir_i32_map_get(self.lowered_function_map, function_id) == 2;
+    }
+
+    public fn pop_reachable_function(self) -> i32 {
+        let node = self.reachable_function_queue_head;
+        if (node == null) { return mir_id_invalid(); }
+        let function_id = ast_read_i32(node);
+        let next = ast_read_rawptr(ptr_offset(node, 8));
+        self.reachable_function_queue_head = next;
+        if (next == null) { self.reachable_function_queue_tail = null; }
+        free(node);
+        return function_id;
+    }
+
+    public fn suspend_reachable_function_queue(self) -> rawptr {
+        let head = self.reachable_function_queue_head;
+        var node = head;
+        while (node != null) {
+            let function_id = ast_read_i32(node);
+            if (!self.function_is_lowered(function_id)) {
+                mir_i32_map_put(self.reachable_function_map, function_id, 0);
+            }
+            node = ast_read_rawptr(ptr_offset(node, 8));
+        }
+        self.reachable_function_queue_head = null;
+        self.reachable_function_queue_tail = null;
+        return head;
+    }
+
+    public fn restore_reachable_function_queue(self, head: rawptr) {
+        if (head == null) { return; }
+        var tail = head;
+        var node = head;
+        while (node != null) {
+            let function_id = ast_read_i32(node);
+            if (!self.function_is_lowered(function_id)) {
+                mir_i32_map_put(self.reachable_function_map, function_id, 2);
+            }
+            tail = node;
+            node = ast_read_rawptr(ptr_offset(node, 8));
+        }
+        if (self.reachable_function_queue_tail != null) {
+            ast_write_rawptr(ptr_offset(self.reachable_function_queue_tail, 8), head);
+        } else {
+            self.reachable_function_queue_head = head;
+        }
+        self.reachable_function_queue_tail = tail;
+    }
+}

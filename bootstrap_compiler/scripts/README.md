@@ -27,7 +27,7 @@ SDK compiler outputs freshly built from this checkout and matching object record
 
 | Script | Role |
 | --- | --- |
-| `build.ps1`, `build.sh` | Historical Phase-0 single-file build helpers; use the SDK compiler source-build flow in the verification guide for acceptance. |
+| `build.ps1`, `build.sh` | Build the manifest target with an explicit Stage 0 (`-Compiler` / `VYX_BOOTSTRAP_VYXC`, otherwise `vyxc` on PATH); record its version and hash. |
 | `VyxTestProcess.ps1` | Shared process timeout/crash-dialog helper. |
 | `build_probes.ps1` | Build the lexer/parser/sema/emit probe executables. |
 | `export_partitioned_ir.ps1` | Export partitioned MIR/LLVM IR for a project. |
@@ -36,6 +36,10 @@ SDK compiler outputs freshly built from this checkout and matching object record
 After building the current SDK compiler target, run the exporter to produce
 a checked ELF object under `out/linux/`. It derives the source unit from that build's
 object records and rejects missing `bootstrap.*` dependencies before codegen.
+For a multi-file logical module, the exporter reads every `group_src` member
+from the object's recorded source stamp and requires the complete module group.
+Both ordinary and dependency-partitioned record formats are accepted.
+The HIR, MIR and LLVM implementation files therefore remain in the exported crate.
 `-DryRun` writes and validates the source list without emitting an object.
 A failed emit removes the canonical object from the link path; the previous
 object is retained with a `.stale.bin` suffix for inspection. The exporter reports

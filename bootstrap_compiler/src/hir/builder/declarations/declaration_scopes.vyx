@@ -1,0 +1,212 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Declaration scopes for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn decl_effectively_imported(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        if (hir_builder_decl_imported(d)) { return true; }
+        var owner = hir_raw_owner_map_get(self.decl_owner_map,d);
+        while (owner != null) {
+            if (hir_builder_decl_imported(owner)) { return true; }
+            owner = hir_raw_owner_map_get(self.decl_owner_map,owner);
+        }
+        return false;
+    }
+
+    fn decl_effectively_from_std_module(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        if (hir_builder_decl_from_std_module(d)) { return true; }
+        var owner = hir_raw_owner_map_get(self.decl_owner_map,d);
+        while (owner != null) {
+            if (hir_builder_decl_from_std_module(owner)) { return true; }
+            owner = hir_raw_owner_map_get(self.decl_owner_map,owner);
+        }
+        return false;
+    }
+
+    fn decl_effectively_project_local(self, d: rawptr) -> bool {
+        if (d == null) { return false; }
+        if (hir_builder_string_contains(decl_get_meta(d), "|project-local")) { return true; }
+        var owner = hir_raw_owner_map_get(self.decl_owner_map,d);
+        while (owner != null) {
+            if (hir_builder_string_contains(decl_get_meta(owner), "|project-local")) { return true; }
+            owner = hir_raw_owner_map_get(self.decl_owner_map,owner);
+        }
+        return false;
+    }
+
+    fn decl_is_foreign_import(self, d: rawptr) -> bool {
+        return self.decl_effectively_imported(d) && !self.decl_effectively_project_local(d);
+    }
+
+    fn preindex_decl_modules(self, head: rawptr, enclosing_module: rawptr) {
+        var current_module = enclosing_module;
+        var module_stack: rawptr = null;
+        var cur = head;
+        while (cur != null) {
+            if (decl_get_kind(cur) == de_MODULE()) {
+                if (decl_get_name(cur) == "__module_end") {
+                    if (module_stack == null) {
+                        diag_emit_at(diag_sev_ERROR(), diag_code_internal(), decl_loc_ptr(cur),
+                                     "HIR module scope has no matching block entry metadata");
+                        current_module = enclosing_module;
+                    } else {
+                        let entry = module_stack;
+                        current_module = ast_read_rawptr(entry);
+                        module_stack = ast_read_rawptr(ptr_offset(entry, 8));
+                        free(entry);
+                    }
+                    cur = decl_get_next(cur);
+                    continue;
+                }
+                if (hir_builder_string_contains(decl_get_meta(cur), "|module-block|")) {
+                    let entry = hir_profile_malloc(16);
+                    if (entry == null) {
+                        diag_emit_at(diag_sev_ERROR(), diag_code_internal(), decl_loc_ptr(cur),
+                                     "cannot allocate HIR module scope stack");
+                        break;
+                    }
+                    ast_write_rawptr(entry, current_module);
+                    ast_write_rawptr(ptr_offset(entry, 8), module_stack);
+                    module_stack = entry;
+                }
+                current_module = cur;
+            }
+            if (current_module != null && hir_raw_owner_map_get(self.decl_module_map,cur) == null) {
+                self.decl_module_map = hir_raw_owner_map_put(self.decl_module_map,cur,current_module);
+            }
+            if (decl_get_members(cur) != null) {
+                self.preindex_decl_modules(decl_get_members(cur), current_module);
+            }
+            cur = decl_get_next(cur);
+        }
+        while (module_stack != null) {
+            let entry = module_stack;
+            module_stack = ast_read_rawptr(ptr_offset(entry, 8));
+            free(entry);
+        }
+    }
+
+    fn decl_source_module(self, d: rawptr) -> string {
+        if (d == null) { return ""; }
+        let explicit_module = hir_builder_decl_source_module(d);
+        if (explicit_module.len > 0 || decl_has_source_module(d)) { return explicit_module; }
+        let module_decl = hir_raw_owner_map_get(self.decl_module_map,d);
+        if (module_decl != null) { return decl_get_name(module_decl); }
+        let owner = hir_raw_owner_map_get(self.decl_owner_map,d);
+        if (owner != null) { return self.decl_source_module(owner); }
+        return "";
+    }
+
+    fn value_item_id_for_name(self, name: string) -> i32 {
+        if (name.len == 0) { return hir_id_invalid(); }
+        let scope = self.current_value_scope_module();
+        let local_key = "decl|" + scope + "|" + name;
+        let local_item = hir_name_id_map_get(self.value_item_index,local_key);
+        if (local_item != hir_id_invalid()) { return local_item; }
+        let lookup_key = "lookup|" + scope + "|" + name;
+        let cached = hir_name_id_map_get(self.value_item_index,lookup_key);
+        if (cached > hir_id_invalid()) { return cached; }
+        let declaration = self.raw_value_decl_for_name(name);
+        if (declaration == null) { return hir_id_invalid(); }
+        var item_id = hir_pointer_map_item(self.decl_map,declaration);
+        if (item_id == hir_id_invalid()) { item_id = self.register_decl(declaration, hir_id_invalid()); }
+        if (item_id != hir_id_invalid()) {
+            self.value_item_index = hir_name_id_map_put(self.value_item_index,lookup_key,item_id);
+        }
+        return item_id;
+    }
+
+    fn current_value_scope_module(self) -> string {
+        var item_id = self.current_item_id;
+        if (item_id == hir_id_invalid() && self.current_function_id != hir_id_invalid()) {
+            item_id = self.unit.function_item(self.current_function_id);
+        }
+        if (item_id == hir_id_invalid()) { return ""; }
+        return self.unit.item_source_module(item_id);
+    }
+
+    fn raw_value_decl_in_module(self, module_name: string, name: string) -> rawptr {
+        if (self.source_unit == null || name.len == 0) { return null; }
+        var found: rawptr = null;
+        var cur = unit_get_decls(self.source_unit);
+        while (cur != null) {
+            let kind = decl_get_kind(cur);
+            if ((kind == de_CONST() || kind == de_GLOBAL_VAR())
+                && decl_get_name(cur) == name
+                && self.decl_source_module(cur) == module_name) {
+                if (found == null || (self.decl_effectively_imported(found)
+                    && !self.decl_effectively_imported(cur))) { found = cur; }
+            }
+            cur = decl_get_next(cur);
+        }
+        return found;
+    }
+
+    fn raw_value_decl_for_qualified_name(self, name: string) -> rawptr {
+        if (self.source_unit == null || name.len == 0) { return null; }
+        var found: rawptr = null;
+        var cur = unit_get_decls(self.source_unit);
+        while (cur != null) {
+            let kind = decl_get_kind(cur);
+            if (kind == de_CONST() || kind == de_GLOBAL_VAR()) {
+                let module_name = self.decl_source_module(cur);
+                if (module_name.len > 0 && module_name + "." + decl_get_name(cur) == name) {
+                    if (found == null || (self.decl_effectively_imported(found)
+                        && !self.decl_effectively_imported(cur))) { found = cur; }
+                }
+            }
+            cur = decl_get_next(cur);
+        }
+        return found;
+    }
+
+    fn raw_value_decl_for_name(self, name: string) -> rawptr {
+        if (self.source_unit == null || name.len == 0) { return null; }
+        let scope = self.current_value_scope_module();
+        let local = self.raw_value_decl_in_module(scope, name);
+        if (local != null) { return local; }
+        let qualified = self.raw_value_decl_for_qualified_name(name);
+        if (qualified != null) { return qualified; }
+        var found: rawptr = null;
+        var cur = unit_get_decls(self.source_unit);
+        while (cur != null) {
+            if (decl_get_kind(cur) == de_USE() && self.decl_source_module(cur) == scope) {
+                let meta = decl_get_meta(cur);
+                var alias = meta.clone();
+                let marker = meta.indexOf("|");
+                if (marker == 0) { alias = ""; }
+                else if (marker > 0) { alias = meta.substring(0, marker); }
+                let target = decl_get_name(cur);
+                var candidate: rawptr = null;
+                if (alias.len == 0) {
+                    candidate = self.raw_value_decl_in_module(target, name);
+                } else if (name == alias) {
+                    candidate = self.raw_value_decl_for_qualified_name(target);
+                } else if (name.startsWith(alias + ".")) {
+                    candidate = self.raw_value_decl_for_qualified_name(target + name.substring(alias.len, name.len));
+                }
+                if (candidate != null) {
+                    if (found != null && self.decl_source_module(found) != self.decl_source_module(candidate)) {
+                        return null;
+                    }
+                    found = candidate;
+                }
+            }
+            cur = decl_get_next(cur);
+        }
+        return found;
+    }
+}

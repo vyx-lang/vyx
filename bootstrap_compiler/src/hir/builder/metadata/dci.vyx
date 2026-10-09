@@ -1,0 +1,315 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Dci for the HIR builder. See README.md.
+
+fn hir_builder_decl_is_foreign_dci(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_string_contains(decl_get_meta(d), "|extern_abi:dci")
+        || hir_builder_string_contains(decl_get_meta(d), "|foreign_dci")
+        || hir_builder_string_contains(decl_get_meta(d), "|extern_abi:cpp")
+        || hir_builder_string_contains(decl_get_meta(d), "|foreign_cpp");
+}
+
+fn hir_builder_decl_is_foreign_cpp(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_string_contains(decl_get_meta(d), "|extern_abi:cpp")
+        || hir_builder_string_contains(decl_get_meta(d), "|foreign_cpp");
+}
+
+// A native (non-foreign) `class`/`struct` record is a value type: it lives in
+// automatic storage like a C++ value object and is passed/returned by value
+// through the struct ABI.  `struct` already carries generic flag bit 4; plain
+// `class` (no interface/error bit) now shares the same value ABI.  Foreign DCI
+// records without a stable value layout, interfaces/traits (bit 2), error
+// records (bit 1), and enums keep their own ABIs and are excluded here.
+fn hir_builder_decl_is_value_type_record(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    if (decl_get_kind(d) != de_CLASS()) { return false; }
+    let flags = decl_get_generic_flags(d);
+    if ((flags & 2) != 0) { return false; }
+    if ((flags & 1) != 0) { return false; }
+    if (hir_builder_decl_is_foreign_dci(d)) { return false; }
+    return true;
+}
+
+fn hir_builder_decl_is_foreign_dci_native(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_decl_is_foreign_dci(d)
+        && (hir_builder_string_contains(decl_get_meta(d), "|foreign_dci_native")
+            || hir_builder_string_contains(decl_get_meta(d), "|foreign_cpp_native"));
+}
+
+fn hir_builder_decl_is_foreign_dci_ctor(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_decl_is_foreign_dci(d)
+        && (hir_builder_string_contains(decl_get_meta(d), "|foreign_dci_ctor")
+            || hir_builder_string_contains(decl_get_meta(d), "|foreign_cpp_ctor")
+            || hir_builder_string_contains(decl_get_generic_params(d), "|kind:constructor"));
+}
+
+fn hir_builder_decl_is_foreign_dci_dtor(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_decl_is_foreign_dci(d)
+        && (hir_builder_string_contains(decl_get_meta(d), "|foreign_dci_dtor")
+            || hir_builder_string_contains(decl_get_meta(d), "|foreign_cpp_dtor")
+            || hir_builder_string_contains(decl_get_generic_params(d), "|kind:destructor"));
+}
+
+fn hir_builder_decl_is_foreign_dci_const_method(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_decl_is_foreign_dci(d)
+        && (hir_builder_string_contains(decl_get_generic_params(d), "|dci_const")
+            || hir_builder_string_contains(decl_get_generic_params(d), "|cpp_const"));
+}
+
+fn hir_builder_decl_has_marker(d: rawptr, marker: string) -> bool {
+    if (d == null || marker.len == 0) { return false; }
+    return hir_builder_string_contains(decl_get_meta(d), "|marker:" + marker);
+}
+
+fn hir_builder_decl_is_foreign_dci_virtual_method(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_decl_is_foreign_dci(d)
+        && hir_builder_decl_has_marker(d, "virtual");
+}
+
+fn hir_builder_decl_is_foreign_dci_override_method(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_decl_is_foreign_dci(d)
+        && hir_builder_decl_has_marker(d, "override");
+}
+
+fn hir_builder_decl_is_foreign_dci_final_method(d: rawptr) -> bool {
+    if (d == null) { return false; }
+    return hir_builder_decl_is_foreign_dci(d)
+        && hir_builder_decl_has_marker(d, "final");
+}
+
+impl HirUnitBuilder {
+    fn collect_foreign_cpp_includes_from_decl_chain(self, head: rawptr, rows: string) -> string {
+        var out = rows;
+        var cd = head;
+        while (cd != null) {
+            // `extern "dci"` is the C++ DCI profile spelling; includes must be
+            // collected for both `|extern_abi:dci` and `|extern_abi:cpp`.
+            if (hir_builder_decl_is_foreign_dci(cd)) {
+                out = hir_builder_append_cpp_include_attrs(out, cd);
+            }
+            if (decl_get_members(cd) != null) {
+                out = self.collect_foreign_cpp_includes_from_decl_chain(decl_get_members(cd), out);
+            }
+            cd = decl_get_next(cd);
+        }
+        return out;
+    }
+
+    fn build_foreign_cpp_includes(self) -> string {
+        if (self.source_unit == null) { return ""; }
+        return self.collect_foreign_cpp_includes_from_decl_chain(unit_get_decls(self.source_unit), "");
+    }
+
+    fn class_decl_requires_dci_stub(self, cd: rawptr, depth: i32) -> bool {
+        if (cd == null || depth > 32) { return false; }
+        if (decl_get_kind(cd) != de_CLASS()) { return false; }
+        // Foreign DCI/C++ types are the stub *bases*, never Vyx stub classes.
+        // Parent match must use foreign_dci so `extern "dci"` (not only
+        // `extern "cpp"`) triggers subclass factory / vtable thunk emission.
+        if (hir_builder_decl_is_foreign_dci(cd)) { return false; }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(cd, parent_i);
+            if (parent_decl == null) { return false; }
+            if (hir_builder_decl_is_foreign_dci(parent_decl)) { return true; }
+            if (self.class_decl_requires_dci_stub(parent_decl, depth + 1)) { return true; }
+            parent_i = parent_i + 1;
+        }
+        return false;
+    }
+
+    /// The direct foreign DCI/C++ parent a stub class takes its layout from.
+    fn dci_stub_foreign_parent_decl(self, cd: rawptr) -> rawptr {
+        if (cd == null) { return null; }
+        var parent_i: i32 = 0;
+        while (parent_i < 16) {
+            let parent_decl = self.class_nth_layout_parent(cd, parent_i);
+            if (parent_decl == null) { return null; }
+            if (hir_builder_decl_is_foreign_dci(parent_decl)) { return parent_decl; }
+            parent_i = parent_i + 1;
+        }
+        return null;
+    }
+
+    /// The base entry a closed instance actually inherits: the base clause's
+    /// arguments substituted with the instance's own (`native.SinkG<T>` with
+    /// `T=i32` becomes `native.SinkG<i32>`).  That is the spelling the
+    /// producer's contract carries, and the only one a descriptor lookup can
+    /// resolve to a layout / vtable.
+    fn dci_stub_instance_base_text(self,
+                                   cd: rawptr,
+                                   owner_params: string,
+                                   owner_args: string) -> string {
+        let parent_decl = self.dci_stub_foreign_parent_decl(cd);
+        if (parent_decl == null) { return ""; }
+        var base_text = decl_get_name(parent_decl);
+        if (base_text.len == 0) { return ""; }
+        var base_args = hir_builder_base_clause_args(decl_get_generic_params(cd), base_text);
+        if (base_args.len > 0) {
+            base_args = hir_builder_substitute_env_in_type_text(base_args, owner_params, owner_args);
+            if (base_args.len == 0) { return ""; }
+            base_text = base_text + "<" + base_args + ">";
+        }
+        return base_text;
+    }
+
+    /// Register one closed instance of a generic DCI stub class, then
+    /// materialize the overrides it contributes as closed functions.
+    ///
+    /// The declaration-level function of such an override keeps the class's
+    /// open parameters (`consume(x: T) -> T`), so it can never be the entry a
+    /// foreign stub dispatches into; the closed instance is.
+    fn record_dci_stub_class_instance(self,
+                                      cd: rawptr,
+                                      owner_key: string,
+                                      owner_params: string,
+                                      owner_args: string) {
+        if (cd == null || owner_key.len == 0) { return; }
+        let base_text = self.dci_stub_instance_base_text(cd, owner_params, owner_args);
+        if (base_text.len == 0) { return; }
+        // Compare whole lines: a row is a prefix of nothing, but a shorter row
+        // could otherwise match inside a longer one.
+        let row = "class\t" + owner_key + "\t" + base_text + "\n";
+        if (!hir_builder_string_contains(self.dci_stub_instance_specs, row)) {
+            self.dci_stub_instance_specs = self.dci_stub_instance_specs + row;
+            // Publish *now*, not at the next `finalize_foreign_cpp_metadata`.
+            //
+            // The row is discovered while a closed instance is materialized,
+            // and in lazy-codegen builds that happens long after the last
+            // publish: `HirUnitBuilder.build` publishes before any function
+            // body exists, and MIR/codegen then materialize bodies on demand
+            // (`hir_codegen_builder_handle_materialize_function_body` ->
+            // `ensure_class_instance`).  A stub class missing from the spec
+            // list is not "a stub class with no layout" -- it is not a stub
+            // class at all, so the instance is lowered as an empty value
+            // struct (no vptr) and every `as *Base` / virtual call against it
+            // fails at the ABI boundary.  The stub-source emitter runs in its
+            // own process off this same list, so it would emit no stub either.
+            self.unit.set_dci_stub_specs(self.build_dci_stub_specs());
+        }
+        self.materialize_dci_stub_class_instance_overrides(cd, owner_key);
+    }
+
+    /// Closed overrides of one stub-class instance.
+    ///
+    /// The environment is the class's own (`T -> i32`) plus `Self -> the
+    /// instance`, which is the same environment the ordinary method sink builds
+    /// for a closed receiver.  The instance function therefore carries the
+    /// instance's owner text (`VyxSink<i32>`) and a fully substituted signature
+    /// (`consume(x: i32) -> i32`) -- the shape the stub emitter matches against
+    /// the base's descriptor vtable.  Flags mirror the declaration-level path
+    /// for a non-generic stub class exactly; `codegen_root` is required because
+    /// no Vyx call site reaches a reverse override (the foreign dispatch is its
+    /// only caller), and the override flag is what makes it eligible as a stub
+    /// override at all.
+    fn materialize_dci_stub_class_instance_overrides(self, cd: rawptr, owner_key: string) {
+        if (cd == null || owner_key.len == 0) { return; }
+        let class_params = hir_builder_decl_template_params(cd);
+        let class_args = hir_builder_owner_args_for_params(class_params, owner_key);
+        if (class_params.len == 0 || class_args.len == 0) { return; }
+        var params = class_params;
+        var args = class_args;
+        if (!hir_builder_generic_contains(params, "Self")) {
+            params = hir_builder_append_csv(params, "Self");
+            args = hir_builder_append_csv(args, owner_key);
+        }
+        var member = decl_get_members(cd);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && hir_builder_decl_has_marker(member, "override")) {
+                let override_fn = self.ensure_function_instance(member, cd, owner_key,
+                                                                params, args);
+                if (override_fn != hir_id_invalid()) {
+                    if (hir_builder_decl_has_marker(member, "virtual")) {
+                        self.unit.add_function_flags(
+                            override_fn, hir_function_flag_foreign_dci_virtual_method());
+                    }
+                    self.unit.add_function_flags(
+                        override_fn,
+                        hir_function_flag_foreign_dci_override_method()
+                        | hir_function_flag_codegen_root());
+                    if (hir_builder_decl_has_marker(member, "final")) {
+                        self.unit.add_function_flags(
+                            override_fn, hir_function_flag_foreign_dci_final_method());
+                    }
+                }
+            }
+            member = decl_get_next(member);
+        }
+    }
+
+    fn append_dci_stub_specs_from_decl_chain(self, head: rawptr, rows: string) -> string {
+        var out = rows;
+        var cd = head;
+        while (cd != null) {
+            if (decl_get_kind(cd) == de_CLASS()) {
+                if (self.class_decl_requires_dci_stub(cd, 0)
+                    && hir_builder_decl_template_params(cd).len == 0) {
+                    var parent_decl = self.class_parent_decl(cd);
+                    var parent_i: i32 = 0;
+                    while (parent_i < 16) {
+                        let p = self.class_nth_layout_parent(cd, parent_i);
+                        if (p == null) { break; }
+                        if (hir_builder_decl_is_foreign_dci(p)) {
+                            parent_decl = p;
+                            break;
+                        }
+                        parent_i = parent_i + 1;
+                    }
+                    if (parent_decl != null) {
+                        // A generic foreign base is inherited as a *closed
+                        // instance*: `class VyxHost : native.Sink<i32>` needs
+                        // the descriptor / stub base to say `native.Sink<i32>`,
+                        // because that is the entry the producer's contract
+                        // carries (`native.Sink` alone is the open trait and
+                        // has no vtable).  The arguments come from the base
+                        // clause; the parser keeps them in `|baseargs:`.
+                        var base_text = decl_get_name(parent_decl);
+                        let base_args = hir_builder_base_clause_args(
+                            decl_get_generic_params(cd), base_text);
+                        if (base_args.len > 0) {
+                            base_text = base_text + "<" + base_args + ">";
+                        }
+                        out = out + "class\t" + decl_get_name(cd) + "\t" + base_text + "\n";
+                    }
+                }
+                out = self.append_dci_stub_specs_from_decl_chain(decl_get_members(cd), out);
+            }
+            cd = decl_get_next(cd);
+        }
+        return out;
+    }
+
+    fn build_dci_stub_specs(self) -> string {
+        if (self.source_unit == null) { return ""; }
+        // Non-generic stub classes come straight from the declaration chain.
+        // Generic ones contributed one row per materialized instance while
+        // that instance was built (see `record_dci_stub_class_instance`).
+        return self.append_dci_stub_specs_from_decl_chain(unit_get_decls(self.source_unit), "")
+               + self.dci_stub_instance_specs;
+    }
+
+    public fn finalize_foreign_cpp_metadata(self) {
+        self.unit.set_foreign_cpp_includes(self.build_foreign_cpp_includes());
+        self.unit.set_dci_stub_specs(self.build_dci_stub_specs());
+    }
+}

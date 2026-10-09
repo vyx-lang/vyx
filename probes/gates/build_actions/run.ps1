@@ -47,10 +47,10 @@ if ($PreparedDir) {
 } else {
     $runDir = Join-Path $PSScriptRoot ('.runs/lifecycle-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
     New-Item -ItemType Directory -Path $runDir -Force | Out-Null
-    $systemPath = Join-Path $repo 'bootstrap_compiler/src/core/build_system.vyx'
-    $actionPath = Join-Path $repo 'bootstrap_compiler/src/core/build_action.vyx'
-    $resourcePath = Join-Path $repo 'bootstrap_compiler/src/core/build_resources.vyx'
-    $policyPath = Join-Path $repo 'bootstrap_compiler/src/core/policy.vyx'
+    $systemPath = Join-Path $repo 'bootstrap_compiler/src/core/project/build_system.vyx'
+    $actionPath = Join-Path $repo 'bootstrap_compiler/src/core/project/build_action.vyx'
+    $resourcePath = Join-Path $repo 'bootstrap_compiler/src/core/project/build_resources.vyx'
+    $policyPath = Join-Path $repo 'bootstrap_compiler/src/core/sema/policy.vyx'
     $system = [IO.File]::ReadAllText($systemPath)
     $action = [IO.File]::ReadAllText($actionPath)
     $source = $system + "`n" + $action + "`n" + [IO.File]::ReadAllText($resourcePath) + "`n" + [IO.File]::ReadAllText($policyPath)

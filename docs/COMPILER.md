@@ -22,12 +22,27 @@ LLVM IR → object files → native linking
 
 `bootstrap_compiler/src/core/` contains the driver, frontend, and build
 system. `src/hir/` and `src/mir/` implement the two intermediate
-representations. `src/codegen/llvm_lower.vyx` lowers MIR to LLVM. See the
+representations. `src/codegen/llvm/llvm_lower.vyx` owns the LLVM lowering context and
+public entry points. Its method implementations live in
+[`src/codegen/llvm/`](../bootstrap_compiler/src/codegen/llvm/README.md), grouped by
+value/storage operations, native ABI, DCI, and function/CGU compilation. See the
 [compiler README](../bootstrap_compiler/README.md) for build commands.
+
+For a lowering bug, start with `values.vyx`, `instructions.vyx` or `calls.vyx`
+and follow the selected operation. The source map lists the corresponding
+implementation and its entry points. These files extend the same qualified
+`LlvmMirLowerer` type within one logical module. `Vyx.toml` supplies the module's
+source list, and the facade retains its storage and lifetime. Semantic
+analysis and project building still have large central units. HIR construction
+now has a [source map](../bootstrap_compiler/src/hir/builder/README.md) for
+declarations, instances, expression resolution and body lifetime. HIR and LLVM
+implementations still share their respective builder/lowering state.
+The [source tree](../bootstrap_compiler/src/README.md) groups the frontend by
+driver, syntax, semantics, facts, DCI, build scheduling and editor services.
 
 ## HIR: language meaning
 
-[`HirUnit`](../bootstrap_compiler/src/hir/hir_model.vyx) stores types, items,
+[`HirUnit`](../bootstrap_compiler/src/hir/model/hir_model.vyx) stores types, items,
 functions, locals, statements, expressions, generic environments, and type
 lists in separate tables. Numeric IDs connect the logical expression and
 statement structures. The physical representation uses flat record pools with
@@ -42,13 +57,19 @@ and HIR verification in that order, reporting errors before lowering. The AST
 and semantic-analysis stages already do part of this work; HIR does not own
 all type checking.
 
-`src/hir/hir.vyx` audits AST semantic facts. The HIR data model lives in
-`src/hir/hir_model.vyx`.
+`src/hir/verify/hir.vyx` audits AST semantic facts. The HIR data model lives in
+`src/hir/model/hir_model.vyx`.
+
+`src/hir/builder/hir_builder.vyx` holds builder storage, construction and native-handle
+entry points. Its implementations in `src/hir/builder/` form the same logical
+module. `function_bodies.vyx` handles reachable body requests;
+`body_storage.vyx` discards generated records after codegen. Keep this bounded
+lifetime when changing generic instances, closures or deferred typing.
 
 ## Interfaces and cross-module definitions
 
 An emitted `.vyi` has an ordinary public declaration surface. For user modules
-containing generics, [`template_artifact.vyx`](../bootstrap_compiler/src/core/template_artifact.vyx)
+containing generics, [`template_artifact.vyx`](../bootstrap_compiler/src/core/sema/template_artifact.vyx)
 also appends a version 1 AST graph with generic bodies and their private
 dependencies. The importer rebuilds semantic references in the consumer and
 retains the defining module for qualified lookup and helper visibility. Explicit
@@ -80,7 +101,7 @@ platform testing for ELF or Wasm.
 
 ## MIR: execution paths
 
-[`MirUnit`](../bootstrap_compiler/src/mir/mir_model.vyx) retains the type
+[`MirUnit`](../bootstrap_compiler/src/mir/model/mir_model.vyx) retains the type
 table and adds tables for functions, basic blocks, locals, fields, places,
 values, instructions, and match cases. A block ends in a terminator such as
 `return`, `goto`, `branch`, `match`, or `yield`.
@@ -92,11 +113,18 @@ values, instructions, and match cases. A block ends in a terminator such as
 | Instr | What happens? | Evaluation, assignment, drop, storage live/dead |
 | Terminator | Where does control go? | Return, jump, branch, iteration |
 
-HIR retains an `if` as a statement. [`lower_if_stmt`](../bootstrap_compiler/src/mir/mir_builder.vyx)
+The [MIR tree](../bootstrap_compiler/src/mir/README.md) separates the record
+model, HIR lowering, analysis, optimization passes and verification.
+`builder/mir_builder.vyx` retains builder state; expression, control-flow, call,
+lifetime and reachable-function operations live in their respective subtrees.
+`model/records/` owns record access; `verify/scope/` checks bounded function
+ranges, while `verify/strict/` checks whole units.
+
+HIR retains an `if` as a statement. [`lower_if_stmt`](../bootstrap_compiler/src/mir/builder/flow/branches.vyx)
 creates then, else, and join blocks with explicit edges. The builder also
 places `drop`, `defer`, and storage-end operations on scope-exit paths. MIR
 allows mutable locals, `assign`, and `read_place`; a `ValueId` does not make
-the entire representation SSA. See [`mir_ids.vyx`](../bootstrap_compiler/src/mir/mir_ids.vyx)
+the entire representation SSA. See [`mir_ids.vyx`](../bootstrap_compiler/src/mir/model/mir_ids.vyx)
 for the current kinds.
 
 `match` also produces values. The builder evaluates its subject once, lowers
@@ -106,7 +134,7 @@ from arms have an [AOT compile/run gate](../probes/gates/match-expression/README
 Incompatible arm types, non-boolean guards, missing arm values, and empty value
 matches have negative diagnostic checks.
 
-[`mir_pass.vyx`](../bootstrap_compiler/src/mir/mir_pass.vyx) runs constant
+[`mir_pass.vyx`](../bootstrap_compiler/src/mir/passes/mir_pass.vyx) runs constant
 folding, constant-branch folding, SCCP, copy propagation, drop-aware dead-code
 elimination, select formation, and CFG simplification. At optimization levels
 above 0, these passes run for a bounded number of rounds. MIR is verified and
@@ -116,8 +144,9 @@ checked against the DCI storage contract before LLVM lowering.
 
 The current LLVM streaming path materializes, optimizes, lowers, and releases
 MIR per function; those phases appear in
-[`llvm_lower.vyx`](../bootstrap_compiler/src/codegen/llvm_lower.vyx). A code
-generation unit (CGU) groups definitions for backend work and object emission.
+[`streaming.vyx`](../bootstrap_compiler/src/codegen/llvm/functions/streaming.vyx). A code
+generation unit (CGU) groups definitions for backend work and object emission in
+[`cgu.vyx`](../bootstrap_compiler/src/codegen/llvm/emit/cgu.vyx).
 This is distinct from running separate project build jobs concurrently.
 
 The project scheduler uses typed actions, input-size estimates, observed memory,

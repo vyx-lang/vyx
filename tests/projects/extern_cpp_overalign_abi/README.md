@@ -43,7 +43,7 @@ object.  That covers both directions of the heap surface:
 
 Vyx gives an imported DCI record a *value* layout by picking an **anchor type
 whose own ABI alignment equals the descriptor's alignment**
-(`finalize_record_ty_body`, `bootstrap_compiler/src/codegen/llvm_lower.vyx`).
+(`finalize_record_ty_body`, `bootstrap_compiler/src/codegen/llvm/llvm_lower.vyx`).
 Because the anchor is self-describing, every generic storage path — local
 slot, load, store, the default `byval`/`sret` alignment — inherits the right
 alignment without any per-site plumbing.

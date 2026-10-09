@@ -1,0 +1,390 @@
+module bootstrap.llvm_mir_lower;
+
+@[vis(world)]
+impl LlvmMirLowerer {
+    public fn dci_synthesize_forward_wrapper(self, request: rawptr, synthesis: rawptr) -> bool {
+        let wrapper = self.dci_json_item(request, "wrapper");
+        let wrapper_link = self.dci_json_string(wrapper, "link_name");
+        if (wrapper_link.len == 0) {
+            self.report_error("DCI forward_direct wrapper is missing a link_name");
+            return false;
+        }
+        if (self.dci_find_foreign_function_by_link(wrapper_link) != mir_id_invalid()) {
+            self.report_error("DCI forward_direct wrapper `" + wrapper_link
+                      + "` collides with an imported symbol");
+            return false;
+        }
+        var target_ref = self.dci_json_string(synthesis, "target");
+        if (target_ref.len == 0) { target_ref = self.dci_json_string(request, "target"); }
+        if (target_ref.len == 0) {
+            self.report_error("DCI forward_direct wrapper `" + wrapper_link
+                      + "` has no target symbol");
+            return false;
+        }
+        let target_symbol = self.dci_symbol_object_for_reference(target_ref);
+        if (target_symbol == null) {
+            self.report_error("DCI forward_direct wrapper target `" + target_ref
+                      + "` is not a uniquely resolvable exported symbol");
+            return false;
+        }
+        // A synthesizable Direct wrapper must forward to a Direct-callable symbol;
+        // routing to another requires_stub surface is not a Direct forward.
+        if (!self.dci_symbol_unwind_supported(target_symbol)) {
+            self.report_error("DCI forward_direct wrapper target `" + target_ref
+                      + "` is not Direct-callable under the declared control-flow contract");
+            return false;
+        }
+        let target_link = self.dci_symbol_link_name(target_symbol);
+        let target_fn = self.dci_find_foreign_function_by_link(target_link);
+        if (target_fn == mir_id_invalid()) {
+            self.report_error("DCI forward_direct wrapper target `" + target_ref
+                      + "` must be imported by the Consumer to synthesize a wrapper");
+            return false;
+        }
+        if (!self.declare_function_signature(target_fn)) {
+            self.report_error("cannot declare DCI forward_direct wrapper target `" + target_ref + "`");
+            return false;
+        }
+        let target_value = llvm_mir_map_get(self.function_values, target_fn);
+        let target_type = llvm_mir_map_get(self.function_types, target_fn);
+        if (target_value == null || target_type == null) {
+            self.report_error("cannot resolve DCI forward_direct wrapper target signature `"
+                      + target_ref + "`");
+            return false;
+        }
+        let wrapper_fn = vyx_rt_add_function(self.mod,
+                                             wrapper_link.c_str(),
+                                             wrapper_link.len as u64,
+                                             target_type);
+        if (wrapper_fn == null) {
+            self.report_error("cannot declare DCI stub wrapper `" + wrapper_link + "`");
+            return false;
+        }
+        vyx_rt_set_linkage(self.mod, wrapper_fn, 0);
+        let saved_block = vyx_rt_get_insert_block(self.mod);
+        let entry_name = "dci.stub.wrapper.entry";
+        let bb = vyx_rt_append_block(self.mod,
+                                     wrapper_fn,
+                                     entry_name.c_str(),
+                                     entry_name.len as u64);
+        if (bb == null) {
+            self.report_error("cannot create DCI stub wrapper block for `" + wrapper_link + "`");
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return false;
+        }
+        vyx_rt_position_at_end(self.mod, bb);
+        let param_count = self.function_llvm_param_count(target_fn);
+        var args: rawptr = null;
+        if (param_count > 0) {
+            args = malloc((param_count * 8) as u64);
+            if (args == null) {
+                self.report_error("cannot allocate DCI stub wrapper arguments");
+                if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+                return false;
+            }
+            var idx: i32 = 0;
+            while (idx < param_count) {
+                let p = vyx_rt_get_param(self.mod, wrapper_fn, idx as u64);
+                if (p == null) {
+                    free(args);
+                    self.report_error("cannot read DCI stub wrapper parameter");
+                    if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+                    return false;
+                }
+                ast_write_rawptr(ptr_offset(args, idx * 8), p);
+                idx = idx + 1;
+            }
+        }
+        let ret_is_void = self.dci_function_uses_sret(target_fn)
+            || llvm_mir_type_kind(&self.m, self.m.function_return_type(target_fn)) == ty_VOID();
+        var call_name = "dci.stub.wrapper.call";
+        if (ret_is_void) { call_name = ""; }
+        let result = vyx_rt_build_call(self.mod,
+                                       target_type,
+                                       target_value,
+                                       args,
+                                       param_count as u64,
+                                       call_name.c_str(),
+                                       call_name.len as u64);
+        if (args != null) { free(args); }
+        let cc = self.dci_symbol_calling_convention(target_symbol);
+        if (result != null && cc.len > 0) {
+            vyx_rt_set_calling_convention(self.mod, result, cc.c_str(), cc.len as u64);
+        }
+        if (ret_is_void) {
+            vyx_rt_build_ret_void(self.mod);
+        } else if (result != null) {
+            vyx_rt_build_ret(self.mod, result);
+        } else {
+            self.report_error("cannot emit DCI stub wrapper return for `" + wrapper_link + "`");
+            if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+            return false;
+        }
+        if (cc.len > 0) {
+            vyx_rt_set_calling_convention(self.mod,
+                                          wrapper_fn,
+                                          cc.c_str(),
+                                          cc.len as u64);
+        }
+        vyx_rt_set_function_attr(self.mod,
+                                 wrapper_fn,
+                                 "nounwind".c_str(),
+                                 8,
+                                 "".c_str(),
+                                 0);
+        if (saved_block != null) { vyx_rt_position_at_end(self.mod, saved_block); }
+        return true;
+    }
+
+    public fn dci_stub_spec_field(self, line: string, wanted: i32) -> string {
+        var start: i32 = 0;
+        var field: i32 = 0;
+        var i: i32 = 0;
+        while (i <= line.len) {
+            var split = false;
+            if (i == line.len) { split = true; }
+            else if (line.charAt(i) == 9) { split = true; }
+            if (split) {
+                if (field == wanted) { return line.substring(start, i).trim(); }
+                field = field + 1;
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return "";
+    }
+
+    public fn dci_stub_type_names_match(self, a: string, b: string) -> bool {
+        let canonical_a = self.dci_canonical_type_name_text(a);
+        let canonical_b = self.dci_canonical_type_name_text(b);
+        if (canonical_a == canonical_b) { return true; }
+        if (self.type_text_base_is_qualified(canonical_a)
+            && self.type_text_base_is_qualified(canonical_b)) {
+            return false;
+        }
+        return self.type_text_equivalent(canonical_a, canonical_b);
+    }
+
+    public fn dci_stub_base_for_type_text(self, derived: string) -> string {
+        let rows = mir_unit_dci_stub_specs(&self.m);
+        let canonical_derived = self.dci_canonical_type_name_text(derived);
+        var exact_base = "";
+        var exact_count: i32 = 0;
+        var fallback_base = "";
+        var fallback_count: i32 = 0;
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i <= rows.len) {
+            var split = false;
+            if (i == rows.len) { split = true; }
+            else if (rows.charAt(i) == 10) { split = true; }
+            if (split) {
+                let line = rows.substring(start, i).trim();
+                if (self.dci_stub_spec_field(line, 0) == "class") {
+                    let d = self.dci_stub_spec_field(line, 1);
+                    let base = self.dci_stub_spec_field(line, 2);
+                    if (self.dci_canonical_type_name_text(d) == canonical_derived) {
+                        exact_base = base;
+                        exact_count = exact_count + 1;
+                    } else if (self.dci_stub_type_names_match(d, derived)) {
+                        fallback_base = base;
+                        fallback_count = fallback_count + 1;
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (exact_count == 1) { return exact_base; }
+        if (exact_count == 0 && fallback_count == 1) { return fallback_base; }
+        return "";
+    }
+
+    public fn type_is_dci_stub_class(self, type_id: i32) -> bool {
+        if (type_id == mir_id_invalid()) { return false; }
+        let text = llvm_mir_type_text(&self.m, self.canonical_record_type_id(type_id));
+        if (text.len == 0) { return false; }
+        return self.dci_stub_base_for_type_text(text).len > 0;
+    }
+
+    public fn function_is_dci_vyx_override_callback(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()) { return false; }
+        if (self.function_is_foreign_dci(function_id)) { return false; }
+        if ((mir_unit_function_flags(&self.m, function_id) & hir_function_flag_foreign_dci_override_method()) == 0) {
+            return false;
+        }
+        let owner = self.m.function_owner_type(function_id);
+        if (owner.len == 0) { return false; }
+        return self.dci_stub_base_for_type_text(owner).len > 0;
+    }
+
+    /// The override's contract word for how a source parameter crosses the
+    /// boundary: `indirect`/`byval` arrive as a pointer to the aggregate.
+    /// Source indices count the receiver; ABI parameters start after it.  The
+    /// decision comes from the resolved contract symbol, so the override's
+    /// materialized signature agrees with the producer-side shim that fills
+    /// the vtable slot (rustc lowers a 12-byte C aggregate to sret + a
+    /// by-reference parameter, which the native first-class rule would not).
+    public fn source_param_uses_dci_override_byval_abi(self, function_id: i32, source_idx: i32) -> bool {
+        if (!self.function_is_dci_vyx_override_callback(function_id)) { return false; }
+        let abi_params = self.dci_abi_parameter_array(function_id);
+        if (abi_params == null || cJSON_IsArray(abi_params) == 0) { return false; }
+        let abi_idx = source_idx - self.dci_symbol_receiver_param_count(function_id);
+        if (abi_idx < 0 || abi_idx >= cJSON_GetArraySize(abi_params)) { return false; }
+        let passing = self.dci_abi_passing(cJSON_GetArrayItem(abi_params, abi_idx));
+        return passing == "indirect" || passing == "byval";
+    }
+
+    /// A DCI override callback is materialized as an `extern "C"` free
+    /// function: the stub TU declares it with plain C types, so a 1/2/4/8-byte
+    /// record crosses in ONE integer register and returns in RAX (the C
+    /// free-function rule) -- not the member rule, where every UDT return goes
+    /// through the hidden pointer.  The DCI stable-value storage type (the
+    /// `{anchor, [tail x i8]}` shape) is not register-class for LLVM's Win64
+    /// CC, so these boundaries must coerce explicitly instead of leaking the
+    /// storage type into the thunk signature.  Larger or non-register sizes
+    /// keep the descriptor-driven sret/indirect facts.
+    public fn dci_override_crosses_as_c_register_record(self, function_id: i32, type_id: i32) -> bool {
+        if (function_id == mir_id_invalid() || type_id == mir_id_invalid()) { return false; }
+        if (!self.function_is_dci_vyx_override_callback(function_id)) { return false; }
+        if (!llvm_mir_effective_target_is_windows()) { return false; }
+        let canonical_type = self.canonical_record_type_id(type_id);
+        if (canonical_type == mir_id_invalid()) { return false; }
+        if (llvm_mir_type_kind(&self.m, canonical_type) != ty_CLASS()) { return false; }
+        if (self.type_is_class_pointer_abi(canonical_type)) { return false; }
+        let bytes = self.dci_open_type_size(type_id);
+        return bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8;
+    }
+
+    public fn dci_stub_factory_symbol_for_type(self, type_id: i32) -> string {
+        let text = llvm_mir_type_text(&self.m, self.canonical_record_type_id(type_id));
+        if (text.len == 0) { return ""; }
+        return "__dci_stub_factory_" + policy_mangle_part(text);
+    }
+
+    public fn dci_stub_destroy_symbol_for_type(self, type_id: i32) -> string {
+        let text = llvm_mir_type_text(&self.m, self.canonical_record_type_id(type_id));
+        if (text.len == 0) { return ""; }
+        return "__dci_stub_destroy_" + policy_mangle_part(text);
+    }
+
+    public fn get_or_declare_dci_stub_factory(self, type_id: i32) -> rawptr {
+        if (!self.type_is_dci_stub_class(type_id)) { return null; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let cached = llvm_mir_map_get(self.dci_stub_factory_values, canonical);
+        if (cached != null) { return cached; }
+        let symbol = self.dci_stub_factory_symbol_for_type(canonical);
+        if (symbol.len == 0) { return null; }
+        let fty = vyx_rt_fn_type(self.mod, self.ty_ptr, null, 0, 0);
+        if (fty == null) {
+            self.report_error("cannot declare DCI stub factory type for "
+                      + llvm_mir_type_text(&self.m, canonical));
+            return null;
+        }
+        let fnv = vyx_rt_add_function(self.mod, symbol.c_str(), symbol.len as u64, fty);
+        if (fnv == null) {
+            self.report_error("cannot declare DCI stub factory `" + symbol + "`");
+            return null;
+        }
+        llvm_mir_map_put(self.dci_stub_factory_values, canonical, fnv);
+        // The base instance this stub is built over, for the requests sidecar.
+        llvm_dci_open_note_instance(
+            self.dci_stub_base_for_type_text(llvm_mir_type_text(&self.m, canonical)));
+        return fnv;
+    }
+
+    public fn lower_dci_stub_factory_call(self, type_id: i32) -> rawptr {
+        let factory = self.get_or_declare_dci_stub_factory(type_id);
+        if (factory == null) { return null; }
+        let fty = vyx_rt_fn_type(self.mod, self.ty_ptr, null, 0, 0);
+        let shared = self.dci_caller_participates_in_shared_unwind();
+        var out: rawptr = null;
+        if (shared) {
+            out = vyx_rt_build_invoke(self.mod, fty, factory, null, 0,
+                                       "dci.stub.new".c_str(), 12);
+        } else {
+            out = vyx_rt_build_call(self.mod,
+                                    fty,
+                                    factory,
+                                    null,
+                                    0,
+                                    "dci.stub.new".c_str(),
+                                    12);
+        }
+        if (out == null) {
+            self.report_error("cannot call DCI stub factory for "
+                      + llvm_mir_type_text(&self.m, type_id)
+                      + " runtime=" + self.runtime_last_error());
+        } elif (shared) {
+            let destroy = self.get_or_declare_dci_stub_destroy(type_id);
+            if (destroy == null || llvm_unwind_track_factory_owner(self.mod, out, destroy) != 0) {
+                self.report_error("cannot register DCI factory object cleanup for "
+                          + llvm_mir_type_text(&self.m, type_id)
+                          + " runtime=" + self.runtime_last_error());
+                return null;
+            }
+        }
+        return out;
+    }
+
+    public fn get_or_declare_dci_stub_destroy(self, type_id: i32) -> rawptr {
+        if (!self.type_is_dci_stub_class(type_id)) { return null; }
+        let canonical = self.canonical_record_type_id(type_id);
+        let cached = llvm_mir_map_get(self.dci_stub_destroy_values, canonical);
+        if (cached != null) { return cached; }
+        let symbol = self.dci_stub_destroy_symbol_for_type(canonical);
+        if (symbol.len == 0) { return null; }
+        let params = malloc(8);
+        if (params == null) {
+            self.report_error("cannot allocate DCI stub destroy signature params");
+            return null;
+        }
+        ast_write_rawptr(params, self.ty_ptr);
+        let fty = vyx_rt_fn_type(self.mod, self.ty_void, params, 1, 0);
+        free(params);
+        if (fty == null) {
+            self.report_error("cannot declare DCI stub destroy type for "
+                      + llvm_mir_type_text(&self.m, canonical));
+            return null;
+        }
+        let fnv = vyx_rt_add_function(self.mod, symbol.c_str(), symbol.len as u64, fty);
+        if (fnv == null) {
+            self.report_error("cannot declare DCI stub destroy `" + symbol + "`");
+            return null;
+        }
+        llvm_mir_map_put(self.dci_stub_destroy_values, canonical, fnv);
+        return fnv;
+    }
+
+    public fn lower_dci_stub_destroy_place(self, place_id: i32) -> bool {
+        if (place_id == mir_id_invalid()) { return false; }
+        let place_type = self.m.place_type(place_id);
+        if (!self.type_is_dci_stub_class(place_type)) { return false; }
+        let destroy = self.get_or_declare_dci_stub_destroy(place_type);
+        if (destroy == null) { return true; }
+        let place_addr = self.lower_place_addr(place_id);
+        let receiver_arg = self.class_object_addr_from_place_addr(place_id, place_addr, place_type);
+        if (receiver_arg == null) {
+            self.report_error("cannot lower DCI stub destroy receiver for "
+                      + llvm_mir_type_text(&self.m, place_type));
+            return true;
+        }
+        let params = malloc(8);
+        if (params == null) {
+            self.report_error("cannot allocate DCI stub destroy call args");
+            return true;
+        }
+        ast_write_rawptr(params, self.ty_ptr);
+        let fty = vyx_rt_fn_type(self.mod, self.ty_void, params, 1, 0);
+        ast_write_rawptr(params, receiver_arg);
+        vyx_rt_build_call(self.mod,
+                          fty,
+                          destroy,
+                          params,
+                          1,
+                          llvm_mir_empty_name(),
+                          0);
+        free(params);
+        return true;
+    }
+}

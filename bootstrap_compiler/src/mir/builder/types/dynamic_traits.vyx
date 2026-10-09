@@ -1,0 +1,218 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_ownership_resolver;
+use bootstrap.hir_semantic_resolver;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.mir_pass;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn type_is_dyn_trait(self, type_id: i32) -> bool {
+        if (type_id == hir_id_invalid()) { return false; }
+        if (hir_type_table_kind(self.h.types, type_id) != ty_CLASS()) { return false; }
+        let text = self.type_text(type_id);
+        if (text.len <= 3) { return false; }
+        return text.startsWith("dyn");
+    }
+
+    // Unique rule: dyn is a property of the peeled type. `ref<dyn T>`,
+    // `mutref<dyn T>`, and `ptr<dyn T>` are handles to the same trait object
+    // as `dyn T`. Coercion and vtable reachability must not depend on the
+    // outermost spelling.
+    public fn type_peel_handle(self, type_id: i32) -> i32 {
+        var cur = type_id;
+        var depth: i32 = 0;
+        while (depth < 4 && cur != hir_id_invalid()) {
+            let kind = hir_type_table_kind(self.h.types, cur);
+            if (kind != ty_PTR() && kind != ty_REF() && kind != ty_MUTREF()) {
+                return cur;
+            }
+            let elem = hir_type_table_elem(self.h.types, cur);
+            if (elem == hir_id_invalid()) { return cur; }
+            cur = elem;
+            depth = depth + 1;
+        }
+        return cur;
+    }
+
+    public fn type_dyn_trait_id(self, type_id: i32) -> i32 {
+        let core = self.type_peel_handle(type_id);
+        if (self.type_is_dyn_trait(core)) { return core; }
+        return hir_id_invalid();
+    }
+
+    public fn type_dyn_payload_id(self, type_id: i32) -> i32 {
+        let core = self.type_peel_handle(type_id);
+        if (core == hir_id_invalid() || self.type_is_dyn_trait(core)) {
+            return hir_id_invalid();
+        }
+        return core;
+    }
+
+    public fn dyn_trait_name_from_type_text(self, type_text: string) -> string {
+        if (type_text.len <= 3) { return ""; }
+        let base = policy_generic_call_base(type_text.clone());
+        if (base.len <= 3 || !base.startsWith("dyn")) { return ""; }
+        let trait_base = base.substring(3, base.len);
+        if (trait_base.len == 0) { return ""; }
+        let args = policy_generic_call_args(type_text.clone());
+        if (args.len > 0) { return trait_base + "::<" + args + ">"; }
+        return trait_base;
+    }
+
+    public fn type_text_matches_dyn_trait(self, type_text: string, dyn_type_id: i32) -> bool {
+        if (!self.type_is_dyn_trait(dyn_type_id) || type_text.len == 0) { return false; }
+        let dyn_text = self.type_text(dyn_type_id);
+        let trait_text = self.dyn_trait_name_from_type_text(dyn_text);
+        if (trait_text.len == 0) { return false; }
+        if (type_text == dyn_text || type_text == trait_text) { return true; }
+        if (policy_type_name_equal(type_text, trait_text)) { return true; }
+        let type_base = policy_generic_call_base(type_text.clone());
+        let trait_base = policy_generic_call_base(trait_text.clone());
+        return mir_builder_last_path_segment(type_base) == mir_builder_last_path_segment(trait_base);
+    }
+
+    public fn interface_name_matches(self, a: string, b: string) -> bool {
+        if (a.len == 0 || b.len == 0) { return false; }
+        if (a == b || policy_type_name_equal(a, b)) { return true; }
+        let abase = policy_generic_call_base(a.clone());
+        let bbase = policy_generic_call_base(b.clone());
+        if (abase == bbase || policy_type_name_equal(abase, bbase)) { return true; }
+        return mir_builder_last_path_segment(abase) == mir_builder_last_path_segment(bbase);
+    }
+
+    public fn interface_extends_trait_name(self, iface_name: string, target_trait: string, depth: i32) -> bool {
+        if (iface_name.len == 0 || target_trait.len == 0) { return false; }
+        if (self.interface_name_matches(iface_name, target_trait)) { return true; }
+        if (depth > 16) { return false; }
+        let rows = hir_unit_interface_supers(self.h);
+        var start: i32 = 0;
+        var i: i32 = 0;
+        while (i <= rows.len) {
+            if (i == rows.len || rows.charAt(i) == 59) {
+                var sep: i32 = -1;
+                var j = start;
+                while (j < i) {
+                    if (rows.charAt(j) == 62 && sep < 0) { sep = j; }
+                    j = j + 1;
+                }
+                if (sep > start && sep + 1 < i) {
+                    let child = rows.substring(start, sep);
+                    let parent = rows.substring(sep + 1, i);
+                    if (self.interface_name_matches(child, iface_name)) {
+                        if (self.interface_name_matches(parent, target_trait)) { return true; }
+                        if (self.interface_extends_trait_name(parent, target_trait, depth + 1)) {
+                            return true;
+                        }
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    public fn dyn_trait_extends_type_text(self, dyn_type_id: i32, target_trait: string) -> bool {
+        if (!self.type_is_dyn_trait(dyn_type_id) || target_trait.len == 0) { return false; }
+        let trait_text = self.dyn_trait_name_from_type_text(self.type_text(dyn_type_id));
+        if (trait_text.len == 0) { return false; }
+        return self.interface_extends_trait_name(trait_text, target_trait, 0);
+    }
+
+    public fn hir_function_matches_dyn_trait(self, hir_function_id: i32, dyn_type_id: i32) -> bool {
+        if (hir_function_id == hir_id_invalid() || !self.type_is_dyn_trait(dyn_type_id)) { return false; }
+        let item_id = self.h.function_item(hir_function_id);
+        if (item_id == hir_id_invalid()) { return false; }
+        let owner_item = self.h.item_owner(item_id);
+        if (owner_item == hir_id_invalid()) { return false; }
+        if (self.h.item_kind(owner_item) != hir_item_interface()) { return false; }
+        let owner_type_text = self.owner_type_text_for_hir_function(hir_function_id);
+        if (self.type_text_matches_dyn_trait(owner_type_text, dyn_type_id)
+            || self.dyn_trait_extends_type_text(dyn_type_id, owner_type_text)) {
+            return true;
+        }
+        let first_local = self.h.function_first_local(hir_function_id);
+        if (first_local != hir_id_invalid()) {
+            let self_type_text = self.type_text(self.h.local_type(first_local));
+            return self.type_text_matches_dyn_trait(self_type_text, dyn_type_id)
+                   || self.dyn_trait_extends_type_text(dyn_type_id, self_type_text);
+        }
+        return false;
+    }
+
+    public fn hir_function_for_item(self, item_id: i32) -> i32 {
+        if (item_id == hir_id_invalid()) { return hir_id_invalid(); }
+        let direct = self.h.item_function(item_id);
+        if (direct > 0) { return direct; }
+        return hir_id_invalid();
+    }
+
+    public fn interface_item_for_dyn_trait(self, dyn_type_id: i32) -> i32 {
+        if (!self.type_is_dyn_trait(dyn_type_id)) { return hir_id_invalid(); }
+        let trait_text = self.dyn_trait_name_from_type_text(self.type_text(dyn_type_id));
+        if (trait_text.len == 0) { return hir_id_invalid(); }
+        var item_id: i32 = 1;
+        while (item_id <= self.h.item_count) {
+            if (self.h.item_kind(item_id) == hir_item_interface()
+                && self.type_text_matches_dyn_trait(self.h.item_name(item_id), dyn_type_id)) {
+                return item_id;
+            }
+            item_id = item_id + 1;
+        }
+        return hir_id_invalid();
+    }
+
+    public fn ensure_dyn_trait_method_reachable(self,
+                                                actual_type_id: i32,
+                                                dyn_type_id: i32,
+                                                prototype_hir_function_id: i32) {
+        let payload_type_id = self.type_dyn_payload_id(actual_type_id);
+        let peeled_dyn_type_id = self.type_dyn_trait_id(dyn_type_id);
+        if (payload_type_id == hir_id_invalid()
+            || peeled_dyn_type_id == hir_id_invalid()
+            || prototype_hir_function_id == hir_id_invalid()) {
+            return;
+        }
+        self.ensure_function_shell_for_hir(prototype_hir_function_id);
+        let method_name = policy_generic_call_base(self.h.function_name(prototype_hir_function_id).clone());
+        if (method_name.len == 0) { return; }
+        self.function_target_by_owner_type_and_method(self.type_text(payload_type_id), method_name);
+    }
+
+    public fn ensure_dyn_trait_methods_reachable(self, actual_type_id: i32, expected_type_id: i32) {
+        let dyn_type_id = self.type_dyn_trait_id(expected_type_id);
+        if (dyn_type_id == hir_id_invalid()) { return; }
+        if (self.type_dyn_trait_id(actual_type_id) == dyn_type_id) { return; }
+        let payload_type_id = self.type_dyn_payload_id(actual_type_id);
+        if (payload_type_id == hir_id_invalid() || payload_type_id == dyn_type_id) { return; }
+        let interface_item = self.interface_item_for_dyn_trait(dyn_type_id);
+        if (interface_item == hir_id_invalid()) { return; }
+        var member_item = self.h.item_first_member(interface_item);
+        while (member_item != hir_id_invalid()) {
+            if (self.h.item_kind(member_item) == hir_item_method()) {
+                let hir_fn = self.hir_function_for_item(member_item);
+                if (hir_fn != hir_id_invalid()) {
+                    self.ensure_dyn_trait_method_reachable(payload_type_id, dyn_type_id, hir_fn);
+                }
+            }
+            member_item = self.h.item_next_sibling(member_item);
+        }
+        var hir_fn: i32 = 1;
+        while (hir_fn <= self.h.function_count) {
+            if (self.hir_function_matches_dyn_trait(hir_fn, dyn_type_id)) {
+                self.ensure_dyn_trait_method_reachable(payload_type_id, dyn_type_id, hir_fn);
+            }
+            hir_fn = hir_fn + 1;
+        }
+    }
+}

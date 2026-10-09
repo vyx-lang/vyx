@@ -1,0 +1,342 @@
+module bootstrap.hir_builder;
+
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.dci_binder;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_native_init;
+use bootstrap.hir_type_table;
+use bootstrap.policy;
+use bootstrap.sema;
+
+// Closures for the HIR builder. See README.md.
+
+impl HirUnitBuilder {
+    fn ensure_capture_local(self, target: rawptr) -> i32 {
+        if (target == null || self.capture_source_head == null) { return hir_id_invalid(); }
+        let existing = hir_local_scope_lookup_target(self.locals, target);
+        if (existing != hir_id_invalid()) { return existing; }
+        let source_node = hir_local_scope_find_node(self.capture_source_head, target);
+        if (source_node == null) { return hir_id_invalid(); }
+        return self.create_capture_local_from_source_node(source_node, target);
+    }
+
+    fn ensure_capture_local_by_name(self, name: string, target: rawptr) -> i32 {
+        if (name.len == 0 || self.capture_source_head == null) { return hir_id_invalid(); }
+        if (target != null) {
+            let existing_target = hir_local_scope_lookup_target(self.locals, target);
+            if (existing_target != hir_id_invalid()) { return existing_target; }
+        }
+        let existing_name = hir_local_scope_lookup(self.locals, name);
+        if (existing_name != hir_id_invalid()) { return existing_name; }
+        var source_node = hir_local_scope_find_node(self.capture_source_head, target);
+        if (source_node == null) {
+            source_node = hir_local_scope_find_node_by_name(self.capture_source_head, name);
+        }
+        if (source_node == null) { return hir_id_invalid(); }
+        var capture_target = target;
+        if (capture_target == null) { capture_target = hir_local_scope_node_target(source_node); }
+        return self.create_capture_local_from_source_node(source_node, capture_target);
+    }
+
+    fn create_capture_local_from_source_node(self, source_node: rawptr, target: rawptr) -> i32 {
+        if (source_node == null) { return hir_id_invalid(); }
+        let cap_name = hir_local_scope_node_name(source_node);
+        let cap_type = hir_local_scope_node_type(source_node);
+        if (cap_name.len == 0 || cap_type == hir_id_invalid()) { return hir_id_invalid(); }
+        let cap_local = self.unit.add_local(self.current_function_id, cap_name, cap_type, 2);
+        self.unit.set_local_capture_source(cap_local, hir_local_scope_node_local(source_node));
+        self.locals = hir_local_scope_push(self.locals,
+                             cap_name,
+                             cap_local,
+                             cap_type,
+                             self.current_function_id,
+                             target);
+        return cap_local;
+    }
+
+    fn preload_capture_target(self, target: rawptr) {
+        if (target == null) { return; }
+        if (hir_local_scope_lookup_target(self.locals, target) != hir_id_invalid()) { return; }
+        self.ensure_capture_local(target);
+    }
+
+    fn preload_capture_expr(self, e: rawptr) {
+        if (e == null) { return; }
+        if (expr_get_semantic_kind(e) == expr_sem_LOCAL()) {
+            let target = expr_get_semantic_target(e);
+            if (target != null) {
+                self.preload_capture_target(target);
+            } else {
+                self.ensure_capture_local_by_name(expr_get_name(e), null);
+            }
+        } elif (expr_get_kind(e) == ex_IDENT()) {
+            self.ensure_capture_local_by_name(expr_get_name(e), expr_get_semantic_target(e));
+        }
+        let k = expr_get_kind(e);
+        if (k == ex_BIN()
+            || k == ex_ASSIGN()) {
+            self.preload_capture_expr(expr_get_lhs(e));
+            self.preload_capture_expr(expr_get_rhs(e));
+            return;
+        }
+        if (k == ex_TERNARY()) {
+            self.preload_capture_expr(expr_get_lhs(e));
+            self.preload_capture_expr(expr_get_rhs(e));
+            self.preload_capture_expr(expr_get_args(e));
+            return;
+        }
+        if (k == ex_UNARY()
+            || k == ex_ADDR_OF()
+            || k == ex_DEREF()
+            || k == ex_AWAIT()
+            || k == ex_COMPTIME()
+            || k == ex_FAIL()) {
+            self.preload_capture_expr(expr_get_lhs(e));
+            return;
+        }
+        if (k == ex_CALL()) {
+            self.preload_capture_expr(expr_get_lhs(e));
+            self.preload_capture_stmt_chain(expr_get_args(e));
+            return;
+        }
+        if (k == ex_MEMBER()) {
+            self.preload_capture_expr(expr_get_lhs(e));
+            return;
+        }
+        if (k == ex_INDEX()) {
+            self.preload_capture_expr(expr_get_lhs(e));
+            self.preload_capture_expr(expr_get_rhs(e));
+            return;
+        }
+        if (k == ex_STRUCT_INIT()
+            || k == ex_FSTRING()
+            || k == ex_TUPLE_LIT()
+            || k == ex_INLINE_ASM()) {
+            self.preload_capture_stmt_chain(expr_get_args(e));
+            return;
+        }
+        if (k == ex_ARRAY_LIT()) {
+            self.preload_capture_stmt_chain(expr_get_args(e));
+            self.preload_capture_expr(expr_get_captures(e));
+            return;
+        }
+        if (k == ex_CLOSURE()) {
+            self.preload_capture_stmt_chain(expr_get_captures(e));
+            self.preload_capture_stmt_chain(expr_get_lhs(e));
+            return;
+        }
+        if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+            self.preload_capture_expr(expr_get_lhs(e));
+            if (k == ex_IF_EXPR()) {
+                self.preload_capture_stmt(expr_get_rhs(e));
+                let else_part = expr_get_args(e);
+                if (else_part != null && expr_get_kind(else_part) == ex_IF_EXPR()) {
+                    self.preload_capture_expr(else_part);
+                } else {
+                    self.preload_capture_stmt(else_part);
+                }
+            } else {
+                var match_arm = expr_get_args(e);
+                while (match_arm != null) {
+                    self.preload_capture_expr(stmt_get_init(match_arm));
+                    self.preload_capture_expr(stmt_get_cond(match_arm));
+                    self.preload_capture_stmt(stmt_get_body(match_arm));
+                    match_arm = stmt_get_next(match_arm);
+                }
+            }
+            return;
+        }
+    }
+
+    fn preload_capture_stmt(self, s: rawptr) {
+        if (s == null) { return; }
+        let k = stmt_get_kind(s);
+        if (k == st_EXPR()) {
+            self.preload_capture_expr(stmt_get_init(s));
+            return;
+        }
+        if (k == st_LET() || k == st_VAR()) {
+            self.preload_capture_expr(stmt_get_init(s));
+            return;
+        }
+        if (k == st_RETURN()) {
+            self.preload_capture_expr(stmt_get_init(s));
+            return;
+        }
+        if (k == st_IF()) {
+            self.preload_capture_expr(stmt_get_cond(s));
+            self.preload_capture_stmt(stmt_get_then_blk(s));
+            self.preload_capture_stmt(stmt_get_else_blk(s));
+            return;
+        }
+        if (k == st_WHILE()) {
+            self.preload_capture_expr(stmt_get_cond(s));
+            self.preload_capture_stmt(stmt_get_body(s));
+            return;
+        }
+        if (k == st_BLOCK()) {
+            self.preload_capture_stmt_chain(stmt_get_body(s));
+            return;
+        }
+        if (k == st_FOR()) {
+            self.preload_capture_stmt(stmt_get_init(s));
+            self.preload_capture_expr(stmt_get_cond(s));
+            self.preload_capture_stmt(stmt_get_body(s));
+            self.preload_capture_stmt(stmt_get_then_blk(s));
+            return;
+        }
+        if (k == st_FOREACH()) {
+            self.preload_capture_expr(stmt_get_cond(s));
+            self.preload_capture_stmt(stmt_get_body(s));
+            return;
+        }
+        if (k == st_MATCH()) {
+            self.preload_capture_expr(stmt_get_init(s));
+            var arm = stmt_get_body(s);
+            while (arm != null) {
+                self.preload_capture_expr(stmt_get_init(arm));
+                self.preload_capture_expr(stmt_get_cond(arm));
+                self.preload_capture_stmt(stmt_get_body(arm));
+                arm = stmt_get_next(arm);
+            }
+            return;
+        }
+        if (k == st_DEFER()) {
+            self.preload_capture_stmt(stmt_get_init(s));
+            return;
+        }
+        if (k == st_STATIC_ASSERT()) {
+            self.preload_capture_expr(stmt_get_cond(s));
+            return;
+        }
+    }
+
+    fn preload_capture_stmt_chain(self, head: rawptr) {
+        var cur = head;
+        while (cur != null) {
+            self.preload_capture_stmt(cur);
+            cur = stmt_get_next(cur);
+        }
+    }
+
+    fn hir_branch_tail_type(self, stmt_id: i32) -> i32 {
+        if (stmt_id == hir_id_invalid()) { return hir_id_invalid(); }
+        var cur = stmt_id;
+        var tail = hir_id_invalid();
+        while (cur != hir_id_invalid()) {
+            tail = cur;
+            cur = self.unit.stmt_next(cur);
+        }
+        let k = self.unit.stmt_kind(tail);
+        if (k == st_BLOCK()) {
+            return self.hir_branch_tail_type(self.unit.stmt_child(tail));
+        }
+        if (k == st_EXPR() || k == st_LET() || k == st_VAR()) {
+            let init_expr = self.unit.stmt_expr(tail);
+            if (init_expr != hir_id_invalid()) { return self.unit.expr_type(init_expr); }
+            return hir_id_invalid();
+        }
+        if (k == st_RETURN()) {
+            let ret_expr = self.unit.stmt_expr(tail);
+            if (ret_expr != hir_id_invalid()) { return self.unit.expr_type(ret_expr); }
+        }
+        return hir_id_invalid();
+    }
+
+    fn closure_return_type_id(self, e: rawptr) -> i32 {
+        let explicit_ret = expr_get_rhs(e);
+        if (explicit_ret != null) {
+            return self.type_id_from_ref(explicit_ret);
+        }
+        let closure_ty = expr_get_ty(e);
+        if (closure_ty != null && tref_get_kind(closure_ty) == ty_FN()) {
+            return self.type_id_from_ref(tref_fn_ret(closure_ty));
+        }
+        return self.unit.types.intern_type_ref(null);
+    }
+
+    fn build_closure_expr(self, e: rawptr, expr_id: i32, type_id: i32) {
+        let closure_item = self.unit.add_item(hir_item_closure(),
+                                             "closure$" + policy_i64_to_string(expr_id as i64),
+                                             type_id,
+                                             self.current_item_id);
+        self.unit.set_item_source_module(closure_item, self.current_value_scope_module());
+        let closure_fn = self.unit.add_function(closure_item,
+                                               self.unit.item_name(closure_item),
+                                               self.closure_return_type_id(e));
+        self.unit.set_expr_target(expr_id, hir_target_function(), closure_fn);
+        let saved_function = self.current_function_id;
+        let saved_item = self.current_item_id;
+        let saved_locals = self.locals.head;
+        let saved_capture_source = self.capture_source_head;
+        self.current_function_id = closure_fn;
+        self.current_item_id = closure_item;
+        self.capture_source_head = saved_locals;
+        self.locals = hir_local_scope_restore(self.locals, null);
+        var cap = expr_get_captures(e);
+        while (cap != null) {
+            let cap_name = stmt_get_name(cap);
+            let cap_init_ast = stmt_get_init(cap);
+            var cap_init_expr = hir_id_invalid();
+            if (cap_init_ast != null) {
+                let closure_locals = self.locals.head;
+                let closure_function = self.current_function_id;
+                let closure_item_active = self.current_item_id;
+                let closure_capture_source = self.capture_source_head;
+                self.current_function_id = saved_function;
+                self.current_item_id = saved_item;
+                self.capture_source_head = saved_capture_source;
+                self.locals = hir_local_scope_restore(self.locals, saved_locals);
+                cap_init_expr = self.build_expr(cap_init_ast);
+                self.locals = hir_local_scope_restore(self.locals, closure_locals);
+                self.capture_source_head = closure_capture_source;
+                self.current_item_id = closure_item_active;
+                self.current_function_id = closure_function;
+            }
+            var cap_ty = self.type_id_from_ref(stmt_get_ty(cap));
+            if (cap_ty == hir_id_invalid()) {
+                cap_ty = self.type_id_from_expr(cap_init_ast);
+            }
+            var cap_flags: i32 = hir_local_flag_capture();
+            if (stmt_get_cond(cap) != null) {
+                cap_flags = cap_flags | hir_local_flag_reference_capture();
+            }
+            let cap_local = self.unit.add_local(closure_fn, cap_name, cap_ty, cap_flags);
+            if (cap_init_expr != hir_id_invalid()) {
+                self.unit.set_local_capture_init_expr(cap_local, cap_init_expr);
+            } else {
+                var cap_source_node = hir_local_scope_find_node(saved_locals, stmt_get_semantic_target(cap));
+                if (cap_source_node == null) {
+                    cap_source_node = hir_local_scope_find_node_by_name(saved_locals, cap_name);
+                }
+                self.unit.set_local_capture_source(cap_local, hir_local_scope_node_local(cap_source_node));
+            }
+            self.locals = hir_local_scope_push(self.locals, cap_name, cap_local, cap_ty, closure_fn, stmt_get_semantic_target(cap));
+            cap = stmt_get_next(cap);
+        }
+        var param = expr_get_args(e);
+        while (param != null) {
+            let pty = self.type_id_from_ref(decl_get_ty(param));
+            let plocal = self.unit.add_local(closure_fn, decl_get_name(param), pty, hir_local_flag_param());
+            self.locals = hir_local_scope_push(self.locals,
+                                 decl_get_name(param),
+                                 plocal,
+                                 pty,
+                                 closure_fn,
+                                 decl_get_semantic_target(param));
+            param = decl_get_next(param);
+        }
+        self.unit.set_expr_type(expr_id, self.function_type_id(closure_fn));
+        self.preload_capture_stmt_chain(expr_get_lhs(e));
+        let body_chain = self.build_stmt_chain(expr_get_lhs(e));
+        self.unit.set_function_body(closure_fn, body_chain.first, body_chain.count);
+        self.unit.set_expr_stmt_aux(expr_id, body_chain.first);
+        self.locals = hir_local_scope_drop_to(self.locals, saved_locals);
+        self.capture_source_head = saved_capture_source;
+        self.current_item_id = saved_item;
+        self.current_function_id = saved_function;
+    }
+}
