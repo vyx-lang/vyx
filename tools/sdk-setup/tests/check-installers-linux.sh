@@ -90,13 +90,17 @@ printf '#!/bin/sh\necho aarch64\n' > "$test_root/mock-bin/uname"
 printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$VYX_TEST_PKG_LOG"\nexit 41\n' > "$test_root/mock-bin/pkg"
 chmod +x "$test_root/mock-bin/pkg"
 export VYX_TEST_PKG_LOG="$test_root/pkg.log"
-for action in setup update; do
+for action in setup update pipe; do
   set +e
-  PREFIX=/data/data/com.termux/files/usr TMPDIR="$test_root/termux-temp" PATH="$test_root/mock-bin:$PATH" bash "$component_root/install/termux.sh" "$action" --base-url "$base_url/sdk" > "$test_root/termux.log" 2>&1
+  if [[ $action == pipe ]]; then
+    cat "$component_root/install/termux.sh" | PREFIX=/data/data/com.termux/files/usr TMPDIR="$test_root/termux-temp" PATH="$test_root/mock-bin:$PATH" bash -s -- setup --base-url "$base_url/sdk" > "$test_root/termux.log" 2>&1
+  else
+    PREFIX=/data/data/com.termux/files/usr TMPDIR="$test_root/termux-temp" PATH="$test_root/mock-bin:$PATH" bash "$component_root/install/termux.sh" "$action" --base-url "$base_url/sdk" > "$test_root/termux.log" 2>&1
+  fi
   termux_status=$?
   set -e
   [[ $termux_status == 41 ]]
-  for arg in install -y clang lld python; do grep -Fxq -- "$arg" "$VYX_TEST_PKG_LOG"; done
+  for arg in install -y clang libcompiler-rt lld ndk-sysroot python; do grep -Fxq -- "$arg" "$VYX_TEST_PKG_LOG"; done
   grep -q '/vyx-sdk-termux-aarch64.deb$' "$VYX_TEST_PKG_LOG"
 done
 printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$VYX_TEST_PKG_LOG"\n' > "$test_root/mock-bin/pkg"

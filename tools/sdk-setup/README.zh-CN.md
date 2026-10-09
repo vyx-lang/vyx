@@ -56,8 +56,11 @@ bash tools/sdk-setup/install/termux.sh update
 pkg uninstall vyx-sdk-termux
 ```
 
-安装和更新由 `pkg` 安装已校验的 SDK 包及 clang、lld、Python；卸载只移除
-`vyx-sdk-termux`，保留这些工具和项目文件。不设置全局 `LD_LIBRARY_PATH`。
+安装和更新由 `pkg` 安装已校验的 SDK 包，显式请求 clang、libcompiler-rt、lld、
+ndk-sysroot 和 Python。通过 `clang++ -print-libgcc-file-name` 检查实际 builtins
+路径；缺库时重装 libcompiler-rt，不猜版本目录，也不创建替代库名的链接。
+安装最后必须编译运行 C++ 程序和 Vyx AOT 项目，只有版本号输出不能算成功。
+卸载只移除 `vyx-sdk-termux`，保留工具和项目文件。不设置全局 `LD_LIBRARY_PATH`。
 
 三个脚本均接受 `setup`、`update`、`uninstall` 动作；桌面脚本另有 `rollback`。
 无人值守确认参数为 Windows `-Yes`、Linux / Termux `--yes`。
@@ -100,3 +103,11 @@ Windows PowerShell 5.1 和 WSL Ubuntu 的验证覆盖目录菜单、取消、含
 卸载取消、配置清理和无关文件保留。Windows 还检查外部目录联接与启动器清理。
 Termux 检查真实 .deb 的校验和、包身份、架构及安装 / 更新 / 卸载参数，但模拟 `pkg`；
 这些检查不等于 Android 实机验证。
+
+```bash
+bash tools/sdk-setup/tests/check-termux-toolchain.sh
+```
+
+该 Linux 主机门使用真实 Clang 复现缺少 builtins 的链接失败，恢复匹配的主机
+compiler-rt 库后编译运行 C++，并用真实 Linux SDK 构建运行 Vyx 项目；另检查
+修复失败、链接失败及 Vyx 构建失败必须拒绝。此门验证安装流程，不能替代 Android 实机执行。

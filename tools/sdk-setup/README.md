@@ -62,8 +62,12 @@ bash tools/sdk-setup/install/termux.sh update
 pkg uninstall vyx-sdk-termux
 ```
 
-Install and update pass the verified SDK package to `pkg`, with clang, lld, and
-Python. Uninstall removes only `vyx-sdk-termux`, keeping those tools and projects.
+Install and update pass the verified SDK package to `pkg`, explicitly requesting
+clang, libcompiler-rt, lld, ndk-sysroot, and Python. A missing builtins archive
+reported by `clang++ -print-libgcc-file-name` triggers a libcompiler-rt reinstall.
+Setup succeeds only after compiling/running a C++ program and a Vyx AOT project;
+version output alone is insufficient. No runtime paths or archive names are guessed.
+Uninstall removes only `vyx-sdk-termux`, keeping those tools and projects.
 The scripts do not set global `LD_LIBRARY_PATH`. macOS has no installer yet.
 
 All scripts accept `setup`, `update`, and `uninstall`; desktop scripts also accept
@@ -110,3 +114,13 @@ setup, rejected downloads/startup, uninstall, configuration cleanup, and unrelat
 file retention. Windows also verifies external junctions and launcher cleanup.
 Termux checks a real `.deb` checksum, identity, architecture, and package-manager
 arguments, with `pkg` mocked. These checks do not establish Android device support.
+
+```bash
+bash tools/sdk-setup/tests/check-termux-toolchain.sh
+```
+
+This additional Linux host gate uses a real Clang driver with missing compiler-rt
+builtins, restores the matching host archive, runs C++, and builds/runs a real
+Linux SDK project. It also rejects failed repairs, linker failures and Vyx build
+failures. The orchestration is tested on Linux; Android device execution remains
+a separate check.
