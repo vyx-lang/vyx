@@ -59,6 +59,49 @@ DCI 不是以 C ABI 为唯一公共分母的 FFI。C ABI 是 DCI 的最低兼容
 - 当前 cJSON 模型中的整数精确范围为 `±2^53`；编码器拒绝超出范围的整数事实。
 - 开放泛型通过 Active Adapter 请求生产端物化；canonical 契约仍只承载闭合事实。
 
+### Vyx 原生契约导出
+
+SDK 编译器通过 `--emit=dcib` 直接从 Vyx 源码输出 DCI 契约。导出范围由开发者显式选择：
+
+```vyx
+module arithmetic;
+
+@[dci_export(symbol="arithmetic_add")]
+public fn add(left: i32, right: i32) -> i32 { return left + right; }
+```
+
+```bash
+vyxc --emit=dcib --src=file arithmetic.vyx -o arithmetic.dcib
+vyxc --emit=dcib --src=project . --target arithmetic
+vyxc --emit=dcib --src=project . --target arithmetic -o contracts/arithmetic.dcib
+```
+
+项目模式使用构建管线，汇集选中目标的 Vyx 源模块，默认输出到
+`<output_dir>/<target>.dcib`，也可用 `-o` 指定路径。依赖提供编译输入，其声明不会因
+被父项目使用而自动成为父目标的导出。`public` 本身不要求发布 DCI 契约。
+没有选中导出声明时报告错误；契约导出不能与 `--run` 组合。
+
+在这条路径上，SDK 编译器承担 Adapter 职责，原生写入 canonical DCIB v1 二进制
+容器，不调用 Python 或外部源码扫描器。契约记录目标、选中实体的符号身份、所有权
+和实际原生 ABI lowering。`.dcib` 是元数据，应与匹配的对象文件或库一起分发。
+生成实现制品时必须保持源码、目标和影响布局的选项一致。现有 Converter 可把契约
+转换成可编辑的 `extern "dci"` 定义：
+
+```bash
+vyxc --emit=obj --src=file arithmetic.vyx -o arithmetic.o
+vyxc dci convert arithmetic.dcib --module arithmetic_api -o arithmetic_api.vyx
+```
+
+当前原生导出接纳已闭合、签名受支持且调用图已证明不展开异常的自由函数。
+签名支持标量和非拥有型 `rawptr`。Vyx 原生受跟踪引用不是普通借用地址 ABI 值，
+当前拒绝导出。调用、生命周期事实未知，签名尚未支持，或外部及递归调用无法证明
+异常行为时均拒绝。仅填写一个 shared exception ABI 名称不能建立兼容性。
+`VYX_DCI_EXPORT_OUT` 选择的 Effect 导出 sidecar 仍是独立的来源事实制品，不是 ABI
+契约。契约闭合或发射失败时不替换已有输出；项目后置钩子在制品发布后运行，
+钩子失败不会回滚已发布的契约。
+[原生导出门](../probes/gates/dci-native-export/README.md) 检查二进制容器和严格契约，
+再分别链接并运行单文件与项目模式的独立 AOT Consumer。
+
 ---
 
 ## 2. 核心规则

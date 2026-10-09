@@ -97,6 +97,14 @@ VYX_API int32_t  vyx_rt_set_relocation_model(void* h, int32_t model);
 VYX_API int32_t  vyx_rt_set_data_layout(void* h, const char* dl, uint64_t len);
 /* LLVM DataLayout address-space-0 index width, or 0 for an invalid handle. */
 VYX_API int32_t  vyx_rt_pointer_index_bits(void* h);
+/* Facts from a defined function in the current, unoptimized LLVM module.
+ * Returns backend-owned UTF-8 JSON, or NULL with vyx_rt_get_last_error set.
+ * Release with vyx_rt_dci_export_free_json in the allocating CRT.
+ * This exposes native ABI evidence; Vyx owns export selection and DCIB encoding. */
+VYX_API char*    vyx_rt_dci_export_function_json(void* h, const char* name, uint64_t len);
+VYX_API void     vyx_rt_dci_export_free_json(void* text);
+VYX_API int32_t  vyx_rt_dci_export_write_file(void* h, const char* path, uint64_t path_len,
+                                            const void* bytes, uint64_t length);
 
 /* ------------------------------------------------------------------- */
 /*  2. Error reporting (1)                                              */

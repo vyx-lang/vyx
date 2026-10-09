@@ -54,6 +54,7 @@
 #include <llvm/Support/Alignment.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/JSON.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
@@ -1414,6 +1415,190 @@ extern "C" VYX_API uint64_t vyx_rt_get_last_error(void* h, char* buf, uint64_t c
         if (copy_n < cap) buf[copy_n] = '\0';
     }
     return required;
+}
+
+namespace {
+
+llvm::json::Object dciNativeTypeFacts(llvm::Type* type, const llvm::DataLayout& layout,
+                                     unsigned depth = 0) {
+    llvm::json::Object result;
+    std::string spelling;
+    llvm::raw_string_ostream stream(spelling);
+    type->print(stream);
+    stream.flush();
+    result["llvm_type"] = spelling;
+    result["kind"] = "unsupported";
+    result["bits"] = int64_t(0);
+    result["size"] = int64_t(0);
+    result["alignment"] = int64_t(0);
+    if (type->isVoidTy()) {
+        result["kind"] = "void";
+        return result;
+    }
+    if (!type->isSized() || layout.getTypeAllocSize(type).isScalable()) return result;
+    result["size"] = int64_t(layout.getTypeAllocSize(type).getFixedValue());
+    result["alignment"] = int64_t(layout.getABITypeAlign(type).value());
+    if (type->isIntegerTy()) {
+        result["kind"] = "integer";
+        result["bits"] = int64_t(type->getIntegerBitWidth());
+    } else if (type->isFloatTy() || type->isDoubleTy()) {
+        result["kind"] = "float";
+        result["bits"] = int64_t(type->isFloatTy() ? 32 : 64);
+    } else if (auto* pointer = llvm::dyn_cast<llvm::PointerType>(type)) {
+        result["kind"] = "pointer";
+        result["bits"] = int64_t(layout.getPointerSizeInBits(pointer->getAddressSpace()));
+        result["address_space"] = int64_t(pointer->getAddressSpace());
+    } else if (auto* structure = llvm::dyn_cast<llvm::StructType>(type)) {
+        if (depth >= 32 || structure->isOpaque()) return result;
+        result["kind"] = "struct";
+        result["packed"] = structure->isPacked();
+        llvm::json::Array fields;
+        const auto* positions = layout.getStructLayout(structure);
+        for (unsigned i = 0; i < structure->getNumElements(); ++i) {
+            auto field = dciNativeTypeFacts(structure->getElementType(i), layout, depth + 1);
+            field["offset"] = int64_t(positions->getElementOffset(i));
+            fields.push_back(std::move(field));
+        }
+        result["fields"] = std::move(fields);
+    }
+    return result;
+}
+
+// Absence of a nounwind attribute is not evidence of propagation. Prove simple
+// defined call graphs, but reject unknown external, indirect and recursive edges.
+bool dciNativeNoUnwind(const llvm::Function& function,
+                      llvm::SmallPtrSetImpl<const llvm::Function*>& visiting,
+                      unsigned depth = 0) {
+    // Native lowering can put nounwind on a definition/call before its
+    // external callees have been proved. Inspect defined bodies regardless of
+    // those attributes. Only LLVM intrinsic semantics establish a declaration
+    // as no-unwind here; an arbitrary foreign declaration is not a proof.
+    if (function.isDeclaration()) return function.isIntrinsic() && function.doesNotThrow();
+    if (depth >= 128 || !visiting.insert(&function).second) return false;
+    bool proven = true;
+    for (const auto& block : function) {
+        for (const auto& instruction : block) {
+            if (const auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
+                const auto* callee = call->getCalledFunction();
+                if (!callee || !dciNativeNoUnwind(*callee, visiting, depth + 1)) proven = false;
+            } else if (instruction.mayThrow() || llvm::isa<llvm::ResumeInst>(instruction)) {
+                proven = false;
+            }
+        }
+    }
+    visiting.erase(&function);
+    return proven;
+}
+
+llvm::json::Array dciNativeAttributes(llvm::AttributeSet attributes) {
+    llvm::json::Array result;
+    for (const auto& attribute : attributes) result.push_back(attribute.getAsString());
+    return result;
+}
+
+} // namespace
+
+extern "C" VYX_API char* vyx_rt_dci_export_function_json(void* h, const char* name,
+                                                          uint64_t len) {
+    if (!h || !name) return nullptr;
+    auto* context = asMod(h);
+    auto* function = context->mod->getFunction(asStr(name, len));
+    if (!function || function->isDeclaration() || function->hasLocalLinkage()) {
+        context->lastError = "DCI export requires a defined externally addressable native function";
+        return nullptr;
+    }
+    if (function->getCallingConv() != llvm::CallingConv::C) {
+        context->lastError = "DCI export does not support this native calling convention";
+        return nullptr;
+    }
+    const auto& layout = context->mod->getDataLayout();
+    const llvm::Triple triple(context->mod->getTargetTriple());
+    if (layout.isDefault() || triple.getArch() == llvm::Triple::UnknownArch) {
+        context->lastError = "DCI export requires a resolved native target and data layout";
+        return nullptr;
+    }
+    llvm::json::Object facts;
+    facts["link_name"] = function->getName().str();
+    facts["defined"] = true;
+    facts["external"] = true;
+    facts["calling_convention"] = "cdecl";
+    facts["variadic"] = function->isVarArg();
+    auto returned = dciNativeTypeFacts(function->getReturnType(), layout);
+    returned["attributes"] = dciNativeAttributes(function->getAttributes().getRetAttrs());
+    facts["return"] = std::move(returned);
+    llvm::json::Array parameters;
+    unsigned index = 0;
+    for (const auto& parameter : function->args()) {
+        auto info = dciNativeTypeFacts(parameter.getType(), layout);
+        info["attributes"] = dciNativeAttributes(function->getAttributes().getParamAttrs(index));
+        if (auto* type = function->getParamByValType(index)) info["byval_type"] = dciNativeTypeFacts(type, layout);
+        if (auto* type = function->getParamStructRetType(index)) info["sret_type"] = dciNativeTypeFacts(type, layout);
+        parameters.push_back(std::move(info));
+        ++index;
+    }
+    facts["parameters"] = std::move(parameters);
+    llvm::SmallPtrSet<const llvm::Function*, 16> visiting;
+    facts["unwind"] = dciNativeNoUnwind(*function, visiting) ? "no_unwind" : "may_unwind";
+    std::string abi;
+    if (triple.isWindowsMSVCEnvironment()) abi = "msvc";
+    else if (triple.isAndroid()) abi = "android";
+    else if (triple.isOSDarwin()) abi = "darwin";
+    else if (triple.isOSLinux() && triple.isGNUEnvironment()) abi = "gnu";
+    else {
+        context->lastError = "DCI export does not support this target ABI";
+        return nullptr;
+    }
+    facts["target"] = llvm::json::Object{
+        {"triple", triple.str()}, {"architecture", triple.getArchName().str()},
+        {"pointer_width", int64_t(layout.getPointerSizeInBits())},
+        {"endianness", layout.isLittleEndian() ? "little" : "big"},
+        {"abi", abi}, {"abi_family", triple.isWindowsMSVCEnvironment() ? "msvc" : "itanium"}};
+    std::string text;
+    llvm::raw_string_ostream output(text);
+    output << llvm::json::Value(std::move(facts));
+    output.flush();
+    auto* result = static_cast<char*>(std::malloc(text.size() + 1));
+    if (!result) {
+        context->lastError = "out of memory collecting DCI native ABI facts";
+        return nullptr;
+    }
+    std::memcpy(result, text.c_str(), text.size() + 1);
+    return result;
+}
+
+extern "C" VYX_API void vyx_rt_dci_export_free_json(void* text) {
+    std::free(text);
+}
+
+extern "C" VYX_API int32_t vyx_rt_dci_export_write_file(void* h, const char* path,
+                                                        uint64_t path_len,
+                                                        const void* bytes, uint64_t length) {
+    if (!h || !path || !bytes || length > 64 * 1024 * 1024) return 1;
+    auto* context = asMod(h);
+    const std::string destination = asStr(path, path_len);
+    int descriptor = -1;
+    llvm::SmallString<256> temporary;
+    auto error = llvm::sys::fs::createUniqueFile(destination + ".tmp-%%%%%%", descriptor, temporary);
+    if (error) {
+        context->lastError = "cannot stage DCI contract: " + error.message();
+        return 1;
+    }
+    {
+        llvm::raw_fd_ostream output(descriptor, true);
+        output.write(static_cast<const char*>(bytes), static_cast<size_t>(length));
+        output.close();
+        if (output.has_error()) {
+            error = output.error();
+            output.clear_error();
+        }
+    }
+    if (!error) error = llvm::sys::fs::rename(temporary, destination);
+    if (error) {
+        llvm::sys::fs::remove(temporary);
+        context->lastError = "cannot publish DCI contract: " + error.message();
+        return 1;
+    }
+    return 0;
 }
 
 extern "C" VYX_API uint64_t vyx_rt_normalize_target_triple(const char* triple,

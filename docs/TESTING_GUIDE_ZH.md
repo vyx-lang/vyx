@@ -97,8 +97,9 @@ MIR2LLVM 是受支持的自举后端。MIR2CPP/`--emit=cpp` 仍为实验性、�
 & $compiler doc .\src\main.vyx            # 从 /// 出 markdown
 ```
 
-支持的 `--emit` 值为 `ir`、`obj`、`exe`、`dll`、`lib`、`vyi`、`cpp` 和
-`dci-stubs`。其中 `cpp` 仍受上面的实验后端策略约束；`hir2`/`mir2` 检查是独立
+支持的 `--emit` 值为 `ir`、`obj`、`exe`、`dll`、`lib`、`vyi`、`cpp`、`dcib` 和
+`dci-stubs`。`dcib` 原生导出 `@[dci_export]` 选中的函数契约，验证与支持范围见
+[原生导出门](../probes/gates/dci-native-export/README.md)。其中 `cpp` 仍受上面的实验后端策略约束；`hir2`/`mir2` 检查是独立
 的 debug 操作（`--dump-hir2`、`--dump-mir2`），不是 emit 值。CLI 选项缺值或无效时，
 编译器在读入源码前报告 `E0003` 并以非零状态退出。
 

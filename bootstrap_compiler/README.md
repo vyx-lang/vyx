@@ -52,6 +52,7 @@ Project commands use one manifest builder:
 ```sh
 vyxc --run=aot --src=project . --target app
 vyxc --emit=ir --src=project . --target app
+vyxc --emit=dcib --src=project . --target library
 vyxc build --target app
 ```
 
@@ -59,6 +60,13 @@ vyxc build --target app
 DCI preparation, hooks, caches and compilation options. IR output stops before
 executable linking and publishes `<output_dir>/<target>.ll`; `-o` overrides this path.
 `--src=file` uses the single-file driver.
+
+`--emit=dcib` emits a native binary DCI contract for explicitly selected
+`@[dci_export]` functions. Project output is `<output_dir>/<target>.dcib`,
+and `-o` overrides it. It does not link or run an executable. ABI evidence
+comes from the current LLVM module; unsupported signatures or unproven unwind
+behavior are diagnosed. See the [native export gate](../probes/gates/dci-native-export/README.md)
+for the supported surface and a separate AOT consumer.
 
 MIR2LLVM is the supported native and self-hosting backend.
 `--emit=cpp` is experimental and is not a release or fixed-point gate.

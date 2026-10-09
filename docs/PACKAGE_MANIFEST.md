@@ -232,6 +232,13 @@ dependency table and are linked automatically from their type/manifest.
 `type = "source"` defines a source package. It produces no archive. Its entry
 and declared sources are exposed to consumers as explicit module sources;
 generic bodies can be instantiated in the consuming target.
+Library and source targets may omit `entry` when `sources` supplies the frontend
+root. In the default single-crate library build, source-package implementations
+are compiled into the consuming archive. Its VYI and DCIB public selection still
+belongs to the target's own sources. Ordinary source-package functions do not yet
+have a unique object ownership plan for split-module or root-partition library
+builds; the [native export gate](../probes/gates/dci-native-export/README.md)
+validates the default single-crate path.
 Compiled user generic modules have another route: generated `.vyi` files carry
 versioned template artifacts for consumer instantiation, including private
 definition dependencies. Link the producer's native library for its ordinary

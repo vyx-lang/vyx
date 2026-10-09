@@ -120,8 +120,10 @@ Use one explicit source mode and one output mode for a reproducible invocation:
 ```
 
 The supported `--emit` values are `ir`, `obj`, `exe`, `dll`, `lib`, `vyi`,
-`cpp`, and `dci-stubs`. `cpp` is experimental under the backend policy above;
-`ir`, `hir2`, and `mir2` inspection are distinct debug operations (`--dump-hir2`,
+`cpp`, `dcib`, and `dci-stubs`. `dcib` emits a native DCI contract for selected
+`@[dci_export]` functions; see the [native export gate](../probes/gates/dci-native-export/README.md).
+`cpp` is experimental under the backend policy above;
+`hir2` and `mir2` inspection are distinct debug operations (`--dump-hir2`,
 `--dump-mir2`) rather than emit kinds. Invalid or incomplete CLI options report
 `E0003` and return a non-zero status before source compilation.
 

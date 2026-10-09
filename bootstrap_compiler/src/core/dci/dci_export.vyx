@@ -1,0 +1,802 @@
+module bootstrap.dci_export;
+
+use std.string;
+use std.fs;
+use bootstrap.ast;
+use bootstrap.dci_dcib;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+
+extern "C" {
+    fn malloc(size: u64) -> rawptr;
+    fn realloc(ptr: rawptr, size: u64) -> rawptr;
+    fn free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, size: u64) -> rawptr;
+    fn vyx_bootstrap_abs_path(path: rawptr) -> rawptr;
+    fn vyx_bootstrap_platform() -> i32;
+    fn cJSON_Parse(text: rawptr) -> rawptr;
+    fn cJSON_Delete(item: rawptr);
+    fn cJSON_Duplicate(item: rawptr, recurse: i32) -> rawptr;
+    fn cJSON_CreateObject() -> rawptr;
+    fn cJSON_CreateArray() -> rawptr;
+    fn cJSON_CreateString(text: rawptr) -> rawptr;
+    fn cJSON_CreateNumber(value: f64) -> rawptr;
+    fn cJSON_CreateBool(value: i32) -> rawptr;
+    fn cJSON_CreateNull() -> rawptr;
+    fn cJSON_AddItemToObject(object: rawptr, key: rawptr, item: rawptr) -> i32;
+    fn cJSON_AddItemToArray(array: rawptr, item: rawptr) -> i32;
+    fn cJSON_GetObjectItemCaseSensitive(object: rawptr, key: rawptr) -> rawptr;
+    fn cJSON_GetArrayItem(array: rawptr, index: i32) -> rawptr;
+    fn cJSON_GetArraySize(array: rawptr) -> i32;
+    fn cJSON_GetStringValue(item: rawptr) -> rawptr;
+    fn cJSON_GetNumberValue(item: rawptr) -> f64;
+    fn cJSON_IsObject(item: rawptr) -> i32;
+    fn cJSON_IsArray(item: rawptr) -> i32;
+    fn cJSON_IsString(item: rawptr) -> i32;
+    fn cJSON_IsNumber(item: rawptr) -> i32;
+    fn cJSON_IsNull(item: rawptr) -> i32;
+    fn cJSON_IsTrue(item: rawptr) -> i32;
+    fn cJSON_IsFalse(item: rawptr) -> i32;
+    // Facts come from the completed LLVM module and its actual DataLayout.
+    // Release the returned allocation through its producer DLL: Windows SDK
+    // executables and backend DLLs may use separate static CRT heaps.
+    fn vyx_rt_dci_export_function_json(cg: rawptr, name: rawptr, length: u64) -> rawptr;
+    fn vyx_rt_dci_export_free_json(pointer: rawptr);
+    fn vyx_rt_dci_export_write_file(cg: rawptr, path: rawptr, path_length: u64, data: rawptr, length: u64) -> i32;
+    fn vyx_rt_get_last_error(cg: rawptr, buffer: rawptr, capacity: u64) -> u64;
+}
+
+var g_dci_export_error: string = "";
+var g_dci_export_error_code: string = "";
+var g_dci_export_error_decl: rawptr = null;
+var g_dci_export_error_source: string = "";
+var g_dci_export_active_decl: rawptr = null;
+var g_dci_export_active_source: string = "";
+
+fn dci_export_fail(message: string) {
+    if (g_dci_export_error.len == 0) {
+        g_dci_export_error = message;
+        g_dci_export_error_code = diag_code_codegen_failure();
+        g_dci_export_error_decl = g_dci_export_active_decl;
+        g_dci_export_error_source = g_dci_export_active_source.clone();
+    }
+}
+
+public fn dci_export_last_error() -> string { return g_dci_export_error; }
+
+fn dci_export_unsupported(message: string) {
+    if (g_dci_export_error.len > 0) { return; }
+    dci_export_fail(message);
+    g_dci_export_error_code = diag_code_codegen_unsupported();
+}
+
+fn dci_export_usage_error(message: string) {
+    if (g_dci_export_error.len > 0) { return; }
+    dci_export_fail(message);
+    g_dci_export_error_code = diag_code_cli_usage();
+    g_dci_export_error_decl = null;
+    g_dci_export_error_source = "";
+}
+
+fn dci_export_emit_error() {
+    if (g_dci_export_error.len == 0) { return; }
+    var location: rawptr = null;
+    if (g_dci_export_error_decl != null && g_dci_export_error_source.len > 0) {
+        // A source location is meaningful only in its owning file. Loading
+        // that file here avoids anchoring another module's line on main.vyx.
+        diag_set_source_context(g_dci_export_error_source.clone(), readFile(g_dci_export_error_source.clone()));
+        location = decl_loc_ptr(g_dci_export_error_decl);
+    }
+    diag_emit_at(diag_sev_ERROR(), g_dci_export_error_code, location,
+        "DCIB export: " + g_dci_export_error);
+}
+
+fn dci_export_item(object: rawptr, key: string) -> rawptr {
+    if (object == null) { return null; }
+    return cJSON_GetObjectItemCaseSensitive(object, key.c_str());
+}
+
+fn dci_export_text(object: rawptr, key: string) -> string {
+    let item = dci_export_item(object, key);
+    if (cJSON_IsString(item) == 0) { return ""; }
+    return from_cstr(cJSON_GetStringValue(item));
+}
+
+fn dci_export_number(object: rawptr, key: string) -> i64 {
+    let item = dci_export_item(object, key);
+    if (cJSON_IsNumber(item) == 0) { return -1; }
+    let value = cJSON_GetNumberValue(item);
+    if (value < 0.0 || value > 9007199254740992.0) { return -1; }
+    let integer = value as i64;
+    if (integer as f64 != value) { return -1; }
+    return integer;
+}
+
+fn dci_export_add(object: rawptr, key: string, item: rawptr) {
+    if (item == null || object == null) {
+        if (item != null) { cJSON_Delete(item); }
+        dci_export_fail("out of memory while creating the native DCI contract");
+        return;
+    }
+    if (cJSON_AddItemToObject(object, key.c_str(), item) == 0) {
+        cJSON_Delete(item);
+        dci_export_fail("out of memory while storing a native DCI fact");
+    }
+}
+
+fn dci_export_append(array: rawptr, item: rawptr) {
+    if (item == null || array == null) {
+        if (item != null) { cJSON_Delete(item); }
+        dci_export_fail("out of memory while creating the native DCI contract");
+        return;
+    }
+    if (cJSON_AddItemToArray(array, item) == 0) {
+        cJSON_Delete(item);
+        dci_export_fail("out of memory while storing a native DCI fact");
+    }
+}
+
+fn dci_export_add_text(object: rawptr, key: string, text: string) {
+    dci_export_add(object, key, cJSON_CreateString(text.c_str()));
+}
+
+fn dci_export_add_number(object: rawptr, key: string, number: i64) {
+    dci_export_add(object, key, cJSON_CreateNumber(number as f64));
+}
+
+fn dci_export_add_bool(object: rawptr, key: string, value: bool) {
+    var number: i32 = 0;
+    if (value) { number = 1; }
+    dci_export_add(object, key, cJSON_CreateBool(number));
+}
+
+// Canonical DCIB v1 encoder. Binary bytes are never carried by a string: NUL
+// and byte lengths retain their protocol meanings throughout the write path.
+class DciExportWriter {
+    public data: rawptr
+    public length: i64
+    public capacity: i64
+    public nodes: i64
+
+    public static fn create() -> DciExportWriter {
+        return DciExportWriter { data: null, length: 0, capacity: 0, nodes: 0 };
+    }
+
+    public fn reserve(self, count: i64) -> bool {
+        if (g_dci_export_error.len > 0) { return false; }
+        if (count < 0 || self.length + count > 67108864) {
+            dci_export_fail("DCIB artifact exceeds the 64 MiB limit");
+            return false;
+        }
+        if (self.length + count <= self.capacity) { return true; }
+        var capacity = self.capacity;
+        if (capacity == 0) { capacity = 4096; }
+        while (capacity < self.length + count) { capacity = capacity * 2; }
+        let replacement = realloc(self.data, capacity as u64);
+        if (replacement == null) {
+            dci_export_fail("out of memory while encoding DCIB");
+            return false;
+        }
+        self.data = replacement;
+        self.capacity = capacity;
+        return true;
+    }
+
+    public fn byte(self, byte: i64) {
+        if (!self.reserve(1)) { return; }
+        var value = byte & 255;
+        memcpy(self.data + self.length, to_rawptr(&value), 1);
+        self.length = self.length + 1;
+    }
+
+    public fn integer(self, value: i64, count: i32) {
+        var i: i32 = 0;
+        while (i < count) {
+            self.byte((value >> (i * 8)) & 255);
+            i = i + 1;
+        }
+    }
+
+    public fn text(self, value: string) {
+        if (!dci_dcib_valid_utf8(value.c_str(), value.len as i64)) {
+            dci_export_fail("DCIB string is not valid UTF-8 or contains NUL");
+            return;
+        }
+        var index: i32 = 0;
+        while (index < value.len) {
+            if (value.charAt(index) == 0) {
+                dci_export_fail("DCIB string contains NUL");
+                return;
+            }
+            index = index + 1;
+        }
+        self.byte(6);
+        self.integer(value.len as i64, 4);
+        if (!self.reserve(value.len as i64)) { return; }
+        if (value.len > 0) {
+            memcpy(self.data + self.length, value.c_str(), value.len as u64);
+            self.length = self.length + value.len as i64;
+        }
+    }
+
+    public fn value(self, item: rawptr, depth: i32) {
+        self.nodes = self.nodes + 1;
+        if (depth > 128 || self.nodes > 1000000) {
+            dci_export_fail("DCIB nesting or node limit exceeded");
+            return;
+        }
+        if (cJSON_IsNull(item) != 0) { self.byte(0); return; }
+        if (cJSON_IsFalse(item) != 0) { self.byte(1); return; }
+        if (cJSON_IsTrue(item) != 0) { self.byte(2); return; }
+        if (cJSON_IsNumber(item) != 0) {
+            let number = cJSON_GetNumberValue(item);
+            if (number < -9007199254740992.0 || number > 9007199254740992.0) {
+                dci_export_fail("DCIB integer exceeds the compiler DOM exact range");
+                return;
+            }
+            let integer = number as i64;
+            if (integer as f64 != number) {
+                dci_export_fail("native ABI fact is not an exact integer");
+                return;
+            }
+            if (integer < 0) { self.byte(3); } else { self.byte(4); }
+            self.integer(integer, 8);
+            return;
+        }
+        if (cJSON_IsString(item) != 0) {
+            self.text(from_cstr(cJSON_GetStringValue(item)));
+            return;
+        }
+        if (cJSON_IsArray(item) != 0) {
+            let count = cJSON_GetArraySize(item);
+            self.byte(7);
+            self.integer(count as i64, 4);
+            var child = dci_cjson_child(item);
+            while (child != null && g_dci_export_error.len == 0) {
+                self.value(child, depth + 1);
+                child = dci_cjson_next(child);
+            }
+            return;
+        }
+        if (cJSON_IsObject(item) == 0) {
+            dci_export_fail("invalid node in native DCI contract");
+            return;
+        }
+        let count = cJSON_GetArraySize(item);
+        self.byte(8);
+        self.integer(count as i64, 4);
+        // cJSON has linked object children. Sorting pointers leaves ownership
+        // unchanged and avoids creating a second whole contract DOM.
+        let children = malloc((count as u64) * 8);
+        if (count > 0 && children == null) {
+            dci_export_fail("out of memory while sorting DCIB map keys");
+            return;
+        }
+        var child = dci_cjson_child(item);
+        var index: i32 = 0;
+        while (child != null && index < count) {
+            memcpy(children + index * 8, to_rawptr(&child), 8);
+            child = dci_cjson_next(child);
+            index = index + 1;
+        }
+        index = 1;
+        while (index < count) {
+            var picked: rawptr = null;
+            memcpy(to_rawptr(&picked), children + index * 8, 8);
+            let picked_key = dci_export_object_key(picked);
+            var previous = index - 1;
+            while (previous >= 0) {
+                var candidate: rawptr = null;
+                memcpy(to_rawptr(&candidate), children + previous * 8, 8);
+                if (str_compare(dci_export_object_key(candidate), picked_key) <= 0) { break; }
+                memcpy(children + (previous + 1) * 8, to_rawptr(&candidate), 8);
+                previous = previous - 1;
+            }
+            memcpy(children + (previous + 1) * 8, to_rawptr(&picked), 8);
+            index = index + 1;
+        }
+        index = 0;
+        var previous_key = "";
+        while (index < count && g_dci_export_error.len == 0) {
+            var picked: rawptr = null;
+            memcpy(to_rawptr(&picked), children + index * 8, 8);
+            let key = dci_export_object_key(picked);
+            if (index > 0 && str_compare(previous_key, key) >= 0) {
+                dci_export_fail("duplicate map key in native DCI contract");
+                break;
+            }
+            self.text(key);
+            self.value(picked, depth + 1);
+            previous_key = key;
+            index = index + 1;
+        }
+        if (children != null) { free(children); }
+    }
+
+    public fn dispose(self) {
+        if (self.data != null) { free(self.data); self.data = null; }
+    }
+}
+
+fn dci_export_object_key(item: rawptr) -> string {
+    // Existing DCIB decoder's cJSON query ABI is 64-bit (next/child offsets
+    // 0/16). The key is the same ABI's final pointer field at byte 56.
+    var key: rawptr = null;
+    memcpy(to_rawptr(&key), item + 56, 8);
+    if (key == null) { dci_export_fail("DCIB object has a missing key"); return ""; }
+    return from_cstr(key);
+}
+
+fn dci_export_crc32(data: rawptr, count: i64) -> i64 {
+    var crc: i64 = 4294967295;
+    var i: i64 = 0;
+    while (i < count) {
+        var byte: i64 = 0;
+        memcpy(to_rawptr(&byte), data + i, 1);
+        crc = crc ^ byte;
+        var bit: i32 = 0;
+        while (bit < 8) {
+            if ((crc & 1) != 0) { crc = (crc >> 1) ^ 3988292384; }
+            else { crc = crc >> 1; }
+            bit = bit + 1;
+        }
+        crc = crc & 4294967295;
+        i = i + 1;
+    }
+    return (~crc) & 4294967295;
+}
+
+fn dci_export_primitive_name(kind: i32) -> string {
+    if (kind == ty_VOID()) { return "void"; }
+    if (kind == ty_BOOL()) { return "bool"; }
+    if (kind == ty_CHAR()) { return "char"; }
+    if (kind == ty_I8()) { return "i8"; }
+    if (kind == ty_I16()) { return "i16"; }
+    if (kind == ty_I32()) { return "i32"; }
+    if (kind == ty_I64()) { return "i64"; }
+    if (kind == ty_U8()) { return "u8"; }
+    if (kind == ty_U16()) { return "u16"; }
+    if (kind == ty_U32()) { return "u32"; }
+    if (kind == ty_U64()) { return "u64"; }
+    if (kind == ty_ISIZE()) { return "isize"; }
+    if (kind == ty_USIZE()) { return "usize"; }
+    if (kind == ty_F32()) { return "f32"; }
+    if (kind == ty_F64()) { return "f64"; }
+    return "";
+}
+
+fn dci_export_primitive_bits(kind: i32, pointer_bits: i64) -> i64 {
+    // Vyx stores and passes bool as i8, unlike LLVM's internal i1 branch
+    // condition. Compare the source's native representation with the facts.
+    if (kind == ty_BOOL()) { return 8; }
+    if (kind == ty_I8() || kind == ty_U8()) { return 8; }
+    if (kind == ty_I16() || kind == ty_U16()) { return 16; }
+    if (kind == ty_I32() || kind == ty_U32() || kind == ty_CHAR() || kind == ty_F32()) { return 32; }
+    if (kind == ty_I64() || kind == ty_U64() || kind == ty_F64()) { return 64; }
+    if (kind == ty_ISIZE() || kind == ty_USIZE()) { return pointer_bits; }
+    return 0;
+}
+
+fn dci_export_type(ty: rawptr, physical: rawptr, pointer_bits: i64, returned: bool, subject: string) -> rawptr {
+    if (ty == null || physical == null) {
+        dci_export_fail(subject + ": missing closed source type or LLVM ABI type");
+        return null;
+    }
+    let kind = tref_get_kind(ty);
+    if (dci_export_item(physical, "byval_type") != null || dci_export_item(physical, "sret_type") != null) {
+        dci_export_unsupported(subject + ": aggregate ABI ownership is not a closed direct scalar/pointer fact");
+        return null;
+    }
+    let physical_kind = dci_export_text(physical, "kind");
+    var name = dci_export_primitive_name(kind);
+    var reference = "value";
+    var pointee_const = false;
+    var nullable = false;
+    if (kind == ty_RAWPTR() || kind == ty_PTR() || kind == ty_REF() || kind == ty_MUTREF()) {
+        if (returned && (kind == ty_REF() || kind == ty_MUTREF())) {
+            dci_export_unsupported(subject + ": returned reference has no exported lifetime relation");
+            return null;
+        }
+        if (physical_kind != "pointer" || dci_export_number(physical, "bits") != pointer_bits
+            || dci_export_number(physical, "address_space") != 0) {
+            dci_export_unsupported(subject + ": source pointer is not a supported direct native pointer ABI");
+            return null;
+        }
+        if (kind == ty_RAWPTR()) { name = "void"; }
+        else {
+            let pointee = tref_pointee(ty);
+            if (pointee == null) { name = ""; }
+            else { name = dci_export_primitive_name(tref_get_kind(pointee)); }
+        }
+        reference = "pointer";
+        nullable = true;
+        if (kind == ty_REF() || kind == ty_MUTREF()) { reference = "reference"; nullable = false; }
+        pointee_const = kind == ty_REF();
+    } else if (kind == ty_VOID()) {
+        if (!returned || physical_kind != "void") {
+            dci_export_fail(subject + ": void source type disagrees with the final LLVM ABI");
+            return null;
+        }
+    } else {
+        var expected_kind = "integer";
+        if (kind == ty_F32() || kind == ty_F64()) { expected_kind = "float"; }
+        if (name.len == 0 || physical_kind != expected_kind
+            || dci_export_number(physical, "bits") != dci_export_primitive_bits(kind, pointer_bits)) {
+            dci_export_unsupported(subject + ": unsupported or non-direct source type `" + tref_get_name(ty)
+                + "`; native DCIB export requires a closed scalar or non-owning pointer ABI");
+            return null;
+        }
+    }
+    if (name.len == 0) {
+        dci_export_unsupported(subject + ": pointer pointee is not a closed primitive type");
+        return null;
+    }
+    let out = cJSON_CreateObject();
+    dci_export_add_text(out, "kind", "primitive");
+    dci_export_add_text(out, "name", name);
+    dci_export_add_text(out, "reference", reference);
+    dci_export_add_text(out, "source_type", tref_get_name(ty));
+    if (reference != "value") {
+        dci_export_add_bool(out, "pointee_const", pointee_const);
+        dci_export_add_bool(out, "nullable", nullable);
+    }
+    if (kind != ty_VOID()) {
+        let size = dci_export_number(physical, "size");
+        let alignment = dci_export_number(physical, "alignment");
+        if (size <= 0 || alignment <= 0) {
+            dci_export_fail(subject + ": LLVM has no closed size/alignment fact");
+            cJSON_Delete(out);
+            return null;
+        }
+        dci_export_add_number(out, "size", size);
+        dci_export_add_number(out, "alignment", alignment);
+    }
+    return out;
+}
+
+fn dci_export_ownership(ty: rawptr) -> string {
+    let kind = tref_get_kind(ty);
+    if (kind == ty_REF()) { return "borrow"; }
+    if (kind == ty_MUTREF()) { return "borrow_mut"; }
+    // Raw pointers are non-owning, Copy address values in Vyx. This describes
+    // copying the address; it grants no retain/release or pointee ownership.
+    return "copy";
+}
+
+fn dci_export_lowering(physical: rawptr, index: i32, returned: bool) -> rawptr {
+    let out = cJSON_CreateObject();
+    let kind = dci_export_text(physical, "kind");
+    if (kind == "void") { dci_export_add_text(out, "passing", "ignore"); return out; }
+    dci_export_add_text(out, "passing", "direct");
+    if (!returned) { dci_export_add_number(out, "index", index as i64); }
+    dci_export_add_number(out, "size", dci_export_number(physical, "size"));
+    dci_export_add_number(out, "alignment", dci_export_number(physical, "alignment"));
+    let attributes = dci_export_item(physical, "attributes");
+    if (attributes != null) {
+        if (cJSON_IsArray(attributes) == 0) { dci_export_fail("invalid LLVM parameter attribute facts"); }
+        else { dci_export_add(out, "attributes", cJSON_Duplicate(attributes, 1)); }
+    }
+    return out;
+}
+
+fn dci_export_link_name(declaration: rawptr) -> string {
+    var symbol = hir_builder_strip_c_symbol_name(hir_builder_decl_attr_value(declaration, "link_name"));
+    if (symbol.len == 0) { symbol = hir_builder_strip_c_symbol_name(hir_builder_decl_attr_value(declaration, "export_name")); }
+    if (symbol.len == 0) { symbol = hir_builder_strip_c_symbol_name(hir_builder_decl_attr_value(declaration, "dci_export")); }
+    if (symbol.len == 0) { symbol = decl_get_name(declaration); }
+    return symbol;
+}
+
+fn dci_export_control_flow() -> rawptr {
+    let flow = cJSON_CreateObject();
+    dci_export_add_text(flow, "default_boundary", "no_unwind");
+    let propagation = cJSON_CreateObject();
+    dci_export_add_text(propagation, "mode", "forbidden");
+    dci_export_add(flow, "propagation", propagation);
+    return flow;
+}
+
+fn dci_export_function(declaration: rawptr, cg: rawptr, root: rawptr, symbols: rawptr, exceptions: rawptr) {
+    let name = decl_get_name(declaration);
+    if (decl_get_generic_params(declaration).len > 0) {
+        dci_export_unsupported(name + ": a generic declaration is not a closed native export");
+        return;
+    }
+    if (decl_get_body(declaration) == null) {
+        dci_export_unsupported(name + ": native DCIB export requires a local function definition");
+        return;
+    }
+    let link_name = dci_export_link_name(declaration);
+    var previous = dci_cjson_child(symbols);
+    while (previous != null) {
+        if (dci_export_text(previous, "link_name") == link_name) {
+            dci_export_unsupported(name + ": duplicate selected native link symbol `" + link_name + "`");
+            return;
+        }
+        if (dci_export_text(previous, "name") == name) {
+            dci_export_unsupported(name + ": duplicate selected semantic name is ambiguous in this native DCI profile");
+            return;
+        }
+        previous = dci_cjson_next(previous);
+    }
+    let facts_text = vyx_rt_dci_export_function_json(cg, link_name.c_str(), link_name.len as u64);
+    if (facts_text == null) {
+        let capacity = vyx_rt_get_last_error(cg, null, 0) + 1;
+        let buffer = malloc(capacity);
+        if (buffer != null) {
+            vyx_rt_get_last_error(cg, buffer, capacity);
+            dci_export_fail(name + ": " + from_cstr(buffer));
+            free(buffer);
+        } else { dci_export_fail(name + ": failed to obtain native LLVM ABI facts"); }
+        return;
+    }
+    let facts = cJSON_Parse(facts_text);
+    vyx_rt_dci_export_free_json(facts_text);
+    if (facts == null) { dci_export_fail(name + ": invalid native LLVM ABI fact document"); return; }
+    let backend_error = dci_export_text(facts, "error");
+    if (backend_error.len > 0) {
+        dci_export_fail(name + ": " + backend_error);
+        cJSON_Delete(facts);
+        return;
+    }
+    if (cJSON_IsTrue(dci_export_item(facts, "defined")) == 0
+        || cJSON_IsTrue(dci_export_item(facts, "external")) == 0
+        || dci_export_text(facts, "link_name") != link_name
+        || dci_export_text(facts, "calling_convention") != "cdecl"
+        || cJSON_IsFalse(dci_export_item(facts, "variadic")) == 0) {
+        dci_export_unsupported(name + ": final LLVM function is not a defined, external, non-variadic cdecl export");
+        cJSON_Delete(facts);
+        return;
+    }
+    if (dci_export_text(facts, "unwind") != "no_unwind") {
+        dci_export_unsupported(name + ": native export may unwind; a closed no_unwind call graph is required");
+        cJSON_Delete(facts);
+        return;
+    }
+    let target = dci_export_item(facts, "target");
+    let pointer_bits = dci_export_number(target, "pointer_width");
+    if (cJSON_IsObject(target) == 0 || pointer_bits <= 0
+        || dci_export_text(target, "triple").len == 0
+        || dci_export_text(target, "architecture").len == 0
+        || dci_export_text(target, "endianness").len == 0
+        || dci_export_text(target, "abi").len == 0) {
+        dci_export_fail(name + ": target ABI identity is incomplete");
+        cJSON_Delete(facts);
+        return;
+    }
+    if (dci_export_item(root, "target") == null) { dci_export_add(root, "target", cJSON_Duplicate(target, 1)); }
+    let physical_params = dci_export_item(facts, "parameters");
+    if (cJSON_IsArray(physical_params) == 0) {
+        dci_export_fail(name + ": missing final LLVM parameter facts");
+        cJSON_Delete(facts);
+        return;
+    }
+    let symbol = cJSON_CreateObject();
+    dci_export_add_text(symbol, "name", name);
+    dci_export_add_text(symbol, "link_name", link_name);
+    dci_export_add_text(symbol, "kind", "function");
+    dci_export_add_text(symbol, "visibility", "public");
+    dci_export_add_text(symbol, "linkage", "external");
+    dci_export_add_text(symbol, "calling_convention", "cdecl");
+    let parameters = cJSON_CreateArray();
+    let lowers = cJSON_CreateArray();
+    var parameter = decl_get_params(declaration);
+    var index: i32 = 0;
+    while (parameter != null && g_dci_export_error.len == 0) {
+        let physical = cJSON_GetArrayItem(physical_params, index);
+        let ty = decl_get_ty(parameter);
+        let parameter_type = dci_export_type(ty, physical, pointer_bits, false,
+            name + ": parameter " + decl_get_name(parameter));
+        if (parameter_type == null) { break; }
+        let item = cJSON_CreateObject();
+        dci_export_add_text(item, "name", decl_get_name(parameter));
+        dci_export_add(item, "type", parameter_type);
+        dci_export_add_text(item, "ownership", dci_export_ownership(ty));
+        dci_export_append(parameters, item);
+        dci_export_append(lowers, dci_export_lowering(physical, index, false));
+        index = index + 1;
+        parameter = decl_get_next(parameter);
+    }
+    if (index != cJSON_GetArraySize(physical_params)) {
+        dci_export_unsupported(name + ": final LLVM parameter count differs from the supported direct source signature");
+    }
+    dci_export_add(symbol, "params", parameters);
+    let returned_ty = decl_get_ty(declaration);
+    let returned_physical = dci_export_item(facts, "return");
+    let returned_type = dci_export_type(returned_ty, returned_physical, pointer_bits, true, name + ": return");
+    if (returned_type != null) {
+        if (tref_get_kind(returned_ty) == ty_VOID()) {
+            cJSON_Delete(returned_type);
+            dci_export_add(symbol, "return", cJSON_CreateNull());
+        } else {
+            let returned = cJSON_CreateObject();
+            dci_export_add(returned, "type", returned_type);
+            dci_export_add_text(returned, "ownership", dci_export_ownership(returned_ty));
+            dci_export_add(symbol, "return", returned);
+        }
+    }
+    let abi = cJSON_CreateObject();
+    dci_export_add_text(abi, "calling_convention", "cdecl");
+    dci_export_add_bool(abi, "variadic", false);
+    dci_export_add(abi, "parameters", lowers);
+    dci_export_add(abi, "return", dci_export_lowering(returned_physical, -1, true));
+    dci_export_add(symbol, "abi", abi);
+    dci_export_add(symbol, "control_flow", dci_export_control_flow());
+    if (g_dci_export_error.len == 0) {
+        dci_export_append(symbols, symbol);
+        let obligation = cJSON_CreateObject();
+        dci_export_add_text(obligation, "subject", link_name);
+        dci_export_add_text(obligation, "boundary", "no_unwind");
+        dci_export_add_text(obligation, "cleanup", "none");
+        dci_export_append(exceptions, obligation);
+    } else { cJSON_Delete(symbol); }
+    cJSON_Delete(facts);
+}
+
+fn dci_export_normal_path(path: string) -> string {
+    let pointer = vyx_bootstrap_abs_path(path.c_str());
+    if (pointer == null) { return ""; }
+    var absolute = from_cstr(pointer).clone();
+    if (vyx_bootstrap_platform() == 1) { absolute = absolute.toLower().replace("/", "\\"); }
+    return absolute;
+}
+
+fn dci_export_decl_source_path(declaration: rawptr) -> string {
+    let meta = decl_get_meta(declaration);
+    let marker = "|source-path:";
+    let begin = meta.indexOf(marker);
+    if (begin < 0) { return ""; }
+    let start = begin + marker.len;
+    var end = start;
+    while (end < meta.len && meta.charAt(end) != 124) { end = end + 1; }
+    return dci_export_normal_path(meta.substring(start, end));
+}
+
+fn dci_export_source_selected(path: string, sources: string) -> bool {
+    if (path.len == 0) { return false; }
+    var start: i32 = 0;
+    var end: i32 = 0;
+    while (end <= sources.len) {
+        if (end == sources.len || sources.charAt(end) == 10) {
+            let line = sources.substring(start, end).trim();
+            if (line.len > 0 && dci_export_normal_path(line) == path) { return true; }
+            start = end + 1;
+        }
+        end = end + 1;
+    }
+    return false;
+}
+
+fn dci_export_collect(head: rawptr, cg: rawptr, root: rawptr, symbols: rawptr, exceptions: rawptr,
+    selected_sources: string, free_function_scope: bool) {
+    var declaration = head;
+    while (declaration != null && g_dci_export_error.len == 0) {
+        let meta = decl_get_meta(declaration);
+        let kind = decl_get_kind(declaration);
+        let selected = meta.indexOf("|effect:dci_export|") >= 0;
+        if (selected && meta.indexOf("|interface-storage|") < 0
+            && dci_export_source_selected(dci_export_decl_source_path(declaration), selected_sources)) {
+            g_dci_export_active_decl = declaration;
+            g_dci_export_active_source = dci_export_decl_source_path(declaration);
+            if (kind == de_FN() && free_function_scope) {
+                dci_export_function(declaration, cg, root, symbols, exceptions);
+            } else {
+                dci_export_unsupported(decl_get_name(declaration)
+                    + ": native DCIB export currently requires a closed free-function declaration");
+            }
+            g_dci_export_active_decl = null;
+            g_dci_export_active_source = "";
+        }
+        // Inspect every owned declaration tree so a selected method or impl
+        // member cannot silently disappear beside valid free-function exports.
+        // Only namespace modules preserve free-function context; class, impl,
+        // and other member containers must never turn methods into free calls.
+        if (decl_get_members(declaration) != null) {
+            dci_export_collect(decl_get_members(declaration), cg, root, symbols, exceptions,
+                selected_sources, free_function_scope && kind == de_MODULE());
+        }
+        declaration = decl_get_next(declaration);
+    }
+}
+
+/// Emit a canonical DCIB contract from sealed source selection and the same
+/// completed native LLVM module used to produce its object code. Unsupported
+/// signatures, missing ownership/lifetime facts and unknown unwind edges fail
+/// before opening the destination; the producer's previous contract survives.
+public fn dci_export_emit(unit: rawptr, cg_handle: rawptr, output_path: string, selected_sources: string) -> i32 {
+    g_dci_export_error = "";
+    g_dci_export_error_code = "";
+    g_dci_export_error_decl = null;
+    g_dci_export_error_source = "";
+    g_dci_export_active_decl = null;
+    g_dci_export_active_source = "";
+    var cg: rawptr = null;
+    if (cg_handle != null) { memcpy(to_rawptr(&cg), cg_handle, 8); }
+    if (unit == null || cg == null || output_path.len == 0) {
+        dci_export_fail("missing source unit, native module or DCIB output path");
+        dci_export_emit_error();
+        return 1;
+    }
+    let root = cJSON_CreateObject();
+    let symbols = cJSON_CreateArray();
+    let exceptions = cJSON_CreateArray();
+    dci_export_add_text(root, "dci", "1.0");
+    dci_export_add_text(root, "kind", "abi");
+    let source = cJSON_CreateObject();
+    dci_export_add_text(source, "language", "vyx");
+    let compiler = cJSON_CreateObject();
+    dci_export_add_text(compiler, "name", "vyxc");
+    dci_export_add(source, "compiler", compiler);
+    let inputs = cJSON_CreateArray();
+    var source_start: i32 = 0;
+    var source_end: i32 = 0;
+    while (source_end <= selected_sources.len) {
+        if (source_end == selected_sources.len || selected_sources.charAt(source_end) == 10) {
+            let path = selected_sources.substring(source_start, source_end).trim();
+            if (path.len > 0) { dci_export_append(inputs, cJSON_CreateString(dci_export_normal_path(path).c_str())); }
+            source_start = source_end + 1;
+        }
+        source_end = source_end + 1;
+    }
+    dci_export_add(source, "inputs", inputs);
+    dci_export_add(root, "source", source);
+    let profile = cJSON_CreateObject();
+    dci_export_add_text(profile, "id", "vyx-native");
+    dci_export_add_text(profile, "version", "1");
+    dci_export_add_text(profile, "level", "L0");
+    dci_export_add_text(profile, "conformance", "feature_subset");
+    dci_export_add_text(profile, "lifecycle_binding", "declaration");
+    let modes = cJSON_CreateArray();
+    dci_export_append(modes, cJSON_CreateString("direct".c_str()));
+    dci_export_add(profile, "consumer_modes", modes);
+    dci_export_add(root, "profile", profile);
+    dci_export_add(root, "control_flow", dci_export_control_flow());
+    let exports = cJSON_CreateObject();
+    dci_export_add(exports, "layouts", cJSON_CreateArray());
+    dci_export_add(exports, "symbols", symbols);
+    dci_export_add(root, "exports", exports);
+    let obligations = cJSON_CreateObject();
+    dci_export_add_text(obligations, "version", "1");
+    dci_export_add(obligations, "lifecycle", cJSON_CreateArray());
+    dci_export_add(obligations, "exceptions", exceptions);
+    dci_export_add(obligations, "edges", cJSON_CreateArray());
+    dci_export_add(root, "obligations", obligations);
+    dci_export_collect(unit_get_decls(unit), cg, root, symbols, exceptions, selected_sources, true);
+    if (g_dci_export_error.len == 0 && cJSON_GetArraySize(symbols) == 0) {
+        dci_export_usage_error("no sealed dci_export function was selected for native DCIB emission");
+    }
+    let payload = DciExportWriter.create();
+    if (g_dci_export_error.len == 0) { payload.value(root, 0); }
+    cJSON_Delete(root);
+    if (g_dci_export_error.len > 0) {
+        payload.dispose();
+        dci_export_emit_error();
+        return 1;
+    }
+    let artifact = DciExportWriter.create();
+    artifact.byte(68); artifact.byte(67); artifact.byte(73); artifact.byte(66);
+    artifact.integer(1, 2); artifact.integer(0, 2);
+    artifact.integer(payload.length, 8);
+    artifact.integer(dci_export_crc32(payload.data, payload.length), 4);
+    if (artifact.reserve(payload.length)) {
+        memcpy(artifact.data + artifact.length, payload.data, payload.length as u64);
+        artifact.length = artifact.length + payload.length;
+    }
+    var result: i32 = 1;
+    if (g_dci_export_error.len == 0) {
+        result = vyx_rt_dci_export_write_file(cg, output_path.c_str(), output_path.len as u64,
+            artifact.data, artifact.length as u64);
+        if (result != 0) {
+            let capacity = vyx_rt_get_last_error(cg, null, 0) + 1;
+            let buffer = malloc(capacity);
+            if (buffer != null) {
+                vyx_rt_get_last_error(cg, buffer, capacity);
+                dci_export_fail(from_cstr(buffer).clone());
+                free(buffer);
+            } else { dci_export_fail("cannot publish DCIB artifact"); }
+        }
+    }
+    payload.dispose(); artifact.dispose();
+    if (result != 0) { dci_export_emit_error(); }
+    return result;
+}

@@ -48,6 +48,58 @@ Adapter fact production has three modes: offline extraction, native compiler emi
 and Active / Online production during a build. They use the same logical Adapter role.
 “Online” does not require network access.
 
+## Native Vyx contract emission
+
+The SDK compiler emits a DCI contract directly from Vyx source with `--emit=dcib`.
+Select the published declarations explicitly:
+
+```vyx
+module arithmetic;
+
+@[dci_export(symbol="arithmetic_add")]
+public fn add(left: i32, right: i32) -> i32 { return left + right; }
+```
+
+```bash
+vyxc --emit=dcib --src=file arithmetic.vyx -o arithmetic.dcib
+vyxc --emit=dcib --src=project . --target arithmetic
+vyxc --emit=dcib --src=project . --target arithmetic -o contracts/arithmetic.dcib
+```
+
+Project mode uses the build pipeline and includes the selected target's Vyx source
+modules. It writes `<output_dir>/<target>.dcib` by default; `-o` changes that path.
+Dependencies provide compilation inputs and are not selected for publication by
+the parent target. `public` alone does not request DCI publication.
+An export with no selected declarations fails, and `--run` cannot be combined with
+contract emission.
+
+The compiler owns the Adapter role for this operation. It writes the canonical
+DCIB v1 binary container without invoking Python or an external source scanner.
+The contract records the target, selected symbol identities, ownership and actual
+native ABI lowering. A `.dcib` file contains metadata; distribute the matching
+object or library alongside it. Emit that object/library from the same source,
+target and layout-affecting options. The existing Converter can turn the contract
+into editable `extern "dci"` definitions:
+
+```bash
+vyxc --emit=obj --src=file arithmetic.vyx -o arithmetic.o
+vyxc dci convert arithmetic.dcib --module arithmetic_api -o arithmetic_api.vyx
+```
+
+Native emission currently admits concrete free functions with supported scalar
+and non-owning `rawptr` signatures and a proved no-unwind call graph. Native tracked
+references are not plain borrowed-address ABI values and are rejected. It also
+rejects unknown calling/lifecycle facts, unsupported signatures and unproved external
+or recursive calls; naming a shared
+exception ABI does not establish compatibility. The Effect export sidecar selected
+with `VYX_DCI_EXPORT_OUT` remains a separate provenance artifact and is not a DCI
+ABI contract. Contract closure or emission failure preserves the previous output.
+Project post hooks run after artifact publication; a hook failure does not roll back
+the published contract.
+The [native export gate](../probes/gates/dci-native-export/README.md) validates the
+binary container and strict contract, then links and executes independent file and
+project AOT consumers.
+
 The Core Consumer must not parse foreign source semantics or select ABI algorithms
 from `source.language`. Language-specific work belongs in the Adapter or a
 capability-matched backend. Binding syntax such as Vyx's `extern "dci"` is not Core syntax.

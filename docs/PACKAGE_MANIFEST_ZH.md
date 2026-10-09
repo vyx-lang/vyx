@@ -65,6 +65,10 @@ sources = ["src/math.vyx"]
 | `auto_sources = false` | 显式管理源文件；新增文件后需加入配置 |
 
 `source` 目标提供源码而不生成归档，使泛型函数体等内容可在消费目标中实例化。
+库和源码目标可以省略 `entry`，由 `sources` 提供解析起点。默认的统一 crate 库构建
+将源码依赖的实现编入消费方归档，VYI 与 DCIB 的公开选择仍属于目标自己的源码。
+分模块或根分区库构建尚无源码包普通函数的唯一对象归属规划；
+[原生导出门](../probes/gates/dci-native-export/README.md) 验收默认统一 crate 路径。
 编译后的用户泛型模块也可通过生成的 `.vyi` 版本化模板制品供消费方实例化，
 并保留私有定义依赖；普通已编译定义仍需链接生产端原生库。完整验证见
 [泛型接口回归门](../probes/gates/generic_interfaces/README.md)。
