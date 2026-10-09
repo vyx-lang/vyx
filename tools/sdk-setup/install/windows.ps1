@@ -1,7 +1,7 @@
 [CmdletBinding(PositionalBinding=$false)]
 param(
     [Parameter(Position=0)][ValidateSet('setup','update','rollback','uninstall')][string]$Action = 'setup',
-    [string]$BaseUrl = 'https://www.vyxlang.com',
+    [string]$BaseUrl = 'https://github.com/vyx-lang/vyx/releases/latest/download',
     [string]$InstallDir,
     [string]$ConfigDir,
     [switch]$Yes,
@@ -169,14 +169,14 @@ $scriptSource = $MyInvocation.MyCommand.ScriptBlock.ToString()
         if ($Action -eq 'rollback') { $expected = $state.previous; $release = Require-Release $expected } else {
             $archiveName = 'vyx-sdk-windows-x86_64-llvm22.zip'
             Write-Host 'Checking the Windows x64 SDK...'
-            $checksum = (Invoke-RestMethod -Uri "$BaseUrl/sdk/$archiveName.sha256").ToString().Trim()
+            $checksum = (Invoke-RestMethod -Uri "$BaseUrl/$archiveName.sha256").ToString().Trim()
             if ($checksum -notmatch ('^([a-fA-F0-9]{64})\s+\*?' + [regex]::Escape($archiveName) + '$')) { throw 'Invalid SDK checksum file.' }
             $expected = $Matches[1].ToLowerInvariant()
             $release = Join-Path $releaseRoot $expected
             if (Test-Path -LiteralPath $release) { $release = Require-Release $expected; Write-Host 'This SDK is already installed.' } else {
                 $archive = Join-Path $stage $archiveName
                 Write-Host 'Downloading the SDK...'
-                Invoke-WebRequest -Uri "$BaseUrl/sdk/$archiveName" -OutFile $archive -UseBasicParsing
+                Invoke-WebRequest -Uri "$BaseUrl/$archiveName" -OutFile $archive -UseBasicParsing
                 if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'SDK checksum mismatch; installation stopped.' }
                 Add-Type -AssemblyName System.IO.Compression.FileSystem
                 [IO.Compression.ZipFile]::ExtractToDirectory($archive, (Join-Path $stage 'unpacked'))

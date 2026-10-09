@@ -2,7 +2,8 @@
 set -euo pipefail
 
 action=setup
-base_url=https://www.vyxlang.com
+base_url=https://github.com/vyx-lang/vyx/releases/latest/download
+installer_url=https://www.vyxlang.com/install/linux.sh
 install_dir=${VYX_INSTALL_DIR:-}
 config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/vyx
 yes=0
@@ -10,6 +11,7 @@ while (($#)); do
   case "$1" in
     setup|update|rollback|uninstall) action=$1; shift ;;
     --base-url) base_url=${2:?Missing download URL}; shift 2 ;;
+    --installer-url) installer_url=${2:?Missing installer URL}; shift 2 ;;
     --install-dir) install_dir=${2:?Missing installation directory}; shift 2 ;;
     --yes|-y) yes=1; shift ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; exit 1 ;;
@@ -142,7 +144,7 @@ trap cleanup EXIT
 if [[ $action == rollback ]]; then expected=$previous; require_release "$expected"; else
   archive_name="vyx-sdk-linux-$architecture-llvm22.tar.gz"
   echo "Checking the Linux $architecture SDK..."
-  curl -fsSL --retry 3 "$base_url/sdk/$archive_name.sha256" -o "$work/checksum"
+  curl -fsSL --retry 3 "$base_url/$archive_name.sha256" -o "$work/checksum"
   checksum_line=$(tr -d '\r' < "$work/checksum")
   [[ $checksum_line != *$'\n'* ]] || fail 'Invalid SDK checksum file.'
   read -r expected checksum_name extra <<< "$checksum_line"
@@ -150,7 +152,7 @@ if [[ $action == rollback ]]; then expected=$previous; require_release "$expecte
   expected=${expected,,}
   if [[ -e $releases/$expected ]]; then require_release "$expected"; echo 'This SDK is already installed.'; else
     echo 'Downloading the SDK...'
-    curl -fSL --retry 3 "$base_url/sdk/$archive_name" -o "$work/$archive_name"
+    curl -fSL --retry 3 "$base_url/$archive_name" -o "$work/$archive_name"
     actual=$(sha256sum "$work/$archive_name")
     [[ ${actual%% *} == "$expected" ]] || fail 'SDK checksum mismatch; installation stopped.'
     mkdir "$work/unpacked"
@@ -167,7 +169,10 @@ fi
 printf '%s\n%s\n' "$expected" "$previous" > "$work/state"
 printf '%s\n' 'vyx-sdk-setup-v2' > "$work/marker"
 printf '%s\n' "$root" > "$work/install-root"
-if [[ -f ${BASH_SOURCE[0]:-} ]]; then cp -- "${BASH_SOURCE[0]}" "$work/manager"; else curl -fsSL --retry 3 "$base_url/install/linux.sh" -o "$work/manager"; fi
+if [[ -f ${BASH_SOURCE[0]:-} ]]; then cp -- "${BASH_SOURCE[0]}" "$work/manager"; else
+  case "$installer_url" in https://*|http://localhost:*|http://127.0.0.1:*|http://\[::1\]:*) ;; *) fail 'Use an HTTPS installer URL (HTTP is supported for localhost fixtures).' ;; esac
+  curl -fsSL --retry 3 "$installer_url" -o "$work/manager"
+fi
 bash -n "$work/manager"
 {
   printf '#!/usr/bin/env bash\nexec bash %s --install-dir %s "$@"\n' "$(quote "$root/vyxup.sh")" "$(quote "$root")"

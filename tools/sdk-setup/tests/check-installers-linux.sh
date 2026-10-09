@@ -13,7 +13,7 @@ install_root="$test_root/SDK with spaces and 'quote"
 python3 - "$base_url" "$install_root" "$test_root" <<'PY'
 import errno, os, pty, select, shlex, sys, time
 base, root, artifacts = sys.argv[1:]
-command = 'curl -fsSL ' + shlex.quote(base + '/install/linux.sh') + ' | bash -s -- --base-url ' + shlex.quote(base)
+command = 'curl -fsSL ' + shlex.quote(base + '/install/linux.sh') + ' | bash -s -- --base-url ' + shlex.quote(base + '/sdk') + ' --installer-url ' + shlex.quote(base + '/install/linux.sh')
 for mode, replies in [('cancel', [('Choose [1]:', '3')]), ('custom', [('Choose [1]:', '2'), ('Installation directory:', root)])]:
     pid, fd = pty.fork()
     if pid == 0:
@@ -48,10 +48,10 @@ cd "$test_root/hello-project"
 printf 'fn main() -> i32 { print("installer-ok"); return 0; }\n' > src/main.vyx
 printf '[package]\nname = "installer_hello"\nversion = "0.1.0"\nentry = "src/main.vyx"\n\n[build]\noutput_dir = "target"\n\n[target.installer_hello]\ntype = "executable"\nentry = "src/main.vyx"\n' > Vyx.toml
 vyxc build --run=aot -j1
-bash "$component_root/install/linux.sh" --yes --base-url "$base_url"
+bash "$component_root/install/linux.sh" --yes --base-url "$base_url/sdk"
 for profile in .profile .bashrc .zshrc .zprofile; do [[ $(grep -Fc '# Vyx SDK' "$HOME/$profile") == 1 ]]; done
 bash -n "$XDG_CONFIG_HOME/vyx/env"
-vyxup update --base-url "$base_url/update"
+vyxup update --base-url "$base_url/update/sdk"
 [[ -f $install_root/current/SETUP-TEST-REVISION ]]
 second=$(readlink "$install_root/current")
 [[ $first != "$second" ]]
@@ -62,7 +62,7 @@ vyxup rollback
 [[ $(readlink "$install_root/current") == "$second" ]]
 for variant in bad-checksum bad-startup; do
   cp "$install_root/.vyx-state" "$test_root/state-before"
-  if vyxup update --base-url "$base_url/$variant" > "$test_root/$variant.log" 2>&1; then echo "Invalid SDK accepted: $variant" >&2; exit 1; fi
+  if vyxup update --base-url "$base_url/$variant/sdk" > "$test_root/$variant.log" 2>&1; then echo "Invalid SDK accepted: $variant" >&2; exit 1; fi
   cmp "$install_root/.vyx-state" "$test_root/state-before"
   [[ $(readlink "$install_root/current") == "$second" ]]
 done
@@ -92,7 +92,7 @@ chmod +x "$test_root/mock-bin/pkg"
 export VYX_TEST_PKG_LOG="$test_root/pkg.log"
 for action in setup update; do
   set +e
-  PREFIX=/data/data/com.termux/files/usr TMPDIR="$test_root/termux-temp" PATH="$test_root/mock-bin:$PATH" bash "$component_root/install/termux.sh" "$action" --base-url "$base_url" > "$test_root/termux.log" 2>&1
+  PREFIX=/data/data/com.termux/files/usr TMPDIR="$test_root/termux-temp" PATH="$test_root/mock-bin:$PATH" bash "$component_root/install/termux.sh" "$action" --base-url "$base_url/sdk" > "$test_root/termux.log" 2>&1
   termux_status=$?
   set -e
   [[ $termux_status == 41 ]]

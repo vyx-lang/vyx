@@ -3,7 +3,7 @@ set -euo pipefail
 
 action=setup
 yes=0
-base_url=https://www.vyxlang.com
+base_url=https://github.com/vyx-lang/vyx/releases/latest/download
 while (($#)); do
   case "$1" in
     setup|update|uninstall) action=$1; shift ;;
@@ -42,12 +42,12 @@ work=$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/vyx-install-XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 archive_name=vyx-sdk-termux-aarch64.deb
 echo 'Downloading the Termux ARM64 SDK...'
-curl --fail --location --silent --show-error --retry 3 "$base_url/sdk/$archive_name.sha256" -o "$work/checksum"
+curl --fail --location --silent --show-error --retry 3 "$base_url/$archive_name.sha256" -o "$work/checksum"
 checksum_line=$(tr -d '\r' < "$work/checksum")
 [[ $checksum_line != *$'\n'* ]] || { echo 'Invalid SDK checksum file.' >&2; exit 1; }
 read -r expected checksum_name extra <<< "$checksum_line"
 [[ $expected =~ ^[a-fA-F0-9]{64}$ && ${checksum_name#\*} == "$archive_name" && -z ${extra:-} ]] || { echo 'Invalid SDK checksum file.' >&2; exit 1; }
-curl --fail --location --show-error --retry 3 "$base_url/sdk/$archive_name" -o "$work/$archive_name"
+curl --fail --location --show-error --retry 3 "$base_url/$archive_name" -o "$work/$archive_name"
 actual=$(sha256sum "$work/$archive_name")
 [[ ${actual%% *} == "${expected,,}" ]] || { echo 'SDK checksum mismatch; installation stopped.' >&2; exit 1; }
 [[ $(dpkg-deb -f "$work/$archive_name" Package) == vyx-sdk-termux && $(dpkg-deb -f "$work/$archive_name" Architecture) == aarch64 ]] || { echo 'The download is not a Termux ARM64 SDK package.' >&2; exit 1; }

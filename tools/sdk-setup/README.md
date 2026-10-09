@@ -4,7 +4,9 @@
 
 Installers for Windows, Linux, and Termux. The local website copies `install/` to
 its `/install/` assets during builds. Scripts download SDK packages and SHA256
-files from `https://www.vyxlang.com`. SDK archives and website assets remain local.
+files only from [GitHub Releases](https://github.com/vyx-lang/vyx/releases/latest).
+The website at `https://www.vyxlang.com` serves the pages and installer scripts;
+website builds and deployments never copy SDK packages.
 
 ## Install and manage
 
@@ -67,7 +69,11 @@ The scripts do not set global `LD_LIBRARY_PATH`. macOS has no installer yet.
 All scripts accept `setup`, `update`, and `uninstall`; desktop scripts also accept
 `rollback`. For unattended confirmation, use Windows `-Yes` or Linux/Termux
 `--yes`. `-BaseUrl` / `--base-url` supports HTTPS mirrors and localhost HTTP test
-servers. Windows `-NoPersistPath` avoids writing user PATH; `-ConfigDir` isolates
+servers; it is the asset directory URL, with the archive filename appended directly.
+The default is `https://github.com/vyx-lang/vyx/releases/latest/download`.
+Linux `--installer-url` controls only where a piped setup fetches its manager script;
+it defaults to `https://www.vyxlang.com/install/linux.sh` and does not change the SDK source.
+Windows `-NoPersistPath` avoids writing user PATH; `-ConfigDir` isolates
 the installation registry during tests.
 
 ## Verify

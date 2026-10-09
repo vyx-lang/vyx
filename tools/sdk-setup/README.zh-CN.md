@@ -1,8 +1,9 @@
 # SDK 安装管理
 
 Windows、Linux 和 Termux 的安装入口。源码在本目录维护；本地网站构建将
-`install/` 中的脚本复制到站点的 `/install/`。安装器使用 `https://www.vyxlang.com`
-的 SDK 包和 SHA256 文件，网站与 SDK 二进制不加入本目录的源码提交。
+`install/` 中的脚本复制到站点的 `/install/`。SDK 包及 SHA256 文件仅从
+[GitHub Releases](https://github.com/vyx-lang/vyx/releases/latest) 获取。
+`https://www.vyxlang.com` 托管网页和安装脚本，网站构建与部署不复制 SDK 包。
 
 ## 安装、更新和卸载
 
@@ -60,7 +61,11 @@ pkg uninstall vyx-sdk-termux
 
 三个脚本均接受 `setup`、`update`、`uninstall` 动作；桌面脚本另有 `rollback`。
 无人值守确认参数为 Windows `-Yes`、Linux / Termux `--yes`。
-下载地址参数 `-BaseUrl` / `--base-url` 用于镜像或隔离验收，只接受 HTTPS 或 localhost HTTP。
+下载地址参数 `-BaseUrl` / `--base-url` 是资产目录地址，直接追加安装包文件名；
+默认值为 `https://github.com/vyx-lang/vyx/releases/latest/download`。
+用于镜像或隔离验收时，只接受 HTTPS 或 localhost HTTP。
+Linux `--installer-url` 仅指定管道安装时获取管理脚本的地址，
+默认为 `https://www.vyxlang.com/install/linux.sh`，不改变 SDK 下载来源。
 Windows `-NoPersistPath` 禁止写用户 PATH，`-ConfigDir` 用于隔离安装位置登记。
 macOS 暂无安装入口。
 
