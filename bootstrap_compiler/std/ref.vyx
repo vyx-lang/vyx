@@ -2,6 +2,8 @@ module std.ref;
 
 use std.defaults;
 use std.core;
+use std.clone;
+use std.string;
 
 /// Vyx Standard Library — shared-ownership (Ref<T>/Weak<T>) and
 /// unique-ownership (Box<T>) smart pointers.
@@ -49,21 +51,22 @@ fn ref_move_value_into<T>(dst: rawptr, val: T) {
     memcpy(dst, to_rawptr(&val), sizeof::<T>());
 }
 
+// The slot owns T. Ordinary objects use their instantiated scope cleanup;
+// primitive str uses its allocator tag rather than lexical freshness rules.
+fn ref_drop_stored_value<T>(slot: *T) {
+    let value: T = *slot;
+}
+
+fn ref_drop_stored_value<str>(slot: *str) {
+    str_drop(*slot);
+}
+
 // ---------- Deref trait ----------
-/// Types that act like smart pointers (heap-indirected single values)
-/// should implement `Deref<T>` so generic code can uniformly unbox them.
-/// `Box<T>`, `Ref<T>`, and any user-defined `class MyBox<T> : Deref<T>`
-/// that exposes `fn deref() -> T` participate.
-///
-/// CodeGen note (Phase 6, 2026-04-23): the compiler inspects this trait
-/// on the struct's owning ClassDecl to decide whether a value-returned
-/// smart-pointer struct needs to be heap-spilled when coerced to an
-/// opaque pointer (see `CodeGenUtils::castToType`).  Without the spill,
-/// the returned pointer would dangle past the callee's stack frame.
-/// Previously only the name `"Box<"` triggered the spill; implementing
-/// `Deref<T>` now opts any smart-pointer class into the same behavior.
+/// Smart pointers borrow their payload through `deref() -> &T`.
+/// Reading an owning payload never creates a second owner. Use `get()`
+/// for an independent value when T implements Clone.
 public trait Deref<T> {
-    fn deref() -> T;
+    fn deref(&self) -> &T;
 }
 
 // ---------- Generic class API ----------
@@ -101,7 +104,7 @@ public class Ref<T> : Deref<T> {
     ///
     /// See std/clone.vyx for the full deep-copy-vs-refcount-bump
     /// dichotomy. This is the refcount-bump variant.
-    public fn clone() -> Ref<T> {
+    public fn clone(&self) -> Ref<T> {
         if (self.rc == null) { return Ref { data: null, rc: null }; }
         let count = vyx_atomic_load_i64(self.rc);
         if (count <= 0) { return Ref { data: null, rc: null }; }
@@ -109,44 +112,38 @@ public class Ref<T> : Deref<T> {
         return Ref { data: self.data, rc: self.rc };
     }
 
-    // Typed dereference: returns the stored T value by reading
-    // `sizeof::<T>()` bytes from the heap slot.  Mirrors `Box<T>.deref`
-    // so `Ref<T>` participates in the `Deref<T>` trait and the
-    // smart-pointer → rawptr routing in CodeGen.
-    public fn deref() -> T {
-        var val: T;
+    /// Borrows the payload. The reference cannot outlive this handle.
+    public fn deref(&self) -> &T {
         if (self.data == null) { panic("Ref::deref on released handle"); }
-        memcpy(to_rawptr(&val), self.data, sizeof::<T>());
-        return val;
+        let payload = self.data as *T;
+        return &payload[0];
     }
 
-    // Typed `get()` — alias for `deref()`, kept as a convenience so
-    // existing Box/Ref callers that expect `.get()` still resolve.
-    public fn get() -> T {
-        var val: T;
+    /// Returns an independent value; deref() borrows the stored payload.
+    @[lazy]
+    public fn get(&self) -> T where T: Clone {
         if (self.data == null) { panic("Ref::get on released handle"); }
-        memcpy(to_rawptr(&val), self.data, sizeof::<T>());
-        return val;
+        let payload = self.data as *T;
+        return (*payload).clone();
     }
 
     /// Replaces the shared payload in place. Existing Ref aliases observe the
-    /// new value. The previous T is materialized first so its normal drop glue
-    /// runs exactly once after the replacement has taken ownership of `val`.
+    /// new value. Release the previous T exactly once before the slot takes
+    /// ownership of `val`.
     public fn set(val: T) {
         if (self.data == null) { panic("Ref::set on released handle"); }
-        var old_value: T;
-        memcpy(to_rawptr(&old_value), self.data, sizeof::<T>());
+        ref_drop_stored_value::<T>(self.data as *T);
         ref_move_value_into::<T>(self.data, val);
     }
 
     // Strong reference count.  `>= 1` while at least one Ref is live.
-    public fn count() -> i64 {
+    public fn count(&self) -> i64 {
         if (self.rc == null) { return 0; }
         return vyx_atomic_load_i64(self.rc);
     }
 
     // Excludes the implicit weak count held by a non-zero strong count.
-    public fn weak_count() -> i64 {
+    public fn weak_count(&self) -> i64 {
         if (self.rc == null) { return 0; }
         let w = vyx_atomic_load_i64(self.rc + 8);
         if (w <= 1) { return 0; }
@@ -167,12 +164,9 @@ public class Ref<T> : Deref<T> {
         if (strong == 0) {
             var payload: rawptr = null;
             memcpy(to_rawptr(&payload), self.rc + 16, 8);
-            // Move the payload into a local before freeing the outer slot.
-            // The monomorphised local's normal drop glue recursively releases
-            // an owning T (for example Ref<Box<U>>).
+            // Release the payload before freeing the outer allocation.
             if (payload != null) {
-                var value: T;
-                memcpy(to_rawptr(&value), payload, sizeof::<T>());
+                ref_drop_stored_value::<T>(payload as *T);
             }
             let null_data: rawptr = null;
             memcpy(self.rc + 16, to_rawptr(&null_data), 8);
@@ -229,7 +223,7 @@ public class Weak<T> {
 
     // Strong count observed through the weak handle; 0 after the
     // last Ref was dropped.
-    public fn strong_count() -> i64 {
+    public fn strong_count(&self) -> i64 {
         if (self.rc == null) { return 0; }
         return vyx_atomic_load_i64(self.rc);
     }
@@ -279,55 +273,37 @@ public class Box<T> : Deref<T> {
         return Box { data: d };
     }
 
-    public fn get() -> T {
+    /// Returns an independent value; deref() borrows the stored payload.
+    @[lazy]
+    public fn get(&self) -> T where T: Clone {
         if (self.data == null) { panic("Box::get on released handle"); }
-        var val: T;
-        memcpy(to_rawptr(&val), self.data, sizeof::<T>());
-        return val;
+        let payload = self.data as *T;
+        return (*payload).clone();
     }
 
-    // Typed dereference: returns the stored T value by reading
-    // `sizeof::<T>()` bytes from the heap slot.  Covers the
-    // common case of unboxing user data (including nested
-    // `Box<Tree<i32>>`) without forcing an explicit `get()`
-    // cast to i64.
-    public fn deref() -> T {
-        var val: T;
+    /// Borrows the unique payload without copying ownership.
+    public fn deref(&self) -> &T {
         if (self.data == null) { panic("Box::deref on released handle"); }
-        memcpy(to_rawptr(&val), self.data, sizeof::<T>());
-        return val;
+        let payload = self.data as *T;
+        return &payload[0];
     }
 
     public fn set(val: T) {
         if (self.data == null) { panic("Box::set on released handle"); }
-        var old_value: T;
-        memcpy(to_rawptr(&old_value), self.data, sizeof::<T>());
+        ref_drop_stored_value::<T>(self.data as *T);
         ref_move_value_into::<T>(self.data, val);
     }
 
-    // Internal raw-slot copy for trivially copyable T only.  This is not a
-    // public Clone contract: bytewise copying an owning payload aliases its
-    // resources and would violate Box's unique-ownership invariant.
-    fn clone() -> Box<T> {
-        let ts = sizeof::<T>();
-        let nd = vyx_aligned_alloc_abi(ts, alignof::<T>());
-        if (nd == null) { panic("Box::clone allocation failed"); }
-        if (self.data != null) {
-            memcpy(nd, self.data, ts);
-        } else {
-            memset(nd, 0, ts);
-        }
-        return Box { data: nd };
+    /// Deep copy of the payload. Available when T provides Clone.
+    @[lazy]
+    public fn clone(&self) -> Box<T> where T: Clone {
+        if (self.data == null) { return Box { data: null }; }
+        return Box::<T>.new(self.deref().clone());
     }
 
     public fn drop() {
         if (self.data == null) { return; }
-        // Materialise the payload before releasing its storage.  At a
-        // monomorphised Box<T> instantiation this local receives the normal
-        // scope-drop glue for an owning T (for example Box<Ref<U>>), so the
-        // payload's ownership is released before this Box is finished.
-        var value: T;
-        memcpy(to_rawptr(&value), self.data, sizeof::<T>());
+        ref_drop_stored_value::<T>(self.data as *T);
         vyx_aligned_free_abi(self.data);
         self.data = null;
     }

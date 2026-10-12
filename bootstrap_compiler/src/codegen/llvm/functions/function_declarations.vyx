@@ -163,15 +163,23 @@ impl LlvmMirLowerer {
         return fty;
     }
 
-    public fn function_uses_c_main_abi(self, function_id: i32) -> bool {
+    public fn function_is_process_entry(self, function_id: i32) -> bool {
         if (function_id == mir_id_invalid()) { return false; }
+        if (self.m.function_name(function_id) != "main") { return false; }
+        if (self.m.function_owner_type(function_id).len != 0) { return false; }
+        if (self.m.function_item_kind(function_id) != hir_item_function()) { return false; }
+        let flags = mir_unit_function_flags(&self.m, function_id);
+        return (flags & hir_function_flag_process_entry()) != 0
+            && (flags & hir_function_flag_codegen_root()) != 0
+            && (flags & hir_function_flag_imported_body()) == 0;
+    }
+
+    public fn function_uses_c_main_abi(self, function_id: i32) -> bool {
         // NVPTX device compilation has no hosted process entry. A top-level
         // `main` remains an ordinary device function instead of receiving the
         // synthesized C argc/argv wrapper and host runtime symbols.
         if (self.target_triple.contains("nvptx")) { return false; }
-        if (self.m.function_name(function_id) != "main") { return false; }
-        if (self.m.function_owner_type(function_id).len != 0) { return false; }
-        return self.m.function_item_kind(function_id) == hir_item_function();
+        return self.function_is_process_entry(function_id);
     }
 
     public fn function_uses_i32_main_abi(self, function_id: i32) -> bool {
@@ -325,12 +333,7 @@ impl LlvmMirLowerer {
         if ((mir_unit_function_flags(&self.m, function_id) & hir_function_flag_no_mangle()) != 0) {
             return true;
         }
-        if (self.m.function_name(function_id) == "main"
-            && self.m.function_owner_type(function_id).len == 0
-            && self.m.function_item_kind(function_id) == hir_item_function()) {
-            return true;
-        }
-        return false;
+        return self.function_is_process_entry(function_id);
     }
 
     public fn function_symbol_owner_text(self, function_id: i32) -> string {
@@ -475,12 +478,32 @@ impl LlvmMirLowerer {
         return name.startsWith("vio_async_");
     }
 
+    public fn function_needs_cross_cgu_private_linkage(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()
+            || self.cgu_emit_index <= 0 || self.cgu_unit_count <= 1
+            || !self.export_root_linkage_mode) { return false; }
+        if ((mir_unit_function_flags(&self.m, function_id) & hir_function_flag_codegen_root()) != 0
+            || self.function_uses_unmangled_abi_symbol(function_id)
+            || self.function_is_dci_vyx_override_callback(function_id)
+            || self.function_name_is_language_lowering_root(self.m.function_name(function_id))) {
+            return false;
+        }
+        // These bodies belong to source functions with a canonical native
+        // identity (module/owner, name, signature and closed generic arguments).
+        // Closures use invocation-local ids and cannot claim this ODR identity.
+        let kind = self.m.function_item_kind(function_id);
+        return (kind == hir_item_function() || kind == hir_item_method())
+            && self.m.function_hir_item(function_id) != hir_id_invalid()
+            && self.m.function_first_block(function_id) != mir_id_invalid();
+    }
+
     public fn function_definition_should_be_internal(self, function_id: i32) -> bool {
         // A root-partitioned compile repeats imported/helper bodies in every
         // chunk. Only explicitly exported roots may keep external linkage;
         // otherwise chunks define the same strong symbol many times. Normal
         // intra-process CGU splitting retains its cross-CGU linkage rule.
         if (self.cgu_emit_index > 0 && !self.export_root_linkage_mode) { return false; }
+        if (self.function_needs_cross_cgu_private_linkage(function_id)) { return false; }
         if (function_id == mir_id_invalid()) { return false; }
         if (self.function_uses_unmangled_abi_symbol(function_id)) { return false; }
         if (self.function_is_dci_vyx_override_callback(function_id)) { return false; }
@@ -629,6 +652,14 @@ impl LlvmMirLowerer {
         if (fn_value == null) { return; }
         if (self.function_definition_should_be_internal(function_id)) {
             vyx_rt_set_linkage(self.mod, fn_value, 1);
+        } elif (self.function_needs_cross_cgu_private_linkage(function_id)) {
+            // A private helper may be owned by a different CGU from its
+            // exported caller. Internal linkage would remove that definition
+            // from the object's symbol table. Root partitions may emit the
+            // same source helper again, so retain an ODR definition rather
+            // than introduce duplicate strong definitions. Source visibility
+            // and the published interface remain unchanged.
+            vyx_rt_set_linkage(self.mod, fn_value, 4);
         } elif (self.function_name_is_mir_generic_instance(function_id)) {
             // A CGU owns each concrete instance, but its callers may live in
             // other LLVM modules. linkonce_odr can be removed when the owner
@@ -898,18 +929,85 @@ impl LlvmMirLowerer {
         return true;
     }
 
+    public fn function_owns_native_definition(self, function_id: i32) -> bool {
+        if (function_id == mir_id_invalid()
+            || self.function_is_interface_prototype_body(function_id)
+            || self.function_is_foreign_dci(function_id)) { return false; }
+        // Streaming discards a successfully lowered body. Its exact emission
+        // fact remains valid after first_block has returned to invalid.
+        if (self.function_definition_was_directly_emitted(function_id)) { return true; }
+        if (!self.function_is_bodyless(function_id)) { return true; }
+        let flags = mir_unit_function_flags(&self.m, function_id);
+        // Explicit native exports are roots before their body materializes.
+        // An imported prototype or extern alias never owns that definition.
+        return (flags & hir_function_flag_codegen_root()) != 0
+            && (flags & hir_function_flag_imported_body()) == 0
+            && (flags & hir_function_flag_declaration_only()) == 0
+            && mir_unit_function_item_kind(&self.m, function_id) != hir_item_extern_function();
+    }
+
+    public fn function_same_native_definition(self, lhs: i32, rhs: i32) -> bool {
+        if (lhs == rhs) { return true; }
+        let item = self.m.function_hir_item(lhs);
+        // The same source item can be encountered twice while materializing a
+        // closed generic. Source names or equal LLVM signatures do not prove
+        // that two distinct items have the same implementation.
+        return item != hir_id_invalid() && item == self.m.function_hir_item(rhs)
+            && self.m.function_generic_args(lhs) == self.m.function_generic_args(rhs)
+            && self.m.function_owner_type(lhs) == self.m.function_owner_type(rhs);
+    }
+
+    public fn function_native_definition_binding_compatible(self,
+                                                             function_id: i32,
+                                                             previous: i32,
+                                                             symbol: string) -> bool {
+        if (!self.function_owns_native_definition(function_id)
+            || !self.function_owns_native_definition(previous)
+            || self.function_same_native_definition(function_id, previous)) { return true; }
+        if (self.error_count == 0) {
+            self.report_error("duplicate native function definition for link symbol `" + symbol
+                + "`: `" + self.m.function_name(previous) + "` and `"
+                + self.m.function_name(function_id) + "`");
+        }
+        return false;
+    }
+
+    public fn function_previous_native_definition(self, function_id: i32, symbol: string) -> i32 {
+        let indexed = llvm_mir_symbol_index_get(self.function_symbol_index,
+                                                self.function_symbol_index_cap,
+                                                symbol);
+        if (indexed != mir_id_invalid() && indexed != function_id
+            && self.function_owns_native_definition(indexed)
+            && !self.function_has_open_template_types(indexed)) { return indexed; }
+        if (indexed == function_id
+            || (indexed == mir_id_invalid()
+                && self.function_symbol_index != null
+                && self.m.function_count < self.function_symbol_index_cap)) { return mir_id_invalid(); }
+        // A bodyless declaration may hold the index's first slot. Search only
+        // this rare shared-symbol case for the actual source definition.
+        var cur: i32 = 1;
+        while (cur < function_id) {
+            if (self.function_owns_native_definition(cur)
+                && !self.function_has_open_template_types(cur)
+                && self.function_symbol_name(cur) == symbol) { return cur; }
+            cur = cur + 1;
+        }
+        return mir_id_invalid();
+    }
+
     public fn function_definition_was_emitted(self, function_id: i32) -> bool {
         if (function_id == mir_id_invalid()) { return false; }
         if (llvm_mir_i32_map_get(self.function_definition_emitted_map, function_id) == 2) {
             return true;
         }
         let symbol = self.function_symbol_name(function_id);
-        let indexed = llvm_mir_symbol_index_get(self.function_symbol_index,
-                                                self.function_symbol_index_cap,
-                                                symbol);
-        if (indexed != mir_id_invalid()
-            && indexed != function_id
-            && llvm_mir_i32_map_get(self.function_definition_emitted_map, indexed) == 2) {
+        let previous = self.function_previous_native_definition(function_id, symbol);
+        if (previous != mir_id_invalid()
+            && self.function_definition_was_directly_emitted(previous)) {
+            // Reusing an emitted symbol is valid for declarations and exact
+            // source duplicates. A distinct definition must report an error
+            // before this early skip can hide it.
+            self.function_native_definition_binding_compatible(function_id, previous, symbol);
             return true;
         }
         return false;
@@ -929,13 +1027,8 @@ impl LlvmMirLowerer {
         if (self.method_candidate_index_ready) {
             self.remember_function_method_candidate(function_id);
         }
-        let symbol = self.function_symbol_name(function_id);
-        let indexed = llvm_mir_symbol_index_get(self.function_symbol_index,
-                                                self.function_symbol_index_cap,
-                                                symbol);
-        if (indexed != mir_id_invalid()) {
-            llvm_mir_i32_map_put(self.function_definition_emitted_map, indexed, 2);
-        }
+        // A declaration may occupy the symbol index's first slot. Marking
+        // that alias here would falsely claim that its own body was emitted.
     }
 
     public fn function_has_callable_body_or_import(self, function_id: i32) -> bool {
@@ -954,45 +1047,13 @@ impl LlvmMirLowerer {
 
     public fn function_symbol_has_prior_body(self, function_id: i32) -> bool {
         if (function_id == mir_id_invalid()) { return false; }
-        if (self.m.function_first_block(function_id) == mir_id_invalid()) { return false; }
+        if (!self.function_owns_native_definition(function_id)) { return false; }
         let symbol = self.function_symbol_name(function_id);
         if (symbol.len == 0) { return false; }
-        // Declarations are scanned in FunctionId order and every eligible
-        // earlier definition is entered in this symbol index.  The old full
-        // prefix walk made initial declaration quadratic for large units
-        // (8k+ functions in a split project).  A bodyless extern declaration
-        // may legitimately own the first slot for a symbol, so preserve the
-        // exact old scan only for that same-symbol collision case.
-        let indexed = llvm_mir_symbol_index_get(self.function_symbol_index,
-                                                self.function_symbol_index_cap,
-                                                symbol);
-        if (indexed != mir_id_invalid() && indexed < function_id) {
-            if (self.m.function_first_block(indexed) != mir_id_invalid()
-                && !self.function_is_interface_prototype_body(indexed)
-                && !self.function_has_open_template_types(indexed)) {
-                return true;
-            }
-        } else if (indexed == function_id
-            || (indexed == mir_id_invalid()
-                && self.function_symbol_index != null
-                && self.m.function_count < self.function_symbol_index_cap)) {
-            // put_first records the first owner. If that owner is this
-            // function, or the exact index misses under a non-full table,
-            // no earlier body shares the symbol. Falling through would scan
-            // 1..function_id-1 and remangle every prior name on each emit.
-            return false;
-        }
-        var cur: i32 = 1;
-        while (cur < function_id) {
-            if (self.m.function_first_block(cur) != mir_id_invalid()
-                && !self.function_is_interface_prototype_body(cur)
-                && self.function_symbol_name(cur) == symbol
-                && !self.function_has_open_template_types(cur)) {
-                return true;
-            }
-            cur = cur + 1;
-        }
-        return false;
+        let previous = self.function_previous_native_definition(function_id, symbol);
+        if (previous == mir_id_invalid()) { return false; }
+        self.function_native_definition_binding_compatible(function_id, previous, symbol);
+        return true;
     }
 
     public fn function_return_kind(self, function_id: i32) -> i32 {
@@ -1094,6 +1155,13 @@ impl LlvmMirLowerer {
                                              symbol: string,
                                              expected_type: rawptr) -> i32 {
         if (function_id == mir_id_invalid() || symbol.len == 0 || expected_type == null) { return 0; }
+        if (self.function_owns_native_definition(function_id)) {
+            let previous = self.function_previous_native_definition(function_id, symbol);
+            if (previous != mir_id_invalid()
+                && !self.function_native_definition_binding_compatible(function_id, previous, symbol)) {
+                return -1;
+            }
+        }
         let indexed = llvm_mir_symbol_index_get(self.function_symbol_index,
                                                 self.function_symbol_index_cap,
                                                 symbol);

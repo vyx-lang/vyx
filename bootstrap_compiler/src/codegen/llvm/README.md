@@ -142,3 +142,10 @@ multiple CGUs, and cold/warm/incremental project builds.
 
 For source builds and the hello, fixed-point and DCI gates, use the
 [compiler README](../../../README.md) and [verification guide](../../../../docs/TESTING_GUIDE.md).
+
+Borrow formation resolves a place's storage representation before creating a
+pointer handle. An owning value-class receiver uses a pointer slot even when
+ordinary locals of that type use inline storage. `&self` / `&mut self` must
+load the object pointer from that slot. The optional region hoist excludes
+these slots. See the [receiver borrow gate](../../../../probes/gates/receiver-borrow/README.md)
+and the quadratic/cubic path calls in `zyn_render_smoke`.

@@ -2461,6 +2461,19 @@ fn sema_const_i64_value(e: rawptr) -> i64 {
     return 0;
 }
 
+fn sema_ct_call_decl(e: rawptr) -> rawptr {
+    if (e == null || expr_get_kind(e) != ex_CALL()) { return null; }
+    // INDIRECT_FN targets are symbol records, not declarations. Inspect the
+    // semantic tag before using any Decl accessor on the target pointer.
+    let kind = expr_get_semantic_kind(e);
+    if (kind != expr_sem_DIRECT_FN() && kind != expr_sem_METHOD()) { return null; }
+    let d = expr_get_semantic_target(e);
+    if (d == null) { return null; }
+    let dk = decl_get_kind(d);
+    if (dk != de_FN() && dk != de_METHOD()) { return null; }
+    return d;
+}
+
 fn sema_decl_is_comptime_callable(d: rawptr) -> bool {
     if (d == null) { return false; }
     let meta = decl_get_meta(d);
@@ -2687,7 +2700,7 @@ fn sema_ct_eval_known(e: rawptr, env: string, depth: i32) -> bool {
             }
             return true;
         }
-        let fdecl = expr_get_semantic_target(e);
+        let fdecl = sema_ct_call_decl(e);
         if (fdecl == null || !sema_decl_is_comptime_callable(fdecl)) { return false; }
         while (acell != null) {
             let ae2 = stmt_get_init(acell);
@@ -2755,7 +2768,8 @@ fn sema_ct_eval_value(e: rawptr, env: string, depth: i32) -> i64 {
             let path = expr_get_str_val(path_e);
             return vyx_bootstrap_file_size(path.c_str());
         }
-        let fdecl = expr_get_semantic_target(e);
+        let fdecl = sema_ct_call_decl(e);
+        if (fdecl == null || !sema_decl_is_comptime_callable(fdecl)) { return 0; }
         return sema_ct_exec_fn_value(fdecl, e, env, depth + 1);
     }
     return 0;
@@ -2962,7 +2976,7 @@ fn sema_ct_exec_fn_value(fdecl: rawptr, call_e: rawptr, env: string, depth: i32)
 
 fn sema_try_fold_comptime_call(e: rawptr) {
     if (e == null || expr_get_kind(e) != ex_CALL()) { return; }
-    let fdecl = expr_get_semantic_target(e);
+    let fdecl = sema_ct_call_decl(e);
     if (fdecl == null || !sema_decl_is_comptime_callable(fdecl)) { return; }
     if (!sema_ct_eval_known(e, "", 0)) { return; }
     sema_expr_rewrite_int(e, sema_ct_eval_value(e, "", 0));
@@ -5500,7 +5514,8 @@ public fn sema_module_exports_name(self, mod: string, name: string) -> bool {
             let candidate_decl = sym_get_decl(scan);
             if (candidate_decl != null
                 && (decl_get_kind(candidate_decl) == de_CLASS()
-                    || decl_get_kind(candidate_decl) == de_ENUM())) {
+                    || decl_get_kind(candidate_decl) == de_ENUM())
+                && !string_contains(decl_get_generic_params(candidate_decl), "|kind:impl")) {
                 let sm = policy_module_base(self.decl_source_module(candidate_decl, null));
                 let same_chunk = sm.len > 0 && sm == scope;
                 if (!decl_marked_imported(candidate_decl) || same_chunk) {
@@ -5534,7 +5549,8 @@ public fn sema_module_exports_name(self, mod: string, name: string) -> bool {
             let candidate_decl = sym_get_decl(node);
             if (candidate_decl != null
                 && (decl_get_kind(candidate_decl) == de_CLASS()
-                    || decl_get_kind(candidate_decl) == de_ENUM())) {
+                    || decl_get_kind(candidate_decl) == de_ENUM())
+                && !string_contains(decl_get_generic_params(candidate_decl), "|kind:impl")) {
                 let sm = policy_module_base(self.decl_source_module(candidate_decl, null));
                 let same_chunk = sm.len > 0 && sm == scope;
                 if (!decl_marked_imported(candidate_decl) || same_chunk) {
@@ -7456,6 +7472,11 @@ public fn sema_expand_short_name(self, name: string, report: bool) -> string {
         if (module_name.len == 0) { return true; }
         if (d == null) { return false; }
         return self.decl_source_module(d, null) == module_name;
+    }
+
+    fn sema_func_decl_matches_scope(self, d: rawptr, module_name: string, exact_scope: bool) -> bool {
+        if (!exact_scope) { return self.sema_func_decl_matches_module(d, module_name); }
+        return d != null && self.decl_source_module(d, null) == module_name;
     }
 
 
@@ -9618,6 +9639,50 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         self.mark_local_moved(local_ent, name);
     }
 
+    // A field expression is a place with its own ownership state. Treating
+    // `owner.field` as an anonymous value leaves the field live in the
+    // aggregate after a move, so its destructor runs twice and a later read
+    // observes freed storage. Track the direct `local.field` form here; a
+    // nested member or indexed place has no field-path state yet and is
+    // rejected while it still carries an owning value.
+    public fn mark_field_moved_if_transfer(self, e: rawptr, ty_ref: rawptr, skip_shared: bool) {
+        if (e == null) { return; }
+        let kind = expr_get_kind(e);
+        if (kind != ex_MEMBER() && kind != ex_INDEX()) { return; }
+        let source_type = expr_get_ty(e);
+        let destination_type = self.resolve_type_alias_ref(ty_ref);
+        if (source_type == null || destination_type == null
+            || self.type_is_copy(destination_type)
+            || !self.type_is_heap_owning(source_type)) { return; }
+        if (skip_shared && (self.type_is_ref_like(destination_type)
+                            || self.type_is_scope_like(destination_type))) { return; }
+
+        if (kind == ex_INDEX()) {
+            self.report_error_coded(diag_code_v_move_001(),
+                                    expr_loc_ptr(e),
+                                    "cannot move an owning value out of an indexed place; clone it explicitly or rebind the element");
+            return;
+        }
+
+        let obj = expr_get_lhs(e);
+        if (obj == null || expr_get_kind(obj) != ex_IDENT()) {
+            self.report_error_coded(diag_code_v_move_001(),
+                                    expr_loc_ptr(e),
+                                    "cannot move an owning value out of a nested field place; rebind the field or clone it explicitly");
+            return;
+        }
+        let field = generic_call_base(expr_get_name(e));
+        if (field.len == 0) { return; }
+        // MIR drop glue currently owns the aggregate as one unit and has no
+        // field-level moved bit. Keep this operation fail-closed until that
+        // representation exists; otherwise the aggregate destructor would
+        // release the field again after this transfer.
+        self.report_error_coded(diag_code_v_move_001(),
+                                expr_loc_ptr(e),
+                                "cannot move owning field '" + expr_get_name(obj) + "." + field
+                                    + "' independently; clone it explicitly or move the containing object");
+    }
+
     public fn param_is_reference(self, p: rawptr) -> bool {
         if (p == null) { return false; }
         let pty = decl_get_ty(p);
@@ -10341,8 +10406,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
             if (receiver_state == sema_alloc_state_borrowed_immutable()
                 && receiver_mode != sema_receiver_mode_shared()) {
                 let cpp_this_on_copy = self.type_has_copy_dup(obj_ty)
-                    && (receiver_mode == sema_receiver_mode_mut()
-                        || receiver_mode == sema_receiver_mode_compat());
+                    && receiver_mode == sema_receiver_mode_compat();
                 if (!cpp_this_on_copy) {
                     self.report_error_help(diag_code_v_borrow_invalidation(),
                                             expr_loc_ptr(callee),
@@ -10757,7 +10821,52 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
             && ek != ty_MUTREF()) {
             return false;
         }
+        if ((ek == ty_PTR() || ek == ty_REF() || ek == ty_MUTREF())
+            && (ak == ty_PTR() || ak == ty_REF() || ak == ty_MUTREF())) {
+            // Addresses preserve the pointee's identity and storage layout.
+            // Value widening (i32 -> i64) and same-tail nominal names cannot
+            // change what an existing address points at.
+            if (ek == ty_MUTREF() && ak == ty_REF()) { return false; }
+            let expected_elem = tref_pointee(expected_resolved);
+            let actual_elem = tref_pointee(actual_resolved);
+            if (ek == ty_PTR() && ak == ty_PTR()
+                && expected_elem != null && actual_elem != null
+                && tref_get_kind(actual_elem) == ty_ARRAY()
+                && tref_get_kind(expected_elem) != ty_ARRAY()) {
+                return self.user_pointee_types_equal(expected_elem, tref_array_elem(actual_elem), 0);
+            }
+            return self.user_pointee_types_equal(tref_pointee(expected_resolved),
+                                                 tref_pointee(actual_resolved), 0);
+        }
         return self.types_compatible(expected_resolved, actual_resolved);
+    }
+
+    fn user_pointee_types_equal(self, expected: rawptr, actual: rawptr, depth: i32) -> bool {
+        if (expected == null || actual == null || depth > 64) { return false; }
+        if (type_name_is_generic(self.cur_generic_params, expected)
+            || type_name_is_generic(self.cur_generic_params, actual)) { return true; }
+        if (self.type_ref_is_newtype(expected) || self.type_ref_is_newtype(actual)) {
+            return type_eq(expected, actual);
+        }
+        let want = self.resolve_type_alias_ref(expected);
+        let got = self.resolve_type_alias_ref(actual);
+        if (want == null || got == null) { return false; }
+        let wk = tref_get_kind(want);
+        let gk = tref_get_kind(got);
+        if (wk != gk) { return false; }
+        if (wk == ty_CLASS()) {
+            let wn = self.sema_canonical_builtin_type_arg(tref_get_name(want), 0);
+            let gn = self.sema_canonical_builtin_type_arg(tref_get_name(got), 0);
+            return wn.len > 0 && wn == gn;
+        }
+        if (wk == ty_PTR() || wk == ty_REF() || wk == ty_MUTREF()) {
+            return self.user_pointee_types_equal(tref_pointee(want), tref_pointee(got), depth + 1);
+        }
+        if (wk == ty_ARRAY()) {
+            return tref_array_size(want) == tref_array_size(got)
+                && self.user_pointee_types_equal(tref_array_elem(want), tref_array_elem(got), depth + 1);
+        }
+        return type_eq(want, got);
     }
 
     public fn expr_adopts_expected_generic_class(self,
@@ -10776,8 +10885,8 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         }
         let expected_name = tref_get_name(expected_resolved);
         let actual_name = tref_get_name(actual_resolved);
-        let expected_base = module_last_segment(generic_call_base(expected_name.clone()));
-        let actual_base = module_last_segment(generic_call_base(actual_name.clone()));
+        let expected_base = self.sema_canonical_builtin_type_arg(generic_call_base(expected_name.clone()), 0);
+        let actual_base = self.sema_canonical_builtin_type_arg(generic_call_base(actual_name.clone()), 0);
         if (expected_base.len == 0 || actual_base.len == 0 || expected_base != actual_base) {
             return false;
         }
@@ -11049,15 +11158,23 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         if (ek == ex_ARRAY_LIT() && tref_get_kind(expected_resolved) == ty_ARRAY()) {
             let elem_ty = tref_array_elem(expected_resolved);
             var cell = expr_get_args(expr);
+            var count: i64 = 0;
             while (cell != null) {
                 let elem_expr = stmt_get_init(cell);
                 if (elem_expr != null && elem_ty != null) {
                     var elem_actual = expr_get_ty(elem_expr);
                     if (elem_actual == null) { elem_actual = self.resolve_expr(elem_expr); }
-                    self.expr_adopts_expected_type(elem_expr, elem_ty, elem_actual);
+                    if (!self.expr_adopts_expected_type(elem_expr, elem_ty, elem_actual)
+                        && !self.types_compatible_user_value(elem_ty, elem_actual)) {
+                        return false;
+                    }
                 }
+                count = count + 1;
                 cell = stmt_get_next(cell);
             }
+            let expected_size_expr = tref_array_size_expr(expected_resolved);
+            if (expected_size_expr != null && sema_const_i64_known(expected_size_expr)
+                && count != sema_const_i64_value(expected_size_expr)) { return false; }
             expr_set_ty(expr, expected);
             return true;
         }
@@ -11071,7 +11188,10 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                 if (elem_expr2 != null && elem_ty2 != null) {
                     var elem_actual2 = expr_get_ty(elem_expr2);
                     if (elem_actual2 == null) { elem_actual2 = self.resolve_expr(elem_expr2); }
-                    self.expr_adopts_expected_type(elem_expr2, elem_ty2, elem_actual2);
+                    if (!self.expr_adopts_expected_type(elem_expr2, elem_ty2, elem_actual2)
+                        && !self.types_compatible_user_value(elem_ty2, elem_actual2)) {
+                        return false;
+                    }
                 }
                 idx = idx + 1;
                 cell2 = stmt_get_next(cell2);
@@ -11116,18 +11236,31 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         let same_sign = (type_kind_is_signed_int(ek) && type_kind_is_signed_int(ak))
             || (type_kind_is_unsigned_int(ek) && type_kind_is_unsigned_int(ak));
         if (!same_sign) { return false; }
+        let expected_bits = type_kind_int_bits(ek);
+        let actual_bits = type_kind_int_bits(ak);
+        if (expected_bits <= 0 || actual_bits <= 0 || actual_bits > expected_bits) {
+            return false;
+        }
         expr_set_ty(expr, expected_resolved);
         return true;
     }
 
     public fn expr_adopts_expected_int_literal(self, expr: rawptr, expected: rawptr) -> bool {
         if (expr == null || expected == null) { return false; }
-        if (expr_get_kind(expr) != ex_INT_LIT()) { return false; }
+        var literal = expr;
+        var negative = false;
+        if (expr_get_kind(expr) == ex_UNARY() && expr_get_op(expr) == tk_MINUS()) {
+            literal = expr_get_lhs(expr);
+            negative = true;
+        }
+        if (literal == null || expr_get_kind(literal) != ex_INT_LIT()) { return false; }
         var expected_resolved = self.resolve_type_alias_ref(expected);
         if (expected_resolved == null) { expected_resolved = expected; }
         let ek = tref_get_kind(expected_resolved);
         if (!type_kind_is_int(ek)) { return false; }
-        if (!sema_int_literal_fits_type_kind(expr_get_int_val(expr), ek)) { return false; }
+        var literal_value = expr_get_int_val(literal);
+        if (negative) { literal_value = -literal_value; }
+        if (!sema_int_literal_fits_type_kind(literal_value, ek)) { return false; }
         expr_set_ty(expr, expected_resolved);
         return true;
     }
@@ -11612,8 +11745,97 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         if (switched) { diag_set_source_context(saved_path, self.sema_diag_cached_read(saved_path)); }
     }
 
+    // Vyx function identity includes its complete declaring module.  The flat
+    // symbol chain also holds other modules' overloads, so keep searching past
+    // them to find a real duplicate in this declaration's own module.  Extern
+    // prototypes retain their separate, existing ABI-level duplicate rules.
+    fn sym_find_dup_fn_same_sig_in_module(self, name: string, declaration: rawptr) -> rawptr {
+        let module_name = self.decl_source_module(declaration, null);
+        var cur = self.funcs_buf;
+        while (cur != null) {
+            if (sym_get_name(cur) == name) {
+                let candidate = sym_get_decl(cur);
+                if (candidate != null
+                    && self.decl_source_module(candidate, null) == module_name
+                    && decl_params_type_equal(candidate, declaration)) {
+                    return cur;
+                }
+            }
+            cur = sym_get_next(cur);
+        }
+        return null;
+    }
+
+    fn sym_find_generic_fn_same_arity_in_module(self,
+                                               name: string,
+                                               declaration: rawptr,
+                                               arity: i32) -> rawptr {
+        let module_name = self.decl_source_module(declaration, null);
+        var cur = self.funcs_buf;
+        while (cur != null) {
+            if (sym_get_name(cur) == name) {
+                let candidate = sym_get_decl(cur);
+                if (candidate != null
+                    && self.decl_source_module(candidate, null) == module_name
+                    && generic_param_count(decl_get_generic_params(candidate)) == arity) {
+                    return cur;
+                }
+            }
+            cur = sym_get_next(cur);
+        }
+        return null;
+    }
+
+    fn sym_find_full_spec_fn_same_args_in_module(self,
+                                                name: string,
+                                                declaration: rawptr,
+                                                args: string) -> rawptr {
+        let module_name = self.decl_source_module(declaration, null);
+        var cur = self.funcs_buf;
+        while (cur != null) {
+            if (sym_get_name(cur) == name) {
+                let candidate = sym_get_decl(cur);
+                if (candidate != null
+                    && self.decl_source_module(candidate, null) == module_name
+                    && sema_meta_is_full_concrete_spec(decl_get_generic_params(candidate))
+                    && sema_generic_params_prefix(decl_get_generic_params(candidate)) == args) {
+                    return cur;
+                }
+            }
+            cur = sym_get_next(cur);
+        }
+        return null;
+    }
+
     public fn collect_decls(self, unit_ptr: rawptr) -> i32 {
         if (unit_ptr == null) { return 0; }
+        // Source lists do not impose a declaration order. Register nominal
+        // class identities before impl targets are bound; checking members
+        // and merging implementations still happens in the ordinary pass.
+        var nominal = unit_get_decls(unit_ptr);
+        while (nominal != null) {
+            if ((decl_get_kind(nominal) == de_CLASS()
+                    && self.decl_is_layout_class(nominal))
+                || decl_get_kind(nominal) == de_ENUM()) {
+                let nominal_name = decl_get_name(nominal);
+                let nominal_gp = decl_get_generic_params(nominal);
+                var nominal_key = nominal_name;
+                if (sema_meta_is_full_concrete_spec(nominal_gp)) {
+                    nominal_key = sema_specialized_class_key(nominal_name, nominal_gp);
+                }
+                if (sym_lookup(self.classes_buf, nominal_key.clone()) == null) {
+                    self.classes_buf = sym_push_decl(self.classes_buf, nominal_key.clone(), nominal);
+                    self.class_count = self.class_count + 1;
+                    let short_key = module_last_segment(nominal_key.clone());
+                    if (!decl_marked_imported(nominal)
+                        && short_key.len > 0 && short_key != nominal_key
+                        && sym_lookup(self.classes_buf, short_key.clone()) == null) {
+                        self.classes_buf = sym_push_decl(self.classes_buf, short_key, nominal);
+                    }
+                }
+            }
+            nominal = decl_get_next(nominal);
+        }
         var cur = unit_get_decls(unit_ptr);
         while (cur != null && !self.too_many_errors()) {
             sema_stamp_loc_from_decl(cur);
@@ -11640,6 +11862,35 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                                                        cur,
                                                        sema_generic_params_prefix(cur_gp));
                 }
+                if (string_contains(cur_gp, "|kind:impl")
+                    && policy_primitive_type_kind(name) == 0) {
+                    // An impl-only file may keep a short target spelling.
+                    // Bind it using that declaration's imports, before the
+                    // impl can register an empty nominal shell under it.
+                    let saved_chunk = self.cur_chunk_module;
+                    let saved_owner = self.cur_owner_decl;
+                    let saved_imported = self.in_imported_scope;
+                    self.cur_chunk_module = self.decl_source_module(cur, null);
+                    self.cur_owner_decl = cur;
+                    self.in_imported_scope = decl_marked_imported(cur);
+                    self.sema_lazy_load_pending_until_symbol(name);
+                    let expanded_target = self.sema_expand_short_name(name.clone(), true);
+                    if (expanded_target.len > 0) {
+                        let target_symbol = self.sema_lookup_class_canonical(expanded_target);
+                        if (target_symbol != null) {
+                            let target_decl = sym_get_decl(target_symbol);
+                            if (target_decl != null
+                                && !string_contains(decl_get_generic_params(target_decl), "|kind:impl")
+                                && !string_contains(decl_get_generic_params(target_decl), "|kind:interface")) {
+                                class_key = decl_get_name(target_decl);
+                                decl_set_name(cur, class_key);
+                            }
+                        }
+                    }
+                    self.cur_chunk_module = saved_chunk;
+                    self.cur_owner_decl = saved_owner;
+                    self.in_imported_scope = saved_imported;
+                }
                 let existing_class = sym_lookup(self.classes_buf, class_key.clone());
                 if (existing_class != null
                     && !string_contains(cur_gp, "|kind:impl")
@@ -11665,7 +11916,18 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                         if (trait_name.len > 0) {
                             sema_decl_mark_trait_impl(cd, trait_name);
                         }
-                        self.apply_impl_members(cd, cur);
+                        // Primitive impl blocks are their own dispatch records.
+                        // Flattening them into the first class keyed by the
+                        // primitive name merges methods from unrelated modules
+                        // and leaves duplicate native bodies in HIR.
+                        if (policy_primitive_type_kind(name) == 0) {
+                            self.apply_impl_members(cd, cur);
+                        } else if (cd != cur) {
+                            // Keep each primitive impl as a separate body
+                            // owner. Return-type lookup needs the complete
+                            // overload surface without flattening bodies.
+                            self.classes_buf = sym_push_decl(self.classes_buf, class_key.clone(), cur);
+                        }
                     }
                 } else if (existing_class != null
                     && sym_get_decl(existing_class) == cur) {
@@ -11785,8 +12047,12 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
             } else if (k == de_ENUM()) {
                 let existing_class = sym_lookup(self.classes_buf, name);
                 if (existing_class != null && sym_get_decl(existing_class) == cur) {
-                    cur = decl_get_next(cur);
-                    continue;
+                    // Its identity was preregistered above. Variants still
+                    // need their callable and payload facts collected here.
+                    if (string_contains(decl_get_meta(cur), "|sema_enum_variants_collected|")) {
+                        cur = decl_get_next(cur);
+                        continue;
+                    }
                 } else if (existing_class != null
                     && decl_marked_imported(cur)
                     && decl_marked_imported(sym_get_decl(existing_class))) {
@@ -11812,6 +12078,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                     }
                     vc = decl_get_next(vc);
                 }
+                decl_set_meta(cur, decl_get_meta(cur) + "|sema_enum_variants_collected|");
             } else if (k == de_TYPE_ALIAS()) {
                 let existing_class = sym_lookup(self.classes_buf, name);
                 if (existing_class != null && sym_get_decl(existing_class) == cur) {
@@ -11891,7 +12158,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                                 self.func_count = self.func_count + 1;
                             }
                         } else if (decl_get_kind(child) == de_EXTERN_FN()
-                            && sym_find_dup_fn_same_sig(self.funcs_buf, cname, child) != null) {
+                            && self.sym_find_dup_fn_same_sig_in_module(cname, child) != null) {
                             // Repeated extern C prototypes are legal in the
                             // host pipeline: SymbolTable::declare keeps the
                             // first binding. Std modules often
@@ -11941,7 +12208,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                                 self.func_count = self.func_count + 1;
                             }
                         } else if (decl_get_kind(child) == de_EXTERN_FN()
-                            && sym_find_dup_fn_same_sig(self.funcs_buf, cname, child) != null) {
+                            && self.sym_find_dup_fn_same_sig_in_module(cname, child) != null) {
                             // Repeated extern C prototypes are legal in the
                             // host pipeline: SymbolTable::declare keeps the
                             // first binding. Std modules often
@@ -11955,10 +12222,24 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                     }
                 } else if (sema_meta_is_full_concrete_spec(decl_get_generic_params(cur))) {
                     let spec_args = sema_generic_params_prefix(decl_get_generic_params(cur));
-                    if (sym_find_full_spec_fn_same_args(self.funcs_buf, name, spec_args) != null) {
+                    var dup_specialization: rawptr = null;
+                    if (k == de_FN()) {
+                        dup_specialization = self.sym_find_full_spec_fn_same_args_in_module(name, cur, spec_args);
+                    } else {
+                        dup_specialization = sym_find_full_spec_fn_same_args(self.funcs_buf, name, spec_args);
+                    }
+                    if (dup_specialization != null && sym_get_decl(dup_specialization) == cur) {
+                        // A loaded unit can also participate in the enclosing
+                        // unit's registration pass. Registering the identical
+                        // declaration again is not a second source definition.
+                        cur = decl_get_next(cur);
+                        continue;
+                    }
+                    if (dup_specialization != null) {
                         self.report_error_coded(diag_code_sema_redefinition(),
                                                 g_sema_cur_loc,
-                                                "redefinition of full template specialization '" + name + "::<" + spec_args + ">'");
+                                                "redefinition of full template specialization '" + name + "::<" + spec_args
+                                                    + ">' in module '" + self.decl_source_module(cur, null) + "'");
                     } else {
                         self.funcs_buf = sym_push_decl(self.funcs_buf, name, cur);
                         self.func_count = self.func_count + 1;
@@ -11967,7 +12248,12 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                     mono_scheduler_record_fn_request(self.mono_scheduler, cur, spec_args);
                 } else if (generic_param_count(decl_get_generic_params(cur)) > 0) {
                     let arity = generic_param_count(decl_get_generic_params(cur));
-                    let dup_generic = sym_find_generic_fn_same_arity(self.funcs_buf, name, arity);
+                    var dup_generic: rawptr = null;
+                    if (k == de_FN()) {
+                        dup_generic = self.sym_find_generic_fn_same_arity_in_module(name, cur, arity);
+                    } else {
+                        dup_generic = sym_find_generic_fn_same_arity(self.funcs_buf, name, arity);
+                    }
                     if (dup_generic != null) {
                         if (!decl_marked_imported(cur)
                             && !decl_marked_imported(sym_get_decl(dup_generic))) {
@@ -11983,7 +12269,12 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                         self.func_count = self.func_count + 1;
                     }
                 } else {
-                    var dup_fn = sym_find_dup_fn_same_sig(self.funcs_buf, name, cur);
+                    var dup_fn: rawptr = null;
+                    if (k == de_FN()) {
+                        dup_fn = self.sym_find_dup_fn_same_sig_in_module(name, cur);
+                    } else {
+                        dup_fn = sym_find_dup_fn_same_sig(self.funcs_buf, name, cur);
+                    }
                     if (dup_fn != null) {
                         let prior_decl = sym_get_decl(dup_fn);
                         if (prior_decl != null
@@ -12198,7 +12489,9 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
 
     public fn flatten_inherited_layout(self, cd: rawptr, depth: i32) {
         if (cd == null || depth > 8) { return; }
-        let gp = decl_get_generic_params(cd);
+        // The busy marker replaces AST storage; keep the parent clause alive
+        // while this declaration and its ancestors are updated.
+        let gp = decl_get_generic_params(cd).clone();
         if (string_contains(gp, "|layout_flat:done")) { return; }
         if (string_contains(gp, "|kind:interface")
             || string_contains(gp, "|kind:impl")
@@ -12441,9 +12734,38 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         decl_set_members(cd, member);
     }
 
+    fn impl_member_chain_already_applied(self, cd: rawptr, impl_decl: rawptr) -> bool {
+        if (cd == null || impl_decl == null) { return false; }
+        let trait_name = sema_extract_impl_trait_meta(decl_get_generic_params(impl_decl));
+        if (trait_name.len == 0) { return false; }
+        let first = decl_get_members(impl_decl);
+        if (first == null) { return false; }
+        let first_name = decl_get_name(first);
+        let source = self.sema_decl_source_path(first);
+        if (first_name.len == 0 || source.len == 0) { return false; }
+        let marker = "|impl_trait:" + trait_name + ",";
+        var cur = decl_get_members(cd);
+        while (cur != null) {
+            if (decl_get_name(cur) == first_name
+                && self.sema_decl_source_path(cur) == source
+                && decl_params_type_equal(cur, first)
+                && string_contains(decl_get_meta(cur), marker)) {
+                // The same imported unit can be reached through both its
+                // source registry and a generated interface.  Its impl
+                // members are the same declarations by source identity; do
+                // not attach a second chain, or native lowering will see two
+                // identical trait methods.
+                return true;
+            }
+            cur = decl_get_next(cur);
+        }
+        return false;
+    }
+
     public fn apply_impl_members(self, cd: rawptr, impl_decl: rawptr) {
         if (cd == null || impl_decl == null) { return; }
         let original_members = decl_get_members(impl_decl);
+        if (self.impl_member_chain_already_applied(cd, impl_decl)) { return; }
         var member = original_members;
         var own_count: i64 = 0;
         var collision = false;
@@ -12476,7 +12798,9 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                 decl_set_members(cd, original_members);
             }
         }
-        let gp = decl_get_generic_params(impl_decl);
+        // Updating the member-count marker frees the getter's borrowed buffer.
+        // The signature scan below needs an owned snapshot of that metadata.
+        let gp = decl_get_generic_params(impl_decl).clone();
         decl_set_generic_params(impl_decl,
                                 gp + "|sema_impl_member_count:" + own_count.toString());
         var i: i32 = 0;
@@ -12519,7 +12843,20 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         if (trait_name.len > 0) {
             sema_decl_mark_trait_impl(cd, trait_name);
         }
-        self.apply_impl_members(cd, impl_decl);
+        // `string` is the legacy spelling of the borrowed `str` primitive.
+        // The stdlib keeps both spellings for source compatibility, but they
+        // have one ABI type and therefore one native Clone symbol.  The
+        // canonical `str` impl is sufficient for both spellings.
+        if (target == "string" && trait_name == "Clone") { return; }
+        // Primitive impl blocks are already the lookup surface for primitive
+        // methods.  Flattening them into a synthetic primitive class as well
+        // leaves both the impl container and the aggregate in HIR, so LLVM
+        // sees duplicate definitions such as `Ord for i32`.  Keep the impl
+        // declaration as the single body owner; user-defined record impls
+        // still flatten into their nominal class as before.
+        if (policy_primitive_type_kind(target) == 0) {
+            self.apply_impl_members(cd, impl_decl);
+        }
     }
 
     public fn trait_decl_member_kind(self, trait_decl: rawptr, mname: string) -> i32 {
@@ -12709,6 +13046,9 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
 
     public fn load_primitive_impl_method_symbols(self, method_name: string) -> bool {
         var trait_name = self.primitive_operator_trait_for_method(method_name);
+        if (method_name == "hash") { trait_name = "Hashable"; }
+        if (method_name == "compare") { trait_name = "Ord"; }
+        if (method_name == "clone") { trait_name = "Clone"; }
         if (method_name == "iter" || method_name == "bytes" || method_name == "chars") {
             trait_name = "StrIteratorExt";
         }
@@ -12725,14 +13065,15 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         if (!type_name_is_primitive_text(prim_name)) { return null; }
         var loaded: bool = false;
         while (true) {
-            var ent = sym_lookup(self.classes_buf, prim_name);
-            if (ent == null) {
+            self.ci_kick();
+            var bucket = sema_string_state_map_get(g_ci_map, prim_name);
+            if (bucket <= 0) {
                 let alias_name = primitive_impl_lookup_name(prim_name);
-                if (alias_name != prim_name) {
-                    ent = sym_lookup(self.classes_buf, alias_name);
-                }
+                if (alias_name != prim_name) { bucket = sema_string_state_map_get(g_ci_map, alias_name); }
             }
-            if (ent != null) {
+            var index = (bucket as i64) - 1;
+            while (index >= 0) {
+                let ent = ci_cell_node(index);
                 let cd = sym_get_decl(ent);
                 if (cd != null) {
                     var mp = decl_get_members(cd);
@@ -12750,6 +13091,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                         mp = decl_get_next(mp);
                     }
                 }
+                index = ci_cell_next(index);
             }
             if (loaded) { return null; }
             loaded = self.load_primitive_impl_method_symbols(method_name);
@@ -13792,10 +14134,20 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
     public fn ensure_method_self_param(self, owner_decl: rawptr, method_decl: rawptr) {
         if (owner_decl == null || method_decl == null) { return; }
         if (decl_get_kind(method_decl) != de_METHOD()) { return; }
+        var self_type_name = sema_decl_self_type_name(owner_decl);
+        if (string_contains(decl_get_generic_params(owner_decl), "|kind:impl")
+            && policy_primitive_type_kind(decl_get_name(owner_decl)) == 0) {
+            let target = self.class_decl_for_type_base(decl_get_name(owner_decl));
+            if (target != null && target != owner_decl
+                && !string_contains(decl_get_generic_params(target), "|kind:impl")) {
+                self_type_name = self.sema_type_canonical_name(target);
+                let head = generic_param_head(decl_get_generic_params(owner_decl));
+                if (head.len > 0) { self_type_name = self_type_name + "::<" + head + ">"; }
+            }
+        }
         let first_param = decl_get_params(method_decl);
         if (first_param != null && decl_get_name(first_param) == "self") {
             sema_mark_receiver_compat_if_missing(first_param);
-            let self_type_name = sema_decl_self_type_name(owner_decl);
             let current_self_ty = decl_get_ty(first_param);
             if (current_self_ty == null
                 || tref_get_kind(current_self_ty) == ty_RAWPTR()
@@ -13807,7 +14159,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         }
         if (!decl_get_is_static(method_decl)) {
             let self_param = decl_alloc(de_FIELD(), "self");
-            decl_set_ty(self_param, tref_create_class(sema_decl_self_type_name(owner_decl)));
+            decl_set_ty(self_param, tref_create_class(self_type_name));
             sema_mark_receiver_compat_if_missing(self_param);
             decl_set_next(self_param, first_param);
             decl_set_params(method_decl, self_param);
@@ -14019,12 +14371,21 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         return self.find_owner_decl_in_decls(unit_get_decls(self.current_unit), member);
     }
 
+    fn sema_interface_body_needs_resolution(self, fn_decl: rawptr, owner_decl: rawptr) -> bool {
+        if (!self.prepare_imported_hir_facts || fn_decl == null) { return false; }
+        if (decl_get_body(fn_decl) == null || decl_has_template_head(fn_decl)) { return false; }
+        if (owner_decl != null && decl_has_template_head(owner_decl)) { return false; }
+        return string_contains(decl_get_meta(fn_decl), "|interface-storage|")
+            && (decl_is_foreign_import(fn_decl) || decl_is_foreign_import(owner_decl));
+    }
+
     public fn sema_resolve_decl_body_if_needed(self, fn_decl: rawptr) {
         if (fn_decl == null) { return; }
         if (!self.sema_service_callable_needed(fn_decl)) { return; }
         if (self.too_many_errors()) { return; }
         if (decl_get_body(fn_decl) == null) { return; }
-        if (self.prepare_hir_facts) { return; }
+        if (self.prepare_hir_facts
+            && !self.sema_interface_body_needs_resolution(fn_decl, self.find_owner_decl_for_member(fn_decl))) { return; }
         let meta = decl_get_meta(fn_decl);
         if (string_contains(meta, "|body_resolved") || string_contains(meta, "|body_resolving")) {
             return;
@@ -14069,6 +14430,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
 
     public fn resolve_method_with_owner(self, method_decl: rawptr, owner_decl: rawptr, owner_imported: bool) {
         if (method_decl == null) { return; }
+        self.ensure_method_self_param(owner_decl, method_decl);
         if (!self.sema_service_callable_needed(method_decl)) { return; }
         if (self.too_many_errors()) { return; }
         if (self.prepare_hir_facts
@@ -14635,6 +14997,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
             }
             if (init != null) {
                 self.mark_identifier_moved_if_transfer(init, ty, true);
+                self.mark_field_moved_if_transfer(init, ty, true);
             }
             self.cur_locals = sym_push_local_ex(self.cur_locals, stmt_get_name(sp), ty, k == st_LET());
             var alloc_state = self.expr_alloc_state(init);
@@ -14820,6 +15183,22 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
             }
             let coll_ty = self.resolve_expr(foreach_cond);
             var iter_ty = self.foreach_element_type_from_collection(coll_ty);
+            // The current foreach ABI binds an element value, while a
+            // borrowed collection only exposes the element storage.  For an
+            // owning element that would turn the lowering's raw storage copy
+            // into a second owner.  Reject this shape at the source instead
+            // of allowing codegen to silently emit a double-drop/UAF path;
+            // an element-address Clone lowering can relax this later.
+            let resolved_coll_ty = self.resolve_type_alias_ref(coll_ty);
+            if (resolved_coll_ty != null
+                && (tref_get_kind(resolved_coll_ty) == ty_REF()
+                    || tref_get_kind(resolved_coll_ty) == ty_MUTREF())
+                && iter_ty != null
+                && self.type_is_heap_owning(iter_ty)) {
+                self.report_error_coded(diag_code_v_move_001(),
+                                        expr_loc_ptr(foreach_cond),
+                                        "borrowed iteration of owning element requires Clone lowering; bind a reference or clone explicitly");
+            }
             let iter_name = stmt_get_name(sp);
             if (iter_name.len > 0) {
                 stmt_set_ty(sp, iter_ty);
@@ -16067,7 +16446,10 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
             if (cargs.len > 0) {
                 expr_set_ty(ep, tref_create_class(cname_full));
             } else {
-                expr_set_ty(ep, tref_create_class(sym_get_name(cent)));
+                // The symbol table also contains short import aliases. Keep
+                // the selected declaration's canonical identity on inferred
+                // values, even when another module exports the same name.
+                expr_set_ty(ep, tref_create_class(self.sema_type_canonical_name(sym_get_decl(cent))));
             }
             return expr_get_ty(ep);
         }
@@ -16489,12 +16871,16 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
 
     public fn overload_candidate_count_in_module(self, name: string, module_name: string) -> i32 {
         if (module_name.len == 0) { return self.overload_candidate_count(name); }
+        return self.overload_candidate_count_in_scope(name, module_name, false);
+    }
+
+    fn overload_candidate_count_in_scope(self, name: string, module_name: string, exact_scope: bool) -> i32 {
         var cur = self.funcs_buf;
         var count: i32 = 0;
         while (cur != null) {
             if (sym_get_name(cur) == name
                 && sym_get_decl(cur) != null
-                && self.sema_func_decl_matches_module(sym_get_decl(cur), module_name)) {
+                && self.sema_func_decl_matches_scope(sym_get_decl(cur), module_name, exact_scope)) {
                 count = count + 1;
             }
             cur = sym_get_next(cur);
@@ -16779,10 +17165,14 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         if (tref_get_kind(resolved) != ty_CLASS()) { return false; }
         let name = tref_get_name(resolved);
         if (name.len == 0) { return false; }
-        let base = module_last_segment(generic_call_base(name.clone()));
+        let base = generic_call_base(name.clone());
         if (base.len == 0) { return false; }
         if (policy_generic_call_args(name.clone()).len > 0) { return false; }
         if (policy_primitive_type_kind(base.clone()) != 0) { return false; }
+        // A qualified nominal type is never an unbound template parameter.
+        // Looking up only its tail turns two concrete same-named declarations
+        // into an ambiguous short lookup and incorrectly skips assignment checks.
+        if (string_contains(base, ".")) { return false; }
         return self.class_decl_for_type_base(base) == null;
     }
 
@@ -17120,17 +17510,24 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
     public fn sym_find_generic_overload_for_args(self, name: string, args: string) -> rawptr {
         let arity = generic_arg_count(args);
         if (arity <= 0) { return null; }
+        var primary: rawptr = null;
         var cur = self.funcs_buf;
         while (cur != null) {
             if (sym_get_name(cur) == name) {
                 let fd = sym_get_decl(cur);
                 if (fd != null && generic_param_count(decl_get_generic_params(fd)) == arity) {
-                    return cur;
+                    let meta = decl_get_generic_params(fd);
+                    if (sema_meta_is_full_concrete_spec(meta)) {
+                        if (self.sema_canonical_builtin_type_args(sema_generic_params_prefix(meta))
+                            == self.sema_canonical_builtin_type_args(args)) { return cur; }
+                    } else if (primary == null) {
+                        primary = cur;
+                    }
                 }
             }
             cur = sym_get_next(cur);
         }
-        return null;
+        return primary;
     }
 
     public fn sym_find_generic_overload_for_args_in_module(self,
@@ -17140,21 +17537,36 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         if (module_name.len == 0) {
             return self.sym_find_generic_overload_for_args(name, args);
         }
+        return self.sym_find_generic_overload_for_args_in_scope(name, args, module_name, false);
+    }
+
+    fn sym_find_generic_overload_for_args_in_scope(self,
+                                                          name: string,
+                                                          args: string,
+                                                          module_name: string,
+                                                          exact_scope: bool) -> rawptr {
         let arity = generic_arg_count(args);
         if (arity <= 0) { return null; }
+        var primary: rawptr = null;
         var cur = self.funcs_buf;
         while (cur != null) {
             if (sym_get_name(cur) == name) {
                 let fd = sym_get_decl(cur);
                 if (fd != null
                     && generic_param_count(decl_get_generic_params(fd)) == arity
-                    && self.sema_func_decl_matches_module(fd, module_name)) {
-                    return cur;
+                    && self.sema_func_decl_matches_scope(fd, module_name, exact_scope)) {
+                    let meta = decl_get_generic_params(fd);
+                    if (sema_meta_is_full_concrete_spec(meta)) {
+                        if (self.sema_canonical_builtin_type_args(sema_generic_params_prefix(meta))
+                            == self.sema_canonical_builtin_type_args(args)) { return cur; }
+                    } else if (primary == null) {
+                        primary = cur;
+                    }
                 }
             }
             cur = sym_get_next(cur);
         }
-        return null;
+        return primary;
     }
 
     public fn sym_find_best_scored_overload(self, name: string, call_ep: rawptr) -> rawptr {
@@ -17255,6 +17667,14 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         if (module_name.len == 0) {
             return self.sym_find_best_scored_overload(name, call_ep);
         }
+        return self.sym_find_best_scored_overload_in_scope(name, module_name, call_ep, false);
+    }
+
+    fn sym_find_best_scored_overload_in_scope(self,
+                                                     name: string,
+                                                     module_name: string,
+                                                     call_ep: rawptr,
+                                                     exact_scope: bool) -> rawptr {
         var best_non_gen: rawptr = null;
         var best_gen: rawptr = null;
         var best_non_score: i32 = -1;
@@ -17265,7 +17685,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         while (cur != null) {
             if (sym_get_name(cur) == name) {
                 let fd = sym_get_decl(cur);
-                if (fd != null && self.sema_func_decl_matches_module(fd, module_name)) {
+                if (fd != null && self.sema_func_decl_matches_scope(fd, module_name, exact_scope)) {
                     let s = self.overload_score_decl(call_ep, fd);
                     if (s >= 0) {
                         if (generic_param_count(decl_get_generic_params(fd)) > 0) {
@@ -17353,10 +17773,27 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         if (module_name.len == 0) {
             return self.sym_find_matching_overload(name, call_ep);
         }
-        let candidate_count = self.overload_candidate_count_in_module(name, module_name);
+        return self.sym_find_matching_overload_in_scope(name, module_name, call_ep, false);
+    }
+
+    // Unlike the existing wildcard query, an empty module here denotes the
+    // root namespace. Bare calls use this scope for both named and root bodies.
+    fn sym_find_matching_overload_in_exact_module(self,
+                                                   name: string,
+                                                   module_name: string,
+                                                   call_ep: rawptr) -> rawptr {
+        return self.sym_find_matching_overload_in_scope(name, module_name, call_ep, true);
+    }
+
+    fn sym_find_matching_overload_in_scope(self,
+                                           name: string,
+                                           module_name: string,
+                                           call_ep: rawptr,
+                                           exact_scope: bool) -> rawptr {
+        let candidate_count = self.overload_candidate_count_in_scope(name, module_name, exact_scope);
         if (candidate_count <= 0) { return null; }
         if (candidate_count == 1) {
-            let only = self.sym_find_first_overload_in_module(name, module_name);
+            let only = self.sym_find_first_overload_in_scope(name, module_name, exact_scope);
             let only_decl = sym_get_decl(only);
             if (only_decl != null && !self.decl_call_arity_matches(call_ep, only_decl)) {
                 self.report_no_matching_overload_for_call(name,
@@ -17372,14 +17809,15 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
             explicit_args = policy_generic_call_args(expr_get_name(callee));
         }
         if (explicit_args.len > 0) {
-            let picked = self.sym_find_generic_overload_for_args_in_module(name,
-                                                                           explicit_args,
-                                                                           module_name);
+            let picked = self.sym_find_generic_overload_for_args_in_scope(name,
+                                                                                 explicit_args,
+                                                                                 module_name,
+                                                                                 exact_scope);
             if (picked != null) { return picked; }
         }
-        let scored = self.sym_find_best_scored_overload_in_module(name, module_name, call_ep);
+        let scored = self.sym_find_best_scored_overload_in_scope(name, module_name, call_ep, exact_scope);
         if (scored != null) { return scored; }
-        let first = self.sym_find_first_overload_in_module(name, module_name);
+        let first = self.sym_find_first_overload_in_scope(name, module_name, exact_scope);
         self.report_no_matching_overload_for_call(name,
                                                   call_ep,
                                                   sym_get_decl(first),
@@ -17402,11 +17840,15 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
 
     public fn sym_find_first_overload_in_module(self, name: string, module_name: string) -> rawptr {
         if (module_name.len == 0) { return self.sym_find_first_overload(name); }
+        return self.sym_find_first_overload_in_scope(name, module_name, false);
+    }
+
+    fn sym_find_first_overload_in_scope(self, name: string, module_name: string, exact_scope: bool) -> rawptr {
         var cur = self.funcs_buf;
         while (cur != null) {
             if (sym_get_name(cur) == name && sym_get_decl(cur) != null) {
                 let fd = sym_get_decl(cur);
-                if (self.sema_func_decl_matches_module(fd, module_name)) {
+                if (self.sema_func_decl_matches_scope(fd, module_name, exact_scope)) {
                     return cur;
                 }
             }
@@ -17838,7 +18280,8 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
                                            true)) {
             return tref_create_kind(ty_RAWPTR());
         }
-        if (!self.prepare_hir_facts) {
+        if (!self.prepare_hir_facts
+            || self.sema_interface_body_needs_resolution(method_decl, selected_owner)) {
             let owner_imported = string_contains(decl_get_meta(selected_owner),
                                                  "|imported");
             let method_meta = decl_get_meta(method_decl);
@@ -18159,7 +18602,8 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
                         if (mod_fent != null) {
                             mod_fent = self.sym_find_matching_overload_in_module(fn_name.clone(), module_name.clone(), e);
                             let mod_fdecl = sym_get_decl(mod_fent);
-                            if (mod_fdecl != null && decl_get_kind(mod_fdecl) == de_FN()) {
+                            if (mod_fdecl != null && (decl_get_kind(mod_fdecl) == de_FN()
+                                || decl_get_kind(mod_fdecl) == de_EXTERN_FN())) {
                                 self.sema_resolve_decl_body_if_needed(mod_fdecl);
                                 self.adopt_expected_call_args(e, mod_fdecl);
                                 if (mod_cargs.len == 0
@@ -18558,10 +19002,31 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
         }
 
         var fent: rawptr = null;
-        if (alias_callee_module.len > 0) {
+        var lexical_function_scope_selected = false;
+        let source_callee_base = generic_call_base(selected_callee_name.clone());
+        if (alias_callee_module.len == 0 && callee_selector_at < 0
+            && selected_versioned_function_decl == null
+            && !string_contains(source_callee_base, ".")
+            && !string_contains(source_callee_base, "::")) {
+            // An imported function body belongs to its own module, not the
+            // primary translation unit. Its local overload set hides same-
+            // named functions in other modules before argument scoring.
+            var lexical_module = self.decl_source_module(self.cur_body_decl, self.cur_owner_decl);
+            if (self.cur_body_decl == null && self.cur_chunk_module.len > 0) {
+                lexical_module = self.cur_chunk_module.clone();
+            }
+            if (self.sema_find_func_symbol_in_module(cname.clone(), lexical_module.clone()) != null) {
+                alias_callee_module = lexical_module;
+                lexical_function_scope_selected = true;
+            }
+        }
+        if (lexical_function_scope_selected) {
+            fent = self.sym_find_matching_overload_in_exact_module(cname.clone(), alias_callee_module.clone(), e);
+        } else if (alias_callee_module.len > 0) {
             fent = self.sym_find_matching_overload_in_module(cname.clone(), alias_callee_module.clone(), e);
         }
-        if (fent == null && selected_versioned_function_decl == null) {
+        if (fent == null && selected_versioned_function_decl == null
+            && !lexical_function_scope_selected) {
             fent = self.sym_find_matching_overload(cname, e);
         }
         if (fent == null) {
@@ -18580,7 +19045,7 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
                 // declaration diagnostic emitted above.
                 return tref_create_kind(ty_RAWPTR());
             }
-            if (sym_any_overloaded_name(self.funcs_buf, cname)) {
+            if (!lexical_function_scope_selected && sym_any_overloaded_name(self.funcs_buf, cname)) {
                 fent = self.sym_find_first_overload(cname);
                 if (fent == null) {
                     return tref_create_kind(ty_RAWPTR());
@@ -18836,6 +19301,9 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
         self.place_depth = self.place_depth + 1;
         var ot = self.resolve_expr(obj);
         self.place_depth = self.place_depth - 1;
+        if (ot != null && !self.type_ref_is_newtype(ot)) {
+            ot = self.resolve_type_alias_ref(ot);
+        }
         if (!self.resolving_assign_lhs
             && obj != null
             && expr_get_kind(obj) == ex_IDENT()) {
@@ -18848,12 +19316,23 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
             }
         }
         var ok = tref_get_kind(ot);
+        // Value methods on a shared/mutable reference use the referent's
+        // signature. Pointer stepping continues to use the handle's type.
+        if ((ok == ty_REF() || ok == ty_MUTREF())
+            && policy_pointer_method_kind(mname) == 0) {
+            let referent = tref_pointee(ot);
+            if (referent != null) { ot = referent; ok = tref_get_kind(ot); }
+        }
         if (ok == ty_PTR() || ok == ty_REF() || ok == ty_MUTREF()) {
             let pointee_ty = tref_pointee(ot);
             if (pointee_ty != null && tref_get_kind(pointee_ty) == ty_CLASS()) {
                 ot = pointee_ty;
                 ok = ty_CLASS();
             }
+        }
+        if (ot != null && !self.type_ref_is_newtype(ot)) {
+            ot = self.resolve_type_alias_ref(ot);
+            ok = tref_get_kind(ot);
         }
         if (ok == ty_RAWPTR()
             && obj != null
@@ -19449,7 +19928,56 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
                 }
             }
         }
+        if ((tk == ex_MEMBER() || tk == ex_INDEX() || tk == ex_DEREF())
+            && rhs != null && lt != null && rt != null) {
+            var stored_type = self.resolve_type_alias_ref(lt);
+            if (tk == ex_INDEX()) {
+                // Class indexing is resolved fully by HIR; Sema's generic
+                // expression fallback is i32. A concrete operator signature
+                // can already prove the assignment slot here without guessing
+                // a container name or assuming its first argument is an item.
+                var receiver_type = self.resolve_type_alias_ref(expr_get_ty(expr_get_lhs(target)));
+                if (receiver_type != null
+                    && (tref_get_kind(receiver_type) == ty_REF() || tref_get_kind(receiver_type) == ty_MUTREF())) {
+                    receiver_type = self.resolve_type_alias_ref(tref_pointee(receiver_type));
+                }
+                if (receiver_type != null && tref_get_kind(receiver_type) == ty_CLASS()) {
+                    let receiver_name = tref_get_name(receiver_type);
+                    let receiver_decl = self.class_decl_for_type_base(generic_call_base(receiver_name.clone()));
+                    let index_method = self.class_decl_member_deep(receiver_decl, "operator[]", 0);
+                    let index_owner = self.class_decl_member_owner_deep(receiver_decl, "operator[]", 0);
+                    if (index_method != null && index_owner != null && decl_get_kind(index_method) == de_METHOD()) {
+                        let declared_index_type = decl_get_ty(index_method);
+                        let receiver_args = policy_generic_call_args(receiver_name);
+                        if (declared_index_type != null) {
+                            stored_type = declared_index_type;
+                            if (receiver_args.len > 0) {
+                                stored_type = sema_substitute_type_with_args(declared_index_type,
+                                    decl_get_generic_params(index_owner), receiver_args);
+                            }
+                            stored_type = self.resolve_type_alias_ref(stored_type);
+                        }
+                    }
+                }
+            }
+            if (stored_type != null
+                && (tref_get_kind(stored_type) == ty_REF() || tref_get_kind(stored_type) == ty_MUTREF())) {
+                stored_type = self.resolve_type_alias_ref(tref_pointee(stored_type));
+            }
+            // Concrete numeric storage is already closed in Sema, including
+            // mutable views returned by Vec's index operator. Keep unresolved
+            // owner-generic fields deferred, but never truncate a known slot.
+            if (stored_type != null && type_kind_is_int(tref_get_kind(stored_type))
+                && !self.types_compatible_user_value(stored_type, rt)
+                && !self.type_ref_is_unresolved_generic_placeholder(rt)) {
+                let adopted_integer = self.expr_adopts_expected_type(rhs, stored_type, rt);
+                if (!adopted_integer) {
+                    self.error_mismatch_at("assignment", stored_type, rt, expr_loc_ptr(rhs));
+                }
+            }
+        }
         self.mark_identifier_moved_if_transfer(rhs, lt, false);
+        self.mark_field_moved_if_transfer(rhs, lt, false);
         if (root != null
             && tk == ex_MEMBER()) {
             self.unmark_field_moved(root, generic_call_base(expr_get_name(target)));
@@ -19749,9 +20277,9 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
     /// Bounded Levenshtein distance; returns cap+1 as soon as the distance
     /// provably exceeds `cap`. Names longer than 63 chars are rejected.
     public fn sema_type_edit_distance(self, a: string, b: string, cap: i32) -> i32 {
-        let n: i32 = a.len;
-        let m: i32 = b.len;
-        if (n >= 64 || m >= 64) { return cap + 1; }
+        if (a.len >= 64 || b.len >= 64) { return cap + 1; }
+        let n: i32 = a.len as i32;
+        let m: i32 = b.len as i32;
         if (n - m > cap || m - n > cap) { return cap + 1; }
         var prev = new [i32; 64]();
         var curr = new [i32; 64]();
@@ -21690,6 +22218,15 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
         while (cur != null && !self.too_many_errors()) {
             sema_stamp_loc_from_decl(cur);
             let k = decl_get_kind(cur);
+            // Imported interfaces expose checked signatures and retain bodies
+            // for concrete use. Resolve those bodies from reachable calls;
+            // eagerly visiting the whole library duplicates unrelated facts
+            // in every consumer. Source imports keep their existing pass.
+            if (decl_is_foreign_import(cur)
+                && string_contains(decl_get_meta(cur), "|interface-storage|")) {
+                cur = decl_get_next(cur);
+                continue;
+            }
             if (k == de_FN()) {
                 if (self.sema_hir_fact_root_selected(cur)) {
                     self.sema_resolve_hir_fact_body(cur, null, false);

@@ -379,6 +379,102 @@ impl HirUnitBuilder {
         return self.ensure_function_instance(best_candidate, null, "", best_params, best_args);
     }
 
+    // Reconstruct namespace members structurally. expr_name on a nested
+    // member is only its last segment, not the module's full identity.
+    fn raw_call_namespace_path(self, e: rawptr) -> string {
+        if (e == null) { return ""; }
+        let kind = expr_get_kind(e);
+        if (kind == ex_IDENT()) {
+            let name = expr_get_name(e);
+            if (hir_local_scope_lookup(self.locals, name) != hir_id_invalid()
+                || self.raw_value_decl_for_name(name) != null) { return ""; }
+            return name;
+        }
+        if (kind != ex_MEMBER()) { return ""; }
+        let lhs = self.raw_call_namespace_path(expr_get_lhs(e));
+        let member = expr_get_name(e);
+        if (lhs.len == 0 || member.len == 0) { return ""; }
+        return lhs + "." + member;
+    }
+
+    fn hir_call_namespace_path(self, expr_id: i32) -> string {
+        if (expr_id == hir_id_invalid()
+            || self.unit.expr_target_kind(expr_id) == hir_target_local()
+            || self.unit.expr_target_kind(expr_id) == hir_target_field()) { return ""; }
+        let kind = self.unit.expr_kind(expr_id);
+        if (kind == ex_IDENT()) {
+            let name = self.unit.expr_name(expr_id);
+            if (hir_local_scope_lookup(self.locals, name) != hir_id_invalid()
+                || self.raw_value_decl_for_name(name) != null) { return ""; }
+            return name;
+        }
+        if (kind != ex_MEMBER()) { return ""; }
+        let lhs = self.hir_call_namespace_path(self.unit.expr_lhs(expr_id));
+        let member = self.unit.expr_name(expr_id);
+        if (lhs.len == 0 || member.len == 0) { return ""; }
+        return lhs + "." + member;
+    }
+
+    fn call_namespace_use_alias(self, path: string) -> string {
+        if (self.source_unit == null || path.len == 0) { return path; }
+        // The de_USE metadata encoding is the same one consumed by
+        // raw_value_decl_for_name; aliases belong to the caller's module.
+        let scope = self.current_value_scope_module();
+        var result = "";
+        var cur = unit_get_decls(self.source_unit);
+        while (cur != null) {
+            if (decl_get_kind(cur) == de_USE() && self.decl_source_module(cur) == scope) {
+                let meta = decl_get_meta(cur);
+                var alias = meta.clone();
+                let marker = meta.indexOf("|");
+                if (marker == 0) { alias = ""; }
+                elif (marker > 0) { alias = meta.substring(0, marker); }
+                var expanded = "";
+                if (alias.len > 0 && path == alias) { expanded = decl_get_name(cur); }
+                elif (alias.len > 0 && path.startsWith(alias + ".")) {
+                    expanded = decl_get_name(cur) + path.substring(alias.len, path.len);
+                }
+                if (expanded.len > 0) {
+                    if (result.len > 0 && result != expanded) { return ""; }
+                    result = expanded;
+                }
+            }
+            cur = decl_get_next(cur);
+        }
+        if (result.len > 0) { return result; }
+        return path;
+    }
+
+    fn qualified_call_namespace(self, e: rawptr, callee_expr_id: i32) -> string {
+        var raw_callee = e;
+        if (raw_callee != null && expr_get_kind(raw_callee) == ex_CALL()) {
+            raw_callee = expr_get_lhs(raw_callee);
+        }
+        var path = "";
+        if (raw_callee != null && expr_get_kind(raw_callee) == ex_MEMBER()) {
+            path = self.raw_call_namespace_path(expr_get_lhs(raw_callee));
+        } elif (callee_expr_id != hir_id_invalid()
+            && self.unit.expr_kind(callee_expr_id) == ex_MEMBER()) {
+            path = self.hir_call_namespace_path(self.unit.expr_lhs(callee_expr_id));
+        }
+        return self.call_namespace_use_alias(path);
+    }
+
+    fn qualified_call_has_module_namespace(self, e: rawptr, callee_expr_id: i32) -> bool {
+        let path = self.qualified_call_namespace(e, callee_expr_id);
+        if (path.len == 0) { return false; }
+        let wanted = policy_module_base(path.clone());
+        var cur = self.decl_map.head;
+        while (cur != null) {
+            let d = ast_read_rawptr(cur);
+            if (d != null && policy_module_base(self.decl_source_module(d)) == wanted) {
+                return true;
+            }
+            cur = ast_read_rawptr(ptr_offset(cur, 24));
+        }
+        return false;
+    }
+
     // Imported template artifacts intentionally clear raw semantic pointers.
     // A qualified free call therefore arrives here as a BUILTIN-shaped member
     // with only its module/name identity.  Recover the declaration by the
@@ -392,20 +488,15 @@ impl HirUnitBuilder {
         if (call_expr_id == hir_id_invalid()
             || callee_expr_id == hir_id_invalid()) { return hir_id_invalid(); }
         var raw_callee = e;
-        if (expr_get_kind(raw_callee) == ex_CALL()) { raw_callee = expr_get_lhs(raw_callee); }
+        if (raw_callee != null && expr_get_kind(raw_callee) == ex_CALL()) { raw_callee = expr_get_lhs(raw_callee); }
         var module_name = "";
-        if (raw_callee != null && expr_get_kind(raw_callee) == ex_MEMBER()) {
-            module_name = expr_get_name(expr_get_lhs(raw_callee));
-            if (module_name.len == 0) {
-                let owner_id = self.unit.expr_lhs(callee_expr_id);
-                if (owner_id != hir_id_invalid()) { module_name = self.unit.expr_name(owner_id); }
-            }
-        } elif (self.unit.expr_kind(callee_expr_id) == ex_MEMBER()) {
-            // Expected-type recovery may invoke this routine after the raw
-            // AST has been discarded. The HIR member owner still preserves
-            // the fully qualified module name.
-            let owner_id = self.unit.expr_lhs(callee_expr_id);
-            if (owner_id != hir_id_invalid()) { module_name = self.unit.expr_name(owner_id); }
+        var scope_known = false;
+        let qualified = (raw_callee != null && expr_get_kind(raw_callee) == ex_MEMBER())
+            || self.unit.expr_kind(callee_expr_id) == ex_MEMBER();
+        if (qualified) {
+            module_name = self.qualified_call_namespace(e, callee_expr_id);
+            if (module_name.len == 0) { return hir_id_invalid(); }
+            scope_known = true;
         } else {
             var current_raw = hir_pointer_map_raw_for_item(self.decl_map,
                                                             self.current_item_id);
@@ -413,7 +504,11 @@ impl HirUnitBuilder {
                 current_raw = hir_pointer_map_raw_for_function(self.decl_map,
                                                                self.current_function_id);
             }
-            module_name = hir_builder_decl_source_module(current_raw);
+            if (current_raw == null) {
+                current_raw = self.function_instances.decl_for_function(self.current_function_id);
+            }
+            scope_known = current_raw != null;
+            module_name = self.decl_source_module(current_raw);
             if (module_name.len == 0 && self.current_function_id != hir_id_invalid()) {
                 let disc = self.unit.function_symbol_discriminator(self.current_function_id);
                 let marker = "source=";
@@ -422,41 +517,18 @@ impl HirUnitBuilder {
                     let start = at + marker.len;
                     var end = start;
                     while (end < disc.len && disc.charAt(end) != 124) { end = end + 1; }
-                    if (end > start) { module_name = disc.substring(start, end); }
+                    if (end > start) {
+                        module_name = disc.substring(start, end);
+                        scope_known = true;
+                    }
                 }
             }
         }
         let base = policy_generic_call_base(self.unit.expr_name(callee_expr_id).clone());
         if (base.len == 0) { return hir_id_invalid(); }
-        // A materialized function instance may no longer carry the raw
-        // source item that stamped its module.  Recover an unqualified call's
-        // module only when the exported short name is unique across the
-        // imported declaration set.  Ambiguous names remain fail-closed.
-        if (module_name.len == 0) {
-            var inferred_module = "";
-            var inferred_ambiguous = false;
-            var infer_cur = self.decl_map.head;
-            while (infer_cur != null) {
-                let infer_candidate = ast_read_rawptr(infer_cur);
-                if (infer_candidate != null
-                    && (decl_get_kind(infer_candidate) == de_FN()
-                        || decl_get_kind(infer_candidate) == de_EXTERN_FN())
-                    && policy_generic_call_base(decl_get_name(infer_candidate).clone()) == base) {
-                    let infer_source = hir_builder_decl_source_module(infer_candidate);
-                    if (infer_source.len > 0) {
-                        let normalized = policy_module_base(infer_source.clone());
-                        if (inferred_module.len == 0) {
-                            inferred_module = normalized;
-                        } elif (inferred_module != normalized) {
-                            inferred_ambiguous = true;
-                        }
-                    }
-                }
-                infer_cur = ast_read_rawptr(ptr_offset(infer_cur, 24));
-            }
-            if (inferred_ambiguous || inferred_module.len == 0) { return hir_id_invalid(); }
-            module_name = inferred_module;
-        }
+        // Empty is the root namespace when provenance is known. Never infer
+        // another module from a matching short name when provenance is lost.
+        if (!scope_known) { return hir_id_invalid(); }
         let wanted_module = policy_module_base(module_name.clone());
         let explicit_args = self.resolve_explicit_generic_args_for_call(e);
         var best: rawptr = null;
@@ -470,14 +542,21 @@ impl HirUnitBuilder {
                 && (decl_get_kind(candidate) == de_FN()
                     || decl_get_kind(candidate) == de_EXTERN_FN())
                 && policy_generic_call_base(decl_get_name(candidate).clone()) == base) {
-                let source_module = hir_builder_decl_source_module(candidate);
-                if (source_module.len > 0
-                    && policy_module_base(source_module.clone()) == wanted_module) {
+                let source_module = self.decl_source_module(candidate);
+                if (policy_module_base(source_module.clone()) == wanted_module) {
                     candidate_count = candidate_count + 1;
                     let params = hir_builder_decl_template_params(candidate);
                     var score = -1;
                     if (params.len == 0) {
-                        score = self.free_decl_score_for_call(call_expr_id, candidate, "", "");
+                        let spec_args = hir_builder_decl_concrete_spec_args(candidate);
+                        if (explicit_args.len == 0) {
+                            score = self.free_decl_score_for_call(call_expr_id, candidate, "", "");
+                        } elif (spec_args.len > 0
+                            && self.canonical_type_args_csv(spec_args)
+                                == self.canonical_type_args_csv(explicit_args)) {
+                            score = self.free_decl_score_for_call(call_expr_id, candidate, "", "");
+                            if (score >= 0) { score = score + 100; }
+                        }
                     } else {
                         let bindings = self.infer_hir_call_bindings(call_expr_id,
                                                                     candidate,
@@ -531,7 +610,9 @@ impl HirUnitBuilder {
     fn best_explicit_free_concrete_spec_call_target(self,
                                                            call_expr_id: i32,
                                                            callee_base: string,
-                                                           explicit_args: string) -> i32 {
+                                                           explicit_args: string,
+                                                           source_module: string,
+                                                           owner_module: string) -> i32 {
         if (callee_base.len == 0 || explicit_args.len == 0) { return hir_id_invalid(); }
         var best_candidate: rawptr = null;
         var best_score: i32 = -1;
@@ -541,6 +622,8 @@ impl HirUnitBuilder {
             let candidate = ast_read_rawptr(cur);
             if (candidate != null
                 && decl_get_kind(candidate) == de_FN()
+                && self.decl_source_module(candidate) == source_module
+                && self.decl_source_module(hir_raw_owner_map_get(self.decl_owner_map, candidate)) == owner_module
                 && policy_generic_call_base(decl_get_name(candidate).clone()) == callee_base
                 && hir_builder_decl_concrete_spec_args(candidate) == explicit_args) {
                 let score = self.free_decl_score_for_call(call_expr_id, candidate, "", "");
@@ -639,9 +722,16 @@ impl HirUnitBuilder {
         let explicit_args = self.resolve_explicit_generic_args_for_call(e);
         if (explicit_args.len == 0) { return hir_id_invalid(); }
         let callee_base = policy_generic_call_base(callee_name.clone());
+        // Sema's selected declaration owns this overload set. A specialization
+        // in another module (or another physical migration owner) cannot
+        // participate merely because its short name and arguments match.
+        let source_module = self.decl_source_module(raw_target);
+        let owner_module = self.decl_source_module(hir_raw_owner_map_get(self.decl_owner_map, raw_target));
         let best_concrete_spec = self.best_explicit_free_concrete_spec_call_target(call_expr_id,
                                                                                   callee_base,
-                                                                                  explicit_args);
+                                                                                  explicit_args,
+                                                                                  source_module,
+                                                                                  owner_module);
         if (best_concrete_spec != hir_id_invalid()) { return best_concrete_spec; }
         let hir_template = self.concrete_free_function_target_for_call_expr(e,
                                                                             call_expr_id,

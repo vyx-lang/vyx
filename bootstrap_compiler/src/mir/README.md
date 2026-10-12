@@ -43,6 +43,7 @@ mir/
 | Calls and receiver selection | [calls/dispatch.vyx](builder/calls/dispatch.vyx): `lower_call_expr_value`; [method_resolution.vyx](builder/calls/method_resolution.vyx) |
 | Value match and branch cleanup | [flow/match.vyx](builder/flow/match.vyx); [lifetime/branch_state.vyx](builder/lifetime/branch_state.vyx) |
 | Moves, defer and drop | [lifetime/moves.vyx](builder/lifetime/moves.vyx), [drop.vyx](builder/lifetime/drop.vyx), [scope_exit.vyx](builder/lifetime/scope_exit.vyx) |
+| Temporary owners and borrowed views | [storage/full_expression.vyx](builder/storage/full_expression.vyx): materialization, statement cleanup, conditional moves and view lifetime extension |
 | Late generic bodies and reachability | [functions/hir_materialization.vyx](builder/functions/hir_materialization.vyx), [reachability.vyx](builder/functions/reachability.vyx) |
 | Function body lowering | [functions/body.vyx](builder/functions/body.vyx): `build_function_body` |
 | Streaming and verification | [functions/streaming.vyx](builder/functions/streaming.vyx); [verify/mir_verify.vyx](verify/mir_verify.vyx) |

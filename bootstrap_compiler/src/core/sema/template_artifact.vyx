@@ -2,9 +2,11 @@ module bootstrap.template_artifact;
 
 use std.string;
 use std.fs;
+use std.collections;
 use bootstrap.ast;
+use bootstrap.policy;
 
-// Versioned, relocatable generic-template artifact.
+// Versioned, relocatable generic/inferred-signature AST artifact.
 //
 // The payload is a length-prefixed AST graph.  It never contains an AST
 // address or a sema target pointer: all edges are serialized recursively and
@@ -28,6 +30,9 @@ var g_ta_decode_nodes: i64 = 0;
 var g_ta_decode_depth: i32 = 0;
 var g_ta_emit_depth: i32 = 0;
 var g_ta_nodes: i64 = 0;
+var g_ta_emit_parts: Vec<string>;
+var g_ta_emit_starts: Vec<i64>;
+var g_ta_emit_bytes: i64 = 0;
 // The v1 graph keeps `next` as an ordinary nested field.  These scratch
 // slots let the decoder parse one record at a time and reconnect a chain
 // iteratively, without adding a field or changing the wire format.
@@ -59,6 +64,7 @@ fn ta_decode_enter() -> bool {
 fn ta_decode_leave() { g_ta_decode_depth = g_ta_decode_depth - 1; }
 
 fn ta_emit_enter() -> bool {
+    if (g_ta_error.len > 0) { return false; }
     g_ta_emit_depth = g_ta_emit_depth + 1;
     if (g_ta_emit_depth > TA_MAX_GRAPH_DEPTH) {
         g_ta_emit_depth = g_ta_emit_depth - 1;
@@ -117,20 +123,27 @@ public fn template_artifact_last_error() -> string { return g_ta_error.clone(); 
 
 fn ta_i64(v: i64) -> string { return v.toString(); }
 
-fn ta_hex_digit(v: i32) -> string {
-    let digits = "0123456789ABCDEF";
-    return digits.substring(v & 15, (v & 15) + 1);
-}
-
 fn ta_hex(s: string) -> string {
-    var out = "";
+    // Artifact payloads can contain megabytes. Repeated concatenation kept
+    // every growing prefix in the string arena: quadratic memory use during
+    // shallow interface emission, even with a single frontend process.
+    if (s.len > TA_MAX_GRAPH_BYTES) { ta_fail("template artifact hex input limit"); return ""; }
+    let n = s.len * 2;
+    let out = vyx_frontend_alloc((n + 1) as u64);
+    if (out == null) { ta_fail("template artifact allocation failure"); return ""; }
+    let digits = "0123456789ABCDEF";
     var i: i64 = 0;
     while (i < s.len) {
         let c = s.charAt(i as i32) & 255;
-        out = out + ta_hex_digit(c >> 4) + ta_hex_digit(c);
+        var high: i32 = digits.charAt(c >> 4);
+        var low: i32 = digits.charAt(c & 15);
+        memcpy(out + i * 2, to_rawptr(&high), 1);
+        memcpy(out + i * 2 + 1, to_rawptr(&low), 1);
         i = i + 1;
     }
-    return out;
+    var z: i32 = 0;
+    memcpy(out + n, to_rawptr(&z), 1);
+    return from_raw_string_parts(out, n, n + 1, 2);
 }
 
 fn ta_unhex(s: string) -> string {
@@ -171,155 +184,189 @@ fn ta_record(tag: string, fields: string) -> string {
     return ta_field(tag) + fields;
 }
 
-fn ta_emit_type(p: rawptr) -> string {
-    if (p == null) { return ""; }
-    if (!ta_emit_enter()) { return ""; }
+// Plan wire fragments in order, resolving each field's decimal length after
+// its children. No fragment contains a copied subtree or chain suffix. The
+// final buffer is allocated once; v1 bytes remain identical to the recursive
+// string encoder, including the nested `next` fields.
+fn ta_emit_text(text: string) {
+    if (g_ta_error.len > 0) { return; }
+    if (text.len > TA_MAX_GRAPH_BYTES - g_ta_emit_bytes) {
+        ta_fail("template artifact graph limit"); return;
+    }
+    g_ta_emit_starts.push(g_ta_emit_bytes);
+    g_ta_emit_parts.push(text.clone());
+    g_ta_emit_bytes = g_ta_emit_bytes + text.len;
+}
+
+fn ta_emit_field(text: string) {
+    if (text.len > TA_MAX_FIELD_BYTES) { ta_fail("template artifact field limit"); return; }
+    ta_emit_text(ta_field(text));
+}
+
+fn ta_emit_field_begin() -> i64 {
+    if (g_ta_error.len > 0) { return -1; }
+    let slot = g_ta_emit_parts.len;
+    ta_emit_text("");
+    return slot;
+}
+
+fn ta_emit_field_end(slot: i64) {
+    if (slot < 0 || g_ta_error.len > 0) { return; }
+    let size = g_ta_emit_bytes - g_ta_emit_starts.get(slot);
+    if (size > TA_MAX_FIELD_BYTES) { ta_fail("template artifact field limit"); return; }
+    let prefix = ta_i64(size) + ":";
+    if (prefix.len > TA_MAX_GRAPH_BYTES - g_ta_emit_bytes) {
+        ta_fail("template artifact graph limit"); return;
+    }
+    g_ta_emit_parts.set(slot, prefix.clone());
+    g_ta_emit_bytes = g_ta_emit_bytes + prefix.len;
+}
+
+fn ta_emit_edge(tag: i32, p: rawptr) {
+    let slot = ta_emit_field_begin();
+    if (tag == 1) { ta_emit_type(p); }
+    elif (tag == 2) { ta_emit_expr(p); }
+    elif (tag == 3) { ta_emit_stmt(p); }
+    elif (tag == 4) { ta_emit_decl(p); }
+    ta_emit_field_end(slot);
+}
+
+fn ta_emit_type(p: rawptr) {
+    if (p == null || !ta_emit_enter()) { return; }
     let k = tref_get_kind(p);
-    var out = ta_record("T", ta_field(ta_i64(k)));
-    var name = tref_get_name(p);
-    out = out + ta_field(ta_hex(name));
-    var a = "";
-    var b = "";
+    ta_emit_field("T");
+    ta_emit_field(ta_i64(k));
+    ta_emit_field(ta_hex(tref_get_name(p)));
+    let a = ta_emit_field_begin();
     if (k == ty_PTR() || k == ty_REF() || k == ty_MUTREF()) {
-        a = ta_emit_type(tref_pointee(p));
+        ta_emit_type(tref_pointee(p));
     } elif (k == ty_ARRAY()) {
-        a = ta_emit_type(tref_array_elem(p));
-        b = ta_emit_expr(tref_array_size_expr(p));
+        ta_emit_type(tref_array_elem(p));
     } elif (k == ty_TUPLE()) {
         let n = tref_tuple_count(p);
-        b = ta_i64(n);
         var i: i64 = 0;
-        while (i < n) { a = a + ta_field(ta_emit_type(tref_tuple_elem_at(p, i))); i = i + 1; }
+        while (i < n && g_ta_error.len == 0) { ta_emit_edge(1, tref_tuple_elem_at(p, i)); i = i + 1; }
     } elif (k == ty_FN() || k == ty_CFN()) {
-        a = ta_emit_type(tref_fn_params(p));
-        b = ta_emit_type(tref_fn_ret(p));
+        ta_emit_type(tref_fn_params(p));
     }
-    out = out + ta_field(a) + ta_field(b);
-    out = out + ta_field(ta_i64(tref_loc_line(p))) + ta_field(ta_i64(tref_loc_col(p)))
-              + ta_field(ta_i64(tref_loc_end_line(p))) + ta_field(ta_i64(tref_loc_end_col(p)));
+    ta_emit_field_end(a);
+    let b = ta_emit_field_begin();
+    if (k == ty_ARRAY()) { ta_emit_expr(tref_array_size_expr(p)); }
+    elif (k == ty_TUPLE()) { ta_emit_text(ta_i64(tref_tuple_count(p))); }
+    elif (k == ty_FN() || k == ty_CFN()) { ta_emit_type(tref_fn_ret(p)); }
+    ta_emit_field_end(b);
+    ta_emit_field(ta_i64(tref_loc_line(p))); ta_emit_field(ta_i64(tref_loc_col(p)));
+    ta_emit_field(ta_i64(tref_loc_end_line(p))); ta_emit_field(ta_i64(tref_loc_end_col(p)));
     ta_emit_leave();
-    return out;
 }
 
-fn ta_emit_expr(p: rawptr) -> string {
-    if (p == null) { return ""; }
-    if (!ta_emit_enter()) { return ""; }
+fn ta_emit_expr(p: rawptr) {
+    if (p == null || !ta_emit_enter()) { return; }
     let ek = expr_get_kind(p);
     var lhs_tag: i32 = 0; var rhs_tag: i32 = 0; var args_tag: i32 = 0;
-    var lhs = ""; var rhs = ""; var args = "";
     if (ek == ex_CLOSURE()) {
-        lhs_tag = 3; lhs = ta_emit_stmt(expr_get_lhs(p));
-        rhs_tag = 1; rhs = ta_emit_type(expr_get_rhs(p));
-        args_tag = 4; args = ta_emit_decl(expr_get_args(p));
+        lhs_tag = 3; rhs_tag = 1; args_tag = 4;
     } elif (ek == ex_IF_EXPR()) {
-        lhs_tag = 2; lhs = ta_emit_expr(expr_get_lhs(p));
-        rhs_tag = 3; rhs = ta_emit_stmt(expr_get_rhs(p));
-        if (expr_get_args(p) != null && expr_get_kind(expr_get_args(p)) == ex_IF_EXPR()) { args_tag = 2; args = ta_emit_expr(expr_get_args(p)); }
-        else { args_tag = 3; args = ta_emit_stmt(expr_get_args(p)); }
+        lhs_tag = 2; rhs_tag = 3;
+        if (expr_get_args(p) != null && expr_get_kind(expr_get_args(p)) == ex_IF_EXPR()) { args_tag = 2; }
+        else { args_tag = 3; }
     } elif (ek == ex_NEW() || ek == ex_DELETE()) {
-        lhs_tag = 2; lhs = ta_emit_expr(expr_get_lhs(p)); rhs_tag = 2; rhs = ta_emit_expr(expr_get_rhs(p));
-        args_tag = 3; args = ta_emit_stmt(expr_get_args(p));
+        lhs_tag = 2; rhs_tag = 2; args_tag = 3;
     } else {
-        if (expr_get_lhs(p) != null) { lhs_tag = 2; lhs = ta_emit_expr(expr_get_lhs(p)); }
-        if (expr_get_rhs(p) != null) { rhs_tag = 2; rhs = ta_emit_expr(expr_get_rhs(p)); }
-        if (ek == ex_TERNARY()) { args_tag = 2; args = ta_emit_expr(expr_get_args(p)); }
-        else { args_tag = 3; args = ta_emit_stmt(expr_get_args(p)); }
+        if (expr_get_lhs(p) != null) { lhs_tag = 2; }
+        if (expr_get_rhs(p) != null) { rhs_tag = 2; }
+        if (ek == ex_TERNARY()) { args_tag = 2; }
+        else { args_tag = 3; }
     }
     var capture_tag: i32 = 3;
-    var capture = "";
+    var capture_edge: i32 = 2;
     if (ek == ex_NEW() || ek == ex_DELETE()) {
-        capture_tag = 1;
-        capture = ta_emit_type(expr_get_captures(p));
+        capture_tag = 1; capture_edge = 1;
     } elif (ek == ex_CLOSURE()) {
-        capture_tag = 2;
-        capture = ta_emit_stmt(expr_get_captures(p));
-    } else {
-        capture = ta_emit_expr(expr_get_captures(p));
+        capture_tag = 2; capture_edge = 3;
     }
-    var out = ta_record("X", ta_field(ta_i64(ek))
-        + ta_field(ta_i64(expr_get_op(p))) + ta_field(ta_i64(expr_get_int_val(p)))
-        + ta_field(ta_hex(expr_get_str_val(p))) + ta_field(ta_hex(expr_get_name(p)))
-        + ta_field(ta_i64(lhs_tag)) + ta_field(lhs) + ta_field(ta_i64(rhs_tag)) + ta_field(rhs)
-        + ta_field(ta_i64(args_tag)) + ta_field(args) + ta_field(ta_emit_type(expr_get_ty(p)))
-        + ta_field(ta_i64(capture_tag)) + ta_field(capture)
-        + ta_field(ta_i64(expr_get_semantic_kind(p))) + ta_field(ta_i64(expr_get_semantic_flags(p)))
-        + ta_field(ta_i64(expr_loc_line(p))) + ta_field(ta_i64(expr_loc_col(p)))
-        + ta_field(ta_i64(expr_loc_end_line(p))) + ta_field(ta_i64(expr_loc_end_col(p))));
+    ta_emit_field("X"); ta_emit_field(ta_i64(ek));
+    ta_emit_field(ta_i64(expr_get_op(p))); ta_emit_field(ta_i64(expr_get_int_val(p)));
+    ta_emit_field(ta_hex(expr_get_str_val(p))); ta_emit_field(ta_hex(expr_get_name(p)));
+    ta_emit_field(ta_i64(lhs_tag)); ta_emit_edge(lhs_tag, expr_get_lhs(p));
+    ta_emit_field(ta_i64(rhs_tag)); ta_emit_edge(rhs_tag, expr_get_rhs(p));
+    ta_emit_field(ta_i64(args_tag)); ta_emit_edge(args_tag, expr_get_args(p));
+    ta_emit_edge(1, expr_get_ty(p));
+    ta_emit_field(ta_i64(capture_tag)); ta_emit_edge(capture_edge, expr_get_captures(p));
+    ta_emit_field(ta_i64(expr_get_semantic_kind(p))); ta_emit_field(ta_i64(expr_get_semantic_flags(p)));
+    ta_emit_field(ta_i64(expr_loc_line(p))); ta_emit_field(ta_i64(expr_loc_col(p)));
+    ta_emit_field(ta_i64(expr_loc_end_line(p))); ta_emit_field(ta_i64(expr_loc_end_col(p)));
     ta_emit_leave();
-    return out;
 }
 
-fn ta_emit_stmt_node(p: rawptr, next_payload: string) -> string {
-    if (p == null) { return ""; }
-    if (!ta_emit_enter()) { return ""; }
-    let out = ta_record("S", ta_field(ta_i64(stmt_get_kind(p))) + ta_field(ta_hex(stmt_get_name(p)))
-        + ta_field(ta_emit_type(stmt_get_ty(p))) + ta_field(ta_emit_expr(stmt_get_init(p)))
-        + ta_field(ta_emit_expr(stmt_get_cond(p))) + ta_field(ta_emit_stmt(stmt_get_then_blk(p)))
-        + ta_field(ta_emit_stmt(stmt_get_else_blk(p))) + ta_field(ta_emit_stmt(stmt_get_body(p)))
-        + ta_field(next_payload) + ta_field(ta_i64(stmt_get_semantic_kind(p)))
-        + ta_field(ta_i64(stmt_get_semantic_flags(p))) + ta_field(ta_i64(stmt_loc_line(p)))
-        + ta_field(ta_i64(stmt_loc_col(p))) + ta_field(ta_i64(stmt_loc_end_line(p)))
-        + ta_field(ta_i64(stmt_loc_end_col(p))));
+fn ta_emit_stmt_prefix(p: rawptr) {
+    if (!ta_emit_enter()) { return; }
+    ta_emit_field("S"); ta_emit_field(ta_i64(stmt_get_kind(p))); ta_emit_field(ta_hex(stmt_get_name(p)));
+    ta_emit_edge(1, stmt_get_ty(p)); ta_emit_edge(2, stmt_get_init(p)); ta_emit_edge(2, stmt_get_cond(p));
+    ta_emit_edge(3, stmt_get_then_blk(p)); ta_emit_edge(3, stmt_get_else_blk(p)); ta_emit_edge(3, stmt_get_body(p));
     ta_emit_leave();
-    return out;
 }
 
-fn ta_emit_stmt(p: rawptr) -> string {
-    if (p == null) { return ""; }
+fn ta_emit_stmt_suffix(p: rawptr) {
+    ta_emit_field(ta_i64(stmt_get_semantic_kind(p))); ta_emit_field(ta_i64(stmt_get_semantic_flags(p)));
+    ta_emit_field(ta_i64(stmt_loc_line(p))); ta_emit_field(ta_i64(stmt_loc_col(p)));
+    ta_emit_field(ta_i64(stmt_loc_end_line(p))); ta_emit_field(ta_i64(stmt_loc_end_col(p)));
+}
+
+fn ta_emit_stmt(p: rawptr) {
+    if (p == null || g_ta_error.len > 0) { return; }
     var count: i32 = 0;
     var cur = p;
     while (cur != null) {
         count = count + 1;
-        if (count > TA_MAX_GRAPH_NODES) { ta_fail("template artifact statement chain limit"); return ""; }
+        if (count > TA_MAX_GRAPH_NODES) { ta_fail("template artifact statement chain limit"); return; }
         cur = stmt_get_next(cur);
     }
-    let nodes = ast_alloc_zero(count * 8);
-    if (nodes == null) { ta_fail("template artifact statement chain allocation failure"); return ""; }
+    let nodes = ast_alloc_zero(count * 16);
+    if (nodes == null) { ta_fail("template artifact statement chain allocation failure"); return; }
     cur = p;
     var i: i32 = 0;
-    while (cur != null) {
-        ast_write_rawptr(nodes + (i as i64) * 8, cur);
+    while (cur != null && g_ta_error.len == 0) {
+        ast_write_rawptr(nodes + (i as i64) * 16, cur);
+        ta_emit_stmt_prefix(cur);
+        ast_write_i64(nodes + (i as i64) * 16 + 8, ta_emit_field_begin());
         i = i + 1;
         cur = stmt_get_next(cur);
     }
-    var out = "";
-    i = count - 1;
-    while (i >= 0) {
-        out = ta_emit_stmt_node(ast_read_rawptr(nodes + (i as i64) * 8), out);
-        if (g_ta_error.len > 0 || out.len > TA_MAX_GRAPH_BYTES) {
-            if (g_ta_error.len == 0) { ta_fail("template artifact graph limit"); }
-            vyx_frontend_free(nodes); return "";
-        }
+    i = i - 1;
+    while (i >= 0 && g_ta_error.len == 0) {
+        ta_emit_field_end(ast_read_i64(nodes + (i as i64) * 16 + 8));
+        ta_emit_stmt_suffix(ast_read_rawptr(nodes + (i as i64) * 16));
         i = i - 1;
     }
     vyx_frontend_free(nodes);
-    return out;
 }
 
-fn ta_emit_decl_node(p: rawptr, next_payload: string) -> string {
-    if (p == null) { return ""; }
-    if (!ta_emit_enter()) { return ""; }
-    let out = ta_record("F", ta_field(ta_i64(decl_get_kind(p))) + ta_field(ta_i64(decl_get_is_public(p) as i32))
-        + ta_field(ta_i64(decl_get_is_static(p) as i32)) + ta_field(ta_i64(decl_get_generic_flags(p)))
-        + ta_field(ta_hex(decl_get_name(p))) + ta_field(ta_emit_type(decl_get_ty(p)))
-        + ta_field(ta_emit_decl(decl_get_params(p))) + ta_field(ta_emit_stmt(decl_get_body(p)))
-        + ta_field(ta_emit_decl(decl_get_members(p))) + ta_field(next_payload)
-        + ta_field(ta_hex(decl_get_generic_params(p))) + ta_field(ta_hex(decl_get_meta(p)))
-        + ta_field(ta_hex(decl_get_doc(p))) + ta_field(ta_i64(decl_get_semantic_kind(p)))
-        + ta_field(ta_i64(decl_get_semantic_flags(p))) + ta_field(ta_i64(decl_loc_line(p)))
-        + ta_field(ta_i64(decl_loc_col(p))) + ta_field(ta_i64(decl_loc_end_line(p)))
-        + ta_field(ta_i64(decl_loc_end_col(p))));
+fn ta_emit_decl_prefix(p: rawptr) {
+    if (!ta_emit_enter()) { return; }
+    ta_emit_field("F"); ta_emit_field(ta_i64(decl_get_kind(p)));
+    ta_emit_field(ta_i64(decl_get_is_public(p) as i32)); ta_emit_field(ta_i64(decl_get_is_static(p) as i32));
+    ta_emit_field(ta_i64(decl_get_generic_flags(p))); ta_emit_field(ta_hex(decl_get_name(p)));
+    ta_emit_edge(1, decl_get_ty(p)); ta_emit_edge(4, decl_get_params(p));
+    ta_emit_edge(3, decl_get_body(p)); ta_emit_edge(4, decl_get_members(p));
     ta_emit_leave();
-    return out;
 }
 
-fn ta_emit_decl(p: rawptr) -> string {
-    if (p == null) { return ""; }
+fn ta_emit_decl_suffix(p: rawptr) {
+    ta_emit_field(ta_hex(decl_get_generic_params(p))); ta_emit_field(ta_hex(decl_get_meta(p)));
+    ta_emit_field(ta_hex(decl_get_doc(p))); ta_emit_field(ta_i64(decl_get_semantic_kind(p)));
+    ta_emit_field(ta_i64(decl_get_semantic_flags(p)));
+    ta_emit_field(ta_i64(decl_loc_line(p))); ta_emit_field(ta_i64(decl_loc_col(p)));
+    ta_emit_field(ta_i64(decl_loc_end_line(p))); ta_emit_field(ta_i64(decl_loc_end_col(p)));
+}
+
+fn ta_emit_decl(p: rawptr) {
+    if (p == null || g_ta_error.len > 0) { return; }
     var count: i32 = 0;
     var cur = p;
     while (cur != null) {
         count = count + 1;
-        if (count > TA_MAX_GRAPH_NODES) { ta_fail("template artifact declaration chain limit"); return ""; }
+        if (count > TA_MAX_GRAPH_NODES) { ta_fail("template artifact declaration chain limit"); return; }
         cur = decl_get_next(cur);
     }
     var serialized_count: i32 = 0;
@@ -328,30 +375,27 @@ fn ta_emit_decl(p: rawptr) -> string {
         if (decl_get_meta(cur).indexOf("|imported") < 0) { serialized_count = serialized_count + 1; }
         cur = decl_get_next(cur);
     }
-    if (serialized_count == 0) { return ""; }
-    let nodes = ast_alloc_zero(serialized_count * 8);
-    if (nodes == null) { ta_fail("template artifact declaration chain allocation failure"); return ""; }
+    if (serialized_count == 0) { return; }
+    let nodes = ast_alloc_zero(serialized_count * 16);
+    if (nodes == null) { ta_fail("template artifact declaration chain allocation failure"); return; }
     cur = p;
     var i: i32 = 0;
-    while (cur != null) {
+    while (cur != null && g_ta_error.len == 0) {
         if (decl_get_meta(cur).indexOf("|imported") < 0) {
-            ast_write_rawptr(nodes + (i as i64) * 8, cur);
+            ast_write_rawptr(nodes + (i as i64) * 16, cur);
+            ta_emit_decl_prefix(cur);
+            ast_write_i64(nodes + (i as i64) * 16 + 8, ta_emit_field_begin());
             i = i + 1;
         }
         cur = decl_get_next(cur);
     }
-    var out = "";
-    i = serialized_count - 1;
-    while (i >= 0) {
-        out = ta_emit_decl_node(ast_read_rawptr(nodes + (i as i64) * 8), out);
-        if (g_ta_error.len > 0 || out.len > TA_MAX_GRAPH_BYTES) {
-            if (g_ta_error.len == 0) { ta_fail("template artifact graph limit"); }
-            vyx_frontend_free(nodes); return "";
-        }
+    i = i - 1;
+    while (i >= 0 && g_ta_error.len == 0) {
+        ta_emit_field_end(ast_read_i64(nodes + (i as i64) * 16 + 8));
+        ta_emit_decl_suffix(ast_read_rawptr(nodes + (i as i64) * 16));
         i = i - 1;
     }
     vyx_frontend_free(nodes);
-    return out;
 }
 
 fn ta_serialized_decl_count(d: rawptr) -> i64 {
@@ -371,9 +415,30 @@ fn ta_emit_unit(u: rawptr) -> string {
     if (u == null) { return ""; }
     let count = ta_serialized_decl_count(unit_get_decls(u));
     if (g_ta_error.len > 0) { return ""; }
-    let decls = ta_emit_decl(unit_get_decls(u));
+    g_ta_emit_parts = Vec::<string>.new();
+    g_ta_emit_starts = Vec::<i64>.new();
+    g_ta_emit_bytes = 0;
+    ta_emit_field("U"); ta_emit_field(ta_i64(count)); ta_emit_edge(4, unit_get_decls(u));
+    var out: rawptr = null;
+    if (g_ta_error.len == 0) {
+        out = vyx_frontend_alloc((g_ta_emit_bytes + 1) as u64);
+        if (out == null) { ta_fail("template artifact allocation failure"); }
+    }
+    if (g_ta_error.len == 0) {
+        var offset: i64 = 0;
+        var i: i64 = 0;
+        while (i < g_ta_emit_parts.len) {
+            let part = g_ta_emit_parts.get(i);
+            if (part.len > 0) { memcpy(out + offset, part.c_str(), part.len as u64); }
+            offset = offset + part.len;
+            i = i + 1;
+        }
+        var z: i32 = 0;
+        memcpy(out + offset, to_rawptr(&z), 1);
+    }
+    g_ta_emit_parts.destroy(); g_ta_emit_starts.destroy();
     if (g_ta_error.len > 0) { return ""; }
-    return ta_record("U", ta_field(ta_i64(count)) + ta_field(decls));
+    return from_raw_string_parts(out, g_ta_emit_bytes, g_ta_emit_bytes + 1, 2);
 }
 
 fn ta_parse_i64(s: string) -> i64 {
@@ -404,9 +469,12 @@ fn ta_read_field(src: string) -> string {
     var colon = g_ta_cursor;
     while (colon < src.len && src.charAt(colon as i32) != 58) { colon = colon + 1; }
     if (colon >= src.len) { ta_fail("template artifact missing field length"); return ""; }
-    let n = ta_parse_i64(src.substring(g_ta_cursor as i32, colon as i32));
+    let n = ta_parse_i64(str_view_range(src, g_ta_cursor, colon));
     if (n < 0 || n > TA_MAX_FIELD_BYTES || colon + 1 + n > src.len) { ta_fail("template artifact field bounds"); return ""; }
-    let out = src.substring((colon + 1) as i32, (colon + 1 + n) as i32);
+    // The decoded graph stays alive throughout parsing. A field is a view,
+    // while persistent AST strings receive detached storage in ta_unhex.
+    // Copying nested `next` fields duplicated every remaining chain suffix.
+    let out = str_view_range(src, colon + 1, colon + 1 + n);
     g_ta_cursor = colon + 1 + n;
     return out;
 }
@@ -422,9 +490,9 @@ fn ta_read_aux_field(src: string) -> string {
     var colon = g_ta_aux_cursor;
     while (colon < src.len && src.charAt(colon as i32) != 58) { colon = colon + 1; }
     if (colon >= src.len) { ta_fail("template artifact list length"); return ""; }
-    let n = ta_parse_i64(src.substring(g_ta_aux_cursor as i32, colon as i32));
+    let n = ta_parse_i64(str_view_range(src, g_ta_aux_cursor, colon));
     if (n < 0 || n > TA_MAX_FIELD_BYTES || colon + 1 + n > src.len) { ta_fail("template artifact list bounds"); return ""; }
-    let out = src.substring((colon + 1) as i32, (colon + 1 + n) as i32);
+    let out = str_view_range(src, colon + 1, colon + 1 + n);
     g_ta_aux_cursor = colon + 1 + n;
     return out;
 }
@@ -748,18 +816,28 @@ fn ta_header_validate(header: string) -> bool {
     return true;
 }
 
-fn ta_has_generic_chain(d: rawptr) -> bool {
+fn ta_needs_body_chain(d: rawptr) -> bool {
     g_ta_scan_depth = g_ta_scan_depth + 1;
     if (g_ta_scan_depth > TA_MAX_GRAPH_DEPTH) {
         g_ta_scan_depth = g_ta_scan_depth - 1;
-        ta_fail("template artifact generic scan depth");
+        ta_fail("template artifact body scan depth");
         return false;
     }
     var cur = d;
     while (cur != null) {
         g_ta_scan_nodes = g_ta_scan_nodes + 1;
-        if (g_ta_scan_nodes > TA_MAX_GRAPH_NODES) { ta_fail("template artifact generic scan limit"); g_ta_scan_depth = g_ta_scan_depth - 1; return false; }
+        if (g_ta_scan_nodes > TA_MAX_GRAPH_NODES) { ta_fail("template artifact body scan limit"); g_ta_scan_depth = g_ta_scan_depth - 1; return false; }
         if (decl_get_meta(cur).indexOf("|imported") >= 0) { cur = decl_get_next(cur); continue; }
+        // A shallow surface cannot express an omitted return type as void.
+        // Transport its body using the same checked AST artifact as generic
+        // declarations so the consumer can infer the real signature. This
+        // also carries private helpers in their original defining scope.
+        let kind = decl_get_kind(cur);
+        if ((kind == de_FN() || kind == de_METHOD()) && decl_get_is_public(cur)
+            && decl_get_body(cur) != null && decl_get_ty(cur) == null) {
+            g_ta_scan_depth = g_ta_scan_depth - 1;
+            return true;
+        }
         // generic_params also carries parser markers (`|kind:class`,
         // `|where:...`, `|extern...`).  Only the prefix before the first
         // marker is a parameter list; generic_flags alone is never evidence
@@ -770,7 +848,7 @@ fn ta_has_generic_chain(d: rawptr) -> bool {
             prefix_end = prefix_end + 1;
         }
         if (prefix_end > 0) { g_ta_scan_depth = g_ta_scan_depth - 1; return true; }
-        if (ta_has_generic_chain(decl_get_members(cur))) { g_ta_scan_depth = g_ta_scan_depth - 1; return true; }
+        if (ta_needs_body_chain(decl_get_members(cur))) { g_ta_scan_depth = g_ta_scan_depth - 1; return true; }
         cur = decl_get_next(cur);
     }
     g_ta_scan_depth = g_ta_scan_depth - 1;
@@ -844,9 +922,9 @@ public fn template_artifact_append(unit: rawptr, output_path: string) -> i32 {
         || artifact_module_name.startsWith("std.")) { return 0; }
     g_ta_scan_nodes = 0;
     g_ta_scan_depth = 0;
-    let has_generic = ta_has_generic_chain(unit_get_decls(unit));
+    let needs_body = ta_needs_body_chain(unit_get_decls(unit));
     if (g_ta_error.len > 0) { return 2; }
-    if (!has_generic) { return 0; }
+    if (!needs_body) { return 0; }
     g_ta_nodes = 0;
     g_ta_emit_depth = 0;
     let graph = ta_emit_unit(unit);

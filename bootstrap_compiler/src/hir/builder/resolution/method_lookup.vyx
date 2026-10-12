@@ -14,14 +14,101 @@ use bootstrap.sema;
 // Method lookup for the HIR builder. See README.md.
 
 impl HirUnitBuilder {
+    // Item kind/name are immutable after registration. Cache only the name
+    // predicate; owner identity, overload scores, visibility and static mode
+    // are still checked at each call. Append newly registered items in ID order.
+    // State: next item=0, candidate head=8, tail=16, owned-state next=24.
+    // Candidate: item ID=0, next=8.
+    fn method_candidate_state(self, method_name: string) -> rawptr {
+        var state = hir_raw_name_map_get(self.method_candidate_index, method_name);
+        if (state == null) {
+            state = hir_profile_malloc(32);
+            if (state == null) { return null; }
+            memset(state, 0, 32);
+            ast_write_i32(state, 1);
+            ast_write_rawptr(ptr_offset(state, 24), self.method_candidate_states);
+            self.method_candidate_states = state;
+            self.method_candidate_index = hir_raw_name_map_put(self.method_candidate_index, method_name, state);
+        }
+        var item_id = ast_read_i32(state);
+        while (item_id <= self.unit.item_count) {
+            if (self.unit.item_kind(item_id) == hir_item_method()
+                && self.function_name_matches_method(self.unit.item_name(item_id), method_name)) {
+                let node = hir_profile_malloc(16);
+                if (node == null) { return null; }
+                memset(node, 0, 16);
+                ast_write_i32(node, item_id);
+                let tail = ast_read_rawptr(ptr_offset(state, 16));
+                if (tail == null) { ast_write_rawptr(ptr_offset(state, 8), node); }
+                else { ast_write_rawptr(ptr_offset(tail, 8), node); }
+                ast_write_rawptr(ptr_offset(state, 16), node);
+            }
+            item_id = item_id + 1;
+            ast_write_i32(state, item_id);
+        }
+        return state;
+    }
+
+    // Function and item names are immutable. Flags, AST ownership and generic
+    // environments are not cached: late materialization can change them.
+    fn function_candidate_state(self, method_name: string) -> rawptr {
+        var state = hir_raw_name_map_get(self.function_candidate_index, method_name);
+        if (state == null) {
+            state = hir_profile_malloc(32);
+            if (state == null) { return null; }
+            memset(state, 0, 32);
+            ast_write_i32(state, 1);
+            ast_write_rawptr(ptr_offset(state, 24), self.method_candidate_states);
+            self.method_candidate_states = state;
+            self.function_candidate_index = hir_raw_name_map_put(self.function_candidate_index, method_name, state);
+        }
+        var fn_id = ast_read_i32(state);
+        while (fn_id <= self.unit.function_count) {
+            if (self.function_name_candidate_matches(fn_id, method_name)) {
+                let node = hir_profile_malloc(16);
+                if (node == null) { return null; }
+                memset(node, 0, 16);
+                ast_write_i32(node, fn_id);
+                let tail = ast_read_rawptr(ptr_offset(state, 16));
+                if (tail == null) { ast_write_rawptr(ptr_offset(state, 8), node); }
+                else { ast_write_rawptr(ptr_offset(tail, 8), node); }
+                ast_write_rawptr(ptr_offset(state, 16), node);
+            }
+            fn_id = fn_id + 1;
+            ast_write_i32(state, fn_id);
+        }
+        return state;
+    }
+
+    fn release_method_candidate_index(self) {
+        var state = self.method_candidate_states;
+        while (state != null) {
+            let next_state = ast_read_rawptr(ptr_offset(state, 24));
+            var node = ast_read_rawptr(ptr_offset(state, 8));
+            while (node != null) {
+                let next_node = ast_read_rawptr(ptr_offset(node, 8));
+                free(node);
+                node = next_node;
+            }
+            free(state);
+            state = next_state;
+        }
+        self.method_candidate_states = null;
+        self.method_candidate_index = hir_raw_name_map_dispose(self.method_candidate_index);
+        self.function_candidate_index = hir_raw_name_map_dispose(self.function_candidate_index);
+    }
+
     fn function_name_matches_method_direct(self, function_name: string, method_name: string) -> bool {
         if (function_name.len == 0 || method_name.len == 0) { return false; }
         if (function_name == method_name) { return true; }
-        if (hir_builder_string_contains(function_name, "::" + method_name)) { return true; }
-        if (hir_builder_string_contains(function_name, "_3A_3A" + method_name + "_3A_3A")) { return true; }
+        if (hir_builder_string_contains_parts(function_name, "::", method_name, "")) { return true; }
+        // Ordinary source names cannot match an encoded associated-name
+        // pattern. Avoid constructing the mangled query for those candidates.
+        if (!hir_builder_string_contains(function_name, "_3A_3A")) { return false; }
+        if (hir_builder_string_contains_parts(function_name, "_3A_3A", method_name, "_3A_3A")) { return true; }
         let encoded_method = hir_builder_symbol_segment_for_name(method_name);
         if (encoded_method != method_name) {
-            return hir_builder_string_contains(function_name, "_3A_3A" + encoded_method + "_3A_3A");
+            return hir_builder_string_contains_parts(function_name, "_3A_3A", encoded_method, "_3A_3A");
         }
         return false;
     }
@@ -41,6 +128,11 @@ impl HirUnitBuilder {
             && (hir_unit_function_flags(self.unit, fn_id) & hir_function_flag_foreign_dci_dtor()) != 0) {
             return false;
         }
+        return self.function_name_candidate_matches(fn_id, method_name);
+    }
+
+    fn function_name_candidate_matches(self, fn_id: i32, method_name: string) -> bool {
+        if (fn_id == hir_id_invalid() || method_name.len == 0) { return false; }
         let item_id = self.unit.function_item(fn_id);
         if (item_id != hir_id_invalid()) {
             let item_name = self.unit.item_name(item_id);
@@ -103,8 +195,22 @@ impl HirUnitBuilder {
             return hir_id_invalid();
         }
         var first_match = hir_id_invalid();
-        var item_id: i32 = 1;
-        while (item_id <= self.unit.item_count) {
+        let candidates = self.method_candidate_state(method_name);
+        var candidate_node: rawptr = null;
+        var next_item: i32 = 1;
+        if (candidates != null) {
+            candidate_node = ast_read_rawptr(ptr_offset(candidates, 8));
+            next_item = 0;
+            if (candidate_node != null) { next_item = ast_read_i32(candidate_node); }
+        }
+        while (next_item > 0 && next_item <= self.unit.item_count) {
+            let item_id = next_item;
+            if (candidates == null) { next_item = next_item + 1; }
+            else {
+                candidate_node = ast_read_rawptr(ptr_offset(candidate_node, 8));
+                next_item = 0;
+                if (candidate_node != null) { next_item = ast_read_i32(candidate_node); }
+            }
             if (self.unit.item_kind(item_id) == hir_item_method()
                 && self.unit.item_name(item_id) == method_name
                 && self.owner_item_matches_type(self.unit.item_owner(item_id), owner_type_name)) {
@@ -116,7 +222,6 @@ impl HirUnitBuilder {
                     }
                 }
             }
-            item_id = item_id + 1;
         }
         if (first_match == hir_id_invalid() && method_name == "clone") {
             return self.method_function_target_by_owner_type_and_method(owner_type_name, "dup");
@@ -138,15 +243,23 @@ impl HirUnitBuilder {
         }
         var project_local = hir_id_invalid();
         var fallback = hir_id_invalid();
-        var fn_id: i32 = 1;
-        while (fn_id <= self.unit.function_count) {
+        let candidate_state = self.function_candidate_state(method_name);
+        var candidate = null;
+        if (candidate_state != null) { candidate = ast_read_rawptr(ptr_offset(candidate_state, 8)); }
+        var next_fn: i32 = 1;
+        while (candidate != null || (candidate_state == null && next_fn <= self.unit.function_count)) {
+            var fn_id = next_fn;
+            if (candidate_state != null) {
+                fn_id = ast_read_i32(candidate);
+                candidate = ast_read_rawptr(ptr_offset(candidate, 8));
+            } else { next_fn = next_fn + 1; }
             let name = self.unit.function_name(fn_id);
+            if (name.startsWith("mir2$")
+                || !self.function_candidate_matches_method_name(fn_id, method_name)) { continue; }
             let raw_decl = hir_pointer_map_raw_for_function(self.decl_map, fn_id);
-            if (!name.startsWith("mir2$")
-                && raw_decl != null
+            if (raw_decl != null
                 && decl_get_kind(raw_decl) == de_METHOD()
-                && hir_builder_decl_template_params(raw_decl).len == 0
-                && self.function_candidate_matches_method_name(fn_id, method_name)) {
+                && hir_builder_decl_template_params(raw_decl).len == 0) {
                 let raw_owner = hir_raw_owner_map_get(self.decl_owner_map, raw_decl);
                 if (raw_owner != null
                     && hir_builder_decl_template_params(raw_owner).len == 0
@@ -168,7 +281,6 @@ impl HirUnitBuilder {
                     }
                 }
             }
-            fn_id = fn_id + 1;
         }
         if (project_local != hir_id_invalid()) { return project_local; }
         return fallback;
@@ -750,6 +862,13 @@ impl HirUnitBuilder {
                                                  call_expr_id: i32,
                                                  method_decl: rawptr,
                                                  want_static: bool) -> i32 {
+        // Generic substitutions assembled from a trait environment can carry
+        // the separator's leading space (for example `" Iterator::<i32>"`).
+        // Type lookup is identity based, so that whitespace makes the closed
+        // receiver miss its concrete class and leaves the interface prototype
+        // as the only candidate.  Normalize once before any cache or class
+        // lookup; the same key must flow into instance materialization.
+        owner_type_name = owner_type_name.trim();
         if (owner_type_name.len == 0
             || method_name.len == 0
             || self.type_text_has_open_template_atom(owner_type_name)) {
@@ -813,8 +932,21 @@ impl HirUnitBuilder {
         // prototype selected by Sema. That prototype does not belong to the
         // now-concrete receiver, so recover the implementation from the
         // receiver class before instance creation. Otherwise a synthetic
-        // `Self` declaration is emitted for a bodyless requirement.
-        if (selected_decl == null && !want_static) {
+        // `Self` declaration is emitted for a bodyless requirement. The
+        // concrete-impl scan above can miss a generic class method before
+        // its closed class instance has been registered; the class-tree
+        // lookup is the authoritative source in that case.
+        var selected_is_interface = false;
+        if (selected_decl != null) {
+            let selected_owner = hir_raw_owner_map_get(self.decl_owner_map, selected_decl);
+            if (selected_owner != null
+                && (((decl_get_generic_flags(selected_owner) & 2) != 0)
+                    || hir_builder_string_contains(decl_get_generic_params(selected_owner),
+                                                    "|kind:interface"))) {
+                selected_is_interface = true;
+            }
+        }
+        if ((selected_decl == null || selected_is_interface) && !want_static) {
             let receiver_decl = self.raw_class_decl_for_type_text(owner_type_name);
             let receiver_method = self.raw_method_decl_for_call_on_class_tree(
                 receiver_decl,

@@ -391,6 +391,7 @@ fn show_usage() {
     print("  --keep-obj            Keep intermediate object files");
     print("  --export-all          Export all compiled symbols");
     print("  --export-top-level-roots  Export top-level callable roots");
+    print("  --no-process-entry  Treat main as an ordinary module function");
     print("  --export-method-roots     Export method roots");
     print("  --no-implicit-std     Do not auto-import the implicit std prelude");
     print("  --vyi-project-private Restrict .vyi emission to the compiling package");
@@ -570,6 +571,12 @@ fn parse_cli_args() -> i32 {
                               "target/triplet option requires a value");
                     return 1;
                 }
+                if ((a == "--export-root-names-file" || a == "--emit-root-names-file")
+                    && !fileExists(getArg(i + 1))) {
+                    diag_emit(diag_sev_ERROR(), diag_code_cli_usage(), 0, 0,
+                              "option `" + a + "`: root names file not found: `" + getArg(i + 1) + "`");
+                    return 1;
+                }
                 i = i + 2;
             } else {
                 diag_emit(diag_sev_ERROR(), diag_code_cli_usage(), 0, 0,
@@ -698,6 +705,7 @@ fn cli_is_mode_arg(a: string) -> bool {
     if (a == "--coverage") { return true; }
     if (a == "-fPIC" || a == "-fpic") { return true; }
     if (a == "--no-implicit-std") { return true; }
+    if (a == "--no-process-entry") { return true; }
     if (a == "--version") { return true; }
     return false;
 }
@@ -706,6 +714,20 @@ fn cli_no_implicit_std() -> bool {
     var i: i32 = 1;
     while (i < argCount()) {
         if (getArg(i) == "--no-implicit-std") { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Project object jobs use this policy when their input is not the executable
+// target's entry source. A source function named main can still be library API.
+fn cli_no_process_entry() -> bool {
+    var i: i32 = 1;
+    while (i < argCount()) {
+        let a = getArg(i);
+        if (a == "--") { break; }
+        if (a == "--no-process-entry") { return true; }
+        if (cli_option_takes_value(a) && i + 1 < argCount()) { i = i + 1; }
         i = i + 1;
     }
     return false;
@@ -1385,7 +1407,7 @@ fn cli_link_args(auto_link_args: string) -> string {
             out = out.clone() + " -l " + getArg(i + 1);
             i = i + 2;
         } else if (a == "--link-obj" && i + 1 < argc) {
-            out = out.clone() + " \"" + driver_host_path(getArg(i + 1)) + "\"";
+            out = out.clone() + driver_object_args(getArg(i + 1));
             i = i + 2;
         } else if (a.startsWith("-L") && a.len > 2) {
             out = out.clone() + " " + a;
@@ -2205,7 +2227,11 @@ fn driver_module_file_list_mode(root: string,
     let raw = readFile(tmp_host.clone());
     deleteFile(tmp_host);
     driver_debug_import("file_list raw_len=" + policy_i64_to_string(raw.len as i64));
-    var rows = "";
+    // The native inventory is already sorted. Re-inserting every path into
+    // a flat string copies all preceding rows for each comparison and can
+    // exhaust memory even when compiling a single file in a large directory.
+    // Preserve inventory order and append to one growable buffer instead.
+    var rows = String::new("");
     var start: i32 = 0;
     var i: i32 = 0;
     while (i <= raw.len) {
@@ -2215,18 +2241,25 @@ fn driver_module_file_list_mode(root: string,
                 line = line.substring(0, line.len - 1).trim();
             }
             if (line.len > 0) {
-                let posix = driver_posix_path(line);
+                // The scanner may return paths relative to the root (for
+                // example `./effect_manifest.vyx`).  Registry rows are later
+                // compared with the absolute source-path metadata stamped on
+                // parsed declarations, so canonicalize before sorting and
+                // deduplicating.  Keeping a relative row here makes a
+                // project sibling load twice and can emit duplicate symbols.
+                let posix = driver_posix_path(driver_resolve_abs_path(line));
                 let filter_path = driver_registry_path_below_root(root.clone(), posix.clone());
                 if (!driver_registry_path_is_ignored_mode(filter_path, allow_generated_vyi)) {
-                    rows = driver_insert_sorted_line(rows, posix);
+                    rows.append(posix);
+                    rows.append("\n");
                 }
             }
             start = i + 1;
         }
         i = i + 1;
     }
-    driver_debug_import("file_list rows_len=" + policy_i64_to_string(rows.len as i64));
-    return rows;
+    driver_debug_import("file_list rows_len=" + policy_i64_to_string(rows.as_str().len as i64));
+    return rows.as_str().clone();
 }
 
 fn driver_module_file_list(root: string) -> string {
@@ -3426,6 +3459,10 @@ fn driver_module_symbols_from_file(path: string) -> string {
     if (content.len == 0) { return ""; }
     var symbols = "|";
     var depth: i32 = 0;
+    // Interface files and source namespaces can use module blocks. Their
+    // contents are still module-level declarations, unlike class/function
+    // bodies, and must remain visible to the lazy import symbol index.
+    var module_depth: i32 = 0;
     var enum_depth: i32 = -1;
     var extern_depth: i32 = -1;
     var start: i32 = 0;
@@ -3439,7 +3476,9 @@ fn driver_module_symbols_from_file(path: string) -> string {
             let trimmed = line.trim();
             var saw_enum_decl: bool = false;
             var saw_extern_decl: bool = false;
-            if (depth == 0) {
+            var saw_module_decl: bool = false;
+            if (depth == module_depth) {
+                saw_module_decl = trimmed.startsWith("module ");
                 let sym = driver_decl_symbol_from_line(trimmed);
                 if (sym.len > 0) {
                     symbols = driver_symbols_add(symbols, sym);
@@ -3501,6 +3540,10 @@ fn driver_module_symbols_from_file(path: string) -> string {
                     }
                     if (!in_string && !in_char && c == 123) {
                         depth = depth + 1;
+                        if (saw_module_decl) {
+                            module_depth = depth;
+                            saw_module_decl = false;
+                        }
                         if (saw_enum_decl && enum_depth < 0) {
                             enum_depth = depth;
                         }
@@ -3510,6 +3553,7 @@ fn driver_module_symbols_from_file(path: string) -> string {
                     } else if (!in_string && !in_char && c == 125) {
                         depth = depth - 1;
                         if (depth < 0) { depth = 0; }
+                        if (depth < module_depth) { module_depth = depth; }
                         if (enum_depth >= 0 && depth < enum_depth) {
                             enum_depth = -1;
                         }
@@ -3533,7 +3577,7 @@ fn driver_module_registry_from_mode(root: string,
     if (root.len == 0) { return ""; }
     let files = driver_module_file_list_mode(root, allow_generated_vyi, report_scan_failure);
     driver_debug_import("registry_from root=" + root + " files_len=" + policy_i64_to_string(files.len as i64));
-    var out = "";
+    var out = String::new("");
     var debug_seen: i32 = 0;
     var start: i32 = 0;
     var i: i32 = 0;
@@ -3548,9 +3592,14 @@ fn driver_module_registry_from_mode(root: string,
                 }
                 if (mod.len > 0) {
                     let stem = driver_path_stem(path);
-                    if (!driver_registry_has_module_stem(out.clone(), mod, stem)) {
+                    if (!driver_registry_has_module_stem(out.as_str(), mod, stem)) {
                         let symbols = driver_module_symbols_from_file(path);
-                        out = out + mod + "\t" + path + "\t" + symbols + "\n";
+                        out.append(mod);
+                        out.append("\t");
+                        out.append(path);
+                        out.append("\t");
+                        out.append(symbols);
+                        out.append("\n");
                     }
                 }
             }
@@ -3558,7 +3607,7 @@ fn driver_module_registry_from_mode(root: string,
         }
         i = i + 1;
     }
-    return out;
+    return out.as_str().clone();
 }
 
 fn driver_module_registry_from(root: string) -> string {
@@ -3760,6 +3809,18 @@ fn driver_std_root_present(root: string) -> bool {
     return false;
 }
 
+fn driver_project_std_root(input_path: string) -> string {
+    // A project-local `std/` tree is the compatibility overlay used by the
+    // bootstrap compiler.  Resolve it from the nearest manifest instead of
+    // using the executable's SDK root: package sources under
+    // `std_packages/*` must continue to see the package registry itself.
+    let project_root = driver_effect_project_root(input_path.clone());
+    if (project_root.len == 0) { return ""; }
+    let local = driver_join_path(project_root, "std");
+    if (driver_std_root_present(local.clone())) { return local; }
+    return "";
+}
+
 fn driver_find_module_lock(input_path: string) -> string {
     var dir = driver_dirname(input_path);
     var depth: i32 = 0;
@@ -3838,7 +3899,12 @@ fn driver_registry_append_lock_aliases(registry: string, input_path: string) -> 
 
 fn driver_registry_append_module_source_path(acc: string, path: string) -> string {
     var out = acc;
-    let source_path = path.trim();
+    // Registry rows are consumed by sema's loaded-path identity cache.  Keep
+    // an explicit source row in the same absolute form as scanned package
+    // rows; otherwise `--src=file .\\foo.vyx` and the registry's
+    // `E:/.../foo.vyx` row can load the same source twice.
+    let raw_path = path.trim();
+    let source_path = driver_resolve_abs_path(raw_path);
     if (source_path.len > 0 && fileExists(source_path.clone())) {
         let mod = driver_module_name_from_file(source_path.clone());
         let stem = driver_path_stem(source_path.clone());
@@ -3967,22 +4033,47 @@ fn driver_registry_append_std_packages(acc: string, root: string) -> string {
     return out;
 }
 
+fn driver_implicit_module_root_allowed(root: string) -> bool {
+    if (root.len == 0) { return false; }
+    // This is a directory query. A trailing separator prevents the file
+    // extension rules from treating a source directory named *.vyi or *.attr
+    // as an interface or schema file.
+    return !driver_registry_path_is_ignored(driver_resolve_abs_path(root) + "/");
+}
+
 fn driver_module_registry(input_path: string) -> string {
     let input_dir = driver_dirname(input_path);
     let input_parent_dir = driver_dirname(input_dir.clone());
-    let input_dir_is_cache = driver_path_last_segment(input_dir.clone()) == ".cache";
+    let input_dir_is_generated = !driver_implicit_module_root_allowed(input_dir.clone());
     let exe_dir = driver_exe_dir();
     driver_debug_import("input_path=" + input_path + " input_dir=" + input_dir + " exe_dir=" + exe_dir);
     // Explicit package interfaces and --module-sources come first. Implicit
     // std.* for --src=file is forwarded by std_packages/registry when present.
     var out = driver_registry_append_interface_roots("");
     out = driver_registry_append_module_sources(out);
+    // The source passed directly with --src=file is already part of the
+    // compiling unit.  Register it before implicit package roots so a cyclic
+    // import (for example std.clone -> std.string -> std.clone) resolves back
+    // to that exact source instead of loading the packaged copy a second time.
+    // Keeping the path in the registry also makes the existing module+stem
+    // de-duplication effective across compatibility and packaged std trees.
+    out = driver_registry_append_module_source_path(out, input_path.clone());
     if (!cli_no_implicit_std()) {
         let packages_root = driver_find_std_packages_root();
         if (packages_root.len > 0) {
             driver_debug_import("std_packages_root=" + packages_root);
             out = driver_registry_append_std_packages(out.clone(), packages_root);
         } else {
+            // Use the project compatibility overlay only when the packaged
+            // standard library is unavailable.  Registering both trees is
+            // ambiguous: `std/hash.vyx` and `std_packages/core/src/hash.vyx`
+            // define the same module and native symbols, so both bodies can
+            // reach codegen even though the registry rows look equivalent.
+            let local_std = driver_project_std_root(input_path.clone());
+            if (local_std.len > 0) {
+                driver_debug_import("project_std=" + local_std);
+                out = driver_registry_append_from(out.clone(), local_std);
+            }
             let exe_std = driver_join_path(exe_dir.clone(), "std");
             driver_debug_import("exe_std=" + exe_std);
             if (driver_std_root_present(exe_std.clone())) {
@@ -4020,23 +4111,25 @@ fn driver_module_registry(input_path: string) -> string {
     out = driver_registry_append_from(out.clone(), exe_src);
     let input_std = driver_join_path(input_dir.clone(), "std");
     driver_debug_import("input_std=" + input_std);
-    if (driver_std_root_present(input_std.clone())) {
+    if (!input_dir_is_generated && driver_std_root_present(input_std.clone())) {
         driver_debug_import("input_std present");
         out = driver_registry_append_from(out.clone(), input_std);
     }
-    // Generated cache directories can contain thousands of historical probes,
+    // Generated directories can contain thousands of historical probes,
     // copied source trees, and interfaces. They are not implicit import roots:
     // scanning one here makes registry construction grow quadratically. A
     // caller that deliberately needs cached modules can still use -L or an
     // explicit interface root.
-    if (!input_dir_is_cache) {
+    // Check every component of the absolute path: a source in .cache/probe/
+    // must not turn that subtree (or a src ancestor) into an implicit root.
+    if (!input_dir_is_generated) {
         out = driver_registry_append_from(out.clone(), input_dir);
     }
-    if (driver_path_stem(input_parent_dir.clone()) == "src") {
+    if (!input_dir_is_generated && driver_path_stem(input_parent_dir.clone()) == "src") {
         out = driver_registry_append_from(out.clone(), input_parent_dir);
     }
     let nearest_src = driver_nearest_src_ancestor(input_path.clone());
-    if (nearest_src.len > 0) {
+    if (!input_dir_is_generated && nearest_src.len > 0) {
         out = driver_registry_append_from(out.clone(), nearest_src);
     }
     out = driver_registry_append_from(out.clone(), ".vyx_deps");
@@ -4068,7 +4161,12 @@ fn driver_module_registry(input_path: string) -> string {
             ai = ai + 1;
         }
     }
-    out = driver_registry_without_path(out.clone(), input_path);
+    // Keep the direct source row in the registry.  `--src=file` compiles the
+    // file as the root unit, but imports from that unit still need to resolve
+    // back to the exact same source.  Removing it here makes a packaged copy
+    // of the same module win (for example std/hash.vyx versus
+    // std_packages/core/src/hash.vyx), so the root and its import become two
+    // definitions with identical native symbols.
     out = driver_registry_append_lock_aliases(out.clone(), input_path);
     driver_debug_import("registry_len=" + policy_i64_to_string(out.len as i64));
     return out;
@@ -4077,8 +4175,16 @@ fn driver_module_registry(input_path: string) -> string {
 fn driver_module_registry_slow(registry: string, from_path: string) -> string {
     var out = registry;
     let input_dir = driver_dirname(from_path);
-    out = driver_registry_append_from(out.clone(), driver_dirname(input_dir));
-    out = driver_registry_append_from(out.clone(), ".");
+    if (!driver_implicit_module_root_allowed(input_dir.clone())) {
+        return out;
+    }
+    let parent_dir = driver_dirname(input_dir);
+    if (driver_implicit_module_root_allowed(parent_dir.clone())) {
+        out = driver_registry_append_from(out.clone(), parent_dir);
+    }
+    if (driver_implicit_module_root_allowed(".")) {
+        out = driver_registry_append_from(out.clone(), ".");
+    }
     return out;
 }
 
@@ -4298,9 +4404,14 @@ fn driver_mark_decl_source_path(d: rawptr, path: string) {
 
 fn driver_mark_unit_source_path(src: rawptr, path: string) {
     if (src == null || path.len == 0) { return; }
+    // Keep root units and registry-loaded units on the same path identity.
+    // The sema loaded-path cache compares this metadata with registry rows;
+    // leaving a relative root path here would make it differ from the
+    // absolute row emitted by `driver_registry_append_module_source_path`.
+    let source_path = driver_resolve_abs_path(path);
     var cur = unit_get_decls(src);
     while (cur != null) {
-        driver_mark_decl_source_path(cur, path);
+        driver_mark_decl_source_path(cur, source_path);
         cur = decl_get_next(cur);
     }
 }
@@ -5704,6 +5815,14 @@ fn vyi_decl_attr_prefix_mode(d: rawptr, indent: string, project_private: bool) -
     if (discard_args.len > 0) {
         out = out + indent + "@[discard(" + discard_args + ")]\n";
     }
+    // Lang items are part of the public type identity.  Keep them in `.vyi`
+    // interfaces so consumers retain compiler-recognized layouts such as
+    // `std.string.String` and can apply String <-> str conversions at call
+    // boundaries instead of treating the imported record as an ordinary class.
+    let lang_item = policy_meta_attribute_value(meta, "lang_item");
+    if (lang_item.len > 0) {
+        out = out + indent + "@[lang_item(" + lang_item + ")]\n";
+    }
     return out;
 }
 
@@ -6384,6 +6503,8 @@ fn driver_compile_cli_main() -> i32 {
     }
     let cli_rc = parse_cli_args();
     if (cli_rc > 0) { return cli_rc; }
+    hir_set_process_entry_enabled(!cli_no_process_entry()
+                                 && !cli_wants_lib() && !cli_wants_dll());
     if (cli_src_kind() == "project"
         && !driver_validate_project_manifest_templates(cli_src_path())) {
         return 1;
@@ -6837,6 +6958,17 @@ fn driver_compile_cli_main() -> i32 {
                                                                                               cli_effective_emit_root_names(),
                                                                                               cli_effective_emit_root_names_specified(),
                                                                                               dci_abi_text.clone());
+                // HIR/MIR lowering can emit a precise diagnostic (for example
+                // a borrowed view that would outlive its owning temporary)
+                // without producing a MIR verifier error.  Dump mode must
+                // still fail the invocation; otherwise `--dump-mir2` would
+                // print an invalid unit and return success while AOT rejects
+                // the same source.
+                if (diag_error_count() > 0) {
+                    hir_codegen_builder_handle_release_codegen_state(hbuilder);
+                    hir_codegen_builder_handle_free(hbuilder);
+                    return 1;
+                }
                 hir_codegen_builder_handle_release_codegen_state(hbuilder);
                 hir_codegen_builder_handle_free(hbuilder);
                 if (dci_abi_path.len > 0) {

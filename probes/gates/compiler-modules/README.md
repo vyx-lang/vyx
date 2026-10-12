@@ -24,6 +24,11 @@ Isolated consumers that call `hidden`, or construct `PrivateCounter` and call
 The current missing-method diagnostic is emitted by LLVM lowering (`I0100`),
 after frontend analysis.
 
+Export and emission root lists are also checked as build inputs: nonexistent
+`--export-root-names-file` and `--emit-root-names-file` paths must fail without an
+object artifact and name the missing file. Existing empty lists remain valid;
+nonempty lists must emit the selected function body.
+
 The fixture has a type definition and two implementation files in one logical
 module. Public method roots must include all three files. No generated C++ or
 JIT path is used. Logs and compiler identity are written to ignored `.runs/`;

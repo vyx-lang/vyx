@@ -59,3 +59,6 @@ try {
     if ($actual -ne 0) { Get-Content consumer/consumer.log -Tail 25; Write-Host "UNRESOLVED: public generic interface lacks callable implementation ($run)"; exit 1 }
     Write-Host "generic interface: OK ($run)"
 } finally { Pop-Location }
+# The final compiler invocation is an expected negative case. Do not leak its
+# nonzero native exit code after all positive and rejection checks passed.
+exit 0

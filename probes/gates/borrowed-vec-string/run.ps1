@@ -55,5 +55,20 @@ foreach ($source in Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'moved_*.vy
         $failed++
     } else { Write-Host "$name OK: E3100 at source location" }
 }
+$owning = Join-Path $PSScriptRoot 'borrowed_owning_foreach.vyx'
+$owningOut = Join-Path $results 'borrowed_owning_foreach.stdout.log'
+$owningErr = Join-Path $results 'borrowed_owning_foreach.stderr.log'
+$owningObj = Join-Path $results 'borrowed_owning_foreach.obj'
+$owningCompile = Invoke-VyxProcess -FilePath $Compiler -WorkingDirectory $repoRoot -TimeoutSec 30 `
+    -ArgumentList @('--src=file', $owning, '--emit=obj', '-o', $owningObj) `
+    -StdoutLog $owningOut -StderrLog $owningErr
+$owningDiagnostics = [IO.File]::ReadAllText($owningOut) + [IO.File]::ReadAllText($owningErr)
+if ($owningCompile.TimedOut -or $owningCompile.ExitCode -ne 1 -or
+    $owningDiagnostics -notmatch 'requires Clone lowering' -or
+    $owningDiagnostics -notmatch 'borrowed_owning_foreach\.vyx:\d+:\d+: error:') {
+    Write-Host "borrowed_owning_foreach FAIL: expected ownership-safe rejection, exit=$($owningCompile.ExitCode)"
+    Write-Host $owningDiagnostics
+    $failed++
+} else { Write-Host 'borrowed_owning_foreach OK: ownership-safe rejection' }
 if ($failed -gt 0) { exit 1 }
 exit 0

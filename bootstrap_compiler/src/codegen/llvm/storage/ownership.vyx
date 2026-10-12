@@ -14,16 +14,28 @@ impl LlvmMirLowerer {
 
     public fn type_is_std_string_class(self, type_id: i32) -> bool {
         if (llvm_mir_type_kind(&self.m, type_id) != ty_CLASS()) { return false; }
+        // Identity comes from the resolved declaration, not a leaf name or
+        // a record that happens to expose similarly named fields.
+        if ((hir_type_table_flags(self.m.types, type_id) & hir_type_flag_std_string()) == 0) { return false; }
         let canonical_type = self.canonical_record_type_id(type_id);
-        let text = llvm_mir_type_text(&self.m, canonical_type);
-        if (text.len == 0) { return false; }
-        let base = policy_generic_call_base(text.clone());
-        if (self.last_path_segment(base) != "String") { return false; }
-        if (self.field_id_for_type_name(canonical_type, "ptr") == mir_id_invalid()) { return false; }
-        if (self.field_id_for_type_name(canonical_type, "len") == mir_id_invalid()) { return false; }
-        if (self.field_id_for_type_name(canonical_type, "cap") == mir_id_invalid()) { return false; }
-        if (self.field_id_for_type_name(canonical_type, "owned") == mir_id_invalid()) { return false; }
-        return self.field_id_for_type_name(canonical_type, "inline0") != mir_id_invalid();
+        if ((hir_type_table_flags(self.m.types, canonical_type) & hir_type_flag_std_string()) == 0) { return false; }
+        if (mir_unit_field_count_for_type(&self.m, canonical_type) != 7) { return false; }
+        // The inline payload is three contiguous i64 fields. Checking names
+        // alone allowed an i32 record to be loaded as pointers and i64s.
+        return self.string_lang_item_field_matches(canonical_type, "ptr", 0, ty_RAWPTR())
+            && self.string_lang_item_field_matches(canonical_type, "len", 1, ty_I64())
+            && self.string_lang_item_field_matches(canonical_type, "cap", 2, ty_I64())
+            && self.string_lang_item_field_matches(canonical_type, "owned", 3, ty_I64())
+            && self.string_lang_item_field_matches(canonical_type, "inline0", 4, ty_I64())
+            && self.string_lang_item_field_matches(canonical_type, "inline1", 5, ty_I64())
+            && self.string_lang_item_field_matches(canonical_type, "inline2", 6, ty_I64());
+    }
+
+    public fn string_lang_item_field_matches(self, type_id: i32, name: string, index: i32, kind: i32) -> bool {
+        let field_id = self.exact_field_id_for_type_name(type_id, name);
+        if (field_id == mir_id_invalid()) { return false; }
+        if (self.m.field_index(field_id) != index) { return false; }
+        return llvm_mir_type_kind(&self.m, mir_unit_field_type(&self.m, field_id)) == kind;
     }
 
     public fn type_is_string_view_type(self, type_id: i32) -> bool {
@@ -919,6 +931,96 @@ impl LlvmMirLowerer {
     }
 
     public fn lower_drop_instr(self, instr_id: i32) {
+        let place = self.m.instr_place(instr_id);
+        var guard = mir_id_invalid();
+        if (place != mir_id_invalid() && self.m.place_kind(place) == mir_place_local()) {
+            guard = self.m.local_drop_guard(self.m.place_local(place));
+        }
+        if (guard == mir_id_invalid()) {
+            self.lower_drop_instr_core(instr_id);
+            return;
+        }
+        let flag_addr = self.lower_place_addr(guard);
+        if (flag_addr == null) {
+            self.report_error("cannot resolve full-expression construction guard");
+            return;
+        }
+        let live = vyx_rt_build_load(self.mod, self.ty_i8, flag_addr, "expr.live".c_str(), 9);
+        let do_drop = vyx_rt_append_block(self.mod, self.current_function_value, "expr.drop".c_str(), 9);
+        let done = vyx_rt_append_block(self.mod, self.current_function_value, "expr.done".c_str(), 9);
+        if (live == null || do_drop == null || done == null) {
+            self.report_error("cannot lower full-expression cleanup branch");
+            return;
+        }
+        vyx_rt_build_cond_br(self.mod, self.truthy_value(live, self.m.place_type(guard)), do_drop, done);
+        vyx_rt_position_at_end(self.mod, do_drop);
+        // Clear before invoking user destruction. Repeated path exits remain
+        // harmless, including a nested return through a surrounding expression.
+        vyx_rt_build_store(self.mod, vyx_rt_const_int(self.mod, self.ty_i8, 0, 0), flag_addr);
+        self.lower_drop_instr_core(instr_id);
+        vyx_rt_build_br(self.mod, done);
+        vyx_rt_position_at_end(self.mod, done);
+    }
+
+    public fn lower_materialized_owner(self, value_id: i32) -> rawptr {
+        let place = self.m.value_place(value_id);
+        let type_id = self.m.value_type(value_id);
+        let addr = self.lower_place_addr(place);
+        let guard = self.m.local_drop_guard(self.m.place_local(place));
+        let flag_addr = self.lower_place_addr(guard);
+        if (addr == null || flag_addr == null) {
+            self.report_error("cannot resolve full-expression owner storage");
+            return null;
+        }
+        let source_value_id = self.m.value_lhs(value_id);
+        // Class-pointer ABI values are already complete object pointers.  A
+        // full-expression owner uses a pointer slot, so copying the native
+        // object bytes into that slot is both the wrong representation and
+        // loses the constructor's ownership identity.  Keep the constructor
+        // result as the slot value; the owner guard and the normal DCI drop
+        // path still perform exactly one destructor/release.
+        if (self.type_is_class_pointer_abi(type_id)
+            && !self.place_is_direct_class_object_pointer(place)) {
+            let object = self.lower_value(source_value_id);
+            if (object == null) {
+                self.report_error("cannot lower class value for full-expression owner ");
+                return null;
+            }
+            vyx_rt_build_store(self.mod, object, addr);
+        } elif (!self.copy_value_storage_to_addr(addr, source_value_id, type_id,
+                                                  "full-expression owner")) {
+            return null;
+        }
+        vyx_rt_build_store(self.mod, vyx_rt_const_int(self.mod, self.ty_i8, 1, 0), flag_addr);
+        self.track_shared_unwind_owner(place, addr);
+        if (self.type_is_class_pointer_abi(type_id)) {
+            return self.class_object_addr_from_place_addr(place, addr, type_id);
+        }
+        return vyx_rt_build_load(self.mod, self.lower_type(type_id), addr, "expr.value".c_str(), 10);
+    }
+
+    public fn lower_conditional_owner_move(self, value_id: i32) -> rawptr {
+        let value = self.lower_value(self.m.value_lhs(value_id));
+        let place = self.m.value_place(value_id);
+        let guard = self.m.local_drop_guard(self.m.place_local(place));
+        let flag_addr = self.lower_place_addr(guard);
+        if (value == null || flag_addr == null) {
+            self.report_error("cannot resolve conditional ownership transfer");
+            return null;
+        }
+        vyx_rt_build_store(self.mod, vyx_rt_const_int(self.mod, self.ty_i8, 0, 0), flag_addr);
+        if (self.dci_caller_participates_in_shared_unwind()) {
+            let addr = self.lower_place_addr(place);
+            let object = self.class_object_addr_from_place_addr(place, addr, self.m.place_type(place));
+            if (llvm_unwind_forget_owner(self.mod, object) != 0) {
+                self.report_error("cannot transfer shared unwind ownership");
+                return null;
+            }
+        }
+        return value;
+    }
+
+    public fn lower_drop_instr_core(self, instr_id: i32) {
         let place_id = self.m.instr_place(instr_id);
         let target_fn = self.m.instr_target_id(instr_id);
         if (place_id == mir_id_invalid()) {
@@ -987,6 +1089,14 @@ impl LlvmMirLowerer {
     }
 
     public fn track_shared_unwind_owner(self, place_id: i32, addr: rawptr) {
+        if (self.m.place_kind(place_id) == mir_place_local()) {
+            let guard = self.m.local_drop_guard(self.m.place_local(place_id));
+            if (guard != mir_id_invalid()) {
+                let flag_addr = self.lower_place_addr(guard);
+                if (flag_addr == null) { self.report_error("cannot activate owning local"); return; }
+                vyx_rt_build_store(self.mod, vyx_rt_const_int(self.mod, self.ty_i8, 1, 0), flag_addr);
+            }
+        }
         if (!self.dci_caller_participates_in_shared_unwind()) { return; }
         let drop = llvm_unwind_drop_for_place(&self.m, self.current_function_id, place_id);
         if (drop == mir_id_invalid()) { return; }

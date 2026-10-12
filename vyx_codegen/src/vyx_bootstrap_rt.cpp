@@ -22,6 +22,7 @@
 #include <mutex>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1912,9 +1913,51 @@ extern "C" VYX_RT_ABI int64_t vyx_rt_system_available_commit_bytes() {
         return -1;
     }
     return static_cast<int64_t>(pages * info.PageSize);
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // Linux exposes a host-wide overcommit budget in /proc/meminfo.  Keep
+    // this separate from MemAvailable: the scheduler already samples
+    // physical pages, while CommitLimit/Committed_AS describes virtual
+    // allocations.  Some containers and older kernels omit one of these
+    // fields; report unknown in that case so the caller can use physical
+    // memory only.
+    std::ifstream meminfo("/proc/meminfo");
+    if (!meminfo) {
+        return -1;
+    }
+    uint64_t commit_limit_kib = 0;
+    uint64_t committed_as_kib = 0;
+    bool have_limit = false;
+    bool have_committed = false;
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        std::istringstream row(line);
+        std::string key;
+        uint64_t value = 0;
+        if (!(row >> key >> value)) {
+            continue;
+        }
+        if (key == "CommitLimit:") {
+            commit_limit_kib = value;
+            have_limit = true;
+        } else if (key == "Committed_AS:") {
+            committed_as_kib = value;
+            have_committed = true;
+        }
+    }
+    if (!have_limit || !have_committed || commit_limit_kib <= committed_as_kib) {
+        return -1;
+    }
+    const uint64_t available_kib = commit_limit_kib - committed_as_kib;
+    if (available_kib > static_cast<uint64_t>(INT64_MAX) / 1024u) {
+        return -1;
+    }
+    return static_cast<int64_t>(available_kib * 1024u);
 #else
-    // Physical availability is a separate budget, not a commit observation.
-    // No POSIX commit/cgroup implementation is installed yet.
+    // Android/Termux and macOS do not expose a portable system-wide commit
+    // budget with the semantics of Windows or Linux /proc/meminfo.  In
+    // particular, Android's process/cgroup limits make host-style commit
+    // figures misleading.  The scheduler falls back to physical availability
+    // when this value is unknown.
     return -1;
 #endif
 }
@@ -2104,7 +2147,7 @@ extern "C" VYX_RT_ABI int64_t vyx_bootstrap_file_size(const char* path) {
     return static_cast<int64_t>(sz);
 }
 
-#if defined(__linux__) || defined(__APPLE__)
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__APPLE__)
 extern "C" VYX_RT_ABI int64_t vyx_bootstrap_ucontext_size() {
     return static_cast<int64_t>(sizeof(ucontext_t));
 }
@@ -8583,6 +8626,12 @@ extern "C" VYX_RT_ABI void println(const char* s, uint64_t len) {
     vyx_rt_write_line(s, len);
 }
 
+// Compiler printf imports resolve to this DLL's CRT on Windows. Compile the
+// canonical byte writer here too so both forms use the same stdout buffer.
+#define VYX_STDIO_ABI VYX_RT_ABI
+#include "../../runtime/src/vyx_stdio.c"
+#undef VYX_STDIO_ABI
+
 extern "C" VYX_RT_ABI void vyx_rt_set_args(int32_t argc, char** argv) {
     vyx_rt_process_argc = argc >= 0 ? argc : 0;
     vyx_rt_process_argv = argv;
@@ -8676,7 +8725,11 @@ extern "C" VYX_RT_ABI int64_t fileSize(const char* path) {
     return size < 0 ? -1 : static_cast<int64_t>(size);
 }
 
-extern "C" VYX_RT_ABI char* vyx_decode_string_escapes(const char* raw, int64_t n) {
+extern "C" VYX_RT_ABI char* vyx_decode_string_escapes_len(const char* raw, int64_t n,
+                                                        int64_t* length_out) {
+    if (length_out) {
+        *length_out = 0;
+    }
     if (!raw || n <= 0) {
         return vyx_rt_empty_cstr();
     }
@@ -8692,7 +8745,6 @@ extern "C" VYX_RT_ABI char* vyx_decode_string_escapes(const char* raw, int64_t n
             const unsigned char nx = static_cast<unsigned char>(raw[i + 1]);
             char ch = 0;
             int skip = 2;
-            bool emit = true;
             if (nx == 'n') {
                 ch = '\n';
             } else if (nx == 't') {
@@ -8706,16 +8758,14 @@ extern "C" VYX_RT_ABI char* vyx_decode_string_escapes(const char* raw, int64_t n
             } else if (nx == '\'') {
                 ch = '\'';
             } else if (nx == '0') {
-                emit = false;
+                ch = '\0';
             } else if (nx == '$') {
                 ch = '$';
             } else {
                 ch = static_cast<char>(c);
                 skip = 1;
             }
-            if (emit) {
-                out[w++] = ch;
-            }
+            out[w++] = ch;
             i += skip;
         } else {
             out[w++] = static_cast<char>(c);
@@ -8724,7 +8774,14 @@ extern "C" VYX_RT_ABI char* vyx_decode_string_escapes(const char* raw, int64_t n
     }
     out[w] = '\0';
     vyx_rt_note_string_len_cached(out, w);
+    if (length_out) {
+        *length_out = static_cast<int64_t>(w);
+    }
     return out;
+}
+
+extern "C" VYX_RT_ABI char* vyx_decode_string_escapes(const char* raw, int64_t n) {
+    return vyx_decode_string_escapes_len(raw, n, nullptr);
 }
 
 extern "C" VYX_RT_ABI char* from_cstr(const char* s) {

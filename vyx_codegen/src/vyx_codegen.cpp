@@ -1062,7 +1062,9 @@ static bool optimizeModuleForRt(VyxRtModule* m, int32_t opt_level) {
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
     auto MPM = PB.buildPerModuleDefaultPipeline(optLevel);
+    const auto optimizationBegin = std::chrono::steady_clock::now();
     MPM.run(*m->mod, MAM);
+    const auto initialOptimizationEnd = std::chrono::steady_clock::now();
     traceLine("ran", beforeInstructions, m->mod->getInstructionCount());
 
     // Wrapper promotion can expose a second allocation layer after SROA. In
@@ -1071,12 +1073,24 @@ static bool optimizeModuleForRt(VyxRtModule* m, int32_t opt_level) {
     // Iterate the strict promotion proof and cleanup pipeline to a fixed point.
     // Real inputs converge in one or two passes; the hard iteration cap is a
     // belt-and-braces guard so a pathological module can never spin here.
+    int promotionRounds = 0;
     for (int pass = 0;
          pass < kVyxStackPromotionMaxIterations
              && promoteVyxNonEscapingSmallAllocations(*m->mod);
          ++pass) {
         auto cleanupMPM = PB.buildPerModuleDefaultPipeline(optLevel);
         cleanupMPM.run(*m->mod, MAM);
+        ++promotionRounds;
+    }
+    const auto promotionEnd = std::chrono::steady_clock::now();
+    if (const char* timing = std::getenv("VYX_LLVM_TIMING");
+        timing && timing[0] != '\0' && timing[0] != '0') {
+        const auto initialMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            initialOptimizationEnd - optimizationBegin).count();
+        const auto promotionMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            promotionEnd - initialOptimizationEnd).count();
+        std::fprintf(stderr, "[llvm-timing] optimize initial_ms=%lld promotion_cleanup_ms=%lld promotion_rounds=%d\n",
+                     static_cast<long long>(initialMs), static_cast<long long>(promotionMs), promotionRounds);
     }
 
     if (!verifyModuleForRt(m, "after-optimize")) {
@@ -1468,25 +1482,32 @@ llvm::json::Object dciNativeTypeFacts(llvm::Type* type, const llvm::DataLayout& 
 // defined call graphs, but reject unknown external, indirect and recursive edges.
 bool dciNativeNoUnwind(const llvm::Function& function,
                       llvm::SmallPtrSetImpl<const llvm::Function*>& visiting,
+                      std::unordered_map<const llvm::Function*, bool>& completed,
                       unsigned depth = 0) {
     // Native lowering can put nounwind on a definition/call before its
     // external callees have been proved. Inspect defined bodies regardless of
     // those attributes. Only LLVM intrinsic semantics establish a declaration
     // as no-unwind here; an arbitrary foreign declaration is not a proof.
     if (function.isDeclaration()) return function.isIntrinsic() && function.doesNotThrow();
+    // A shared helper is a single proof obligation. Revisiting its entire
+    // body for every incoming edge makes a small diamond-shaped call graph
+    // take exponential time. Cache only completed proofs; an active node
+    // must still be rejected as a recursive edge.
+    if (auto known = completed.find(&function); known != completed.end()) return known->second;
     if (depth >= 128 || !visiting.insert(&function).second) return false;
     bool proven = true;
     for (const auto& block : function) {
         for (const auto& instruction : block) {
             if (const auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction)) {
                 const auto* callee = call->getCalledFunction();
-                if (!callee || !dciNativeNoUnwind(*callee, visiting, depth + 1)) proven = false;
+                if (!callee || !dciNativeNoUnwind(*callee, visiting, completed, depth + 1)) proven = false;
             } else if (instruction.mayThrow() || llvm::isa<llvm::ResumeInst>(instruction)) {
                 proven = false;
             }
         }
     }
     visiting.erase(&function);
+    completed.emplace(&function, proven);
     return proven;
 }
 
@@ -1538,7 +1559,8 @@ extern "C" VYX_API char* vyx_rt_dci_export_function_json(void* h, const char* na
     }
     facts["parameters"] = std::move(parameters);
     llvm::SmallPtrSet<const llvm::Function*, 16> visiting;
-    facts["unwind"] = dciNativeNoUnwind(*function, visiting) ? "no_unwind" : "may_unwind";
+    std::unordered_map<const llvm::Function*, bool> completed;
+    facts["unwind"] = dciNativeNoUnwind(*function, visiting, completed) ? "no_unwind" : "may_unwind";
     std::string abi;
     if (triple.isWindowsMSVCEnvironment()) abi = "msvc";
     else if (triple.isAndroid()) abi = "android";
@@ -3011,6 +3033,27 @@ extern "C" VYX_API int32_t vyx_rt_track_eh_allocation(void* h, void* object,
     return 0;
 }
 
+extern "C" VYX_API int32_t vyx_rt_forget_eh_owner(void* h, void* object) {
+    if (!h || !object) return -1;
+    auto* m = asMod(h);
+    auto* bb = m->builder ? m->builder->GetInsertBlock() : nullptr;
+    if (!bb || !bb->getParent()->hasPersonalityFn()) return 0;
+    if (!asVal(object)->getType()->isPointerTy()) return -1;
+    auto state = m->ehFunctions.find(bb->getParent());
+    if (state == m->ehFunctions.end()) return 0;
+    auto& b = *m->builder;
+    auto* head = state->second.head;
+    auto* node = b.CreateCall(vyx_eh_find_function(m), {head, asVal(object)}, "eh.moved.node");
+    auto* unlink = llvm::BasicBlock::Create(*m->ctx, "eh.move.unlink", bb->getParent());
+    auto* done = llvm::BasicBlock::Create(*m->ctx, "eh.moved", bb->getParent());
+    b.CreateCondBr(b.CreateICmpEQ(node, vyx_eh_null(m)), done, unlink);
+    b.SetInsertPoint(unlink);
+    b.CreateCall(vyx_eh_unlink_function(m), {head, node});
+    b.CreateBr(done);
+    b.SetInsertPoint(done);
+    return 0;
+}
+
 extern "C" VYX_API int32_t vyx_rt_track_eh_owner(
     void* h, void* object, void* destructor, void* release) {
     if (!h || !object || !destructor) return -1;
@@ -4161,6 +4204,7 @@ extern "C" VYX_API int32_t vyx_rt_print_to_file(void* h,
 static int32_t emitModuleToFile(VyxRtModule* m, const char* path, uint64_t len,
                                 int32_t opt_level, llvm::CodeGenFileType fileType) {
     if (!m || !path || len == 0) return -1;
+    const auto emitBegin = std::chrono::steady_clock::now();
     const int32_t normalizedLevel = normalizedOptimizationLevelFromInt(opt_level);
     if (normalizedLevel != 0 &&
         (!m->optimized || m->optimizedLevel != normalizedLevel)) {
@@ -4196,8 +4240,17 @@ static int32_t emitModuleToFile(VyxRtModule* m, const char* path, uint64_t len,
                            : "TargetMachine cannot emit object file";
         return -1;
     }
+    const auto codegenBegin = std::chrono::steady_clock::now();
     pm.run(*m->mod);
     out.flush();
+    if (const char* timing = std::getenv("VYX_LLVM_TIMING");
+        timing && timing[0] != '\0' && timing[0] != '0') {
+        const auto end = std::chrono::steady_clock::now();
+        const auto prepMs = std::chrono::duration_cast<std::chrono::milliseconds>(codegenBegin - emitBegin).count();
+        const auto codegenMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - codegenBegin).count();
+        std::fprintf(stderr, "[llvm-timing] emit prepare_ms=%lld machine_ms=%lld\n",
+                     static_cast<long long>(prepMs), static_cast<long long>(codegenMs));
+    }
     return 0;
 }
 

@@ -54,11 +54,23 @@ Clear-EffectManifestEnv
 function Write-Utf8NoBom([string]$Path, [string]$Text) {
     [IO.File]::WriteAllText($Path, $Text, [Text.UTF8Encoding]::new($false))
 }
+function Copy-Utf8NoBom([string]$Source, [string]$Destination) {
+    $text = [IO.File]::ReadAllText($Source).Replace("`r`n", "`n").Replace("`r", "`n")
+    Write-Utf8NoBom $Destination $text
+}
 function Invoke-Capture([string]$File, [string[]]$Arguments, [string]$WorkingDirectory) {
     $stdout = Join-Path $WorkingDirectory ([IO.Path]::GetFileName($File) + '.stdout.log')
     $stderr = Join-Path $WorkingDirectory ([IO.Path]::GetFileName($File) + '.stderr.log')
-    $proc = Start-Process -FilePath $File -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -PassThru -Wait
+    # PowerShell rejects an empty `-ArgumentList` collection.  Executables in
+    # this gate are often launched without arguments, so omit the parameter in
+    # that case instead of turning a successful compiler run into a gate error.
+    if ($null -eq $Arguments -or $Arguments.Count -eq 0) {
+        $proc = Start-Process -FilePath $File -WorkingDirectory $WorkingDirectory `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -PassThru -Wait
+    } else {
+        $proc = Start-Process -FilePath $File -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -PassThru -Wait
+    }
     $text = ''
     if (Test-Path -LiteralPath $stdout) { $text += Get-Content -LiteralPath $stdout -Raw }
     if (Test-Path -LiteralPath $stderr) { $text += Get-Content -LiteralPath $stderr -Raw }
@@ -145,7 +157,7 @@ if ($invalidBuild.Exit -eq 0 -or $invalidBuild.Text -notmatch 'EFFECT-ARGS') {
 $declarativeDir = Join-Path $outRoot 'declarative-handler'
 New-Item -ItemType Directory -Force -Path $declarativeDir | Out-Null
 $declarativeSchema = Join-Path $declarativeDir 'schemas.effect'
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/declarative_schemas.txt') -Destination $declarativeSchema
+Copy-Utf8NoBom (Join-Path $PSScriptRoot 'fixtures/declarative_schemas.txt') $declarativeSchema
 $declarativeSrc = Join-Path $PSScriptRoot 'fixtures/declarative_use.vyx'
 $declarativeExe = Join-Path $declarativeDir 'declarative_use.exe'
 # Keep the producer manifest immutable while this independent package-schema
@@ -230,7 +242,7 @@ Clear-EffectManifestEnv
 $schemaStaleDir = Join-Path $outRoot 'manifest-in-schema-stale'
 New-Item -ItemType Directory -Force -Path $schemaStaleDir | Out-Null
 $schemaStaleTable = Join-Path $schemaStaleDir 'schemas.effect'
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/declarative_schemas.txt') -Destination $schemaStaleTable
+Copy-Utf8NoBom (Join-Path $PSScriptRoot 'fixtures/declarative_schemas.txt') $schemaStaleTable
 Clear-EffectManifestEnv
 $env:VYX_EFFECT_MANIFEST_IN = $manifestOut
 $env:VYX_EFFECT_SOURCE_STAMP = $manifestSourceStamp
@@ -839,7 +851,7 @@ if ($explicitRun.Exit -ne 0) { throw "explicit-only schema AOT run failed: $($ex
 $compatDir = Join-Path $outRoot 'attribute-legacy-merge'
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/attribute_project') -Destination $compatDir -Recurse
 $compatSchema = Join-Path $compatDir 'legacy.schemas'
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixtures/declarative_schemas.txt') -Destination $compatSchema
+Copy-Utf8NoBom (Join-Path $PSScriptRoot 'fixtures/declarative_schemas.txt') $compatSchema
 $compatMain = Join-Path $compatDir 'main.vyx'
 $compatSource = @'
 @[storage.cache(level="abi", retain=true)]

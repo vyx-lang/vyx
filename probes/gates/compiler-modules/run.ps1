@@ -149,6 +149,44 @@ fn main() -> i32 {
     Add-ContractResult $result $passed
 }
 
+# Export roots are build inputs. A missing list must not produce a successful,
+# empty object; an existing empty list remains a valid request for no roots.
+$rootInputs = Join-Path $runRoot 'root-inputs'
+[void][IO.Directory]::CreateDirectory($rootInputs)
+Write-ContractText (Join-Path $rootInputs 'main.vyx') @'
+public fn answer() -> i32 { return 42; }
+fn main() -> i32 { return 0; }
+'@
+Write-ContractText (Join-Path $rootInputs 'empty.txt') ''
+Write-ContractText (Join-Path $rootInputs 'selected.txt') 'answer'
+foreach ($option in @('--export-root-names-file', '--emit-root-names-file')) {
+    $kind = $option.Substring(2).Replace('-names-file', '')
+    $missing = Join-Path $rootInputs 'absent.txt'
+    $deniedOutput = Join-Path $rootInputs "$kind-denied.obj"
+    $result = Invoke-ContractCompiler "$kind-missing" $rootInputs @(
+        '--src=file', 'main.vyx', '--emit=obj', $option, $missing, '-o', $deniedOutput
+    )
+    Add-ContractResult $result ($result.exit_code -ne 0 `
+        -and $result.diagnostics.Contains('root names file not found') `
+        -and $result.diagnostics.Contains($missing) `
+        -and -not (Test-Path -LiteralPath $deniedOutput))
+    foreach ($list in @('empty', 'selected')) {
+        $output = Join-Path $rootInputs "$kind-$list.ll"
+        $arguments = @(
+            '--src=file', 'main.vyx', '--emit=ir', $option, "$list.txt", '-o', $output
+        )
+        # Emission partitions filter the codegen root set; export flags seed
+        # that set. They deliberately remain separate operations.
+        if ($option -eq '--emit-root-names-file') { $arguments += '--export-top-level-roots' }
+        $result = Invoke-ContractCompiler "$kind-$list" $rootInputs $arguments
+        $passed = $result.exit_code -eq 0 -and (Test-Path -LiteralPath $output)
+        if ($passed -and $list -eq 'selected') {
+            $passed = [IO.File]::ReadAllText($output) -match '(?ms)^define i32 @__vyx_F_answer_[^\r\n]*\{\r?\n[^}]*store i32 42[^}]*ret i32 '
+        }
+        Add-ContractResult $result $passed
+    }
+}
+
 @{ identity=$identity; tests=@($results.ToArray()) } | ConvertTo-Json -Depth 5 |
     Set-Content -LiteralPath (Join-Path $runRoot 'results.json') -Encoding utf8
 if ($results | Where-Object { -not $_.passed }) { exit 1 }

@@ -1,0 +1,344 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_builder;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn full_expression_temp_for_expr(self, expr_id: i32) -> rawptr {
+        var cur = self.full_expression_temps;
+        while (cur != null) {
+            if (ast_read_i32(cur) == expr_id) { return cur; }
+            cur = ast_read_rawptr(ptr_offset(cur, 8));
+        }
+        return null;
+    }
+
+    public fn materialize_full_expression_owner(self, expr_id: i32, value_id: i32) -> i32 {
+        if (expr_id == hir_id_invalid() || value_id == mir_id_invalid()) { return value_id; }
+        if (hir_unit_expr_value_category(self.h, expr_id) != hir_value_cat_value()) { return value_id; }
+        let type_id = self.unit.value_type(value_id);
+        if (hir_type_table_kind(self.h.types, type_id) != ty_CLASS()) { return value_id; }
+        // Descriptor-owned DCI records construct directly into final storage.
+        // Their existing lifecycle lowering owns the place; a native value
+        // materialization would introduce an illegal object copy.
+        if (mir_unit_type_is_foreign_dci(&self.unit, type_id)) { return value_id; }
+        var drop_hir_fn = hir_unit_expr_drop_function(self.h, expr_id);
+        if (self.has_hir_codegen_builder) {
+            let concrete_type_text = hir_type_table_text(self.h.types, type_id);
+            let concrete_drop = hir_codegen_builder_handle_ensure_drop_instance_for_type_text(
+                self.hir_codegen_builder, concrete_type_text);
+            // Instantiating a destructor can grow any HIR table. The builder
+            // frees the previous storage when it grows; refresh this view
+            // before reading or writing an expression or publishing it back.
+            self.refresh_from_codegen_builder();
+            if (concrete_drop != hir_id_invalid()) {
+                drop_hir_fn = concrete_drop;
+                self.h.set_expr_drop_function(expr_id, concrete_drop);
+            }
+        }
+        if (drop_hir_fn == hir_id_invalid()) { return value_id; }
+        let k = self.h.expr_kind(expr_id);
+        if (k != ex_CALL() && k != ex_STRUCT_INIT() && k != ex_TERNARY()
+            && k != ex_IF_EXPR() && k != ex_MATCH_EXPR()) { return value_id; }
+        // An overloaded assignment can return an existing place. Only actual
+        // factory/aggregate/control results introduce a temporary owner.
+        let vk = self.unit.value_kind(value_id);
+        if (vk != mir_value_call() && vk != mir_value_aggregate()
+            && vk != mir_value_control_result()
+            && !(vk == mir_value_read_place()
+                 && (k == ex_TERNARY() || k == ex_IF_EXPR() || k == ex_MATCH_EXPR()))) {
+            return value_id;
+        }
+        if (k == ex_TERNARY() && vk == mir_value_control_result()) {
+            self.unit.set_value_rhs(value_id,
+                self.conditional_owner_arm(self.h.expr_rhs(expr_id), self.unit.value_rhs(value_id)));
+            self.unit.set_value_aux(value_id,
+                self.conditional_owner_arm(self.h.expr_aux(expr_id), self.unit.value_aux(value_id)));
+        }
+        let saved_drop_stack = self.drop_stack_head;
+        let place_id = self.add_owned_temp_place(type_id, expr_id, "expr.owner", drop_hir_fn);
+        // Full-expression lifetime is independent of lexical scope. A branch
+        // must never destroy a lazily evaluated sibling before it is constructed.
+        let drop_node = self.drop_stack_head;
+        self.drop_stack_head = saved_drop_stack;
+        if (drop_node != saved_drop_stack && drop_node != null) { free(drop_node); }
+        let guard_place = self.add_temp_place_with_flags(self.bool_type_id(), expr_id,
+                                                        "expr.live", mir_local_flag_drop_guard());
+        self.unit.set_local_drop_guard(self.unit.place_local(place_id), guard_place);
+        let out = self.unit.add_value(self.current_function_id, mir_value_materialize(), type_id,
+                                       place_id, mir_target_none(), mir_id_invalid(), expr_id,
+                                       self.value_flags_for_expr(expr_id), 0, 0, "expr.owner", "");
+        self.unit.set_value_lhs(out, value_id);
+        let node = mir_profile_malloc(24);
+        if (node == null) {
+            self.report_error("cannot record full-expression owner");
+            return mir_id_invalid();
+        }
+        ast_write_i32(node, expr_id);
+        ast_write_i32(ptr_offset(node, 4), self.unit.local_hir_id(self.unit.place_local(place_id)));
+        ast_write_rawptr(ptr_offset(node, 8), self.full_expression_temps);
+        ast_write_i32(ptr_offset(node, 16), out);
+        ast_write_i32(ptr_offset(node, 20), 1);
+        self.full_expression_temps = node;
+        return out;
+    }
+
+    public fn conditional_owner_arm(self, expr_id: i32, value_id: i32) -> i32 {
+        let temporary = self.full_expression_temp_for_expr(expr_id);
+        if (temporary != null) {
+            ast_write_i32(ptr_offset(temporary, 20), 0);
+            return value_id;
+        }
+        if (self.unit.value_kind(value_id) != mir_value_read_place()) { return value_id; }
+        let place = self.unit.value_place(value_id);
+        if (self.unit.place_kind(place) != mir_place_local()) { return value_id; }
+        let local = self.unit.place_local(place);
+        if ((self.unit.local_flags(local) & mir_local_flag_auto_drop()) == 0) { return value_id; }
+        if (self.unit.local_drop_guard(local) == mir_id_invalid()) {
+            var guard_flags = mir_local_flag_drop_guard();
+            if ((self.unit.local_flags(local) & mir_local_flag_param()) != 0) {
+                guard_flags = guard_flags | mir_local_flag_guard_initially_live();
+            }
+            self.unit.set_local_drop_guard(local,
+                self.add_temp_place_with_flags(self.bool_type_id(), expr_id, "move.live", guard_flags));
+        }
+        let out = self.unit.add_value(self.current_function_id, mir_value_move_place(),
+            self.unit.value_type(value_id), place, mir_target_none(), mir_id_invalid(), expr_id,
+            0, 0, 0, "conditional.move", "");
+        self.unit.set_value_lhs(out, value_id);
+        return out;
+    }
+
+    public fn emit_full_expression_temp_drop(self, node: rawptr, stmt_id: i32) {
+        if (node == null || self.current_block_terminated()
+            || ast_read_i32(ptr_offset(node, 20)) == 0) { return; }
+        let hir_local = ast_read_i32(ptr_offset(node, 4));
+        let value_id = ast_read_i32(ptr_offset(node, 16));
+        let place_id = self.unit.value_place(value_id);
+        let drop_fn = self.ensure_function_shell_for_hir(hir_unit_local_drop_function(self.h, hir_local));
+        self.unit.add_instr(self.current_function_id, self.current_block_id, mir_instr_drop(),
+                             self.unit.place_type(place_id), place_id, mir_id_invalid(),
+                             mir_id_invalid(), mir_id_invalid(), mir_target_function(), drop_fn,
+                             stmt_id, ast_read_i32(node), 0, hir_local, "expr.owner");
+    }
+
+    public fn emit_pending_full_expression_drops(self, stmt_id: i32) {
+        var cur = self.full_expression_temps;
+        while (cur != null) {
+            self.emit_full_expression_temp_drop(cur, stmt_id);
+            cur = ast_read_rawptr(ptr_offset(cur, 8));
+        }
+    }
+
+    public fn full_expression_borrow_mentions_stmt(self, stmt_id: i32) -> bool {
+        if (stmt_id <= 0 || stmt_id == hir_id_invalid() || stmt_id > self.h.stmt_count) { return false; }
+        var cur = stmt_id;
+        while (cur != hir_id_invalid()) {
+            let expr_id = self.h.stmt_expr(cur);
+            if (expr_id != hir_id_invalid()
+                && self.full_expression_borrow_mentions_owner(expr_id)) { return true; }
+            let cond_id = self.h.stmt_cond(cur);
+            if (cond_id != hir_id_invalid()
+                && self.full_expression_borrow_mentions_owner(cond_id)) { return true; }
+            let child = self.h.stmt_child(cur);
+            if (child != hir_id_invalid()
+                && self.full_expression_borrow_mentions_stmt(child)) { return true; }
+            let else_stmt = self.h.stmt_else(cur);
+            if (else_stmt != hir_id_invalid()
+                && self.full_expression_borrow_mentions_stmt(else_stmt)) { return true; }
+            cur = self.h.stmt_next(cur);
+        }
+        return false;
+    }
+
+    public fn full_expression_borrow_mentions_owner(self, expr_id: i32) -> bool {
+        if (expr_id <= 0 || expr_id == hir_id_invalid() || expr_id > self.h.expr_count) { return false; }
+        let node = self.full_expression_temp_for_expr(expr_id);
+        if (node != null && ast_read_i32(ptr_offset(node, 20)) != 0) { return true; }
+        let k = self.h.expr_kind(expr_id);
+        if (k == ex_IDENT() && self.h.expr_target_kind(expr_id) == hir_target_local()) {
+            var borrow = self.full_expression_borrows;
+            while (borrow != null) {
+                if (ast_read_i32(borrow) == self.h.expr_target_id(expr_id)) { return true; }
+                borrow = ast_read_rawptr(ptr_offset(borrow, 8));
+            }
+        }
+        // Follow only fields owned by expression kinds that can carry a value.
+        // Unconditionally walking lhs/rhs/aux lets literal nodes expose stale
+        // positive IDs from a previous expression and falsely reject a later
+        // `return 0` after a borrowed local was built.
+        if (k == ex_CALL() || k == ex_TERNARY() || k == ex_IF_EXPR()
+            || k == ex_MATCH_EXPR()) {
+            if (self.full_expression_borrow_mentions_owner(self.h.expr_lhs(expr_id))) { return true; }
+            if (self.full_expression_borrow_mentions_owner(self.h.expr_rhs(expr_id))) { return true; }
+            if (self.full_expression_borrow_mentions_owner(self.h.expr_aux(expr_id))) { return true; }
+        }
+        if (k == ex_MEMBER() || k == ex_CAST() || k == ex_ADDR_OF()
+            || k == ex_DEREF() || k == ex_INDEX()) {
+            if (self.full_expression_borrow_mentions_owner(self.h.expr_lhs(expr_id))) { return true; }
+        }
+        if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+            if (self.full_expression_borrow_mentions_stmt(self.h.expr_stmt_rhs(expr_id))) { return true; }
+            if (self.full_expression_borrow_mentions_stmt(self.h.expr_stmt_aux(expr_id))) { return true; }
+        }
+        if (k == ex_CALL() || k == ex_STRUCT_INIT() || k == ex_TUPLE_LIT()
+            || k == ex_ARRAY_LIT() || k == ex_TERNARY() || k == ex_IF_EXPR()
+            || k == ex_MATCH_EXPR()) {
+            var arg = self.h.expr_first_arg(expr_id);
+            while (arg != hir_id_invalid()) {
+                if (self.full_expression_borrow_mentions_owner(arg)) { return true; }
+                arg = self.h.expr_next_arg(arg);
+            }
+        }
+        return false;
+    }
+
+    public fn full_expression_result_can_borrow(self, type_id: i32) -> bool {
+        let kind = hir_type_table_kind(self.h.types, type_id);
+        return kind == ty_STRING() || kind == ty_REF() || kind == ty_MUTREF();
+    }
+
+    public fn extend_full_expression_borrow(self, mark: rawptr, expr_id: i32, type_id: i32,
+                                            hir_local: i32, branch_result: bool) {
+        let expression_kind = self.h.expr_kind(expr_id);
+        let aggregate_result = expression_kind == ex_STRUCT_INIT()
+            || expression_kind == ex_TUPLE_LIT()
+            || expression_kind == ex_ARRAY_LIT();
+        if (!self.full_expression_result_can_borrow(type_id) && !aggregate_result) { return; }
+        var has_owner = self.full_expression_borrow_mentions_owner(expr_id);
+        // A method receiver can hide the owner behind a lowered call node.
+        // The mark bounds this fallback to the current full expression, so an
+        // unrelated temporary from an earlier statement cannot be retained.
+        if (!has_owner) {
+            var probe = self.full_expression_temps;
+            while (probe != null && probe != mark) {
+                if (ast_read_i32(ptr_offset(probe, 20)) != 0) {
+                    has_owner = true;
+                    break;
+                }
+                probe = ast_read_rawptr(ptr_offset(probe, 8));
+            }
+        }
+        if (!has_owner) { return; }
+        // A view stored in a binding needs its backing temporary throughout
+        // that binding's scope, including conditional construction guards.
+        var node = self.full_expression_temps;
+        while (node != null && node != mark) {
+            if (ast_read_i32(ptr_offset(node, 20)) != 0) {
+                let owner_local = ast_read_i32(ptr_offset(node, 4));
+                // A regular binding already has a lexical drop-stack entry.
+                // Keep its owner in that scope; only branch result temporaries
+                // (which have no destination entry yet) need function-level
+                // promotion to survive the branch join.
+                let expression_kind = self.h.expr_kind(expr_id);
+                let is_control_result = branch_result
+                    || expression_kind == ex_IF_EXPR()
+                    || expression_kind == ex_MATCH_EXPR()
+                    || expression_kind == ex_TERNARY();
+                if (self.drop_stack_find(hir_local) != null || !is_control_result) {
+                    self.drop_stack_push(owner_local);
+                } else {
+                    self.promote_full_expression_borrow_owner(owner_local);
+                }
+                ast_write_i32(ptr_offset(node, 20), 0);
+            }
+            node = ast_read_rawptr(ptr_offset(node, 8));
+        }
+        let borrow = mir_profile_malloc(16);
+        if (borrow == null) { self.report_error("cannot record temporary borrow provenance"); return; }
+        ast_write_i32(borrow, hir_local);
+        ast_write_rawptr(ptr_offset(borrow, 8), self.full_expression_borrows);
+        self.full_expression_borrows = borrow;
+    }
+
+    public fn promote_full_expression_borrow_owner(self, hir_local: i32) {
+        if (hir_local == hir_id_invalid() || !self.hir_local_has_drop(hir_local)) { return; }
+        // The owner is intentionally moved past the branch scope.  Keep its
+        // drop node linked because branch snapshots may point at it; mark it
+        // inactive until the function-exit pass reactivates it and drops it.
+        self.drop_stack_set_active(hir_local, false);
+        if (self.lowering_return_expression) {
+            self.full_expression_return_borrow_pending = true;
+        }
+        var cur = self.full_expression_borrow_owners;
+        while (cur != null) {
+            if (ast_read_i32(cur) == hir_local) { return; }
+            cur = ast_read_rawptr(ptr_offset(cur, 8));
+        }
+        let node = mir_profile_malloc(16);
+        if (node == null) { self.report_error("cannot record borrowed temporary owner"); return; }
+        memset(node, 0, 16);
+        ast_write_i32(node, hir_local);
+        ast_write_rawptr(ptr_offset(node, 8), self.full_expression_borrow_owners);
+        self.full_expression_borrow_owners = node;
+    }
+
+    public fn emit_full_expression_borrow_owner_drops(self, stmt_id: i32) {
+        var cur = self.full_expression_borrow_owners;
+        while (cur != null) {
+            let next = ast_read_rawptr(ptr_offset(cur, 8));
+            let hir_local = ast_read_i32(cur);
+            if (!self.current_block_terminated()) {
+                if (self.drop_stack_find(hir_local) == null) {
+                    self.drop_stack_push(hir_local);
+                } else {
+                    self.drop_stack_set_active(hir_local, true);
+                }
+                self.emit_drop_for_hir_local(hir_local, stmt_id, hir_id_invalid(), true);
+            }
+            free(cur);
+            cur = next;
+        }
+        self.full_expression_borrow_owners = null;
+    }
+
+    public fn check_full_expression_return_borrow(self, expr_id: i32, type_id: i32) {
+        let expression_kind = self.h.expr_kind(expr_id);
+        var active_owner = false;
+        var temp = self.full_expression_temps;
+        while (temp != null) {
+            if (ast_read_i32(ptr_offset(temp, 20)) != 0) {
+                active_owner = true;
+                break;
+            }
+            temp = ast_read_rawptr(ptr_offset(temp, 8));
+        }
+        let mentions_owner = self.full_expression_borrow_mentions_owner(expr_id);
+        let local_view = expression_kind == ex_IDENT() && mentions_owner;
+        var invalid = self.full_expression_result_can_borrow(type_id)
+            && (self.full_expression_return_borrow_pending
+                || (mentions_owner && (active_owner || local_view)));
+        if (invalid) {
+            diag_emit_codegen_at(hir_unit_expr_loc_ptr(self.h, expr_id),
+                "returned view borrows an owning temporary that is destroyed at function exit");
+            self.hir_codegen_error_count = self.hir_codegen_error_count + 1;
+        }
+        self.full_expression_return_borrow_pending = false;
+    }
+
+    public fn finish_full_expression(self, mark: rawptr, stmt_id: i32) {
+        while (self.full_expression_temps != null && self.full_expression_temps != mark) {
+            let node = self.full_expression_temps;
+            self.emit_full_expression_temp_drop(node, stmt_id);
+            self.full_expression_temps = ast_read_rawptr(ptr_offset(node, 8));
+            free(node);
+        }
+    }
+
+    public fn lower_full_expression_condition(self, expr_id: i32, stmt_id: i32) -> i32 {
+        let mark = self.full_expression_temps;
+        let value_id = self.lower_expr(expr_id);
+        if (self.full_expression_temps == mark) { return value_id; }
+        let result = self.add_temp_place(self.unit.value_type(value_id), expr_id, "expr.condition");
+        self.emit_assign(result, value_id, stmt_id, expr_id);
+        self.finish_full_expression(mark, stmt_id);
+        return self.add_read_value(result, expr_id);
+    }
+}
