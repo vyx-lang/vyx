@@ -157,8 +157,16 @@ try {
         "--undefined-only", $runtimeArchive
     ) -WorkingDirectory $runRoot
     Assert-Success "runtime dependency inspection" $runtimeUndefined
+    # llvm-nm prefixes each archive member with its filename. Only undefined
+    # symbol records are dependencies; e.g. a codegen/llvm path is not an
+    # imported LLVM symbol.
+    $undefinedSymbols = @($runtimeUndefined.Text -split "`n" | ForEach-Object {
+        if ($_ -match '^\s*(?:[0-9A-Fa-f]+\s+)?[UuWwVv]\s+(.+?)\s*$') {
+            $Matches[1]
+        }
+    }) -join "`n"
     foreach ($forbidden in @("LLVM", "vyx_compiler_backend", "__cxa_", "__gxx_", "std::")) {
-        if ($runtimeUndefined.Text -match [regex]::Escape($forbidden)) {
+        if ($undefinedSymbols -match [regex]::Escape($forbidden)) {
             throw "[sdk-runtime-contract] Vyx runtime has forbidden native dependency '$forbidden'"
         }
     }

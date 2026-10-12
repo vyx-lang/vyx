@@ -13,6 +13,8 @@
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <sys/uio.h>
+#include <elf.h>
 #include <unistd.h>
 
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
@@ -147,7 +149,17 @@ int plant(Breakpoint& bp) {
         return -1;
     }
     bp.orig = word;
+#if defined(__aarch64__)
+    // AArch64 instructions are four bytes wide and use BRK #0 for a software
+    // breakpoint.  PTRACE_PEEKTEXT still returns a machine word, so preserve
+    // the neighbouring instruction bytes when replacing the low instruction.
+    constexpr unsigned long kInstructionMask = 0xffffffffUL;
+    constexpr unsigned long kBreakpointInstruction = 0xd4200000UL;
+    long patched = static_cast<long>((static_cast<unsigned long>(word) & ~kInstructionMask) |
+                                     kBreakpointInstruction);
+#else
     long patched = (word & ~0xffL) | 0xccL;
+#endif
     if (ptrace(PTRACE_POKETEXT, g_eng.pid, reinterpret_cast<void*>(bp.addr),
                reinterpret_cast<void*>(patched)) != 0) {
         return -1;
@@ -169,16 +181,50 @@ int restore(Breakpoint& bp) {
 }
 
 int read_regs(user_regs_struct& regs) {
+#if defined(__aarch64__)
+    struct iovec io {&regs, sizeof(regs)};
+    return ptrace(PTRACE_GETREGSET, g_eng.pid,
+                  reinterpret_cast<void*>(static_cast<uintptr_t>(NT_PRSTATUS)), &io);
+#else
     return ptrace(PTRACE_GETREGS, g_eng.pid, nullptr, &regs);
+#endif
 }
 
 int write_regs(const user_regs_struct& regs) {
+#if defined(__aarch64__)
+    struct iovec io {const_cast<user_regs_struct*>(&regs), sizeof(regs)};
+    return ptrace(PTRACE_SETREGSET, g_eng.pid,
+                  reinterpret_cast<void*>(static_cast<uintptr_t>(NT_PRSTATUS)), &io);
+#else
     return ptrace(PTRACE_SETREGS, g_eng.pid, nullptr, const_cast<user_regs_struct*>(&regs));
+#endif
+}
+
+uint64_t program_counter(const user_regs_struct& regs) {
+#if defined(__aarch64__)
+    return static_cast<uint64_t>(regs.pc);
+#else
+    return static_cast<uint64_t>(regs.rip);
+#endif
+}
+
+void set_program_counter(user_regs_struct& regs, uint64_t value) {
+#if defined(__aarch64__)
+    regs.pc = static_cast<unsigned long>(value);
+#else
+    regs.rip = static_cast<unsigned long>(value);
+#endif
 }
 
 Breakpoint* hit_at(uint64_t rip) {
     for (auto& bp : g_eng.breaks) {
-        if (bp.planted && (bp.addr == rip || bp.addr + 1 == rip)) {
+        if (bp.planted && (bp.addr == rip
+#if defined(__aarch64__)
+                           || bp.addr + 4 == rip
+#else
+                           || bp.addr + 1 == rip
+#endif
+                           )) {
             return &bp;
         }
     }
@@ -206,15 +252,19 @@ int wait_once(std::string& reason) {
         reason = "error";
         return -1;
     }
-    uint64_t rip = static_cast<uint64_t>(regs.rip);
-    Breakpoint* bp = hit_at(rip);
+    uint64_t pc = program_counter(regs);
+    Breakpoint* bp = hit_at(pc);
     if (bp == nullptr) {
-        bp = hit_at(rip - 1);
+#if defined(__aarch64__)
+        bp = pc >= 4 ? hit_at(pc - 4) : nullptr;
+#else
+        bp = pc >= 1 ? hit_at(pc - 1) : nullptr;
+#endif
     }
     if (bp != nullptr) {
         restore(*bp);
-        if (static_cast<uint64_t>(regs.rip) != bp->addr) {
-            regs.rip = static_cast<unsigned long>(bp->addr);
+        if (program_counter(regs) != bp->addr) {
+            set_program_counter(regs, bp->addr);
             write_regs(regs);
         }
         reason = "breakpoint";
@@ -386,7 +436,7 @@ extern "C" VYX_API int32_t vyx_dap_stack_json(char* buf, int32_t cap) {
     }
     std::string file = g_eng.exe;
     int32_t line = 1;
-    uint64_t rip = static_cast<uint64_t>(regs.rip);
+    uint64_t rip = program_counter(regs);
     for (const auto& e : g_eng.lines) {
         if (e.addr <= rip) {
             file = e.file;

@@ -110,13 +110,15 @@ foreach ($entry in $required.GetEnumerator()) {
     }
 }
 
-function Copy-CleanTree([string]$Source, [string]$DestinationPath) {
+function Copy-CleanTree([string]$Source, [string]$DestinationPath, [switch]$ExcludeBuildArtifacts) {
     New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
     foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {
         if ($item.PSIsContainer) {
             if ($item.Name -in @(".cache", "out", "__pycache__")) { continue }
-            Copy-CleanTree -Source $item.FullName -DestinationPath (Join-Path $DestinationPath $item.Name)
+            Copy-CleanTree -Source $item.FullName -DestinationPath (Join-Path $DestinationPath $item.Name) `
+                -ExcludeBuildArtifacts:$ExcludeBuildArtifacts
         } else {
+            if ($ExcludeBuildArtifacts -and $item.Extension -in @('.exe', '.obj', '.o', '.dll', '.lib', '.a', '.so', '.pyc', '.pyo')) { continue }
             Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $DestinationPath $item.Name)
         }
     }
@@ -229,8 +231,13 @@ try {
 
     $dciSource = Join-Path (Join-Path $repoRoot "tools") "dci"
     if (Test-Path -LiteralPath $dciSource -PathType Container) {
-        Copy-CleanTree -Source $dciSource -DestinationPath (Join-Path (Join-Path $stage "tools") "dci")
+        Copy-CleanTree -Source $dciSource -DestinationPath (Join-Path (Join-Path $stage "tools") "dci") -ExcludeBuildArtifacts
     }
+    $packagesSource = Join-Path (Join-Path $repoRoot "tools") "packages"
+    if (-not (Test-Path -LiteralPath (Join-Path $packagesSource "package_manager.py") -PathType Leaf)) {
+        throw "Package manager source is missing: $packagesSource"
+    }
+    Copy-CleanTree -Source $packagesSource -DestinationPath (Join-Path (Join-Path $stage "tools") "packages") -ExcludeBuildArtifacts
     $toolsInit = Join-Path (Join-Path $repoRoot "tools") "__init__.py"
     if (Test-Path -LiteralPath $toolsInit -PathType Leaf) {
         $toolsDestination = Join-Path $stage "tools"
@@ -380,19 +387,88 @@ try {
             }
         }
 
-        foreach ($linkSpec in @(
-            @("libLLVM.so", "libLLVM.so*"),
-            @("libz.so", "libz.so.*"),
-            @("libzstd.so", "libzstd.so.*")
+        # Host `ldd` cannot inspect a foreign-architecture SDK. Walk ELF
+        # DT_NEEDED entries instead, resolving exact SONAMEs from the target
+        # sysroot and copying the complete non-glibc dependency closure.
+        $librarySearchRoots = New-Object System.Collections.Generic.List[string]
+        $librarySearchRoots.Add((Join-Path $llvmRoot "lib"))
+        $usrRoot = Split-Path (Split-Path $llvmRoot -Parent) -Parent
+        $sysroot = Split-Path $usrRoot -Parent
+        # A toolchain under /tmp/<workspace>/toolchain reaches the filesystem
+        # root here. PowerShell represents that parent as an empty string.
+        if ([string]::IsNullOrWhiteSpace($sysroot)) { $sysroot = '/' }
+        $usrLibRoot = Join-Path $usrRoot "lib"
+        $sysLibRoot = Join-Path $sysroot "lib"
+        $multiarch = switch ($Arch) {
+            { $_ -in @("aarch64", "arm64") } { "aarch64-linux-gnu"; break }
+            "x86_64" { "x86_64-linux-gnu"; break }
+            "i686" { "i386-linux-gnu"; break }
+            "armv7l" { "arm-linux-gnueabihf"; break }
+            "riscv64" { "riscv64-linux-gnu"; break }
+            default { "" }
+        }
+        foreach ($root in @(
+            $(if ($multiarch) { Join-Path $usrLibRoot $multiarch }),
+            $(if ($multiarch) { Join-Path $sysLibRoot $multiarch }),
+            $(if ($multiarch) { Join-Path (Join-Path "/usr" $multiarch) "lib" }),
+            $usrLibRoot,
+            $sysLibRoot
         )) {
-            $targetLibrary = Get-ChildItem -LiteralPath $lib.FullName -Filter $linkSpec[1] -File |
-                Sort-Object Name |
-                Select-Object -First 1
-            if ($null -ne $targetLibrary) {
-                Add-RelativeLink -LinkPath (Join-Path $toolchainLib.FullName $linkSpec[0]) `
-                    -Target ("../../lib/" + $targetLibrary.Name)
+            if ($root -and (Test-Path -LiteralPath $root -PathType Container) -and
+                -not $librarySearchRoots.Contains($root)) {
+                $librarySearchRoots.Add($root)
             }
         }
+        if ($multiarch) {
+            $gccCrossRoot = Join-Path (Join-Path "/usr/lib/gcc-cross" $multiarch) ""
+            foreach ($gccVersionRoot in Get-ChildItem -LiteralPath $gccCrossRoot -Directory -ErrorAction SilentlyContinue) {
+                $librarySearchRoots.Add($gccVersionRoot.FullName)
+            }
+        }
+        $systemLibraries = @("libc.so.6", "libm.so.6")
+        $pendingLibraries = New-Object 'System.Collections.Generic.Queue[string]'
+        $visitedLibraries = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($inputPath in $lddInputs) { $pendingLibraries.Enqueue($inputPath) }
+        while ($pendingLibraries.Count -gt 0) {
+            $inputPath = $pendingLibraries.Dequeue()
+            $inputPath = [System.IO.Path]::GetFullPath($inputPath)
+            if (-not $visitedLibraries.Add($inputPath)) { continue }
+            $dynamicInfo = & readelf -d $inputPath 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "readelf could not inspect SDK ELF dependency input: $inputPath`n$($dynamicInfo -join "`n")"
+            }
+            foreach ($line in $dynamicInfo) {
+                if ($line -notmatch 'Shared library: \[(?<name>[^\]]+)\]') { continue }
+                $soname = $Matches.name
+                if ($soname -in $systemLibraries -or $soname -match '^ld-linux-.*\.so') { continue }
+
+                $destinationLibrary = Join-Path $lib.FullName $soname
+                if (-not (Test-Path -LiteralPath $destinationLibrary -PathType Leaf)) {
+                    $targetLibrary = $null
+                    foreach ($searchRoot in $librarySearchRoots) {
+                        $targetLibrary = Get-ChildItem -LiteralPath $searchRoot -Filter $soname `
+                            -File -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -ceq $soname } |
+                            Select-Object -First 1
+                        if ($null -ne $targetLibrary) { break }
+                    }
+                    if ($null -eq $targetLibrary) {
+                        throw "cannot resolve target ELF dependency '$soname' required by $inputPath"
+                    }
+                    Copy-ResolvedFile -Source $targetLibrary.FullName -DestinationPath $destinationLibrary
+                }
+                $pendingLibraries.Enqueue($destinationLibrary)
+            }
+        }
+
+        # LLVM tools have RUNPATHs relative to toolchain/lib. Link every
+        # collected dependency there under the exact SONAME its parent needs.
+        Get-ChildItem -LiteralPath $lib.FullName -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '\.so(\..*)?$' } |
+            ForEach-Object {
+                Add-RelativeLink -LinkPath (Join-Path $toolchainLib.FullName $_.Name) `
+                    -Target ("../../lib/" + $_.Name)
+            }
 
         $launcher = @'
 #!/usr/bin/env sh
