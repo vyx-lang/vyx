@@ -47,6 +47,20 @@ production path/env helpers use native runtime services.
   charged twice; physical and commit headroom independently constrain admission;
   manual limits remain caps; unknown headroom cannot invent memory. Byte-level
   admission handles sub-GiB budgets and avoids overflowing reservation sums.
+  The host reserve stays separate from active workers' growth allowances;
+  observed worker memory never discounts that reserve. Cold Vyx estimates
+  include imported generic expansion as well as primary source bytes.
+  Split compilation also accounts for the bytes in its peer interface inputs;
+  imported raw modules are counted separately. The source-index walk checks
+  dependencies introduced by a primary sibling, every imported module sibling,
+  transitive imports, cycles, duplicate paths and unrelated module prefixes.
+  A measured profile supersedes the combined cold estimate. Transport checks
+  retain primary, peer-interface and imported-source byte fields.
+  The active-batch exhaustion check tests physical and commit budgets
+  independently, unknown telemetry, threshold equality and small reserves.
+- Task classification: `.vyi` emission is a Vyx frontend action for memory
+  estimation, while only object generation consumes codegen slots. C++ actions
+  use the native-tool prior.
 - String lifetime: builder output is detached using `owned.raw().clone()` before
   destroying its owner. Tests 0, 1, 23, 24, 63 and 64 bytes, then overwrites the
   helper's stack through another call. The short cache and short queue cases

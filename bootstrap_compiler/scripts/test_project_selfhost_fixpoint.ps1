@@ -2,7 +2,7 @@ param(
     [string]$SeedCompiler = "",
     [ValidateRange(1, 3600)][int]$TimeoutSec = 1800,
     [ValidateRange(3, 12)][int]$Generations = 3,
-    [ValidateRange(1, 256)][int]$Jobs = 10,
+    [ValidateRange(1, 256)][int]$Jobs = 20,
     [string]$Target = "",
     [string]$WorkRoot = "",
     [string]$LlvmRoot = "",

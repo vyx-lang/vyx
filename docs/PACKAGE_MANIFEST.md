@@ -2,7 +2,7 @@
 
 [简体中文](PACKAGE_MANIFEST_ZH.md) · [Project tutorial](PROJECTS.md) · [Documentation index](README.md)
 
-> **Documentation status (2026-09-02):** current self-host implementation reference.
+> **Documentation status:** current self-host implementation reference.
 > The package/source-target, target-selection and triplet-link features below
 > describe the self-host implementation in
 > `bootstrap_compiler/src/core/project/build_system.vyx`. The frozen host toolchain does
@@ -37,13 +37,215 @@ for `-o` are relative to the caller; manifest paths are relative to the project.
 Select `--target` when the manifest has multiple targets and no package-named target.
 These output modes cannot be combined with `--run=aot` or `--artifact-file`.
 
-`vyx publish`, `vyx install`, `vyx search`, and `vyx lock` talk to a local
-`file://` registry (`VYX_REGISTRY`, default `./.vyx-registry`). `publish`
-copies the current package into `pkgs/<name>/<version>/` and updates
-`index.txt`. `install name[@ver]` materializes that tree into
-`.cache/registry/<name>/<version>/` and writes `Vyx.lock`. A dependency may
-use `version = "1.2.3"` or `path = "registry:name@1.2.3"`; the build resolves
-those from the cache or the registry root. There is no remote HTTP registry.
+Third-party packages are resolved through named JSON sources. See
+[Package sources and lock files](#package-sources-and-lock-files) for source
+configuration, archive contents, and reproducible builds.
+
+## Package sources and lock files
+
+A source is a JSON index; its address may be an HTTP(S) URL, a `file://` URL,
+or a local path. Host it on GitHub, a private server, or a shared filesystem.
+Package archives may be hosted separately. The package manager uses Python
+3.11 or newer and the standard library; the SDK ships its engine in
+`tools/packages/`. Projects using only local paths and `std:` packages do not
+require Python for dependency resolution.
+
+Add sources for the current user:
+
+```sh
+vyxc source add community https://packages.example.org/index.json
+vyxc source add company https://packages.example.org/private/index.json --token-env VYX_PACKAGE_TOKEN
+vyxc source list
+vyxc source remove community
+```
+
+These example addresses must be replaced with your actual indexes.
+User configuration is stored in `~/.vyx/sources.json`; `VYX_PACKAGE_SOURCES`
+selects another configuration file. Its format is:
+
+```json
+{
+  "schema": 1,
+  "sources": [
+    {"name": "company", "url": "https://packages.example.org/private/index.json", "token_env": "VYX_PACKAGE_TOKEN"},
+    {"name": "community", "url": "https://packages.example.org/index.json"}
+  ]
+}
+```
+
+Project-specific sources belong in `Vyx.toml`:
+
+```toml
+[sources.company]
+url = "https://packages.example.org/private/index.json"
+token_env = "VYX_PACKAGE_TOKEN"
+
+[dependencies]
+codec = { version = "^1.2.0", source = "company", target = "codec" }
+```
+
+Project sources come first, in declaration order, followed by user sources
+whose names were not overridden. Specifying `source` restricts a dependency
+to that source. Otherwise, the first source containing the package owns its
+resolution, even when it has no compatible version. An inaccessible source,
+invalid JSON, or invalid package metadata is an error; resolution does not
+silently substitute a package from a later source. Use an explicit source
+for private package names.
+
+An index has this structure:
+
+```json
+{
+  "schema": 1,
+  "packages": {
+    "codec": {
+      "description": "Binary encoding library",
+      "versions": {
+        "1.2.3": {
+          "url": "archives/codec-1.2.3.tar.gz",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "strip_prefix": "codec-1.2.3"
+        }
+      }
+    }
+  }
+}
+```
+
+Replace the example SHA256 with the archive's actual hash. Relative archive
+URLs are resolved against the index location. The archive must contain the
+package's `Vyx.toml` and declared inputs after removing the optional
+`strip_prefix`. The manager verifies SHA256 before extraction and rejects
+unsafe archive paths. Source identity combines the configured name and normalized
+index URL; token values are excluded. Differently named sources remain separate
+even when they use the same URL, so private authentication views do not share a
+dependency identity. Caches live under
+`.cache/packages/<source-identity-hash>/<name>/<version>/<archive-hash>/`.
+
+Version requirements support exact SemVer (`1.2.3`), caret (`^1.2.0`), tilde
+(`~1.2.0`), comparisons (`>=1.2.0 <2.0.0`), wildcards (`1.2.*` or `*`),
+and alternatives separated by `||`. Resolution selects a compatible version
+within the authoritative source. The graph selects one version per named source
+and package name; incompatible requirements produce a version conflict.
+Prereleases require an explicit prerelease
+requirement; `*` does not opt into prerelease releases.
+
+```sh
+vyxc search codec
+vyxc install 'codec@^1.2.0' --source company
+vyxc lock
+vyxc build --locked
+vyxc build --offline
+vyxc update
+```
+
+`install` with a package argument records a versioned dependency in
+`Vyx.toml`; without one it materializes the declared dependency graph. `lock`
+resolves that graph and writes `Vyx.packages.lock`. `update` explicitly
+re-resolves versions. Resolution covers every declared target's effective
+dependencies after applying global, inherited-template, and target overrides
+and removals. It follows dependencies in local and downloaded packages and may
+fetch packages for targets not selected by the current build. An unused
+template or an overridden default does not add a dependency constraint.
+
+`Vyx.packages.lock` is a JSON lock file recording precise versions, source
+identities, archive hashes, verified payload digests, and dependency edges.
+Commit it with `Vyx.toml`.
+It is separate from `Vyx.lock`, which selects MOSP module versions and
+variants. `--locked` rejects a missing lock or dependency graph changes.
+`--offline` requires a matching lock and verified package cache; it does not
+turn a failed network request into permission to use an unrelated cached
+package. Ordinary builds preserve compatible locked versions; use `update`
+to change them.
+
+Private sources read bearer tokens from the configured environment variable.
+Tokens are not stored in project files or lock files, and authenticated
+cross-origin redirects are rejected. The source token is sent only to
+same-origin archive URLs; independently hosted archives do not receive it.
+Archive hashes verify downloaded bytes; the configured source remains
+responsible for publishing correct metadata.
+
+`vyxc publish --source NAME --dry-run` lists the selected payload;
+`vyxc publish --source NAME` creates the archive and updates a local JSON index.
+Use `[package]` `include` and `exclude` arrays to control its contents. Hidden
+files, generated outputs, logs, and local tool state are excluded by default.
+Put distribution libraries in `native/` or `lib/`, outside generated `out/`
+and `target/`. Module selections in `Vyx.lock` are retained;
+`Vyx.packages.lock` is not published as part of a dependency's payload.
+Publishing directly to a remote server or GitHub is not automated: upload
+the archive and updated index through that host's normal workflow. See the
+[package engine guide](../tools/packages/README.md) for the exact version
+constraints, archive formats, and command options.
+
+### Source, binary, and DCI packages
+
+A version entry defaults to `kind = "source"` and uses `url` / `sha256`
+directly. Source packages build through their declared targets. A `binary` or
+`dci` version instead provides an `artifacts` array with explicit target
+triplets and ABIs:
+
+```json
+{
+  "kind": "dci",
+  "artifacts": [
+    {
+      "triplet": "x86_64-pc-windows-msvc",
+      "abi": "msvc",
+      "url": "archives/codec-1.2.3-windows-msvc.tar.gz",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "strip_prefix": "codec-1.2.3"
+    }
+  ]
+}
+```
+
+This object replaces a version entry in the preceding index. Replace the
+hash with the real archive hash. Exactly one artifact must match the build's
+triplet and ABI; absent or overlapping matches are errors. A binary-package
+lock is specific to that target identity and cannot silently select another
+platform's archive.
+
+The archive contains a normal `Vyx.toml` describing the packaged native
+library and its public inputs. For example, a Windows DCI shared library:
+
+```toml
+[package]
+name = "codec"
+version = "1.2.3"
+kind = "dci"
+
+[target.codec]
+type = "prebuilt"
+artifact = "native/codec.lib"
+linkage = "shared"
+triplet = "x86_64-pc-windows-msvc"
+abi = "msvc"
+sources = ["bindings/codec.vyx"]
+dci_files = ["contracts/codec.dcib"]
+runtime_files = ["native/codec.dll"]
+```
+
+`artifact` names the existing link input; on Windows a shared library uses
+its import library here, and its DLL belongs in `runtime_files`. `linkage`
+is `static` or `shared`. All file paths are relative to the package root.
+`sources` exposes Vyx definitions; optional `interface_sources` supplies
+additional Vyx or `.vyi` interface inputs. A DCI package must include its
+contracts in `dci_files` and its Vyx declarations in `sources`. The consumer
+selects a package target with the dependency's `target` field.
+
+The build uses the packaged library, definitions, and contracts without
+rerunning the producer Adapter. The DCI Converter can generate definitions
+before publishing; the resulting definitions remain ordinary inspectable
+Vyx files. A `.vyi` interface must pass the consuming compiler's format and
+compatibility checks. Selecting the same triplet and ABI does not establish
+compatibility with arbitrary compiler or library versions.
+
+Fetching, checking, extracting, and resolving a package do not execute its
+manifest hooks. Source-package targets that require a separate build use the
+ordinary project builder, including their declared build hooks, with the
+current user's permissions. Package integrity checks do not provide a build sandbox.
+Prebuilt dependency targets consume their existing artifacts without
+running a producer build.
 
 ## Supported Sections
 
@@ -194,7 +396,7 @@ Recognized keys:
 
 | Key | Meaning |
 |---|---|
-| `type` | `executable`, `shared` / `dylib`, `static` / `staticlib`, or `source` |
+| `type` | `executable`, `shared` / `dylib`, `static` / `staticlib`, `source`, or `prebuilt` |
 | `entry` | Target entry `.vyx` file |
 | `sources` | Extra `.vyx`, `.c`, `.cc`, `.cpp`, or `.cxx` sources |
 | `extends` | Ordered target-template names |
@@ -296,6 +498,13 @@ manifest paths as additional search roots. Static package dependencies propagate
 their matching public/native link closure to consumers.
 
 #### Cross compilation and target runtimes
+
+When `vyxc` runs on Android/Termux, the host toolchain is already an Android
+toolchain. The build uses Termux's `clang`, `clang++`, `llvm-ar`, and default
+sysroot directly; it does not inspect `ANDROID_NDK_ROOT`, `ANDROID_NDK_HOME`,
+or an Android SDK NDK. The SDK wrapper sets `LLVM_ROOT` / `LLVM_BIN`, and a
+manual installation may set those variables or use `PATH`. Native Termux
+builds use the ordinary SDK runtime directory rather than an NDK staged tree.
 
 `--triplet` is forwarded consistently to MIR/LLVM emission, C/C++ compilation,
 the archiver and the final Clang link. Android targets discover the host NDK from
@@ -402,11 +611,12 @@ so package scripts can be pure Vyx code instead of shell wrappers.
 ### Global and target-local dependencies
 
 ```toml
-[registries]
-local = "file:///C:/packages"
+[sources.company]
+url = "file:///C:/packages/index.json"
 
 [dependencies]
-support = "../support@main"
+support = { path = "../support", target = "support" }
+codec = { version = "1.2.3", source = "company", target = "codec" }
 
 [target.app.dependencies]
 json = { path = "std:json", target = "std_json" }
@@ -430,7 +640,8 @@ target or library name. A dependency may select an explicit target:
 json = { path = "std:json", target = "std_json" }
 ```
 
-When `path` is omitted, `target` names another target in the same manifest:
+When both `path` and `version` are omitted, `target` names another target in
+the same manifest:
 
 ```toml
 [target.app.dependencies]
@@ -453,6 +664,7 @@ Target type controls automatic consumption:
 | `source` | Inject exposed Vyx sources into the consuming compilation |
 | `static` / `staticlib` | Load VYI metadata and link the archive automatically |
 | `shared` / `dylib` | Load VYI metadata, link it, and copy runtime assets |
+| `prebuilt` | Load packaged definitions/interfaces, link `artifact`, consume DCI contracts, and deploy declared `runtime_files` |
 | `executable` | Allowed only with `usage = "build"` |
 
 This replaces hand-written `depends_on + lib_paths + libs` triples. Existing
@@ -488,9 +700,10 @@ public_lib_paths = ["native/lib"]
 public_libs = ["codec_native"]
 ```
 
-Local path dependencies still do not fetch HTTP archives or authenticate to a
-hosted registry. Versioned dependencies are resolved from the `file://`
-registry / `.cache/registry` tree written by `vyx install` / `vyx publish`.
+Local path dependencies are read directly. Versioned dependencies are
+materialized from the configured JSON sources and selected by
+`Vyx.packages.lock`; the build consumes their source or native targets through
+the same dependency graph.
 
 When a target resolves one or more source packages, the compiler disables the
 bootstrap-private implicit flat standard-library search for that target. Every

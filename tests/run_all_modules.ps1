@@ -120,11 +120,12 @@ function Resolve-TestPathFilter {
 
 $PathFilter = Resolve-TestPathFilter $PathFilter
 $cacheRoot = Join-Path $testsRoot ".cache"
+$moduleRunId = (Get-Date -Format 'yyyyMMdd_HHmmss') + '_' + $PID + '_' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 if (-not (Test-Path $cacheRoot)) {
     New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
 }
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
-    $LogPath = Join-Path $cacheRoot ("run_all_modules_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
+    $LogPath = Join-Path $cacheRoot ("run_all_modules_" + $moduleRunId + ".log")
 } elseif (-not [System.IO.Path]::IsPathRooted($LogPath)) {
     $LogPath = Join-Path $repoRoot $LogPath
 }
@@ -408,6 +409,7 @@ function Test-ExcludedRelative {
     param([string]$Rel)
     $r = $Rel.Replace('/', '\')
     if ($r -match '(?i)(^|\\)[^\\]*cache[^\\]*(\\|$)') { return $true }
+    if ($r -match '(?i)(^|\\)\.scratch(\\|$)') { return $true }
     if ($r -match '\\target\\') { return $true }
     # mir2cpp is not a supported backend; its projects are not part of the
     # test suite's supported surface.
@@ -600,10 +602,13 @@ if ($moduleFiles.Count -eq 0 -and $projectDirs.Count -eq 0) {
     Write-Error "No runnable test modules/projects found under tests/ (check -PathFilter)."
 }
 
-$bootstrapOutDir = Join-Path $testsRoot ".cache\bootstrap_modules"
-$bootstrapRunDir = Join-Path $testsRoot ".cache\bootstrap_runs"
-$bootstrapRunLogDir = Join-Path $testsRoot ".cache\bootstrap_run_logs"
-$processLogRoot = Join-Path $testsRoot ".cache\run_all_modules_process_logs"
+# Each invocation owns its compiler outputs and matching runtime deployment.
+# Concurrent shards must not replace DLLs loaded by another runner or overwrite
+# its executable/process logs (including when they select the same test case).
+$bootstrapOutDir = Join-Path (Join-Path $cacheRoot 'bootstrap_modules') $moduleRunId
+$bootstrapRunDir = Join-Path (Join-Path $cacheRoot 'bootstrap_runs') $moduleRunId
+$bootstrapRunLogDir = Join-Path (Join-Path $cacheRoot 'bootstrap_run_logs') $moduleRunId
+$processLogRoot = Join-Path (Join-Path $cacheRoot 'run_all_modules_process_logs') $moduleRunId
 if (-not $HostOnly -and $vyxcBoot) {
     $needDir = $bootstrapRunDir
     if ($BootstrapCompileOnly) { $needDir = $bootstrapOutDir }

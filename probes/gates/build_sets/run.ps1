@@ -70,14 +70,20 @@ $savedLlvm = $env:LLVM_ROOT
 try {
     $env:LLVM_ROOT = Join-Path $repo 'clang'
     $env:PATH = (Split-Path $Compiler) + ';' + (Join-Path $env:LLVM_ROOT 'bin') + ';' + $env:PATH
+    # This profiling fixture imports backend host counters. Keep its DLLs
+    # beside the executables so the Windows loader uses this exact build.
+    foreach ($dll in @('vyx_compiler_backend.dll', 'tbb12.dll')) {
+        Copy-Item -LiteralPath (Join-Path (Split-Path $Compiler) $dll) -Destination (Join-Path $runDir $dll)
+    }
     Push-Location $runDir
     try {
         Write-Host "compiler: $Compiler"
         Write-Host "compiler_sha256: $((Get-FileHash $Compiler -Algorithm SHA256).Hash)"
-        Write-Host "runtime_sha256: $((Get-FileHash (Join-Path (Split-Path $Compiler) 'vyx_compiler_backend.dll') -Algorithm SHA256).Hash)"
+        Write-Host "backend_sha256: $((Get-FileHash (Join-Path (Split-Path $Compiler) 'vyx_compiler_backend.dll') -Algorithm SHA256).Hash)"
+        Write-Host "runtime_sha256: $((Get-FileHash (Join-Path (Split-Path $Compiler) 'vyx_runtime.lib') -Algorithm SHA256).Hash)"
         foreach ($name in @('current', 'baseline')) {
             & $Compiler --src=file (Join-Path $runDir "$name.vyx") --emit=exe -o (Join-Path $runDir "$name.exe") `
-                -L (Split-Path $Compiler) -l vyx_compiler_backend *> "$name.compile.log"
+                -L (Split-Path $Compiler) -l vyx_compiler_backend -l vyx_runtime -l synchronization -l tbb12 *> "$name.compile.log"
             if ($LASTEXITCODE -ne 0) {
                 Get-Content "$name.compile.log" -Tail 50
                 throw "$name compile failed: $LASTEXITCODE"

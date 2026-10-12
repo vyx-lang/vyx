@@ -10,8 +10,13 @@ New-Item -ItemType Directory -Path (Join-Path $runDir '.cache') -Force | Out-Nul
 $source = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_system.vyx'))
 $actionSource = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_action.vyx'))
 $resourceSource = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_resources.vyx'))
+$sourceIndex = [IO.File]::ReadAllText((Join-Path $repo 'bootstrap_compiler/src/core/project/build_source_index.vyx'))
 $actionModel = [regex]::Match($actionSource, '(?ms)^public class BuildAction\s*\{.*?^\}').Value
 if (-not $actionModel) { throw 'Missing production BuildAction model' }
+$sourceIndexModel = [regex]::Replace($sourceIndex, '(?m)^(?:module|use) [^\r\n]+\r?\n', '')
+$walkModel = [regex]::Match($source, '(?ms)^class BuildPartitionWalkScratch\s*\{.*?^\}').Value
+if (-not $walkModel) { throw 'Missing production import walk scratch model' }
+$actionModel += "`n" + $sourceIndexModel + "`n" + $walkModel
 $currentSource = $source + "`n" + $actionSource + "`n" + $resourceSource
 
 function Get-Function([string]$Text, [string]$Name) {
@@ -71,6 +76,9 @@ function Write-Fixture([string]$Name, [string]$Content) {
     [IO.File]::WriteAllText((Join-Path $runDir $Name), $Content)
 }
 Write-Fixture 'fixtures/present.obj' 'exists'
+foreach ($item in @(@('primary',50),@('primary-peer',70),@('import-b',10),@('import-b-peer',20),@('import-c',30),@('unrelated',90))) {
+    Write-Fixture ('fixtures/' + $item[0] + '.vyx') ('x' * $item[1])
+}
 Write-Fixture 'fixtures/long_records.tsv' ("a`tb`t" + ('x' * 96) + "`nb`tc`t" + ('k' * 96) + "`n")
 Write-Fixture 'fixtures/long_records_expected.tsv' ("a`tb`tz`nb`tc`t" + ('k' * 96) + "`n")
 foreach ($length in @(0, 1, 23, 24, 63, 64)) {
@@ -106,8 +114,9 @@ Write-Fixture 'fixtures/renamed.tsv' "0`tfixtures/a.vyx`tsema.obj`tcmd`n1`tfixtu
 
 $roots = @('build_cache_digest_index', 'build_cache_has_indexed', 'build_cache_replace_many',
            'build_action_launch_order', 'build_action_ready', 'build_task_priority', 'build_field',
-           'build_resource_credit', 'build_resource_headroom', 'build_resource_limit', 'build_resource_fits',
-           'build_resource_cold_estimate', 'build_resource_measured_estimate', 'build_action_memory_estimate')
+           'build_resource_credit', 'build_resource_default_reserve', 'build_resource_headroom', 'build_resource_limit', 'build_resource_fits',
+           'build_resource_cold_estimate', 'build_resource_measured_estimate', 'build_action_memory_estimate', 'build_active_memory_exhausted',
+           'build_task_uses_vyx_frontend', 'build_task_is_vyx_codegen', 'build_import_source_bytes')
 $unit = Join-Path $runDir 'scheduler.vyx'
 Write-Unit $currentSource $roots ([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'probe.vyx'))) $unit $actionModel
 if (-not $SkipBaseline) {
@@ -127,6 +136,10 @@ foreach ($key in @('LLVM_ROOT', 'PATH', 'VYX_BUILD_USE_TASK_TIMES', 'VYX_BUILD_N
 try {
     $env:LLVM_ROOT = Join-Path $repo 'clang'
     $env:PATH = (Split-Path $Compiler) + ';' + (Join-Path $env:LLVM_ROOT 'bin') + ';' + $env:PATH
+    foreach ($name in @('vyx_compiler_backend.dll', 'tbb12.dll')) {
+        $dependency = Join-Path (Split-Path $Compiler) $name
+        if (Test-Path -LiteralPath $dependency) { Copy-Item -LiteralPath $dependency -Destination $runDir -Force }
+    }
     Push-Location $runDir
     try {
         $env:VYX_BUILD_USE_TASK_TIMES = '0'
@@ -135,7 +148,7 @@ try {
         if (-not $SkipBaseline) { $units += 'baseline' }
         foreach ($name in $units) {
             & $Compiler --src=file (Join-Path $runDir "$name.vyx") --emit=exe -o (Join-Path $runDir "$name.exe") `
-                -L (Split-Path $Compiler) -l vyx_compiler_backend *> "$name.compile.log"
+                -L (Split-Path $Compiler) -l vyx_compiler_backend -l vyx_runtime *> "$name.compile.log"
             if ($LASTEXITCODE -ne 0) {
                 Get-Content "$name.compile.log" -Tail 50
                 throw "$name compilation failed: $LASTEXITCODE"

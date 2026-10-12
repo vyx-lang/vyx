@@ -1,19 +1,31 @@
 module bootstrap.pkg;
 
+use std.clone;
 use std.fs;
 use std.string;
+use bootstrap.policy;
 
-/// Lab package manager: file:// registry, publish / install / search / lock.
-///
-/// Registry root (`VYX_REGISTRY`, else `./.vyx-registry`):
-///   index.txt                 name<TAB>version<TAB>description
-///   pkgs/<name>/<version>/    published tree (Vyx.toml + sources)
-
+/// Native package commands use the same JSON registry resolver as builds.
+/// Python owns registry I/O, version solving and verified materialization;
+/// this bridge preserves argv and the owning project's dependency graph.
 extern "C" {
     fn getenv(name: rawptr) -> rawptr;
+    fn vyx_bootstrap_abs_path(path: rawptr) -> rawptr;
+    fn vyx_bootstrap_cwd() -> rawptr;
+    fn vyx_bootstrap_platform() -> i32;
     fn vyx_bootstrap_mkdir_p(path: rawptr) -> i32;
-    fn vyx_bootstrap_copy_tree(src: rawptr, dst: rawptr) -> i32;
+    fn vyx_bootstrap_build_lock_try_acquire(path: rawptr, owner: rawptr) -> i32;
+    fn vyx_bootstrap_build_lock_release(path: rawptr) -> i32;
+    fn vyx_bootstrap_process_spawn_args(args: rawptr, cwd: rawptr,
+        stdout_path: rawptr, stderr_path: rawptr,
+        env_name: rawptr, env_value: rawptr) -> i64;
+    fn vyx_bootstrap_process_wait(id: i64) -> i32;
+    fn vyx_bootstrap_process_close(id: i64);
 }
+
+var g_pkg_project_root: string = "";
+var g_pkg_resolution_cache: string = "";
+var g_pkg_request_counter: i64 = 0;
 
 fn pkg_env(name: string) -> string {
     let raw = getenv(name.c_str());
@@ -21,53 +33,100 @@ fn pkg_env(name: string) -> string {
     return from_cstr(raw);
 }
 
-public fn pkg_registry_root() -> string {
-    var root = pkg_env("VYX_REGISTRY");
-    if (root.len == 0) { root = ".vyx-registry"; }
-    if (root.startsWith("file://")) {
-        root = root.substring(7, root.len);
-    }
-    return root;
-}
-
 fn pkg_join(a: string, b: string) -> string {
     if (a.len == 0) { return b; }
-    if (b.len == 0) { return a; }
-    let last = a.charAt(a.len - 1);
-    if (last == 47 || last == 92) { return a + b; }
+    if (a.endsWith("/") || a.endsWith("\\")) { return a + b; }
     return a + "/" + b;
 }
 
-fn pkg_toml_unquote(v: string) -> string {
-    var s = v.trim();
-    if (s.startsWith("\"") && s.endsWith("\"") && s.len >= 2) {
-        return s.substring(1, s.len - 1);
+fn pkg_dirname(path: string) -> string {
+    var last: i32 = -1;
+    var i: i32 = 0;
+    while (i < path.len) {
+        let c = path.charAt(i);
+        if (c == 47 || c == 92) { last = i; }
+        i = i + 1;
     }
-    return s;
+    if (last < 0) { return ""; }
+    if (last == 0) { return path.substring(0, 1); }
+    if (last == 2 && path.charAt(1) == 58) { return path.substring(0, 3); }
+    return path.substring(0, last);
 }
 
-fn pkg_toml_get(manifest: string, section: string, key: string) -> string {
-    var cur: string = "";
+fn pkg_abs(path: string) -> string {
+    let raw = vyx_bootstrap_abs_path(path.c_str());
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}
+
+public fn pkg_current_dir() -> string {
+    let raw = vyx_bootstrap_cwd();
+    if (raw == null) { return ""; }
+    return from_cstr(raw);
+}
+
+public fn pkg_project_root() -> string {
+    if (g_pkg_project_root.len > 0) { return g_pkg_project_root.clone(); }
+    var root = pkg_env("VYX_PACKAGE_PROJECT");
+    if (root.len == 0) { root = pkg_current_dir(); }
+    g_pkg_project_root = pkg_abs(root);
+    return g_pkg_project_root.clone();
+}
+
+fn pkg_script_under(start: string) -> string {
+    var dir = start;
+    var depth: i32 = 0;
+    while (dir.len > 0 && depth < 32) {
+        let candidate = pkg_join(dir.clone(), "tools/packages/package_manager.py");
+        if (fileExists(candidate.clone())) { return candidate; }
+        let next = pkg_dirname(dir.clone());
+        if (next == dir) { break; }
+        dir = next;
+        depth = depth + 1;
+    }
+    return "";
+}
+
+fn pkg_cli_script() -> string {
+    let configured = pkg_env("VYX_PACKAGE_TOOLS");
+    if (configured.len > 0) {
+        if (configured.endsWith(".py") && fileExists(configured.clone())) { return configured; }
+        let script = pkg_join(configured.clone(), "package_manager.py");
+        if (fileExists(script.clone())) { return script; }
+        print("error: VYX_PACKAGE_TOOLS does not contain package_manager.py: " + configured);
+        return "";
+    }
+    var executable = getArg(0);
+    if (!executable.contains("/") && !executable.contains("\\")) {
+        var command_name = executable.clone();
+        if (vyx_bootstrap_platform() == 1 && !command_name.endsWith(".exe")) {
+            command_name = command_name + ".exe";
+        }
+        let located = pkg_find_path_tool(command_name);
+        if (located.len > 0) { executable = located; }
+    }
+    let from_exe = pkg_script_under(pkg_dirname(pkg_abs(executable)));
+    if (from_exe.len > 0) { return from_exe; }
+    let from_project = pkg_script_under(pkg_project_root());
+    if (from_project.len > 0) { return from_project; }
+    return pkg_script_under(pkg_current_dir());
+}
+
+fn pkg_find_path_tool(name: string) -> string {
+    let windows = vyx_bootstrap_platform() == 1;
+    let path = pkg_env("PATH");
+    let sep = if (windows) { 59 } else { 58 };
     var start: i32 = 0;
     var i: i32 = 0;
-    while (i <= manifest.len) {
-        if (i == manifest.len || manifest.charAt(i) == 10) {
-            var line = manifest.substring(start, i).trim();
-            if (line.endsWith("\r")) {
-                line = line.substring(0, line.len - 1).trim();
+    while (i <= path.len) {
+        if (i == path.len || path.charAt(i) == sep) {
+            var dir = path.substring(start, i).trim();
+            if (dir.startsWith("\"") && dir.endsWith("\"") && dir.len >= 2) {
+                dir = dir.substring(1, dir.len - 1);
             }
-            if (line.len > 0 && !line.startsWith("#")) {
-                if (line.startsWith("[") && line.endsWith("]")) {
-                    cur = line.substring(1, line.len - 1);
-                } else if (cur == section) {
-                    let eq = line.indexOf("=");
-                    if (eq > 0) {
-                        let k = line.substring(0, eq).trim();
-                        if (k == key) {
-                            return pkg_toml_unquote(line.substring(eq + 1, line.len));
-                        }
-                    }
-                }
+            if (dir.len > 0) {
+                let candidate = pkg_join(dir, name.clone());
+                if (fileExists(candidate.clone())) { return candidate; }
             }
             start = i + 1;
         }
@@ -76,314 +135,246 @@ fn pkg_toml_get(manifest: string, section: string, key: string) -> string {
     return "";
 }
 
-fn pkg_read_cwd_manifest() -> string {
-    if (fileExists("Vyx.toml")) { return readFile("Vyx.toml"); }
-    if (fileExists("vyx.toml")) { return readFile("vyx.toml"); }
-    return "";
+fn pkg_python() -> string {
+    let configured = pkg_env("VYX_PYTHON");
+    if (configured.len > 0) { return configured; }
+    let windows = vyx_bootstrap_platform() == 1;
+    let primary = if (windows) { "python.exe" } else { "python3" };
+    let found = pkg_find_path_tool(primary);
+    if (found.len > 0) { return found; }
+    let fallback = if (windows) { "python3.exe" } else { "python" };
+    return pkg_find_path_tool(fallback);
 }
 
-fn pkg_index_path(root: string) -> string {
-    return pkg_join(root, "index.txt");
-}
+fn pkg_arg(arg: string) -> string { return arg.len.toString() + ":" + arg; }
 
-fn pkg_pkg_dir(root: string, name: string, version: string) -> string {
-    return pkg_join(pkg_join(pkg_join(root, "pkgs"), name), version);
-}
-
-fn pkg_cache_dir(name: string, version: string) -> string {
-    return pkg_join(pkg_join(pkg_join(".cache", "registry"), name), version);
-}
-
-fn pkg_looks_like_version(s: string) -> bool {
-    if (s.len == 0) { return false; }
-    if (s.contains("/") || s.contains("\\") || s.contains(":")) { return false; }
-    var digits: i32 = 0;
-    var i: i32 = 0;
-    while (i < s.len) {
-        let c = s.charAt(i);
-        if (c >= 48 && c <= 57) { digits = digits + 1; }
-        else if (c != 46) { return false; }
-        i = i + 1;
-    }
-    return digits > 0;
-}
-
-fn pkg_index_upsert(root: string, name: string, version: string, desc: string) {
-    let path = pkg_index_path(root);
-    var out: string = "";
-    if (fileExists(path)) {
-        let old = readFile(path);
-        var start: i32 = 0;
-        var i: i32 = 0;
-        while (i <= old.len) {
-            if (i == old.len || old.charAt(i) == 10) {
-                var line = old.substring(start, i);
-                if (line.endsWith("\r")) { line = line.substring(0, line.len - 1); }
-                if (line.len > 0) {
-                    let tab = line.indexOf("\t");
-                    var keep = true;
-                    if (tab > 0 && line.substring(0, tab) == name) {
-                        let rest = line.substring(tab + 1, line.len);
-                        let tab2 = rest.indexOf("\t");
-                        var ver = rest;
-                        if (tab2 >= 0) { ver = rest.substring(0, tab2); }
-                        if (ver == version) { keep = false; }
-                    }
-                    if (keep) { out = out + line + "\n"; }
-                }
-                start = i + 1;
-            }
-            i = i + 1;
-        }
-    }
-    out = out + name + "\t" + version + "\t" + desc + "\n";
-    writeFile(path, out);
-}
-
-fn pkg_index_find(root: string, name: string, version: string) -> string {
-    let path = pkg_index_path(root);
-    if (!fileExists(path)) { return ""; }
-    let old = readFile(path);
-    var start: i32 = 0;
-    var i: i32 = 0;
-    var best: string = "";
-    while (i <= old.len) {
-        if (i == old.len || old.charAt(i) == 10) {
-            var line = old.substring(start, i);
-            if (line.endsWith("\r")) { line = line.substring(0, line.len - 1); }
-            if (line.len > 0) {
-                let tab = line.indexOf("\t");
-                if (tab > 0 && line.substring(0, tab) == name) {
-                    let rest = line.substring(tab + 1, line.len);
-                    let tab2 = rest.indexOf("\t");
-                    var ver = rest;
-                    if (tab2 >= 0) { ver = rest.substring(0, tab2); }
-                    if (version.len == 0 || ver == version) { best = ver; }
-                }
-            }
-            start = i + 1;
-        }
-        i = i + 1;
-    }
-    return best;
-}
-
-public fn pkg_resolve_version(name: string, version: string) -> string {
-    if (name.len == 0) { return ""; }
-    var ver = version;
-    let cache = pkg_cache_dir(name, ver);
-    if (ver.len > 0 && fileExists(pkg_join(cache, "Vyx.toml"))) { return cache; }
-    let root = pkg_registry_root();
-    if (ver.len == 0) { ver = pkg_index_find(root, name, ""); }
-    if (ver.len == 0) { return ""; }
-    let hit = pkg_pkg_dir(root, name, ver);
-    if (fileExists(pkg_join(hit, "Vyx.toml"))) { return hit; }
-    return "";
-}
-
-fn pkg_write_lock_line(name: string, version: string, path: string) {
-    var body: string = "";
-    if (fileExists("Vyx.lock")) { body = readFile("Vyx.lock"); }
-    var out: string = "";
-    var start: i32 = 0;
-    var i: i32 = 0;
-    while (i <= body.len) {
-        if (i == body.len || body.charAt(i) == 10) {
-            var line = body.substring(start, i);
-            if (line.endsWith("\r")) { line = line.substring(0, line.len - 1); }
-            if (line.len > 0) {
-                let tab = line.indexOf("\t");
-                if (!(tab > 0 && line.substring(0, tab) == name)) {
-                    out = out + line + "\n";
-                }
-            }
-            start = i + 1;
-        }
-        i = i + 1;
-    }
-    out = out + name + "\t" + version + "\t" + path + "\n";
-    writeFile("Vyx.lock", out);
-}
-
-fn pkg_ensure_dep_toml(name: string, version: string, path: string) {
-    var manifest = pkg_read_cwd_manifest();
-    if (manifest.len == 0) {
-        manifest = "[package]\nname = \"app\"\nversion = \"0.0.0\"\n\n[dependencies]\n";
-    }
-    let needle = name + " =";
-    if (manifest.contains(needle)) { return; }
-    if (!manifest.contains("[dependencies]")) {
-        manifest = manifest + "\n[dependencies]\n";
-    }
-    manifest = manifest + name + " = { path = \"" + path + "\", version = \"" + version + "\" }\n";
-    writeFile("Vyx.toml", manifest);
-}
-
-public fn pkg_cmd_publish() -> i32 {
-    let manifest = pkg_read_cwd_manifest();
-    if (manifest.len == 0) {
-        print("vyx publish: no Vyx.toml in the current directory");
+fn pkg_run(args: string) -> i32 {
+    let script = pkg_cli_script();
+    if (script.len == 0) {
+        print("error: package tools not found; set VYX_PACKAGE_TOOLS to tools/packages");
         return 1;
     }
-    let name = pkg_toml_get(manifest, "package", "name");
-    var version = pkg_toml_get(manifest, "package", "version");
-    if (name.len == 0) {
-        print("vyx publish: [package].name is required");
+    let python = pkg_python();
+    if (python.len == 0) {
+        print("error: package resolution requires Python 3.11 or newer; set VYX_PYTHON");
         return 1;
     }
-    if (version.len == 0) { version = "0.0.0"; }
-    let root = pkg_registry_root();
-    vyx_bootstrap_mkdir_p(root.c_str());
-    let dest = pkg_pkg_dir(root, name, version);
-    vyx_bootstrap_mkdir_p(dest.c_str());
-    if (vyx_bootstrap_copy_tree(".".c_str(), dest.c_str()) != 0) {
-        print("vyx publish: failed to copy package tree into " + dest);
+    let packed = pkg_arg(python) + pkg_arg(script) + args;
+    let pid = vyx_bootstrap_process_spawn_args(packed.c_str(), "".c_str(),
+        "".c_str(), "".c_str(), "".c_str(), "".c_str());
+    if (pid == 0) {
+        print("error: failed to launch the package resolver");
         return 1;
     }
-    pkg_index_upsert(root, name, version, pkg_toml_get(manifest, "package", "description"));
-    print("published " + name + " " + version + " -> " + dest);
-    return 0;
-}
-
-public fn pkg_cmd_install(name: string, version: string) -> i32 {
-    if (name.len == 0) {
-        return pkg_cmd_install_manifest();
-    }
-    let src = pkg_resolve_version(name, version);
-    if (src.len == 0) {
-        print("vyx install: package not found in registry: " + name);
-        return 1;
-    }
-    var ver = version;
-    if (ver.len == 0) { ver = pkg_index_find(pkg_registry_root(), name, ""); }
-    if (ver.len == 0) { ver = "0.0.0"; }
-    let dest = pkg_cache_dir(name, ver);
-    var copied: i32 = 0;
-    if (src == dest || fileExists(pkg_join(dest, "Vyx.toml"))) {
-        copied = 0;
-    } else {
-        vyx_bootstrap_mkdir_p(dest.c_str());
-        copied = vyx_bootstrap_copy_tree(src.c_str(), dest.c_str());
-    }
-    if (copied != 0) {
-        print("vyx install: failed to materialize " + name + " into " + dest);
-        return 1;
-    }
-    pkg_write_lock_line(name, ver, dest);
-    pkg_ensure_dep_toml(name, ver, dest);
-    print("installed " + name + " " + ver + " -> " + dest);
-    return 0;
-}
-
-fn pkg_cmd_install_manifest() -> i32 {
-    let manifest = pkg_read_cwd_manifest();
-    if (manifest.len == 0) {
-        print("vyx install: no Vyx.toml and no package name given");
-        return 1;
-    }
-    var rc: i32 = 0;
-    var section: string = "";
-    var start: i32 = 0;
-    var i: i32 = 0;
-    while (i <= manifest.len) {
-        if (i == manifest.len || manifest.charAt(i) == 10) {
-            var line = manifest.substring(start, i).trim();
-            if (line.endsWith("\r")) { line = line.substring(0, line.len - 1).trim(); }
-            if (line.len > 0 && !line.startsWith("#")) {
-                if (line.startsWith("[") && line.endsWith("]")) {
-                    section = line.substring(1, line.len - 1);
-                } else if (section == "dependencies") {
-                    let eq = line.indexOf("=");
-                    if (eq > 0) {
-                        let key = line.substring(0, eq).trim();
-                        var value = line.substring(eq + 1, line.len).trim();
-                        var ver: string = "";
-                        if (value.startsWith("{")) {
-                            let marker = "version";
-                            let at = value.indexOf(marker);
-                            if (at >= 0) {
-                                var p = at + marker.len;
-                                while (p < value.len && value.charAt(p) != 34) { p = p + 1; }
-                                if (p < value.len && value.charAt(p) == 34) {
-                                    p = p + 1;
-                                    var end = p;
-                                    while (end < value.len && value.charAt(end) != 34) { end = end + 1; }
-                                    ver = value.substring(p, end);
-                                }
-                            }
-                        } else {
-                            ver = pkg_toml_unquote(value);
-                            if (!pkg_looks_like_version(ver)) { ver = ""; }
-                        }
-                        if (ver.len > 0 || pkg_looks_like_version(pkg_toml_unquote(value))) {
-                            if (pkg_cmd_install(key, ver) != 0) { rc = 1; }
-                        }
-                    }
-                }
-            }
-            start = i + 1;
-        }
-        i = i + 1;
-    }
+    let rc = vyx_bootstrap_process_wait(pid);
+    vyx_bootstrap_process_close(pid);
     return rc;
 }
 
-public fn pkg_cmd_search(query: string) -> i32 {
-    let root = pkg_registry_root();
-    let path = pkg_index_path(root);
-    if (!fileExists(path)) {
-        print("vyx search: empty registry at " + root);
-        return 0;
+public fn pkg_target_abi(triplet: string) -> string {
+    let name = policy_target_compiler_name(triplet);
+    if (name == "ndk") { return "android"; }
+    if (name == "clang") { return "darwin"; }
+    return name;
+}
+
+fn pkg_has_cli_option(name: string) -> bool {
+    var i: i32 = 1;
+    while (i < argCount()) {
+        let a = getArg(i);
+        if (a == "--") { break; }
+        if (a == name || a.startsWith(name + "=")) { return true; }
+        i = i + 1;
     }
-    let body = readFile(path);
+    return false;
+}
+
+fn pkg_target_args() -> string {
+    let triplet = policy_effective_target_triple();
+    return pkg_arg("--triplet") + pkg_arg(triplet.clone())
+        + pkg_arg("--abi") + pkg_arg(pkg_target_abi(triplet));
+}
+
+fn pkg_build_mode_args() -> string {
+    var out: string = "";
+    if (pkg_has_cli_option("--locked")) { out = out + pkg_arg("--locked"); }
+    if (pkg_has_cli_option("--offline")) { out = out + pkg_arg("--offline"); }
+    return out;
+}
+
+fn pkg_cache_get(key: string) -> string {
     var start: i32 = 0;
     var i: i32 = 0;
-    var hits: i32 = 0;
-    while (i <= body.len) {
-        if (i == body.len || body.charAt(i) == 10) {
-            var line = body.substring(start, i);
-            if (line.endsWith("\r")) { line = line.substring(0, line.len - 1); }
-            if (line.len > 0 && (query.len == 0 || line.contains(query))) {
-                print(line);
-                hits = hits + 1;
+    while (i <= g_pkg_resolution_cache.len) {
+        if (i == g_pkg_resolution_cache.len || g_pkg_resolution_cache.charAt(i) == 10) {
+            let row = g_pkg_resolution_cache.substring(start, i);
+            if (row.startsWith(key.clone() + "\t")) {
+                return row.substring(key.len + 1, row.len);
             }
             start = i + 1;
         }
         i = i + 1;
     }
-    if (hits == 0) { print("vyx search: no matches"); }
-    return 0;
+    return "";
 }
 
-public fn pkg_cmd_lock() -> i32 {
-    return pkg_cmd_install_manifest();
+fn pkg_cache_key(root: string, owner: string, section: string, alias: string) -> string {
+    var normalized_root = root.replace("\\", "/");
+    var normalized_owner = owner.replace("\\", "/");
+    if (vyx_bootstrap_platform() == 1) {
+        normalized_root = normalized_root.toLower();
+        normalized_owner = normalized_owner.toLower();
+    }
+    return normalized_root + "\t" + normalized_owner + "\t" + section + "\t" + alias;
+}
+
+fn pkg_map_field(row: string, wanted: i32) -> string {
+    var field: i32 = 0;
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= row.len) {
+        if (i == row.len || row.charAt(i) == 9) {
+            if (field == wanted) { return row.substring(start, i); }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// The resolver validates the whole graph once and returns its exact edges.
+/// Publish this invocation's map only after every row has been checked.
+fn pkg_cache_map(root: string, text: string) -> bool {
+    var additions: string = "";
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= text.len) {
+        if (i == text.len || text.charAt(i) == 10) {
+            var row = text.substring(start, i);
+            if (row.endsWith("\r")) { row = row.substring(0, row.len - 1); }
+            if (row.len > 0) {
+                var tabs: i32 = 0;
+                var p: i32 = 0;
+                while (p < row.len) {
+                    if (row.charAt(p) == 9) { tabs = tabs + 1; }
+                    p = p + 1;
+                }
+                let owner = pkg_map_field(row.clone(), 0);
+                let section = pkg_map_field(row.clone(), 1);
+                let alias = pkg_map_field(row.clone(), 2);
+                let destination = pkg_map_field(row, 3);
+                if (tabs != 3 || owner.len == 0 || section.len == 0 || alias.len == 0
+                    || destination.len == 0 || destination.contains("\r")
+                    || (!fileExists(pkg_join(destination.clone(), "Vyx.toml"))
+                        && !fileExists(pkg_join(destination.clone(), "vyx.toml")))) {
+                    print("error: invalid verified package path map");
+                    return false;
+                }
+                additions = additions + pkg_cache_key(root.clone(), pkg_abs(owner), section, alias)
+                    + "\t" + destination + "\n";
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    g_pkg_resolution_cache = g_pkg_resolution_cache + additions;
+    return true;
+}
+
+/// Resolve the named declaration in its owning manifest, rather than guessing
+/// a package identity from an alias or the compiler's working directory.
+public fn pkg_resolve_dependency(owner: string, section: string, alias: string) -> string {
+    let root = pkg_project_root();
+    let owner_abs = pkg_abs(owner);
+    if (root.len == 0 || owner_abs.len == 0 || alias.len == 0
+        || root.contains("\n") || root.contains("\r") || root.contains("\t")
+        || owner_abs.contains("\n") || owner_abs.contains("\r") || owner_abs.contains("\t")
+        || section.contains("\n") || section.contains("\t")
+        || alias.contains("\n") || alias.contains("\t")) {
+        print("error: invalid package dependency identity");
+        return "";
+    }
+    let key = pkg_cache_key(root.clone(), owner_abs.clone(), section.clone(), alias.clone());
+    let cached = pkg_cache_get(key.clone());
+    if (cached.len > 0) { return cached; }
+    let requests = pkg_join(root.clone(), ".cache/packages/requests");
+    if (vyx_bootstrap_mkdir_p(requests.c_str()) != 0) {
+        print("error: cannot create package request directory: " + requests);
+        return "";
+    }
+    var output: string = "";
+    var lock: string = "";
+    var acquired = false;
+    while (!acquired) {
+        output = pkg_join(requests.clone(), g_pkg_request_counter.toString() + ".path");
+        lock = output.clone() + ".lock";
+        g_pkg_request_counter = g_pkg_request_counter + 1;
+        let lock_rc = vyx_bootstrap_build_lock_try_acquire(lock.c_str(), "package resolver".c_str());
+        if (lock_rc == 0) { acquired = true; }
+        else if (lock_rc != 1) {
+            print("error: cannot reserve package resolver output: " + output);
+            return "";
+        }
+    }
+    deleteFile(output.clone());
+    let map_output = output.clone() + ".map";
+    deleteFile(map_output.clone());
+    let args = pkg_arg("resolve-path") + pkg_arg("--project") + pkg_arg(root.clone())
+        + pkg_arg("--owner") + pkg_arg(owner_abs)
+        + pkg_arg("--section") + pkg_arg(section)
+        + pkg_arg("--name") + pkg_arg(alias)
+        + pkg_arg("--output") + pkg_arg(output.clone())
+        + pkg_arg("--map-output") + pkg_arg(map_output.clone())
+        + pkg_target_args() + pkg_build_mode_args();
+    let rc = pkg_run(args);
+    var path: string = "";
+    if (rc == 0 && fileExists(output.clone())) {
+        path = readFile(output.clone());
+        if (path.endsWith("\n")) { path = path.substring(0, path.len - 1); }
+        if (path.endsWith("\r")) { path = path.substring(0, path.len - 1); }
+    }
+    deleteFile(output);
+    var map_valid = false;
+    if (rc == 0 && fileExists(map_output.clone())) {
+        map_valid = pkg_cache_map(root, readFile(map_output.clone()));
+    }
+    deleteFile(map_output);
+    let release_rc = vyx_bootstrap_build_lock_release(lock.c_str());
+    if (rc != 0 || release_rc != 0 || !map_valid || path.len == 0
+        || path.contains("\n") || path.contains("\r") || path.contains("\t")) {
+        print("error: package dependency resolution failed");
+        return "";
+    }
+    if (!fileExists(pkg_join(path.clone(), "Vyx.toml"))
+        && !fileExists(pkg_join(path.clone(), "vyx.toml"))) {
+        print("error: resolved package has no manifest: " + path);
+        return "";
+    }
+    g_pkg_resolution_cache = g_pkg_resolution_cache + key + "\t" + path.clone() + "\n";
+    return path;
 }
 
 public fn pkg_dispatch() -> i32 {
     if (argCount() < 2) { return 1; }
-    let cmd = getArg(1);
-    if (cmd == "publish") { return pkg_cmd_publish(); }
-    if (cmd == "search") {
-        var q: string = "";
-        if (argCount() >= 3) { q = getArg(2); }
-        return pkg_cmd_search(q);
+    let command = getArg(1);
+    var args: string = "";
+    var i: i32 = 1;
+    while (i < argCount()) {
+        args = args + pkg_arg(getArg(i));
+        i = i + 1;
     }
-    if (cmd == "lock") { return pkg_cmd_lock(); }
-    if (cmd == "install") {
-        var name: string = "";
-        var ver: string = "";
-        if (argCount() >= 3) {
-            let spec = getArg(2);
-            let at = spec.indexOf("@");
-            if (at > 0) {
-                name = spec.substring(0, at);
-                ver = spec.substring(at + 1, spec.len);
-            } else {
-                name = spec;
-            }
+    if (!pkg_has_cli_option("--project")) {
+        args = args + pkg_arg("--project") + pkg_arg(pkg_current_dir());
+    }
+    if (command == "install" || command == "lock" || command == "update") {
+        let triplet = policy_effective_target_triple();
+        if (!pkg_has_cli_option("--triplet")) {
+            args = args + pkg_arg("--triplet") + pkg_arg(triplet.clone());
         }
-        if (argCount() >= 4 && ver.len == 0) { ver = getArg(3); }
-        return pkg_cmd_install(name, ver);
+        if (!pkg_has_cli_option("--abi")) {
+            args = args + pkg_arg("--abi") + pkg_arg(pkg_target_abi(triplet));
+        }
     }
-    return 1;
+    return pkg_run(args);
 }

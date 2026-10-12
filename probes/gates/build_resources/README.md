@@ -37,10 +37,11 @@ Existing direct-child `process_resident_bytes` and
 `process_peak_resident_bytes` exports keep their RSS semantics. Private commit
 and RSS are separate measurements; neither is an alias for the other. The new
 private/CPU/tree APIs currently support Windows and explicitly return `-1` on
-other platforms. POSIX system commit likewise returns `-1`; its previous
+other platforms. System commit is available on Windows and ordinary Linux;
+Android/Termux and macOS return `-1` for that metric. The previous POSIX
 physical-memory approximation has been removed. Physical availability remains
-available independently. The scheduler must decide how to constrain a platform
-with only one known budget, without interpreting unknown as zero usage.
+available independently, and the scheduler uses it when commit is unknown
+without interpreting unknown as zero usage.
 
 Current tree commit uses the OS `JobObjectMemoryUsageInformation` query used by
 [Microsoft hcsshim](https://github.com/microsoft/hcsshim/blob/main/internal/winapi/jobobject.go).
@@ -59,9 +60,31 @@ memory, and must never be inferred from a root exit or low memory usage.
 System commit uses `GetPerformanceInfo`, resolved dynamically from kernel32 or
 psapi; no new link library is required. `GlobalMemoryStatusEx::ullAvailPageFile`
 is not used as system commit because it can also reflect the calling process's
-limit. The observations do not themselves impose a hard allocation limit.
+limit. On ordinary Linux hosts the runtime also reads
+`/proc/meminfo` (`CommitLimit - Committed_AS`). Android/Termux and macOS return
+`-1` for this Windows/Linux-specific observation and the scheduler uses physical
+availability instead. The observations do not themselves impose a hard
+allocation limit.
 
 ## Assertions
+
+The default scheduling cushion is one eighth of physical memory available when
+the batch starts, bounded between 256 MiB and 3 GiB. Unknown availability retains
+3 GiB. A fixed 3 GiB reserve needlessly serialized busy hosts and exceeded the
+available memory of small devices. The cushion includes the 25% growth allowance already
+reserved for active workers. Physical and commit margins are counted separately
+and only within each worker's reservation. Unknown measurements earn no margin.
+An explicit `VYX_BUILD_MEMORY_RESERVE_MB` retains the separate reserve in full.
+This is admission policy; it does not impose a hard allocation limit.
+
+`check-policy.ps1 -Compiler <current SDK compiler>` also compiles the production
+Vyx admission helpers at O0/O2. It checks unknown observations, reservation
+bounds, independent commit/physical constraints, overflow saturation and
+admission of the measured large-module pair on a 32 GiB host. It also checks
+that source-size tier boundaries never lower an estimate and that medium
+modules can share the budget without inheriting the largest-unit slope. It does not
+certify the peak memory of other import graphs; live telemetry and matching
+action history still govern their reservations.
 
 The test holds 16 MiB in a root, adds 32 MiB, and starts a descendant holding
 64 MiB. It verifies the allocation growth, separate direct/tree commit and CPU,

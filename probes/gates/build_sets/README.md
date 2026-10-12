@@ -1,5 +1,20 @@
 # Planner pipe-set gate
 
+`check-source-scans.ps1 -Compiler <current SDK compiler>` extracts the production
+source-text cache, token scan, argument and path helpers. O0/O2 checks cover empty payloads,
+prefix collisions, CRLF and a final row without a newline, distinct source
+paths, invalidation after a size change, and 500 reads of a 2 MiB source.
+Repeated duplicate-row insertion also checks that the planner reads its
+existing table without cloning the full input, preserving the original bytes.
+The repeated-read test observes Windows private commit and limits retained
+growth to 32 MiB. The mtime wrapper calls the actual backend filesystem API;
+all cache and index algorithms come from compiler source. Environment cases
+include dollar and Windows percent variables, nested defaults and unmatched
+delimiters. Path cases preserve UTF-8 bytes and ASCII-only case conversion.
+DCI token cases exclude strings and comments and include exact end-of-input
+matches. Long token scans and 2 MiB arguments must stay within the same memory
+bound; throughput is checked separately with complete project builds.
+
 ```powershell
 pwsh -File probes/gates/build_sets/run.ps1
 ```
@@ -44,3 +59,14 @@ appends accepted names in input order to one `StringBuilder`, then detaches the
 result before destroying owned storage. The table and builder are explicitly
 destroyed, including the heap-capacity/empty-result branch. The standalone
 `has` scan makes no full-set clone; `add` remains linear in the existing set.
+
+`check-source-scans.ps1 -Compiler <current SDK compiler>` also compares cached
+generic-call spans with the original full-text scanner at O0/O2. The 90
+combinations cover exact identifier boundaries, repeated calls, nested type
+arguments, malformed angles, qualified names, and selecting the outer versus
+inner call. A selected outer call consumes its complete span; unselected outer
+calls still expose nested candidates. The planner keeps the scanner's existing
+interpretation of comments and strings; semantic validation belongs to the
+frontend. Cached spans use the same path/mtime/size identity as source text and
+are invalidated when that identity changes. Repeated queries of a large source
+must reuse the span rows and remain within the private-memory allowance.

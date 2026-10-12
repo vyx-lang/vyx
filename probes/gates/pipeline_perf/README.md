@@ -1,5 +1,16 @@
 # Build pipeline measurements (Windows)
 
+Keep `VYX_BOOTSTRAP_PROFILE` and `VYX_MIR_MEM_TRACE` disabled for wall-time
+comparisons. `VYX_MIR_TIMING=1` and `VYX_MIR_BODY_TIMING=1` report elapsed phases
+without walking the allocator. `VYX_MIR_HEAP_WALK=1` explicitly enables the
+Windows CRT heap census in body diagnostics; its cost grows with live allocations
+and must not be included in compiler throughput measurements.
+
+`Check-CguPolicy.ps1 -Compiler <current SDK compiler>` checks the production
+default-unit selector at O0/O2. A single emitter defaults to one CGU;
+explicit environment and CLI unit counts take precedence. Project builds
+assign one emitter per source worker when the outer job count exceeds one.
+
 The first measured runs and their limitations are recorded in [BASELINE.md](BASELINE.md).
 The repeated final measurements and the separate self-host observations are
 reported in [RESULTS.md](RESULTS.md).
@@ -69,6 +80,12 @@ memory limits nor changes resource-control environment switches. Processes run
 without opening a console window. Build stdout and stderr go to separate files;
 the harness returns the compiler's exit code, including failure.
 
+`-CompilerArgs` measures a supplied compiler argument array instead of `build`.
+Use it for a single costly module while retaining the same native completion
+and resource observations. `VYX_LLVM_TIMING=1` separates native optimization,
+promotion cleanup rounds and machine-code emission in stderr; it is disabled
+by default. Metadata records the relevant CGU, memory and profiling switches.
+
 Each invocation saves:
 
 - `metadata.json`: compiler hash/version, same-directory backend DLL/runtime
@@ -82,6 +99,12 @@ Each invocation saves:
   edits; compiler and native artifact hashes identify the actual files tested.
 - `result.json`: wall time, parent peak RSS/private commit, simultaneous sampled
   tree peak RSS/private commit, observed CPU time and peak active Vyx children.
+  `observed_exit_seconds` records monotonic time until the exit observation;
+  `drain_seconds` separates the subsequent wait for redirected output streams.
+  Completion is the Windows process handle becoming signaled. An exit status
+  can be published while process detach still runs; `os_exit_status_seconds`
+  records that timestamp separately. Native process queries keep sampling CPU
+  and memory during that interval, which `Process.GetProcessById` can omit.
 - `samples.csv`: per-sample active Vyx/native compiler counts, memory and CPU.
 - `processes.csv`: last observations keyed by process ID and creation time.
 - `stdout.log` and `stderr.log`: unmodified compiler output streams.
@@ -94,6 +117,11 @@ and finish between samples, and the final CPU tail of an exited child, can be
 missed. Consequently CPU/wall is an observed lower bound, not a complete CPU
 utilization measurement. Active Vyx children exclude the parent driver; native
 compiler/linker children are counted separately.
+
+Tree discovery checks creation times along each parent edge and for retained
+orphans. Windows reuses numeric PIDs: a surviving process can still name an old
+parent PID that now belongs to the compiler. A process older than its purported
+parent is excluded. Raw parent-PID equality does not establish tree membership.
 
 The default interval is 100 ms. Toolhelp process snapshots and process queries
 have a cost, especially on large trees; `sample_work_ms` quantifies time spent

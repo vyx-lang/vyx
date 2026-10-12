@@ -5,6 +5,7 @@ param(
     [ValidateRange(1, 1024)][int]$Jobs = 20,
     [string]$OutputDir = (Join-Path $PSScriptRoot ('.runs/measure-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))),
     [string[]]$BuildArgs = @(),
+    [string[]]$CompilerArgs = @(),
     [string]$CacheLabel = 'preserved; caller managed',
     [ValidateRange(50, 10000)][int]$SampleIntervalMs = 100
 )
@@ -45,6 +46,9 @@ public static class VyxBuildObservation {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool Process32FirstW(IntPtr snapshot, ref PROCESSENTRY32 entry);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool Process32NextW(IntPtr snapshot, ref PROCESSENTRY32 entry);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr process, uint milliseconds);
     [DllImport("psapi.dll", SetLastError = true)] static extern bool GetProcessMemoryInfo(IntPtr process, ref MEMORY_COUNTERS counters, uint size);
     public sealed class Sample {
         public int Id, ParentId;
@@ -52,55 +56,98 @@ public static class VyxBuildObservation {
         public long StartTicks, RssBytes, PrivateBytes, PeakRssBytes, PeakPrivateBytes;
         public double CpuMilliseconds;
     }
+    public static IntPtr OpenWaitHandle(int id) {
+        IntPtr handle = OpenProcess(0x101000, false, id);
+        if (handle == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        return handle;
+    }
+    public static bool HasTerminated(IntPtr handle) {
+        uint status = WaitForSingleObject(handle, 0);
+        if (status == 0) return true;
+        if (status == 258) return false;
+        throw new System.ComponentModel.Win32Exception();
+    }
+    public static void CloseWaitHandle(IntPtr handle) { if (handle != IntPtr.Zero) CloseHandle(handle); }
+    static Sample ReadProcess(int id, int parent, string name) {
+        // Process.GetProcessById/Handle treats a published exit status as
+        // completion. Windows can still be running DLL detach with a live
+        // address space and an unsignaled process handle at that point.
+        IntPtr handle = OpenProcess(0x1000, false, id);
+        if (handle == IntPtr.Zero) return null;
+        try {
+            long creation, exit, kernel, user;
+            var counters = new MEMORY_COUNTERS { cb = (uint)Marshal.SizeOf(typeof(MEMORY_COUNTERS)) };
+            if (!GetProcessTimes(handle, out creation, out exit, out kernel, out user)
+                || !GetProcessMemoryInfo(handle, ref counters, counters.cb)) return null;
+            return new Sample {
+                Id = id, ParentId = parent, Name = System.IO.Path.GetFileNameWithoutExtension(name),
+                StartTicks = DateTime.FromFileTimeUtc(creation).Ticks,
+                CpuMilliseconds = (kernel + user) / 10000.0,
+                RssBytes = (long)counters.WorkingSetSize.ToUInt64(),
+                PrivateBytes = (long)counters.PrivateUsage.ToUInt64(),
+                PeakRssBytes = (long)counters.PeakWorkingSetSize.ToUInt64(),
+                PeakPrivateBytes = (long)counters.PeakPagefileUsage.ToUInt64()
+            };
+        } finally { CloseHandle(handle); }
+    }
     public static Sample[] ReadTree(int root, Dictionary<int, long> known) {
         var parents = new Dictionary<int, int>();
+        var names = new Dictionary<int, string>();
         IntPtr snapshot = CreateToolhelp32Snapshot(2, 0);
         if (snapshot == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception();
         try {
             var entry = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32)) };
             if (Process32FirstW(snapshot, ref entry)) do {
                 parents[(int)entry.th32ProcessID] = (int)entry.th32ParentProcessID;
+                names[(int)entry.th32ProcessID] = entry.szExeFile;
             } while (Process32NextW(snapshot, ref entry));
         } finally { CloseHandle(snapshot); }
-        var members = new HashSet<int> { root };
+        var samples = new Dictionary<int, Sample>();
+        var members = new Dictionary<int, Sample>();
+        if (parents.ContainsKey(root)) {
+            var rootSample = ReadProcess(root, parents[root], names[root]);
+            if (rootSample != null) { samples[root] = rootSample; members[root] = rootSample; }
+        }
+        long rootStart;
+        if (members.ContainsKey(root)) rootStart = members[root].StartTicks;
+        else if (!known.TryGetValue(root, out rootStart)) return new Sample[0];
         // A Windows PID can be reused after a child exits. Only retain an
         // orphaned descendant when its process creation time still matches.
         foreach (var pair in known) {
             if (!parents.ContainsKey(pair.Key)) continue;
-            try {
-                using (Process prior = Process.GetProcessById(pair.Key)) {
-                    if (prior.StartTime.ToUniversalTime().Ticks == pair.Value) members.Add(pair.Key);
-                }
-            } catch (InvalidOperationException) { }
-              catch (ArgumentException) { }
-              catch (System.ComponentModel.Win32Exception) { }
+            var prior = ReadProcess(pair.Key, parents[pair.Key], names[pair.Key]);
+            if (prior != null && prior.StartTicks == pair.Value && prior.StartTicks >= rootStart) {
+                samples[pair.Key] = prior;
+                members[pair.Key] = prior;
+            }
         }
         bool changed;
         do {
             changed = false;
-            foreach (var pair in parents) if (members.Contains(pair.Value) && members.Add(pair.Key)) changed = true;
+            foreach (var pair in parents) {
+                if (members.ContainsKey(pair.Key) || !members.ContainsKey(pair.Value)) continue;
+                Sample child;
+                if (!samples.TryGetValue(pair.Key, out child)) {
+                    child = ReadProcess(pair.Key, pair.Value, names[pair.Key]);
+                    samples[pair.Key] = child;
+                }
+                // The snapshot stores numeric parent PIDs, not parent
+                // identities. A surviving process can retain a parent PID
+                // that Windows has since reused for a new compiler. It
+                // cannot be this parent's child if it predates the parent.
+                if (child != null && child.StartTicks >= members[pair.Value].StartTicks) {
+                    members[pair.Key] = child;
+                    changed = true;
+                }
+            }
         } while (changed);
         var result = new List<Sample>();
-        foreach (int id in members) {
+        foreach (int id in members.Keys) {
             if (!parents.ContainsKey(id)) continue;
-            try {
-                using (Process process = Process.GetProcessById(id)) {
-                    var counters = new MEMORY_COUNTERS { cb = (uint)Marshal.SizeOf(typeof(MEMORY_COUNTERS)) };
-                    if (!GetProcessMemoryInfo(process.Handle, ref counters, counters.cb)) continue;
-                    known[id] = process.StartTime.ToUniversalTime().Ticks;
-                    result.Add(new Sample {
-                        Id = id, ParentId = parents[id], Name = process.ProcessName,
-                        StartTicks = process.StartTime.ToUniversalTime().Ticks,
-                        CpuMilliseconds = process.TotalProcessorTime.TotalMilliseconds,
-                        RssBytes = (long)counters.WorkingSetSize.ToUInt64(),
-                        PrivateBytes = (long)counters.PrivateUsage.ToUInt64(),
-                        PeakRssBytes = (long)counters.PeakWorkingSetSize.ToUInt64(),
-                        PeakPrivateBytes = (long)counters.PeakPagefileUsage.ToUInt64()
-                    });
-                }
-            } catch (InvalidOperationException) { }
-              catch (ArgumentException) { }
-              catch (System.ComponentModel.Win32Exception) { }
+            var sample = members[id];
+            if (sample == null) continue;
+            known[id] = sample.StartTicks;
+            result.Add(sample);
         }
         return result.ToArray();
     }
@@ -109,10 +156,14 @@ public static class VyxBuildObservation {
 }
 
 $argv = [Collections.Generic.List[string]]::new()
-$argv.Add('build')
-if ($Target) { $argv.Add('--target'); $argv.Add($Target) }
-$argv.Add("-j$Jobs")
-foreach ($argument in $BuildArgs) { $argv.Add($argument) }
+if ($CompilerArgs.Count -gt 0) {
+    foreach ($argument in $CompilerArgs) { $argv.Add($argument) }
+} else {
+    $argv.Add('build')
+    if ($Target) { $argv.Add('--target'); $argv.Add($Target) }
+    $argv.Add("-j$Jobs")
+    foreach ($argument in $BuildArgs) { $argv.Add($argument) }
+}
 
 $machine = Get-CimInstance Win32_ComputerSystem
 $cpu = @(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name)
@@ -231,6 +282,17 @@ $metadata = [ordered]@{
     cpu = $cpu
     llvm_root = $llvmRoot
     clang_version = $clangVersion
+    compiler_environment = [ordered]@{
+        VYX_CODEGEN_UNITS = $env:VYX_CODEGEN_UNITS
+        VYX_CGU_EMIT_THREADS = $env:VYX_CGU_EMIT_THREADS
+        VYX_CGU_THREADS = $env:VYX_CGU_THREADS
+        VYX_BUILD_MEMORY_RESERVE_MB = $env:VYX_BUILD_MEMORY_RESERVE_MB
+        VYX_BUILD_MEMORY_SLOTS = $env:VYX_BUILD_MEMORY_SLOTS
+        VYX_BOOTSTRAP_PROFILE = $env:VYX_BOOTSTRAP_PROFILE
+        VYX_MIR_HEAP_WALK = $env:VYX_MIR_HEAP_WALK
+        VYX_MIR_TIMING = $env:VYX_MIR_TIMING
+        VYX_LLVM_TIMING = $env:VYX_LLVM_TIMING
+    }
     limitations = @(
         'Tree metrics cover descendants observed during the compiler process lifetime. Very short children can be missed.',
         'CPU is the sum of the latest observed cumulative CPU times, keyed by PID and start time. It undercounts unobserved process tails.',
@@ -245,7 +307,7 @@ $metadata = [ordered]@{
 }
 $metadata | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $outputPath 'metadata.json') -Encoding utf8NoBOM
 Write-Host "Cache mode: $CacheLabel. Existing project caches are preserved; cold state must be prepared by the caller."
-Write-Host "Measuring $compilerPath build (-j$Jobs). Logs: $outputPath"
+Write-Host "Measuring $compilerPath ($($argv[0])). Logs: $outputPath"
 
 $startInfo = [Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $compilerPath
@@ -275,8 +337,10 @@ $sampleCostMs = 0.0
 $compilerName = [IO.Path]::GetFileNameWithoutExtension($compilerPath)
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $exitCode = $null
+$observationHandle = [IntPtr]::Zero
 try {
     if (-not $process.Start()) { throw 'Compiler process did not start.' }
+    $observationHandle = [VyxBuildObservation]::OpenWaitHandle($process.Id)
     $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdoutFile)
     $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderrFile)
     do {
@@ -310,18 +374,23 @@ try {
         $sampleCount++
         $row = @($clock.ElapsedMilliseconds, $observations.Count, $compilerChildren, $nativeChildren, $parentRss, $parentPrivate, $rss, $private, $cpuMs, $workMs)
         $csv.WriteLine(($row | ForEach-Object { [Convert]::ToString($_, [Globalization.CultureInfo]::InvariantCulture) }) -join ',')
-        if ($process.HasExited) { break }
+        if ([VyxBuildObservation]::HasTerminated($observationHandle)) { break }
         Start-Sleep -Milliseconds $SampleIntervalMs
     } while ($true)
+    $observedExitSeconds = $clock.Elapsed.TotalSeconds
     $process.WaitForExit()
     $exitCode = $process.ExitCode
     $null = $stdoutTask.GetAwaiter().GetResult()
     $null = $stderrTask.GetAwaiter().GetResult()
     $clock.Stop()
-    $wall = ($process.ExitTime.ToUniversalTime() - $process.StartTime.ToUniversalTime()).TotalSeconds
+    $statusWall = ($process.ExitTime.ToUniversalTime() - $process.StartTime.ToUniversalTime()).TotalSeconds
+    $wall = $observedExitSeconds
     $summary = [ordered]@{
         exit_code = $exitCode
         wall_seconds = $wall
+        os_exit_status_seconds = $statusWall
+        observed_exit_seconds = $observedExitSeconds
+        drain_seconds = $clock.Elapsed.TotalSeconds - $observedExitSeconds
         harness_elapsed_seconds = $clock.Elapsed.TotalSeconds
         parent_peak_rss_bytes = $parentPeakRss
         parent_peak_private_bytes = $parentPeakPrivate
@@ -341,6 +410,7 @@ try {
         Export-Csv -LiteralPath (Join-Path $outputPath 'processes.csv') -NoTypeInformation -Encoding utf8NoBOM
     Write-Host ("Exit={0}; wall={1:N3}s; tree peak RSS={2:N1}MiB; observed CPU={3:N3}s; peak Vyx children={4}" -f $exitCode, $wall, ($treePeakRss / 1MB), ($cpuMs / 1000), $peakCompilerChildren)
 } finally {
+    [VyxBuildObservation]::CloseWaitHandle($observationHandle)
     $csv.Dispose()
     $stdoutFile.Dispose()
     $stderrFile.Dispose()

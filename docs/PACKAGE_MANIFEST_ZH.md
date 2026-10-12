@@ -60,7 +60,7 @@ sources = ["src/math.vyx"]
 | `build.threads` | 默认并发任务数；0 使用硬件并发度，命令行 `-j` 可覆盖 |
 | `dependencies` | 包内目标共享的依赖 |
 | `target.<name>` | 一个命名构建目标 |
-| `type` | `executable`、`static`、`shared` 或 `source` |
+| `type` | `executable`、`static`、`shared`、`source` 或 `prebuilt` |
 | `entry`、`sources` | 目标入口与其他源文件 |
 | `auto_sources = false` | 显式管理源文件；新增文件后需加入配置 |
 
@@ -115,13 +115,175 @@ lib_paths = ["native/lib"]
 `libs_windows`、`libs_linux` 等平台字段与基础列表累加；
 更具体的平台项不替换基础项。依赖缺失与环会在编译前诊断。
 
-## 本地包注册表
+## 包源与锁文件
 
-`vyxc publish`、`install`、`search`、`lock` 使用本地 `file://` 注册表，
-由 `VYX_REGISTRY` 指定，默认 `./.vyx-registry`。
-安装的包写入 `.cache/registry/<name>/<version>/`，安装过程写入 `Vyx.lock`。
-依赖可使用 `version = "1.2.3"` 或 `path = "registry:name@1.2.3"`。
-当前没有远程 HTTP 注册表。
+第三方依赖使用命名的 JSON 清单源。清单地址可以是 HTTP(S) URL、`file://` URL
+或本地路径，清单与包归档可以分别存放在 GitHub、私有服务器或共享文件系统。
+包管理引擎随 SDK 放在 `tools/packages/`，使用 Python 3.11 及以上版本的标准库。
+只依赖本地 `path` 和 `std:` 包的项目，不需要为依赖解析安装 Python。
+
+为当前用户配置源：
+
+```sh
+vyxc source add community https://packages.example.org/index.json
+vyxc source add company https://packages.example.org/private/index.json --token-env VYX_PACKAGE_TOKEN
+vyxc source list
+vyxc source remove community
+```
+
+示例域名需替换成实际清单地址。用户配置保存在 `~/.vyx/sources.json`；
+`VYX_PACKAGE_SOURCES` 可指定其他配置文件。格式如下：
+
+```json
+{
+  "schema": 1,
+  "sources": [
+    {"name": "company", "url": "https://packages.example.org/private/index.json", "token_env": "VYX_PACKAGE_TOKEN"},
+    {"name": "community", "url": "https://packages.example.org/index.json"}
+  ]
+}
+```
+
+项目自己的源写在 `Vyx.toml` 中：
+
+```toml
+[sources.company]
+url = "https://packages.example.org/private/index.json"
+token_env = "VYX_PACKAGE_TOKEN"
+
+[dependencies]
+codec = { version = "^1.2.0", source = "company", target = "codec" }
+```
+
+项目源按声明顺序排在前面，随后使用未被项目同名配置覆盖的用户源。
+依赖指定 `source` 时只从该源解析；省略时，第一个包含该包的源负责解析，
+即使其中没有满足版本要求的版本，也不会转向后面的源。源无法访问、JSON 无效
+或包元数据无效都会报错。私有包建议显式指定来源。
+
+清单格式如下：
+
+```json
+{
+  "schema": 1,
+  "packages": {
+    "codec": {
+      "description": "Binary encoding library",
+      "versions": {
+        "1.2.3": {
+          "url": "archives/codec-1.2.3.tar.gz",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "strip_prefix": "codec-1.2.3"
+        }
+      }
+    }
+  }
+}
+```
+
+示例 SHA256 必须替换为实际归档的哈希。归档相对 URL 按清单位置解析；
+移除可选的 `strip_prefix` 后，包中必须有 `Vyx.toml` 及其声明的输入。
+解包前验证 SHA256，并拒绝不安全的归档路径。源身份由配置的源名与规范化后的
+清单 URL 共同确定，不包含 token 值。即使 URL 相同，不同命名源也保持独立，
+避免不同私有认证视图共用依赖身份。缓存目录为
+`.cache/packages/<source-identity-hash>/<name>/<version>/<archive-hash>/`。
+
+版本要求支持精确 SemVer（`1.2.3`）、caret（`^1.2.0`）、tilde（`~1.2.0`）、
+比较条件（`>=1.2.0 <2.0.0`）、通配符（`1.2.*` 或 `*`），以及用 `||` 连接的候选范围。
+解析器在负责该包的源中选择兼容版本；同一命名源的同一个包在依赖图中统一为一个版本，
+无法同时满足的要求会报告版本冲突。预发布版本需在要求中显式指定预发布版本；
+`*` 不会自动选用预发布版。
+
+```sh
+vyxc search codec
+vyxc install 'codec@^1.2.0' --source company
+vyxc lock
+vyxc build --locked
+vyxc build --offline
+vyxc update
+```
+
+带包名的 `install` 将版本依赖写入 `Vyx.toml`；不带包名时物化项目声明的依赖图。
+`lock` 解析依赖图并写出 `Vyx.packages.lock`，`update` 显式重新选择版本。
+解析覆盖项目所有目标的有效依赖，按全局、继承模板、目标的顺序应用覆写和移除，
+再处理本地包与下载包的传递依赖；因此可能下载本次未选目标所需的包。
+未使用的模板和已被覆写的默认项不额外施加版本约束。
+
+`Vyx.packages.lock` 是 JSON 文件，记录精确版本、源身份、归档哈希、已验证的 payload 摘要与依赖边，
+应随 `Vyx.toml` 一起提交。它与选择 MOSP 模块版本和变体的 `Vyx.lock` 分开。
+`--locked` 拒绝缺少锁文件或依赖图发生变化的构建。`--offline` 要求已有匹配的锁文件
+和通过校验的包缓存，不会在网络失败后静默使用其他缓存包。普通构建保留兼容的
+锁定版本，需要更新版本时运行 `update`。
+
+私有源的 bearer token 从配置指定的环境变量读取，不写入项目文件或锁文件；
+携带认证信息的跨域重定向会被拒绝。源的 token 只发送给同源归档 URL，不发送给
+独立托管的跨域归档。归档哈希用于验证下载内容，正确的包元数据仍由配置的源负责发布。
+
+`vyxc publish --source NAME --dry-run` 列出实际发布文件；
+`vyxc publish --source NAME` 生成归档并更新本地 JSON 清单。
+用 `[package]` 的 `include`、`exclude` 数组控制内容。默认排除隐藏文件、生成物、
+日志与本地工具状态。发布用原生库应放在 `native/` 或 `lib/`，避免放进生成目录
+`out/`、`target/`。模块版本选择文件 `Vyx.lock` 保留在包中，包管理的
+`Vyx.packages.lock` 不作为依赖包的发布内容。
+远程服务器或 GitHub 的上传使用对应平台自己的发布流程，不由 `publish` 自动完成。
+完整版本约束、归档格式和命令选项见[包管理引擎说明](../tools/packages/README.md)。
+
+### 源码、二进制与 DCI 包
+
+版本条目的 `kind` 默认为 `source`，直接使用 `url` / `sha256`，包中的目标照常构建。
+`binary` 和 `dci` 条目改用 `artifacts` 数组，明确列出目标 triplet 和 ABI：
+
+```json
+{
+  "kind": "dci",
+  "artifacts": [
+    {
+      "triplet": "x86_64-pc-windows-msvc",
+      "abi": "msvc",
+      "url": "archives/codec-1.2.3-windows-msvc.tar.gz",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "strip_prefix": "codec-1.2.3"
+    }
+  ]
+}
+```
+
+这个对象放在上述清单的版本条目位置，哈希替换为实际归档哈希。
+必须恰好有一个产物匹配构建的 triplet 和 ABI；缺少匹配或重复匹配都会报错。
+二进制包的锁定结果包含目标身份，不会静默使用另一平台的归档。
+
+归档内仍以 `Vyx.toml` 描述原生库及其公开输入。例如一个 Windows DCI 动态库包：
+
+```toml
+[package]
+name = "codec"
+version = "1.2.3"
+kind = "dci"
+
+[target.codec]
+type = "prebuilt"
+artifact = "native/codec.lib"
+linkage = "shared"
+triplet = "x86_64-pc-windows-msvc"
+abi = "msvc"
+sources = ["bindings/codec.vyx"]
+dci_files = ["contracts/codec.dcib"]
+runtime_files = ["native/codec.dll"]
+```
+
+`artifact` 指向现成的链接输入；Windows 动态库在这里填写导入库，DLL 放入
+`runtime_files`。`linkage` 为 `static` 或 `shared`，所有文件路径都相对包根目录。
+`sources` 提供 Vyx 定义，可选的 `interface_sources` 提供额外的 Vyx 或 `.vyi` 接口输入。
+DCI 包必须同时在 `dci_files` 中提供契约，在 `sources` 中提供 Vyx 声明。
+消费方通过依赖的 `target` 字段选择包内目标。
+
+构建直接使用包内原生库、定义与契约，不重新运行生产端 Adapter。
+发布前可以用 DCI Converter 生成定义，产物仍是开发者可检查的 Vyx 文件。
+`.vyi` 必须通过消费编译器的格式与兼容性检查；triplet 和 ABI 相同，不代表任意
+编译器版本或库版本都能兼容。
+
+下载、校验、解包与解析依赖不会执行包清单的构建钩子。源码包中需要单独构建的目标
+使用普通项目构建器，以当前用户权限执行声明的钩子；包完整性校验不提供构建沙箱。
+预编译依赖直接消费已有产物，不运行生产端构建。
 
 ## DCI 配置
 
@@ -140,6 +302,12 @@ lib_paths = ["native/lib"]
 vyxc build --target app -g -O0
 vyxc build --target app --triplet aarch64-linux-android23
 ```
+
+如果 `vyxc` 运行在 Android/Termux，直接使用 Termux 自带的 LLVM 工具链和
+sysroot，不需要 NDK，也不会查找 Android SDK 的 NDK。SDK 安装脚本会提供
+`LLVM_ROOT` / `LLVM_BIN`；手动安装时可设置这两个变量，或把 Termux 的 LLVM
+目录加入 `PATH`。Windows/Linux 宿主把 Android 作为交叉目标时，仍需要 NDK
+sysroot，并使用下面的 staged runtime 目录。
 
 调试配置见[编辑器与调试](TOOLING_ZH.md)。
 交叉编译需要目标平台的工具链、运行时及依赖，具体要求见[测试与构建指南](TESTING_GUIDE_ZH.md)。
