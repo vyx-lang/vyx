@@ -1,141 +1,224 @@
 module std.network.grpc;
 
-/// Vyx gRPC Client
-/// HTTP/2-based RPC client for gRPC services.
-///
-/// Usage:
-///   let channel = GrpcChannel.connect("localhost:50051");
-///   let response = channel.unaryCall("/service/Method", requestData);
-///   print("Response: ${response.data}");
-///   channel.close();
-///
-/// Note: This is a simplified gRPC client over HTTP/2.
-/// For full Protocol Buffers support, use the protobuf compiler plugin.
+use std.network.curl;
 
-extern "C" {
-    fn socket(domain: i32, type: i32, protocol: i32) -> i32;
-    fn connect(sockfd: i32, addr: rawptr, addrlen: i32) -> i32;
-    fn send(sockfd: i32, buf: rawptr, len: i64, flags: i32) -> i64;
-    fn recv(sockfd: i32, buf: rawptr, len: i64, flags: i32) -> i64;
-    fn close(sockfd: i32) -> i32;
-    fn malloc(size: i64) -> rawptr;
-    fn free(ptr: rawptr);
-    fn memcpy(dest: rawptr, src: rawptr, n: i64) -> rawptr;
-    fn htons(hostshort: i32) -> i32;
+/// Synchronous unary gRPC over HTTP/2. Payloads contain serialized bytes,
+/// including NUL. Streaming and compressed messages are unsupported.
+public class GrpcStatus {
+    public const OK: i32 = 0;
+    public const CANCELLED: i32 = 1;
+    public const UNKNOWN: i32 = 2;
+    public const INVALID_ARGUMENT: i32 = 3;
+    public const DEADLINE_EXCEEDED: i32 = 4;
+    public const NOT_FOUND: i32 = 5;
+    public const ALREADY_EXISTS: i32 = 6;
+    public const PERMISSION_DENIED: i32 = 7;
+    public const RESOURCE_EXHAUSTED: i32 = 8;
+    public const FAILED_PRECONDITION: i32 = 9;
+    public const ABORTED: i32 = 10;
+    public const OUT_OF_RANGE: i32 = 11;
+    public const UNIMPLEMENTED: i32 = 12;
+    public const INTERNAL: i32 = 13;
+    public const UNAVAILABLE: i32 = 14;
+    public const DATA_LOSS: i32 = 15;
+    public const UNAUTHENTICATED: i32 = 16;
 }
 
-/// gRPC status codes
-struct GrpcStatus {
-    static let OK: i32 = 0
-    static let CANCELLED: i32 = 1
-    static let UNKNOWN: i32 = 2
-    static let INVALID_ARGUMENT: i32 = 3
-    static let DEADLINE_EXCEEDED: i32 = 4
-    static let NOT_FOUND: i32 = 5
-    static let ALREADY_EXISTS: i32 = 6
-    static let PERMISSION_DENIED: i32 = 7
-    static let UNAUTHENTICATED: i32 = 16
-    static let UNAVAILABLE: i32 = 14
-    static let UNIMPLEMENTED: i32 = 12
-    static let INTERNAL: i32 = 13
+public struct GrpcResponse {
+    status: i32;
+    data: string;
+    ok: bool;
+    message: string;
 }
 
-/// gRPC response
-struct GrpcResponse {
-    status: i32
-    data: string
-    ok: bool
+public struct GrpcMetadata { key: string; value: string; }
+
+fn grpc_error(status: i32, message: string) -> GrpcResponse {
+    return GrpcResponse { status: status, data: "", ok: false, message: message };
 }
 
-/// gRPC metadata (key-value headers)
-struct GrpcMetadata {
-    key: string
-    value: string
+fn grpc_read_byte(data: string, offset: i32) -> i64 {
+    return (data.charAt(offset) & 255) as i64;
 }
 
-/// gRPC channel (connection to a server)
-class GrpcChannel {
-    private host: string
-    private port: i32
-    private sockfd: i32
-    private connected: bool
+fn grpc_write_byte(data: rawptr, offset: i32, value: i64) {
+    var byte: u8 = (value & 255) as u8;
+    memcpy(data + offset, to_rawptr(&byte), 1);
+}
 
-    /// Connect to a gRPC server at host:port
-    public static fn connect(address: string) -> GrpcChannel {
-        var host: string = "localhost";
-        var port: i32 = 50051;
-
-        let colonPos = address.indexOf(":");
-        if (colonPos > 0) {
-            host = address.substring(0, colonPos);
-        } else {
-            host = address;
+// Capture includes trailers; match the complete header name.
+fn grpc_header(headers: string, name: string) -> string {
+    var value = "";
+    var start: i32 = 0;
+    var end: i32 = 0;
+    while (end < headers.len) {
+        if (headers.charAt(end) == 10) {
+            let line = headers.substring(start, end).trim();
+            let colon = line.indexOf(":");
+            if (colon > 0 && line.substring(0, colon).toLower() == name) {
+                value = line.substring(colon + 1, line.len).trim();
+            }
+            start = end + 1;
         }
+        end = end + 1;
+    }
+    return value;
+}
 
-        let fd = socket(2, 1, 0);
+fn grpc_parse_status(text: string) -> i32 {
+    if (text.len == 0 || text.len > 2) { return -1; }
+    var value: i32 = 0;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let digit = text.charAt(i) - 48;
+        if (digit < 0 || digit > 9) { return -1; }
+        value = value * 10 + digit;
+        i = i + 1;
+    }
+    if (value > 16) { return -1; }
+    return value;
+}
 
-        return GrpcChannel {
-            host: host,
-            port: port,
-            sockfd: fd,
-            connected: fd >= 0
-        };
+fn grpc_hex_digit(c: i32) -> i32 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return -1;
+}
+
+fn grpc_decode_message(text: string) -> string {
+    var out = "";
+    var i: i32 = 0;
+    while (i < text.len) {
+        if (text.charAt(i) == 37 && i + 2 < text.len) {
+            let hi = grpc_hex_digit(text.charAt(i + 1));
+            let lo = grpc_hex_digit(text.charAt(i + 2));
+            if (hi >= 0 && lo >= 0) {
+                var byte: u8 = (hi * 16 + lo) as u8;
+                out = out + from_cstr_len(to_rawptr(&byte), 1);
+                i = i + 3;
+                continue;
+            }
+        }
+        out = out + text.substring(i, i + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+public class GrpcChannel {
+    @[vis(self)] handle: rawptr;
+    @[vis(self)] endpoint: string;
+    @[vis(self)] ready: bool;
+    @[vis(self)] timeout: i32;
+    @[vis(self)] last_error: string;
+
+    /// Establish transport; bare host:port selects plaintext HTTP/2.
+    /// https:// retains libcurl certificate and hostname verification.
+    public static fn connect(address: string, ca_file: string = "") -> GrpcChannel {
+        var url = address;
+        if (!url.startsWith("http://") && !url.startsWith("https://")) { url = "http://" + url; }
+        var out = GrpcChannel { handle: null, endpoint: url, ready: false, timeout: 10, last_error: "" };
+        http_init();
+        out.handle = curl_new();
+        if (out.handle == null) { out.last_error = "could not create libcurl handle"; return out; }
+        var rc = curl_set(out.handle, CURLOPT_URL, out.endpoint.c_str());
+        rc = rc | curl_set(out.handle, CURLOPT_HTTP_VERSION, 5 as rawptr);
+        rc = rc | curl_set(out.handle, CURLOPT_TIMEOUT, 10 as rawptr);
+        rc = rc | curl_set(out.handle, CURLOPT_NOSIGNAL, 1 as rawptr);
+        rc = rc | curl_set(out.handle, CURLOPT_CONNECT_ONLY, 1 as rawptr);
+        if (ca_file.len > 0) { rc = rc | curl_set(out.handle, CURLOPT_CAINFO, ca_file.c_str()); }
+        if (rc == 0) { rc = curl_perform(out.handle); }
+        if (rc != 0) { out.last_error = http_error(rc); out.close(); return out; }
+        if (curl_set(out.handle, CURLOPT_CONNECT_ONLY, null) != 0) {
+            out.last_error = "could not enable HTTP/2 requests"; out.close(); return out;
+        }
+        out.ready = true;
+        return out;
     }
 
-    /// Perform a unary RPC call
+    public fn setTimeout(seconds: i32) { if (seconds > 0) { self.timeout = seconds; } }
+
+    /// One uncompressed request and response, each at most 16 MiB.
     public fn unaryCall(method: string, requestData: string) -> GrpcResponse {
-        if (!self.connected) {
-            return GrpcResponse { status: 14, data: "not connected", ok: false };
+        if (!self.ready || self.handle == null) { return grpc_error(14, "channel is closed: " + self.last_error); }
+        if (!method.startsWith("/") || method.len < 3 || method.contains("?")
+            || method.contains("#") || method.contains("\r") || method.contains("\n")) {
+            return grpc_error(3, "expected /service/method path");
         }
-
-        // Construct HTTP/2-like frame with gRPC framing:
-        // 1 byte compression flag (0) + 4 byte message length + message body
-        let msgLen = requestData.len;
-
-        // Send the request data
-        let sent = send(self.sockfd, requestData.c_str() as rawptr, msgLen as i64, 0);
-        if (sent <= 0) {
-            return GrpcResponse { status: 14, data: "send failed", ok: false };
+        if (requestData.len > 16777216) { return grpc_error(8, "request exceeds 16 MiB"); }
+        let frame = malloc((requestData.len + 5) as u64);
+        if (frame == null) { return grpc_error(8, "could not allocate request frame"); }
+        grpc_write_byte(frame, 0, 0);
+        grpc_write_byte(frame, 1, (requestData.len as i64) >> 24);
+        grpc_write_byte(frame, 2, (requestData.len as i64) >> 16);
+        grpc_write_byte(frame, 3, (requestData.len as i64) >> 8);
+        grpc_write_byte(frame, 4, requestData.len as i64);
+        memcpy(frame + 5, requestData.c_str(), requestData.len as u64);
+        let body_sink = curl_sink();
+        let header_sink = curl_sink();
+        if (body_sink == null || header_sink == null) {
+            free(frame); curl_sink_close(body_sink); curl_sink_close(header_sink);
+            return grpc_error(8, "could not allocate response capture");
         }
-
-        // Read the response
-        let buf = malloc(4096);
-        if (buf == null) {
-            return GrpcResponse { status: 13, data: "alloc failed", ok: false };
+        var headers: rawptr = null;
+        headers = curl_header(headers, "Content-Type: application/grpc");
+        headers = curl_header(headers, "TE: trailers");
+        headers = curl_header(headers, "grpc-accept-encoding: identity");
+        headers = curl_header(headers, "grpc-timeout: " + self.timeout.toString() + "S");
+        let url = self.endpoint + method;
+        var rc = curl_set(self.handle, CURLOPT_URL, url.c_str());
+        rc = rc | curl_set(self.handle, CURLOPT_POST, 1 as rawptr);
+        rc = rc | curl_set(self.handle, CURLOPT_POSTFIELDS, frame);
+        rc = rc | curl_set(self.handle, CURLOPT_POSTFIELDSIZE, (requestData.len + 5) as rawptr);
+        rc = rc | curl_set(self.handle, CURLOPT_HTTPHEADER, headers);
+        rc = rc | curl_set(self.handle, CURLOPT_WRITEDATA, body_sink);
+        rc = rc | curl_set(self.handle, CURLOPT_HEADERDATA, header_sink);
+        rc = rc | curl_set(self.handle, CURLOPT_TIMEOUT, self.timeout as rawptr);
+        if (rc == 0) { rc = curl_perform(self.handle); }
+        let http_status = curl_status(self.handle);
+        let http_version = curl_http_version(self.handle);
+        curl_set(self.handle, CURLOPT_POSTFIELDS, null);
+        curl_set(self.handle, CURLOPT_HTTPHEADER, null);
+        curl_set(self.handle, CURLOPT_WRITEDATA, null);
+        curl_set(self.handle, CURLOPT_HEADERDATA, null);
+        free(frame); curl_header_free(headers);
+        let body = curl_sink_read_limited(body_sink, 16777221);
+        let response_headers = curl_sink_read_limited(header_sink, 65536);
+        if (rc != 0) {
+            self.last_error = http_error(rc);
+            if (rc == 28) { return grpc_error(4, self.last_error); }
+            return grpc_error(14, self.last_error);
         }
-
-        let n = recv(self.sockfd, buf, 4096, 0);
-        if (n <= 0) {
-            free(buf);
-            return GrpcResponse { status: 14, data: "recv failed", ok: false };
+        if (http_version != 3) { return grpc_error(13, "server did not negotiate HTTP/2"); }
+        if (http_status != 200) { return grpc_error(14, "HTTP status " + http_status.toString()); }
+        let response_type = grpc_header(response_headers, "content-type").toLower();
+        if (response_type != "application/grpc" && !response_type.startsWith("application/grpc+")) {
+            return grpc_error(13, "response is not application/grpc");
         }
-
-        let response = from_cstr(buf);
-        free(buf);
-
-        return GrpcResponse { status: 0, data: response, ok: true };
+        let status = grpc_parse_status(grpc_header(response_headers, "grpc-status"));
+        if (status < 0) { return grpc_error(2, "missing or invalid grpc-status"); }
+        let message = grpc_decode_message(grpc_header(response_headers, "grpc-message"));
+        if (status != 0) { return grpc_error(status, message); }
+        if (body.len < 5) { return grpc_error(13, "missing unary response frame"); }
+        if (grpc_read_byte(body, 0) != 0) { return grpc_error(12, "compressed gRPC messages are unsupported"); }
+        let length = (grpc_read_byte(body, 1) << 24) | (grpc_read_byte(body, 2) << 16)
+            | (grpc_read_byte(body, 3) << 8) | grpc_read_byte(body, 4);
+        if (length > 16777216) { return grpc_error(8, "response exceeds 16 MiB"); }
+        if (length + 5 != body.len) { return grpc_error(13, "invalid unary response frame length"); }
+        return GrpcResponse { status: 0, data: body.substring(5, body.len), ok: true, message: message };
     }
 
-    /// Check if the channel is connected
-    public fn isConnected() -> bool {
-        return self.connected;
-    }
-
-    /// Get the server address
-    public fn address() -> string {
-        return self.host + ":" + self.port.toString();
-    }
-
-    /// Close the channel
+    public fn isConnected() -> bool { return self.ready; }
+    public fn address() -> string { return self.endpoint; }
+    public fn lastError() -> string { return self.last_error; }
     public fn close() {
-        if (self.connected) {
-            close(self.sockfd);
-            self.connected = false;
-        }
+        if (self.handle != null) { curl_close(self.handle); self.handle = null; }
+        self.ready = false;
     }
+    public fn drop() { self.close(); }
 }
 
-/// Convert gRPC status code to human-readable string
 public fn grpc_status_name(code: i32) -> string {
     if (code == 0) { return "OK"; }
     if (code == 1) { return "CANCELLED"; }
@@ -145,9 +228,14 @@ public fn grpc_status_name(code: i32) -> string {
     if (code == 5) { return "NOT_FOUND"; }
     if (code == 6) { return "ALREADY_EXISTS"; }
     if (code == 7) { return "PERMISSION_DENIED"; }
+    if (code == 8) { return "RESOURCE_EXHAUSTED"; }
+    if (code == 9) { return "FAILED_PRECONDITION"; }
+    if (code == 10) { return "ABORTED"; }
+    if (code == 11) { return "OUT_OF_RANGE"; }
     if (code == 12) { return "UNIMPLEMENTED"; }
     if (code == 13) { return "INTERNAL"; }
     if (code == 14) { return "UNAVAILABLE"; }
+    if (code == 15) { return "DATA_LOSS"; }
     if (code == 16) { return "UNAUTHENTICATED"; }
     return "UNKNOWN";
 }
