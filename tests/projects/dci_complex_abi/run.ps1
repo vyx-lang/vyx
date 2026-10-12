@@ -222,6 +222,30 @@ Assert-Test ([regex]::IsMatch($irText, 'define\s+i32\s+@__vyx_M_VyxSink_N_consum
 Assert-Test ($irText.IndexOf("call void @__dci_stub_destroy_VyxSink", [StringComparison]::Ordinal) -ge 0) `
     "generated IR does not destroy the automatic C++ stub"
 
+# Foreign DCI class values are complete objects owned by the generated
+# program.  Their storage must use the same malloc/free pair as the emitted
+# destructor path; the class allocator is an arena-capable runtime service and
+# is not a valid release domain for these objects.  Keep this assertion in the
+# real C++ ABI gate so a stale snapshot cannot hide a lifetime regression.
+foreach ($size in @(40, 32, 24, 4)) {
+    Assert-Test ([regex]::IsMatch($irText, '(?m)\bcall\s+ptr\s+@vyx_runtime_malloc\(i64\s+' + $size + '\)')) `
+        "foreign DCI object allocation of $size bytes must use malloc"
+    Assert-Test (-not [regex]::IsMatch($irText, '(?m)\bcall\s+ptr\s+@vyx_class_alloc_abi\(i64\s+' + $size + '\)')) `
+        "foreign DCI object allocation of $size bytes must not use vyx_class_alloc_abi"
+}
+Assert-Test (-not [regex]::IsMatch($irText, '(?m)\bcall\s+ptr\s+@vyx_pointer_region_create\(')) `
+    "foreign DCI class values must not be lowered through pointer-region copies"
+foreach ($destructor in @(
+    '??1Multi@abi_complex@@UEAA@XZ',
+    '??1BigState@abi_complex@@QEAA@XZ',
+    '??1VecBox@abi_complex@@QEAA@XZ',
+    '??1NativeDriver@abi_complex@@QEAA@XZ'
+)) {
+    $destructorPattern = '(?m)@"' + [regex]::Escape($destructor) + '"[^\r\n]*\r?\n\s*call\s+void\s+@vyx_runtime_free\(ptr\s+'
+    Assert-Test ([regex]::IsMatch($irText, $destructorPattern)) `
+        "foreign DCI destructor $destructor is missing its storage release"
+}
+
 foreach ($entry in @($leftEntries[0], $rightEntries[0], $sinkEntries[0])) {
     Assert-Test (-not [string]::IsNullOrWhiteSpace($entry.mangled)) "vtable entry is missing its C++ mangled symbol"
     $directPattern = 'call\s+' + $llvmCallConventionPattern + 'i32\s+@"' + [regex]::Escape($entry.mangled) + '"'

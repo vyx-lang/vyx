@@ -40,10 +40,21 @@ The gate checks:
 - Project default output, explicit `-o` output and the `build --emit=dcib` shorthand
   agree byte for byte. Project `--run` rejection preserves the previous contract. A separately
   built static library is consumed and executed through the project contract.
+- The static archive keeps a private `@[noinline]` helper callable across native
+  code generation units. With `mir_partition=true`, two exports in verified
+  distinct root chunks call that same helper without duplicate strong symbols.
+  The private helper is absent from both published DCIB contracts.
 - Missing selection, unsupported string/tracked reference signatures, unproved external unwind
   behavior, a recursive call graph and an incompatible `--run=aot` combination
   are rejected. A rejected
   export preserves the previous output file.
+- A shared call graph is checked once per completed function proof; the fixture
+  rejects exponential traversal of repeated call edges. Active recursive edges
+  and unknown callees still require a normal rejection.
+- A selected export cannot bind to an unselected definition with the same native
+  symbol, including `export_name`, `no_mangle`, inherited attribute blocks,
+  `@[export]` and the `export` declaration marker. Such collisions preserve the
+  previous contract.
 - A supported free function in the same unit does not permit silently omitting a
   selected class method or module. Both mixed selection cases must fail with a
   normal diagnostic and preserve the previous output.

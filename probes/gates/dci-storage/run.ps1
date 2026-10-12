@@ -19,13 +19,15 @@ foreach ($level in @('O0', 'O2')) {
     $exe = Join-Path $run "$level.exe"
     & $Compiler --src=file (Join-Path $PSScriptRoot 'main.vyx') --emit=ir "-$level" -o $ir
     if ($LASTEXITCODE -ne 0) { throw "$level IR emission failed" }
-    # Intercept only allocation calls in the generated program. The runtime
-    # and the native producer retain their normal allocators. This checks
-    # actual destructor/release order and detects leaks and double releases.
+    # Intercept only allocation calls in the generated program, including
+    # current runtime entry points and legacy libc names. Match complete LLVM
+    # symbols so unrelated helpers keep their normal allocators. The runtime
+    # and native producer are linked unchanged.
     $text = [IO.File]::ReadAllText($ir)
-    $text = $text.Replace('@vyx_class_alloc_abi', '@tracked_class_malloc')
-    $text = $text.Replace('@malloc', '@tracked_malloc').Replace('@free', '@tracked_free')
-    $text = $text.Replace('@calloc', '@tracked_calloc')
+    $text = [regex]::Replace($text, '@vyx_class_alloc_abi(?=[(\s])', '@tracked_class_malloc')
+    $text = [regex]::Replace($text, '@(vyx_runtime_malloc|malloc)(?=[(\s])', '@tracked_malloc')
+    $text = [regex]::Replace($text, '@(vyx_runtime_calloc|calloc)(?=[(\s])', '@tracked_calloc')
+    $text = [regex]::Replace($text, '@(vyx_runtime_free|free)(?=[(\s])', '@tracked_free')
     [IO.File]::WriteAllText($hooked, $text)
     & $clang $hooked (Join-Path $run 'native.obj') "-L$runtime" -lvyx_runtime `
         -ltbb12 -lsynchronization -lws2_32 -fms-runtime-lib=static -fuse-ld=lld -o $exe

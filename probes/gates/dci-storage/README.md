@@ -13,6 +13,11 @@ constructor/destructor symbols, and records every allocation, destruction and
 release. Only allocation calls in the emitted program are intercepted; the
 application runtime and native producer keep their own allocators. The tracker
 also covers LLVM's conversion of `malloc` plus zeroing into `calloc` at `-O2`.
+It matches complete LLVM function names for the current `vyx_runtime_malloc`,
+`vyx_runtime_calloc` and `vyx_runtime_free` entry points, as well as legacy
+`malloc`/`calloc`/`free` and `vyx_class_alloc_abi` calls. Missing a runtime entry
+point would leave its allocation unregistered and fail at the first native
+constructor, before the destructor/release checks can run.
 
 The executable checks repeated scopes, early returns, direct constructor
 reassignment, borrowed pointer calls, and loop `continue`/`break` cleanup. A
@@ -28,9 +33,10 @@ aborts the executable. The live allocation count must return to zero.
 | Fixed, `-O2`, complete probe | 2056 | 2056 | 2056 | Exit 0 |
 
 `llvm_lifetime.vyx` owns the allocation/drop emission extracted from
-`llvm_lower.vyx`. DCI complete objects use the generated module's `malloc/free`
-pair. The implementation avoids the general class arena for DCI complete
-objects; the acceptance baseline here is AOT, and JIT parity is deferred.
+`llvm_lower.vyx`. DCI complete objects use `vyx_runtime_malloc/free`; the gate
+redirects those calls in the generated module. The implementation avoids the
+general class arena for DCI complete objects; the acceptance baseline here is
+AOT, and JIT parity is deferred.
 Storage is released after a DCI destructor only for pointer-represented owning
 locals. Stable inline records, borrowed parameters, descriptor lifecycle
 operations and native subclass factory destruction retain their existing paths.

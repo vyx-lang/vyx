@@ -569,6 +569,9 @@ def failure_record_layout(adapter: Any, measured: dict[str, Any]) -> Any:
         size=int(measured["size"]),
         alignment=int(measured["align"]),
         fields=fields,
+        # The shared DciFailure C ABI is a value record even though its
+        # pointer payloads require the explicit copy/destroy operations below.
+        representation="stable",
         traits={
             "pod": False,
             "trivial": False,

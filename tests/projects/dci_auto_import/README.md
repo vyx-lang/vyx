@@ -16,9 +16,10 @@ The Converter includes `session.hpp` and emits the original constructor/method
 signatures with their measured defaults. There are no default-argument wrappers.
 
 The import pipeline uses Python 3.11+, or Python 3.10 with the SDK's `tomli` dependency.
-Set `LLVM_ROOT` to the repository's LLVM 22 directory. A packaged SDK can set
-`VYX_DCI_TOOLS` to its installed tools directory and select its native compiler
-in the target's `cxx` setting.
+Set `LLVM_ROOT` to the repository's LLVM 22 directory. A compiler running from
+the repository discovers `tools/dci/dci.py` from the project directory's parent
+tree; a packaged SDK can set `VYX_DCI_TOOLS` to its installed tools directory
+and select its native compiler in the target's `cxx` setting.
 
 Header dependencies, author-declared export scope, native compilers and DCI tool
 content participate in the import cache identity. Missing or changed generated

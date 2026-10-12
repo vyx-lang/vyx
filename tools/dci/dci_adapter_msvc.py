@@ -237,6 +237,7 @@ class RecordLayout:
     vbptr_offsets: list[int] = field(default_factory=list)
     traits: dict[str, Any] = field(default_factory=dict)
     lifecycle: dict[str, Any] = field(default_factory=dict)
+    representation: str = ""
 
 
 @dataclass
@@ -5637,7 +5638,11 @@ def write_abi(
                     "type_name": rec.type_name,
                     "size": rec.size,
                     "alignment": rec.alignment,
-                    # A type has a stable by-value representation when its bytes
+                    # An Adapter-created ABI record can declare its stable
+                    # representation independently of nontrivial ownership.
+                    # Ordinary extracted C++ types retain the conservative
+                    # inferred rule below. A type has a stable by-value
+                    # representation when its bytes
                     # ARE its value: standard-layout + trivially-copyable +
                     # trivially-destructible. POD additionally demands a trivial
                     # default constructor, which is irrelevant to copying an
@@ -5647,7 +5652,7 @@ def write_abi(
                     # default ctor. This criterion is a strict superset of the old
                     # (pod && standard_layout), so it never declassifies a type
                     # that was already stable.
-                    "representation": (
+                    "representation": rec.representation or (
                         "stable"
                         if bool(rec.traits.get("standard_layout"))
                         and bool(rec.traits.get("trivially_copyable"))

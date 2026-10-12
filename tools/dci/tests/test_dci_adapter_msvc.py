@@ -1939,6 +1939,36 @@ class DciTranslateUnwindAdapterTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._tmpdir.cleanup()
 
+    def test_failure_value_representation_matches_rust_without_losing_lifecycle(self) -> None:
+        rust_spec = importlib.util.spec_from_file_location(
+            "dci_adapter_rust", MODULE_PATH.with_name("dci_adapter_rust.py")
+        )
+        assert rust_spec is not None and rust_spec.loader is not None
+        rust_adapter = importlib.util.module_from_spec(rust_spec)
+        sys.modules[rust_spec.name] = rust_adapter
+        rust_spec.loader.exec_module(rust_adapter)
+
+        layouts = {item["type_name"]: item for item in self.document["exports"]["layouts"]}
+        failure = layouts["dci::Failure"]
+        rust_failure = rust_adapter.rust_failure_layout()
+        for key in ("size", "alignment", "representation", "is_pod", "is_trivially_destructible"):
+            self.assertEqual(failure[key], rust_failure[key], key)
+        self.assertEqual(failure["representation"], "stable")
+        self.assertFalse(failure["is_pod"])
+        self.assertFalse(failure["is_trivially_destructible"])
+        self.assertEqual(
+            [(field["name"], field["offset"]) for field in failure["fields"]],
+            [(field["name"], field["offset"]) for field in rust_failure["fields"]],
+        )
+        for key in ("ownership_model", "copy_semantics", "move_semantics", "destruction"):
+            self.assertEqual(failure["lifecycle"][key], rust_failure["lifecycle"][key], key)
+        for operation in ("copy", "destroy"):
+            self.assertEqual(
+                failure["lifecycle"]["operations"][operation],
+                rust_failure["lifecycle"]["operations"][operation],
+            )
+        self.assertEqual(layouts["abi::Buffer"]["representation"], "native")
+
     def test_throwing_checked_divide_emits_translate_unwind_translator(self) -> None:
         symbols = self.document["exports"]["symbols"]
         orig = next(

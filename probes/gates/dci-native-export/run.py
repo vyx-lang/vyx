@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 GATE = Path(__file__).resolve().parent
 ROOT = GATE.parents[2]
@@ -18,10 +20,10 @@ import dcib
 import dci_validate
 
 
-def checked(args, cwd, env, *, success=True):
+def checked(args, cwd, env, *, success=True, timeout=240):
     command = [str(arg) for arg in args]
     result = subprocess.run(command, cwd=cwd, env=env, text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=240)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     print(result.stdout, end="", flush=True)
     if (result.returncode == 0) != success:
         raise RuntimeError(f"unexpected exit {result.returncode}: {command}")
@@ -89,6 +91,26 @@ def rejected_output(compiler, input_path, output_path, env, triplet, *extra):
         raise RuntimeError("a rejected export modified the previous artifact")
 
 
+def verify_distinct_root_chunks(project, target):
+    tasks = (project / ".cache" / f"tasks_{target}.tmp").read_text(encoding="utf-8")
+    roots = []
+    for match in re.finditer(r'--emit-root-names-file\s+"([^"]+)"', tasks):
+        names = Path(match.group(1).replace("\\", os.sep))
+        if not names.is_absolute():
+            names = project / names
+        roots.append(set(names.read_text(encoding="utf-8").split("|")))
+    add = [index for index, names in enumerate(roots) if "exported_add" in names]
+    shared = [index for index, names in enumerate(roots) if "exported_shared_helper" in names]
+    if len(add) != 1 or len(shared) != 1 or add[0] == shared[0]:
+        raise RuntimeError(f"shared helper regression did not exercise distinct root chunks: {roots}")
+
+
+def verify_private_helper_interface(project, target):
+    interface = (project / "out" / f"{target}.vyi").read_text(encoding="utf-8")
+    if re.search(r"\bfn\s+add_seven\s*\(", interface):
+        raise RuntimeError("cross-CGU linkage exposed the private helper in the published interface")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, required=True)
@@ -112,6 +134,7 @@ def main():
         "exported_void": "native_gate_void",
         "exported_pointer": "native_gate_pointer",
         "exported_default": "exported_default",
+        "exported_shared_helper": "native_gate_shared_helper",
     }
     cache = GATE / ".cache"
     cache.mkdir(exist_ok=True)
@@ -129,6 +152,19 @@ def main():
             checked([*export_args, "-o", work / "scalars-again.dcib"], work, env)
             if contract.read_bytes() != (work / "scalars-again.dcib").read_bytes():
                 raise RuntimeError("same source/options produced different DCIB bytes")
+            # Thirty-two shared levels have only 33 function bodies. Proving
+            # each incoming edge independently used to revisit billions of
+            # paths, despite the tiny native program. Keep a generous timeout
+            # to distinguish that regression from ordinary host scheduling.
+            shared = GATE / "fixtures/shared_call_graph.vyx"
+            shared_contract = work / "shared-call-graph.dcib"
+            shared_start = time.perf_counter()
+            checked([compiler, "--emit=dcib", "--src=file", shared,
+                     "--triplet", args.triplet, "-O0", "-o", shared_contract],
+                    work, env, timeout=20)
+            shared_seconds = time.perf_counter() - shared_start
+            verify_contract(shared_contract,
+                            {"exported_shared_graph": "native_gate_shared_graph"}, args.triplet)
             obj = work / ("scalars.obj" if windows else "scalars.o")
             checked([compiler, "--emit=obj", "--src=file", scalar, "-o", obj,
                      "--triplet", args.triplet], work, env)
@@ -138,11 +174,26 @@ def main():
             write(project / "Vyx.toml", '[package]\nname="native_export_project"\nversion="1.0.0"\n'
                   '[build]\noutput_dir="out"\n[target.api]\ntype="static"\n'
                   'sources=["src/scalars.vyx","src/extra.vyx"]\n'
+                  '[target.partitioned]\ntype="static"\nmir_partition=true\n'
+                  'sources=["src/scalars.vyx","src/extra.vyx"]\n'
+                  '[target.app]\ntype="exe"\nentry="src/application.vyx"\nmir_partition=false\n'
+                  'sources=["src/application.vyx","src/extra.vyx"]\n'
+                  '[target.partitioned_app]\ntype="exe"\nentry="src/application.vyx"\nmir_partition=true\n'
+                  'sources=["src/application.vyx","src/extra.vyx"]\n'
                   '[dependencies]\nhidden={path="../hidden",target="hidden"}\n')
-            write(project / "src/scalars.vyx", scalar.read_text(encoding="utf-8"))
+            # The project planner deliberately keeps <=50KB single-file
+            # modules whole. Cross that documented implementation threshold
+            # with a generated comment, without publishing a large fixture.
+            write(project / "src/scalars.vyx", scalar.read_text(encoding="utf-8")
+                  + "\n// Root-partition regression padding: " + ("x" * 52000) + "\n")
             write(project / "src/extra.vyx", 'module native_export_extra;\nuse hidden_export;\n'
                   '@[dci_export(symbol="native_gate_extra")]\n'
                   'public fn exported_extra(value: i32) -> i32 { return hidden_add_seven(value); }\n')
+            write(project / "src/application.vyx", 'module native_export_application;\n'
+                  'use native_export_extra;\nuse hidden_export;\n'
+                  'fn main() -> i32 {\n'
+                  '    if (exported_extra(10) != 17 || hidden_add_seven(20) != 27) { return 1; }\n'
+                  '    print("source-dependency=ok"); return 0;\n}\n')
             hidden = work / "hidden"
             write(hidden / "Vyx.toml", '[package]\nname="hidden_export"\nversion="1.0.0"\n'
                   '[target.hidden]\ntype="source"\nsources=["src/lib.vyx"]\n')
@@ -166,21 +217,53 @@ def main():
             if default_contract.read_bytes() != explicit_contract.read_bytes():
                 raise RuntimeError("rejected project --run modified the previous contract")
             checked([compiler, "build", "--target", "api", "--triplet", args.triplet, "-j2"], project, env)
+            verify_private_helper_interface(project, "api")
             library = project / "out" / ("api.lib" if windows else "libapi.a")
             convert_consume(compiler, default_contract, library, work / "project-consumer", env,
                             args.triplet, extra=True)
 
+            # Repeated root chunks compile the same private, explicitly
+            # noinline callee. Its source visibility must not change, while
+            # its machine definition remains linkable without strong duplicates.
+            checked([compiler, "--emit=dcib", "--src=project", project, "--target", "partitioned",
+                     "--triplet", args.triplet, "-j2"], work, env)
+            partitioned_contract = project / "out/partitioned.dcib"
+            verify_contract(partitioned_contract, {**expected, "exported_extra": "native_gate_extra"}, args.triplet)
+            checked([compiler, "build", "--target", "partitioned", "--triplet", args.triplet, "-j2"], project, env)
+            verify_distinct_root_chunks(project, "partitioned")
+            verify_private_helper_interface(project, "partitioned")
+            partitioned_library = project / "out" / ("partitioned.lib" if windows else "libpartitioned.a")
+            convert_consume(compiler, partitioned_contract, partitioned_library,
+                            work / "partitioned-consumer", env, args.triplet, extra=True)
+            for application_target in ("app", "partitioned_app"):
+                application = checked([compiler, "--src=project", project, "--target", application_target,
+                                       "--run=aot", "--triplet", args.triplet, "-j2"], work, env)
+                if "source-dependency=ok" not in application:
+                    raise RuntimeError(f"{application_target}: source package implementation was not executed")
+
             for fixture in ("unsupported_string.vyx", "unsupported_reference.vyx", "no_selection.vyx", "unproven_call.vyx",
                             "unproven_recursion.vyx",
-                            "mixed_selected_method.vyx", "mixed_selected_module.vyx"):
+                            "mixed_selected_method.vyx", "mixed_selected_module.vyx",
+                            "unselected_native_collision.vyx", "unselected_no_mangle_collision.vyx",
+                            "unselected_no_mangle_block_collision.vyx", "unselected_export_attr_collision.vyx",
+                            "unselected_export_marker_collision.vyx"):
                 rejected_output(compiler, GATE / "fixtures" / fixture, work / (fixture + ".dcib"),
                                 env, args.triplet)
             rejected_output(compiler, scalar, work / "run-combination.dcib", env, args.triplet, "--run=aot")
             write(cache / "verification.json", json.dumps({
                 "compiler": str(compiler), "sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
+                "backend_sha256": hashlib.sha256((compiler.parent / ("vyx_compiler_backend.dll" if windows
+                    else "libvyx_compiler_backend.so")).read_bytes()).hexdigest(),
+                "runtime_sha256": hashlib.sha256((compiler.parent / ("vyx_runtime.lib" if windows
+                    else "libvyx_runtime.a")).read_bytes()).hexdigest(),
                 "triplet": args.triplet, "result": "PASS", "file_aot": True, "project_aot": True,
                 "canonical_roundtrip": True, "deterministic": True,
                 "dependency_exports_filtered": True, "rejected_output_preserved": True,
+                "source_dependency_executables": ["app", "partitioned_app"],
+                "private_noinline_helper": True, "distinct_project_root_chunks": True,
+                "private_helper_not_in_interface": True,
+                "shared_graph_levels": 32, "shared_graph_seconds": shared_seconds,
+                "shared_graph_source_sha256": hashlib.sha256(shared.read_bytes()).hexdigest(),
             }, ensure_ascii=False, indent=2) + "\n")
         except Exception:
             failed = cache / "failed" / work.name
