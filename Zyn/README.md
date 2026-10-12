@@ -134,6 +134,14 @@ mutable application state belongs in `AppWorld`.
 
 ## Dynamic views
 
+`Components.children(Vec<dyn Component>)` transfers the input list into the
+container and preserves its order. `App.run(Vec<dyn Component>)` also consumes
+that list. Trait objects are borrowed for configuration and drawing, and
+mutably borrowed for updates; these operations do not clone them.
+`ComponentHost.mountAll` borrows its input list and retains independent views.
+The [container ownership smoke](../samples/projects/zyn_container_ownership_smoke/README.md)
+checks these paths and text editing without opening a window.
+
 `App.run(component)` and `App.run(components)` keep the component available
 throughout the render loop. After a command changes `AppWorld`, Zyn calls
 `Component.view(world)` again and binds actions on the new tree before drawing
