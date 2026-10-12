@@ -240,8 +240,8 @@ sema 当 host builtin、不当未定义的自由名（`is_host_builtin`）：
 ## 驱动（`main.vyx` `show_usage` / `main`）
 
 `main` 里接上的命令：`--src=file|project`、`build`、`new`、`dci`、`run`、
-`repl`（`vyx_bootstrap_repl_run`）、`install`/`publish`/`search`/`lock`
-（`pkg_dispatch`，`file://` registry）、`test`、`bench`、`fmt`、`doc`、
+`repl`（`vyx_bootstrap_repl_run`）、`source`/`install`/`publish`/`search`/`lock`/`update`
+（`pkg_dispatch`，命名的 JSON 包源）、`test`、`bench`、`fmt`、`doc`、
 `version`、`help`。
 `--emit=`：`ir obj exe dll lib vyi cpp dci-stubs hir mir hir-verify
 mir-verify hir-facts`。LLVM 是验收后端；`cpp` 是实验。
@@ -324,8 +324,12 @@ mir-verify hir-facts`。LLVM 是验收后端；`cpp` 是实验。
 - 应用侧导入写 `use std.collections;`（`use` 也接受 `.` 分隔）。
   `import` 解析成同一个 `DE_USE`，路径用 `::`。
   `use path::*` / `import path::*` 在 `*` 处停下（`parse_import_path`）。
-- 项目是 `Vyx.toml`（`PACKAGE_MANIFEST_ZH.md`）。有本地 `file://` registry，
-  没有远程 HTTP registry。
+- 项目使用 `Vyx.toml`（[清单参考](PACKAGE_MANIFEST_ZH.md)）。第三方包从命名的
+  JSON 源解析，源可使用 HTTP(S)、`file://` 或本地路径。支持源码、预编译二进制和
+  DCI 包；二进制产物要求匹配目标 triplet 和 ABI，DCI 包包含原生库、契约与 Vyx 定义。
+  源身份由源名与规范化后的清单 URL 确定，不包含 token 值；不同命名源即使 URL
+  相同，依赖与缓存身份仍各自独立。每个命名源中的同一个包统一为一个版本。
+  `Vyx.packages.lock` 锁定包依赖图与归档哈希，`Vyx.lock` 继续负责 MOSP 模块版本选择。
 - `extern "C"` 和 `cfn` 描述 C ABI 调用与回调。
   `extern "dci"` 导入原生事实契约，涵盖受支持的 C++ / Rust 布局、调用、生命周期与派发。
   Active Adapter 在构建期间请求生产端实例化泛型，Consumer 消费闭合事实。

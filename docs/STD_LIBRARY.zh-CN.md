@@ -38,7 +38,7 @@ bridge（JSON/miniz）继续使用 static package。当前入口：
 | `std:cacao` | `std_cacao` | Cacao 图形/GPU C ABI 绑定（按需，自行链接 Cacao） |
 | `std:dll` | `std_dll` | 动态库加载 |
 | `std:llvm` | `std_llvm` | LLVM C API 绑定 |
-| `std:network` | `std_network` | curl 绑定、HTTP 客户端、WebSocket、gRPC（模块 `std.network.*`） |
+| `std:network` | `std_network` | [HTTP、文本 WebSocket、无压缩一元 gRPC](../bootstrap_compiler/std_packages/network/README.md)；gRPC 需要启用 HTTP/2 的 libcurl |
 | `std:security` | `std_security` | OpenSSL 绑定 + 纯 Vyx 哈希（模块 `std.security.*`） |
 | `std:sqlite` | `std_sqlite` | SQLite3 驱动 |
 | `std:stb_image` | `std_stb_image` | `std.image`：stb_image + write + resize2（stub C 实现宏） |
@@ -266,8 +266,10 @@ let n = v.pop();                 // 弹出最后 → T
 | `new()` | `static -> Vec<T>` | 创建空 Vec |
 | `with_capacity(n)` | `static -> Vec<T>` | 指定初始容量 |
 | `push(val: T)` | | 追加元素 |
-| `get(i: i64)` | `-> T` | 获取元素（越界 panic） |
-| `get_unchecked(i)` | `-> T` | 无边界检查获取 |
+| `get(i: i64)` | `-> T` | 克隆元素（越界 panic；拥有资源的 T 需实现 Clone） |
+| `get_unchecked(i)` | `-> T` | 克隆元素，无边界检查 |
+| `get_ref(i: i64)` | `-> &T` | 借用元素，不克隆（越界 panic） |
+| `get_mut(i: i64)` | `-> &mut T` | 通过可变 Vec 借用原地修改元素（越界 panic） |
 | `set(i: i64, val: T)` | | 设置元素 |
 | `pop()` | `-> T` | 弹出最后元素 |
 | `first()` | `-> T` | 首元素 |
@@ -285,11 +287,24 @@ let n = v.pop();                 // 弹出最后 → T
 | `swap(i, j)` | | 交换两个位置 |
 | `reverse()` | | 反转 |
 | `sort()` | | 排序（快排） |
-| `clear()` | | 清空 |
+| `clear()` | | 析构存活元素并清空，保留容量 |
 | `reserve(n)` | | 预留容量 |
 | `shrink_to_fit()` | | 收缩容量 |
 | `iter()` | `-> Iterator<T>` | 获取迭代器 |
-| `destroy()` | | 释放内存 |
+| `destroy()` | | 析构存活元素并释放存储；重复调用无害 |
+
+`push`、`set` 和 `pop` 转移元素所有权。`set` 会先析构被替换的元素；
+缩小 `resize` 会析构移除的元素，扩大时分别克隆填充值。
+只读访问不能克隆的元素时用 `get_ref`；借用期间不要扩容、替换、移除或销毁该元素。
+原地修改元素时用 `get_mut`，它要求可变借用 Vec，不复制元素所有权。
+存入 `Vec`、`Box` 和 `Ref` 的原始 `str` 按分配器标记释放堆存储；字面量和借用视图不会被释放。
+`Ref` 在最后一个强引用销毁时释放载荷，嵌套容器遵循相同规则。
+
+`std.ref` 中 `Box<T>` 唯一拥有载荷，`Ref<T>` 共享载荷。两者的 `deref() -> &T`
+都借用载荷，`get() -> T` 克隆载荷，因此 `get` 要求 `T: Clone`。
+`Box.deref_mut(&mut self) -> &mut T` 提供唯一载荷的可变借用，也支持 `Box<dyn Trait>`。
+共享借用的 `Box` 不能调用它；`Ref` 的共享载荷不提供这个操作。
+`Box.clone()` 深拷贝载荷；`Ref.clone()` 增加强引用计数。载荷的借用不能比句柄活得更久。
 
 ### 字段
 - `len: i64` — 元素数量（只读使用）

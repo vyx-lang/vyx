@@ -825,7 +825,7 @@ declarations, and build configuration.
 | Build | `cargo build` | `cmake --build` | `vyxc build --target <name>` |
 | Run one file | `cargo run` | manual | `vyxc --src=file app.vyx --run=aot` |
 | Test | `cargo test` | `ctest` | `vyxc test` |
-| Dependencies | crates.io | vcpkg / conan | `Vyx.toml` plus a local `file://` registry (`vyxc install` / `publish` / `search` / `lock`) |
+| Dependencies | crates.io | vcpkg / conan | `Vyx.toml` plus named JSON sources (`vyxc source` / `install` / `search` / `lock` / `update`) |
 
 `vyxc new` produces:
 
@@ -857,11 +857,26 @@ package; `--target <name>` builds one. Multi-artifact projects (library plus
 examples plus a test binary) therefore do not need to be split into several
 packages.
 
-Dependency resolution goes through a **local `file://` registry**, not a public
-network index. That makes toolchain behaviour identical on an intranet or
-offline — which matters when porting a C++ project's vcpkg dependencies: stage
-the corresponding packages in the local registry, then refer to them by name.
-`lock` writes `Vyx.lock` to pin versions, the same role as `Cargo.lock`.
+Dependency sources are JSON indexes hosted on GitHub, private servers, or local
+filesystems. Register them with `vyxc source add NAME URL`, or declare
+`[sources.NAME]` in `Vyx.toml`. A versioned dependency can select its source:
+`codec = { version = "^1.2.0", source = "company", target = "codec" }`.
+Source identity includes its configured name and normalized index URL, excluding
+token values. Differently named sources at the same URL keep separate dependency
+and cache identities. Each named source selects one version of a given package.
+The first source containing a package is authoritative; a failed source does
+not silently fall back to a different publisher. Source packages compile
+normally. Prebuilt binary and DCI packages select an archive for the target
+triplet and ABI and consume its packaged libraries and interfaces; a DCI
+package also carries contracts and Vyx definitions.
+
+`vyxc lock` writes `Vyx.packages.lock`, recording the package graph, source
+identities, and archive hashes. Commit it as you would `Cargo.lock`.
+`vyxc build --locked` rejects dependency drift; `--offline` requires the
+matching lock and verified cache. `vyxc update` explicitly re-resolves
+versions. MOSP module selection remains in the separate `Vyx.lock` file.
+See [package sources and lock files](PACKAGE_MANIFEST.md#package-sources-and-lock-files)
+for authentication, index format, and publishing.
 
 Finally, layer your troubleshooting instead of reading one wall of errors:
 

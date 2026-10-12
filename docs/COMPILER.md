@@ -69,9 +69,13 @@ lifetime when changing generic instances, closures or deferred typing.
 ## Interfaces and cross-module definitions
 
 An emitted `.vyi` has an ordinary public declaration surface. For user modules
-containing generics, [`template_artifact.vyx`](../bootstrap_compiler/src/core/sema/template_artifact.vyx)
-also appends a version 1 AST graph with generic bodies and their private
-dependencies. The importer rebuilds semantic references in the consumer and
+containing generics or public functions/methods with inferred return types,
+[`template_artifact.vyx`](../bootstrap_compiler/src/core/sema/template_artifact.vyx)
+also appends a version 1 AST graph with the required bodies and their private
+dependencies. A shallow interface cannot infer a return annotation from syntax
+alone; the checked graph preserves this inference in the consumer instead of
+silently changing a value-returning function to `void`.
+The importer rebuilds semantic references in the consumer and
 retains the defining module for qualified lookup and helper visibility. Explicit
 and inferred generic arguments are substituted before typing the return value.
 Carrying a private helper in the graph does not make it publicly callable.
@@ -81,10 +85,26 @@ surface and graph, module identity, node count, and bounds before semantic looku
 If artifact markers are present, an invalid artifact fails import; it is not
 silently reduced to bodyless declarations. Flat declaration and statement lists
 are traversed iteratively, so list length does not consume the structural nesting
-limit. Runtime, `bootstrap.*`, and `std.*` modules currently use their ordinary
+limit. Emission plans length prefixes and payload fragments before one final
+buffer write. Hex encoding is linear; neither growing prefixes nor chain suffixes
+are repeatedly copied into the string arena. Decoding borrows bounded field slices
+from the live payload rather than copying each remaining chain. AST names, literals
+and metadata receive their own decoded storage. The
+[artifact scaling gate](../probes/gates/template_artifact_scaling/README.md) checks
+v1 compatibility, large payload hashes, list handling and an AOT consumer under
+a measured memory guard. Runtime, `bootstrap.*`, and `std.*` modules currently use their ordinary
 interfaces without this payload; this is a user-template mechanism, not a
 serialized shared frontend session. See the [generic interface gate](../probes/gates/generic_interfaces/README.md)
 for the format limits and the std consumer's source-unit requirement.
+Imported `.vyi` bodies are excluded from the eager whole-library HIR-fact pass.
+Calls resolve the concrete nongeneric interface bodies they reach, including
+private helper calls, before Sema's context is released. Signatures, inferred
+returns and source imports retain their checks; template instantiation still
+uses its generic environment. The [interface demand gate](../probes/gates/interface-fact-demand/README.md)
+checks normal SDK discovery, transitive calls, unused bodies and invalid calls.
+The [return inference gate](../probes/gates/return-inference/README.md) exercises
+separate project objects at O0/O2, including nongeneric private helpers and
+function-body diagnostics.
 
 Imported enums retain their declaring owner. Global linker names use the
 declaring module and source name, rather than compilation-local HIR IDs or
@@ -150,8 +170,21 @@ generation unit (CGU) groups definitions for backend work and object emission in
 This is distinct from running separate project build jobs concurrently.
 
 The project scheduler uses typed actions, input-size estimates, observed memory,
-and successful-task cost history. It reserves 3 GiB by default before admitting
-jobs; the reserve arithmetic uses `i64`. Task-time history is scanned once per
+and successful-task cost history. The default host reserve is one third of the
+physical memory available at batch start, bounded between 256 MiB and 4 GiB.
+Active workers' growth allowances do not reduce that reserve. Interface emission
+also counts as frontend work for memory estimates; codegen slot accounting is
+separate. Cold object estimates include the bytes of peer interfaces loaded by that
+action, in addition to its primary source; splitting a file into root chunks does
+not remove those inputs. Split units also account for their registered import
+closure, including every file of an imported logical module and dependencies
+introduced by primary peers. A visited set bounds cycles and counts each imported
+source once. Successful measured history supersedes the cold estimate.
+If running workers consume half of the host reserve (at most 2 GiB remaining),
+the scheduler reports physical and commit headroom and cancels its own batch.
+Unknown telemetry does not trigger this check. Cancellation is a last resort
+for underestimated growth; it does not make estimates hard memory caps.
+The reserve arithmetic uses `i64`. Task-time history is scanned once per
 batch and matched by full output identity. These are scheduling estimates, not
 hard per-process memory caps or proof that the frontend is shared across jobs.
 The [compiler pressure gate](../probes/gates/compiler-industrial/README.md)

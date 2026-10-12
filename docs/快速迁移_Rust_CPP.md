@@ -696,7 +696,7 @@ extern "C" {
 | 构建 | `cargo build` | `cmake --build` | `vyxc build --target <name>` |
 | 单文件运行 | `cargo run` | 手动 | `vyxc --src=file app.vyx --run=aot` |
 | 测试 | `cargo test` | `ctest` | `vyxc test` |
-| 依赖 | crates.io | vcpkg / conan | `Vyx.toml` + 本地 `file://` registry（`vyxc install` / `publish` / `search` / `lock`） |
+| 依赖 | crates.io | vcpkg / conan | `Vyx.toml` + 命名的 JSON 源（`vyxc source` / `install` / `search` / `lock` / `update`） |
 
 ### `vyxc new` 生成什么
 
@@ -723,9 +723,22 @@ auto_sources = false
 
 `[target.<name>]` 是和 Cargo / CMake 最不一样的地方：**一个包可以同时产出多个目标**（可执行文件、静态库、动态库），每个目标自己声明源文件集合与类型。`vyxc build` 构建包里全部目标，`--target <name>` 只构建其中一个。多产物项目（库 + 示例 + 测试二进制）因此不需要拆成多个包。
 
-### 依赖解析走本地 registry
+### 依赖源与可复现构建
 
-`install` / `publish` / `search` / `lock` 对接的是**本地 `file://` registry**，不是网络上的公共索引。所以在内网或离线环境里工具链行为完全一致——这对「把 C++ 的 vcpkg 依赖迁过来」很重要：可以先把对应包放进本地 registry，再按名字引用。`lock` 写出 `Vyx.lock` 固定版本，定位和 `Cargo.lock` 相同。
+包源是 JSON 清单，可以放在 GitHub、私有服务器或本地文件系统。
+用 `vyxc source add NAME URL` 注册用户源，或在 `Vyx.toml` 中声明 `[sources.NAME]`。
+版本依赖可以限定来源：
+`codec = { version = "^1.2.0", source = "company", target = "codec" }`。
+源身份包含配置的源名与规范化后的清单 URL，不包含 token 值；不同命名源即使 URL
+相同，依赖与缓存身份仍各自独立。同一命名源中的同一个包统一为一个版本。
+第一个包含包的源负责解析；源访问失败不会静默换成另一个发布者的包。
+源码包照常编译；预编译二进制与 DCI 包按目标 triplet、ABI 选择归档，消费包内库和
+接口。DCI 包还包含契约与 Vyx 定义。
+
+`vyxc lock` 将包依赖图、源身份与归档哈希写入 `Vyx.packages.lock`，像 `Cargo.lock`
+一样随项目提交。`vyxc build --locked` 拒绝依赖漂移，`--offline` 要求匹配的锁文件和
+通过校验的缓存。`vyxc update` 显式重新选择版本。MOSP 模块版本仍由单独的
+`Vyx.lock` 选择。认证、清单格式与发布步骤见[包源与锁文件](PACKAGE_MANIFEST_ZH.md#包源与锁文件)。
 
 ### 排查顺序
 

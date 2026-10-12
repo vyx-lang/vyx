@@ -135,6 +135,22 @@ they supplement, and never replace, a compile/run contract for user programs.
 
 ## Cross compilation (Windows host)
 
+When `vyxc` itself runs on Android/Termux, Android is the host platform.
+The compiler uses Termux's `clang`, `clang++`, `llvm-ar`, and their default
+sysroot directly. It does not inspect `ANDROID_NDK_ROOT`, `ANDROID_NDK_HOME`,
+or an Android SDK NDK, and no NDK installation is required. The SDK package
+wrapper sets `LLVM_ROOT` / `LLVM_BIN`; a manual installation can set those
+variables or put the Termux LLVM tools on `PATH`. This native host path uses
+the ordinary SDK runtime search and does not create `runtimes/android/.../ndk`.
+
+The Termux package binds its private LLVM through private SONAMEs and ELF
+`RUNPATH`, and keeps SDK library directories out of `LD_LIBRARY_PATH`. Exporting those directories
+would make system clang inherit another LLVM version and fail with missing
+symbols before linking. Packaging checks `verneed` against dependency SONAMEs
+and private version definitions. Ordinary runtime linker names are preserved.
+The launcher uses Termux's fixed installation prefix.
+See [Termux packaging and the ELF environment gate](../bootstrap_compiler/scripts/README.md#termux-packaging).
+
 `--triplet` selects the LLVM/backend target. Android is the supported
 cross-link path from Windows when an NDK is visible. macOS triples can emit
 LLVM IR and Mach-O objects from this LLVM SDK; linking a Darwin executable
@@ -181,6 +197,11 @@ Its summary reports passed, skipped, and failed runs separately. A project
 script uses exit code `77` only when the fixture has an explicit platform
 requirement, such as an x86_64 MSVC ABI descriptor; a skip is never counted as
 a pass.
+
+Each invocation uses a unique directory below `tests/.cache/` for compiled
+modules, executables, runtime DLLs and process logs. Parallel shards keep their
+runtime deployments separate. Default log names include the process ID and a
+run identifier; callers supplying `-LogPath` must choose distinct paths.
 
 ```powershell
 # Full module/project sweep against the compiler just built above.
@@ -283,6 +304,22 @@ clean shutdown.
 The old `dci_spdlog/run.sh` and `probes/gates/gate-c/` were retired on 2026-09-28;
 they are not current acceptance commands. `--verify-mir2` and a Vyx FFI-only
 program cannot replace DCI end-to-end execution.
+
+## AST storage and primitive string methods
+
+```powershell
+python probes/gates/ast-storage/run.py --compiler $compiler
+python probes/gates/primitive-string-methods/run.py --compiler $compiler
+```
+
+The [AST storage gate](../probes/gates/ast-storage/README.md) covers
+`Vec<Ref<T>>`, indirect function calls, inherited fields, derived-class trait
+implementations and comptime calls at AOT O0/O2. Its optional Windows memory
+guard relinks the same compiler objects to expose stale AST views and record
+bounds errors. Record guarded and ordinary compiler identities separately.
+The [string-method gate](../probes/gates/primitive-string-methods/README.md)
+checks both primitive method spellings, result types, NUL-containing text and
+user methods with the same names.
 
 ## Project fixed point
 

@@ -261,8 +261,8 @@ undefined, `E2100`/`E2101` duplicate/redefinition, `E2200` no overload,
 ## Driver (`main.vyx` `show_usage` / `main`)
 
 Commands wired in `main`: `--src=file|project`, `build`, `new`, `dci`, `run`,
-`repl` (`vyx_bootstrap_repl_run`), `install`/`publish`/`search`/`lock`
-(`pkg_dispatch`, `file://` registry), `test`, `bench`, `fmt`, `doc`,
+`repl` (`vyx_bootstrap_repl_run`), `source`/`install`/`publish`/`search`/`lock`/`update`
+(`pkg_dispatch`, named JSON package sources), `test`, `bench`, `fmt`, `doc`,
 `version`, `help`.
 `--emit=` kinds: `ir obj exe dll lib vyi cpp dci-stubs hir mir hir-verify
 mir-verify hir-facts`. LLVM is the acceptance backend; `cpp` is experimental.
@@ -357,8 +357,16 @@ Probes: `tests/projects/versioned_module_import`,
 - Application import: `use std.collections;` (`use` also accepts `.`
   separators). `import` parses as the same `DE_USE` node and uses `::`.
   `use path::*` / `import path::*` stops at `*` (`parse_import_path`).
-- Projects: `Vyx.toml` (`PACKAGE_MANIFEST.md`). Local `file://` registry
-  exists; there is no remote HTTP registry.
+- Projects: `Vyx.toml` ([manifest reference](PACKAGE_MANIFEST.md)). Third-party
+  source, prebuilt binary, and DCI packages use named JSON sources over
+  HTTP(S), `file://`, or local paths. Binary artifacts require a matching
+  target triplet and ABI; DCI packages carry native libraries, contracts,
+  and Vyx definitions. A source's name and normalized index URL determine its
+  identity; token values do not. Differently named sources at the same URL keep
+  separate dependency and cache identities, with one version per named source
+  and package.
+  `Vyx.packages.lock` pins the package graph and archive hashes; `Vyx.lock`
+  retains its separate MOSP module-version role.
 - `extern "C"` and `cfn` describe C ABI calls and callbacks.
   `extern "dci"` imports native fact contracts, including supported C++ and Rust
   layouts, calls, lifecycles, and dispatch. Active Adapters request producer-side

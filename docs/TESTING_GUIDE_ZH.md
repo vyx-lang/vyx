@@ -19,7 +19,7 @@ if (-not (Test-Path $env:VYX_BOOTSTRAP_VYXC)) { throw 'missing Stage 0 compiler'
 $compilerTarget = [regex]::Match((Get-Content .\bootstrap_compiler\Vyx.toml -Raw), '(?m)^name\s*=\s*"([^"]+)"').Groups[1].Value
 
 Push-Location .\bootstrap_compiler
-& $env:VYX_BOOTSTRAP_VYXC build --target $compilerTarget -j10
+& $env:VYX_BOOTSTRAP_VYXC build --target $compilerTarget -j20
 if ($LASTEXITCODE -ne 0) { throw 'bootstrap build failed' }
 Copy-Item -LiteralPath ".\out\$compilerTarget.exe" -Destination .\out\vyxc.exe -Force
 Pop-Location
@@ -111,6 +111,20 @@ MIR2LLVM 是受支持的自举后端。MIR2CPP/`--emit=cpp` 仍为实验性、�
 
 ## 交叉编译（Windows 宿主）
 
+在 Android/Termux 上运行 `vyxc` 时，Android 是宿主平台。编译器直接使用
+Termux 提供的 `clang`、`clang++`、`llvm-ar` 以及它们的默认 sysroot；不读取
+`ANDROID_NDK_ROOT`、`ANDROID_NDK_HOME` 或 Android SDK 下的 NDK，也不要求
+额外安装 NDK。安装包的启动脚本会设置 `LLVM_ROOT` / `LLVM_BIN`；自行部署时
+也可以让这些变量或 `PATH` 指向 Termux 的 LLVM。此路径使用普通 SDK runtime
+搜索，不会生成 `runtimes/android/.../ndk` 目录。
+
+Termux 包通过私有 SONAME 和 ELF `RUNPATH` 加载 SDK 私有 LLVM，不把这些目录导出到
+`LD_LIBRARY_PATH`。否则系统 `clang` 会继承 SDK 库路径，可能加载不同版本的
+`libLLVM.so` 并在链接前报符号缺失。打包时检查 `verneed` 与依赖库 SONAME
+和私有版本定义的关联，保留普通运行时库的应用链接名称。
+启动脚本使用 Termux 的固定 prefix；
+重新打包和 ELF 环境回归见 [脚本说明](../bootstrap_compiler/scripts/README.md#termux-packaging)。
+
 `--triplet` 选择 LLVM/后端目标。Windows 上可见 NDK 时，Android 是受支持的
 交叉链接路径。macOS triple 可用本仓库 LLVM SDK 产出 LLVM IR 与 Mach-O 目标文件；
 链接 Darwin 可执行文件仍需要 macOS sysroot，**不是**当前验证门。
@@ -152,6 +166,10 @@ Windows 上不要把 `--src=file` 的输入放在仓库根目录 `out/` 下。
 `tests/run_all_modules.ps1` 会分别统计成功、跳过和失败。只有明确绑定平台的 fixture
 （例如 x86_64 MSVC ABI descriptor）才可用退出码 `77` 标记不适用；跳过不会计为
 成功。
+
+每次运行在 `tests/.cache/` 下使用独立目录存放模块产物、可执行文件、运行时 DLL
+和进程日志。并发分片分别部署配套运行时。默认日志名包含进程 ID 和运行标识；
+显式传入 `-LogPath` 时，请为各分片指定不同路径。
 
 ```powershell
 # 模块与 manifest project sweep
@@ -237,6 +255,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./probes/gates/compiler-indu
 `tests/run_all_modules.ps1` 或 `tests/checks/run_checks.ps1` 自动调用。
 8 模块 / 4 jobs 是已记录的 Windows smoke 规模；大工程性能结论还需要更大规模、
 重复采样、内存配置与真实工程。任务并发不代表共享一次前端或并发 LLVM lowering。
+
+### AST 存储与基础类型字符串方法
+
+```powershell
+python probes/gates/ast-storage/run.py --compiler $compiler
+python probes/gates/primitive-string-methods/run.py --compiler $compiler
+```
+
+[AST 存储门](../probes/gates/ast-storage/README.md)以 AOT O0/O2 覆盖
+`Vec<Ref<T>>`、间接函数调用、继承字段、派生类 trait 实现与编译期调用。
+可选的 Windows 内存保护模式使用同次编译器对象重新链接，暴露失效 AST 视图与
+记录越界；该调试产物和普通 SDK 编译器的身份分别记录。
+[字符串方法门](../probes/gates/primitive-string-methods/README.md)检查基础类型的
+两种方法名、返回类型、含 NUL 的文本，以及同名用户方法的派发。
 
 ### 门 C：DCI 端到端
 

@@ -39,7 +39,7 @@ static packages.
 | `std:cacao` | `std_cacao` | Cacao graphics/GPU C ABI bindings (opt-in; link Cacao) |
 | `std:dll` | `std_dll` | dynamic library loader |
 | `std:llvm` | `std_llvm` | LLVM C API bindings |
-| `std:network` | `std_network` | curl bindings, HTTP client, WebSockets, gRPC (modules `std.network.*`) |
+| `std:network` | `std_network` | [HTTP, text WebSocket and uncompressed unary gRPC](../bootstrap_compiler/std_packages/network/README.md); gRPC requires HTTP/2-enabled libcurl |
 | `std:security` | `std_security` | OpenSSL bindings and pure-Vyx hashes (modules `std.security.*`) |
 | `std:sqlite` | `std_sqlite` | SQLite3 driver |
 | `std:stb_image` | `std_stb_image` | `std.image`: stb_image + write + resize2 (stub C implementation macros) |
@@ -288,7 +288,7 @@ compiler built-ins.
 
 | Type | Module | Principal operations |
 |---|---|---|
-| `Vec<T>` | `std.vec` | `new`, `push`, `get`, `set`, `pop`, `count`, `capacity`, `destroy` |
+| `Vec<T>` | `std.vec` | `new`, `push`, `get`, `get_ref`, `get_mut`, `set`, `pop`, `count`, `capacity`, `destroy` |
 | `Dict<K, V>` | `std.dict` | `new`, `put`, `get`, `contains`, `remove`, `destroy` |
 | `Set<T>` | `std.set` | `new`, `add`, `contains`, `remove`, `destroy` |
 | `Stack<T>` / `Queue<T>` | `std.stack` | push/pop or enqueue/dequeue operations |
@@ -298,6 +298,26 @@ compiler built-ins.
 Do not modify a container's structure while an iterator is live. A `String`
 cursor also borrows the source storage: changing or destroying the source
 invalidates it.
+
+`Vec.get` and `get_unchecked` return independent clones. Owning element types
+must provide `Clone`; `get_ref(i) -> &T` borrows an element without cloning.
+`get_mut(i) -> &mut T` requires a mutable vector borrow and updates the stored
+element directly. Do not resize or remove storage while an element is borrowed.
+Keep the element alive and its storage stable while that reference is used.
+`push`, `set`, and `pop` transfer ownership. Replacing an element, clearing,
+shrinking, or destroying a vector runs the removed elements' destructors.
+Growing `resize` and `filled` clone the seed separately for each new slot.
+Stored primitive `str` values release their buffers according to their allocator
+tag; literal and borrowed views are not freed. This applies to `Vec`, `Box`, and
+the last strong `Ref`, including nested containers.
+
+`std.ref` provides `Box<T>` for unique ownership and `Ref<T>` for shared ownership.
+Both expose `deref() -> &T` for borrowing and `get() -> T` for cloning a payload
+that implements `Clone`. `Box.clone()` deep-copies the payload; `Ref.clone()`
+increments the strong count. A payload reference cannot outlive its handle.
+`Box.deref_mut(&mut self) -> &mut T` exclusively borrows the unique payload,
+including `Box<dyn Trait>`. It cannot be called through a shared Box reference.
+Shared `Ref` payloads do not expose this operation.
 
 ### Reflection, hash, and other modules
 

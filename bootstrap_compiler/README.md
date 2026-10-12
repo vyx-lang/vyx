@@ -11,7 +11,9 @@ The compiler implements the Fact Semantic Ownership System core features describ
 Use a compatible SDK from this repository's
 [latest Release](https://github.com/vyx-lang/vyx/releases/latest)
 as Stage 0. Install LLVM 22 for the host, including the tools and libraries needed
-to build the compiler backend. On Windows, provide the MSVC / Windows SDK build environment.
+to build the compiler backend. On Android/Termux, use the platform LLVM already
+provided by Termux; an Android NDK is not required. On Windows, provide the MSVC /
+Windows SDK build environment.
 
 The HIR, MIR and LLVM source layout requires a Stage 0 that publishes public inherent `impl`
 methods in `.vyi` and collects export roots from every file in a logical module.
@@ -30,7 +32,7 @@ $env:PATH = "$env:LLVM_ROOT\bin;" + $env:PATH
 $compilerTarget = [regex]::Match((Get-Content .\bootstrap_compiler\Vyx.toml -Raw), '(?m)^name\s*=\s*"([^"]+)"').Groups[1].Value
 
 Push-Location .\bootstrap_compiler
-& $env:VYX_BOOTSTRAP_VYXC build --target $compilerTarget -j10
+& $env:VYX_BOOTSTRAP_VYXC build --target $compilerTarget -j20
 if ($LASTEXITCODE -ne 0) { throw "bootstrap build failed" }
 Copy-Item -LiteralPath ".\out\$compilerTarget.exe" -Destination .\out\vyxc.exe -Force
 Pop-Location
@@ -99,6 +101,21 @@ Focused AOT gates live under `../probes/gates/`:
   project generation and cold/warm/incremental `-j1`/`-jN` runs.
 - [Compiler module contracts](../probes/gates/compiler-modules/README.md): public
   inherent implementation interfaces, multi-file module roots and helper visibility.
+- [Value construction](../probes/gates/value-construction/README.md): native
+  factories, constructor forwarding, string conversions and nominal type checks.
+- [Nominal identities](../probes/gates/nominal-identity/README.md): distinct module
+  types, inferred assignments, generic contextual types, and borrowed aliases.
+- [Integer conversions](../probes/gates/integer-conversions/README.md): fitting
+  literals, widening, explicit casts and rejection of implicit truncation in stores.
+- [Module discovery](../probes/gates/module-discovery/README.md): bounded implicit
+  discovery around generated directories, explicit cached imports and module-local
+  function, overload and specialization identity.
+- [Lexer boundaries](../probes/gates/lexer-boundaries/README.md): located malformed
+  literals/comments, multiline interpolation and exact NUL string output.
+- [Native symbol ownership](../probes/gates/native-symbol-collision/README.md):
+  independent producers/consumers, compatible declarations and duplicate definitions.
+- [CUDA symbol identity](../probes/gates/cuda-symbol-identity/README.md): module and
+  version identities shared by device PTX and the host's embedded kernel metadata.
 
 The final Windows AOT artifact follow-up passed self-host S2/S3 byte identity at
 `build --target $compilerTarget -j4 -O0`, SHA-256
