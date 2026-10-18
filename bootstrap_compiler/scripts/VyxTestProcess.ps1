@@ -421,6 +421,54 @@ namespace VyxWin32 {
             }
         }
 
+        public static int[] ProcessIds(IntPtr job) {
+            int capacity = 64;
+            for (int attempt = 0; attempt < 12; ++attempt) {
+                int size = checked(8 + capacity * IntPtr.Size);
+                IntPtr buffer = Marshal.AllocHGlobal(size);
+                try {
+                    if (!QueryInformationJobObject(job, 3, buffer, (uint)size, IntPtr.Zero)) {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error == 234) { capacity *= 2; continue; }
+                        throw new Win32Exception(error, "Query Job process IDs failed");
+                    }
+                    int count = Marshal.ReadInt32(buffer, 4);
+                    if (count < 0 || count > capacity) {
+                        throw new InvalidOperationException("invalid Job process count");
+                    }
+                    var ids = new int[count];
+                    for (int i = 0; i < count; ++i) {
+                        ids[i] = checked((int)Marshal.ReadIntPtr(buffer, 8 + i * IntPtr.Size).ToInt64());
+                    }
+                    return ids;
+                } finally { Marshal.FreeHGlobal(buffer); }
+            }
+            throw new InvalidOperationException("Job process list kept growing");
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+
+        public static long WorkingSetBytes(IntPtr job) {
+            long total = 0;
+            foreach (int id in ProcessIds(job)) {
+                try {
+                    using (var process = System.Diagnostics.Process.GetProcessById(id)) {
+                        bool member;
+                        // The process may exit between enumeration and opening it.
+                        // Verify the opened process before reading a reused PID.
+                        if (!IsProcessInJob(process.Handle, job, out member) || !member) { continue; }
+                        process.Refresh();
+                        total = checked(total + process.WorkingSet64);
+                    }
+                } catch (ArgumentException) {
+                } catch (InvalidOperationException) {
+                } catch (Win32Exception) {
+                }
+            }
+            return total;
+        }
+
         public static void Close(IntPtr job) {
             if (job != IntPtr.Zero) {
                 CloseHandle(job);
@@ -679,12 +727,12 @@ function Test-VyxMemoryJobLimit {
     param(
         [IntPtr]$JobHandle,
         [int]$MemoryLimitMB,
-        [ref]$PeakWorkingSetMB
+        [ref]$PeakPrivateCommitMB
     )
     if ($MemoryLimitMB -le 0) { return $false }
     $mb = Get-VyxMemoryJobPeakMB -JobHandle $JobHandle
-    if ($mb -gt [double]$PeakWorkingSetMB.Value) {
-        $PeakWorkingSetMB.Value = $mb
+    if ($mb -gt [double]$PeakPrivateCommitMB.Value) {
+        $PeakPrivateCommitMB.Value = $mb
     }
     if ($mb -le 0.0) { return $false }
     return ($mb -ge ([double]$MemoryLimitMB * 0.98))
@@ -949,23 +997,35 @@ function Get-VyxVisibleCrashWindowHandleSet {
 
 function Get-VyxProcessTreeIds {
     param([int]$RootPid)
-    $ids = @($RootPid)
+    # A numeric parent PID can refer to a previous process with that PID.
+    # Resolve a single snapshot and verify each edge by creation time.
+    $snapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $byId = @{}
+    $byParent = @{}
+    foreach ($item in $snapshot) {
+        $byId[[int]$item.ProcessId] = $item
+        $parentId = [int]$item.ParentProcessId
+        if (-not $byParent.ContainsKey($parentId)) { $byParent[$parentId] = [Collections.Generic.List[object]]::new() }
+        $byParent[$parentId].Add($item)
+    }
+    if (-not $byId.ContainsKey($RootPid)) { return @() }
+    $ids = [Collections.Generic.List[int]]::new()
+    $ids.Add($RootPid)
     $queue = New-Object System.Collections.Queue
     $queue.Enqueue($RootPid)
     while ($queue.Count -gt 0) {
         $procId = [int]$queue.Dequeue()
-        try {
-            $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$procId" -ErrorAction SilentlyContinue
-            foreach ($child in $children) {
-                $cid = [int]$child.ProcessId
-                if ($ids -notcontains $cid) {
-                    $ids += $cid
-                    $queue.Enqueue($cid)
-                }
+        $parent = $byId[$procId]
+        foreach ($child in $byParent[$procId]) {
+            $cid = [int]$child.ProcessId
+            if ($parent.CreationDate -and $child.CreationDate -and
+                $child.CreationDate -ge $parent.CreationDate -and -not $ids.Contains($cid)) {
+                $ids.Add($cid)
+                $queue.Enqueue($cid)
             }
-        } catch {}
+        }
     }
-    return $ids
+    return $ids.ToArray()
 }
 
 function Stop-VyxProcessTree {
@@ -1002,10 +1062,13 @@ function Test-VyxProcessTreeMemoryLimit {
     param(
         [int]$RootPid,
         [int]$MemoryLimitMB,
-        [ref]$PeakWorkingSetMB
+        [ref]$PeakWorkingSetMB,
+        [IntPtr]$JobHandle = [IntPtr]::Zero
     )
     if ($MemoryLimitMB -le 0) { return $false }
-    $bytes = Get-VyxProcessTreeWorkingSetBytes -RootPid $RootPid
+    $bytes = if (Test-VyxMemoryJobHandle -JobHandle $JobHandle) {
+        [VyxWin32.JobLimit]::WorkingSetBytes($JobHandle)
+    } else { Get-VyxProcessTreeWorkingSetBytes -RootPid $RootPid }
     $mb = [Math]::Round(([double]$bytes / 1048576.0), 1)
     if ($mb -gt [double]$PeakWorkingSetMB.Value) {
         $PeakWorkingSetMB.Value = $mb
@@ -1387,6 +1450,7 @@ function Invoke-VyxProcess {
         $timedOut = $false
         $memoryExceeded = $false
         $peakWorkingSetMB = 0.0
+        $peakPrivateCommitMB = 0.0
         if ($TimeoutSec -gt 0) {
             $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
             while (-not $proc.HasExited) {
@@ -1397,9 +1461,9 @@ function Invoke-VyxProcess {
                 }
                 $waitMs = [Math]::Min(150, $remainingMs)
                 if ($proc.WaitForExit($waitMs)) { break }
-                if (Test-VyxProcessTreeMemoryLimit -RootPid $proc.Id -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB)) {
+                if (Test-VyxProcessTreeMemoryLimit -RootPid $proc.Id -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB) -JobHandle $jobHandle) {
                     $memoryExceeded = $true
-                    "memory limit exceeded: peak ${peakWorkingSetMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
+                    "memory limit exceeded: working-set ${peakWorkingSetMB}MB private-commit ${peakPrivateCommitMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
                     Stop-VyxProcessTree -RootPid $proc.Id
                     break
                 }
@@ -1411,9 +1475,9 @@ function Invoke-VyxProcess {
                     break
                 }
             }
-            if (-not $memoryExceeded -and (Test-VyxMemoryJobLimit -JobHandle $jobHandle -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB))) {
+            if (-not $memoryExceeded -and (Test-VyxMemoryJobLimit -JobHandle $jobHandle -MemoryLimitMB $MemoryLimitMB -PeakPrivateCommitMB ([ref]$peakPrivateCommitMB))) {
                 $memoryExceeded = $true
-                "memory limit exceeded: peak ${peakWorkingSetMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
+                "memory limit exceeded: working-set ${peakWorkingSetMB}MB private-commit ${peakPrivateCommitMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
             }
             if ($timedOut) {
                 "timeout after $TimeoutSec sec: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
@@ -1439,9 +1503,9 @@ function Invoke-VyxProcess {
         try { $stderr = $stderrTask.GetAwaiter().GetResult() } catch {}
         Set-Content -Encoding utf8 -LiteralPath $StdoutLog -Value $stdout
         Set-Content -Encoding utf8 -LiteralPath $StderrLog -Value $stderr
-        if (-not $memoryExceeded -and (Test-VyxMemoryJobLimit -JobHandle $jobHandle -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB))) {
+        if (-not $memoryExceeded -and (Test-VyxMemoryJobLimit -JobHandle $jobHandle -MemoryLimitMB $MemoryLimitMB -PeakPrivateCommitMB ([ref]$peakPrivateCommitMB))) {
             $memoryExceeded = $true
-            "memory limit exceeded: peak ${peakWorkingSetMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
+            "memory limit exceeded: working-set ${peakWorkingSetMB}MB private-commit ${peakPrivateCommitMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
         }
 
         $exit = -902
@@ -1465,6 +1529,7 @@ function Invoke-VyxProcess {
             DialogCaught = $dialogCaught
             MemoryExceeded = $memoryExceeded
             PeakWorkingSetMB = $peakWorkingSetMB
+            PeakPrivateCommitMB = $peakPrivateCommitMB
             JobLimited = $jobLimited
             StdoutLog = $StdoutLog
             StderrLog = $StderrLog
@@ -1545,6 +1610,7 @@ function Invoke-VyxProcess {
     $timedOut = $false
     $memoryExceeded = $false
     $peakWorkingSetMB = 0.0
+    $peakPrivateCommitMB = 0.0
     # Wait for the target process and poll for child assertion/runtime dialogs.
     if ($TimeoutSec -gt 0) {
         $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
@@ -1556,9 +1622,9 @@ function Invoke-VyxProcess {
             }
             $waitMs = [Math]::Min(150, $remainingMs)
             if ($proc.WaitForExit($waitMs)) { break }
-            if (Test-VyxProcessTreeMemoryLimit -RootPid $proc.Id -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB)) {
+            if (Test-VyxProcessTreeMemoryLimit -RootPid $proc.Id -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB) -JobHandle $jobHandle) {
                 $memoryExceeded = $true
-                "memory limit exceeded: peak ${peakWorkingSetMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
+                "memory limit exceeded: working-set ${peakWorkingSetMB}MB private-commit ${peakPrivateCommitMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
                 Stop-VyxProcessTree -RootPid $proc.Id
                 break
             }
@@ -1570,9 +1636,9 @@ function Invoke-VyxProcess {
                 break
             }
         }
-        if (-not $memoryExceeded -and (Test-VyxMemoryJobLimit -JobHandle $jobHandle -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB))) {
+        if (-not $memoryExceeded -and (Test-VyxMemoryJobLimit -JobHandle $jobHandle -MemoryLimitMB $MemoryLimitMB -PeakPrivateCommitMB ([ref]$peakPrivateCommitMB))) {
             $memoryExceeded = $true
-            "memory limit exceeded: peak ${peakWorkingSetMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
+            "memory limit exceeded: working-set ${peakWorkingSetMB}MB private-commit ${peakPrivateCommitMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
         }
         if ($timedOut) {
             "timeout after $TimeoutSec sec: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
@@ -1581,9 +1647,9 @@ function Invoke-VyxProcess {
     } else {
         while (-not $proc.HasExited) {
             if ($proc.WaitForExit(150)) { break }
-            if (Test-VyxProcessTreeMemoryLimit -RootPid $proc.Id -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB)) {
+            if (Test-VyxProcessTreeMemoryLimit -RootPid $proc.Id -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB) -JobHandle $jobHandle) {
                 $memoryExceeded = $true
-                "memory limit exceeded: peak ${peakWorkingSetMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
+                "memory limit exceeded: working-set ${peakWorkingSetMB}MB private-commit ${peakPrivateCommitMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
                 Stop-VyxProcessTree -RootPid $proc.Id
                 break
             }
@@ -1617,9 +1683,9 @@ function Invoke-VyxProcess {
     } else {
         try { $exit = $proc.ExitCode } catch { $exit = -903 }
     }
-    if (-not $memoryExceeded -and (Test-VyxMemoryJobLimit -JobHandle $jobHandle -MemoryLimitMB $MemoryLimitMB -PeakWorkingSetMB ([ref]$peakWorkingSetMB))) {
+    if (-not $memoryExceeded -and (Test-VyxMemoryJobLimit -JobHandle $jobHandle -MemoryLimitMB $MemoryLimitMB -PeakPrivateCommitMB ([ref]$peakPrivateCommitMB))) {
         $memoryExceeded = $true
-        "memory limit exceeded: peak ${peakWorkingSetMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
+        "memory limit exceeded: working-set ${peakWorkingSetMB}MB private-commit ${peakPrivateCommitMB}MB limit ${MemoryLimitMB}MB: $FilePath $($ArgumentList -join ' ')" | Set-Content -Encoding utf8 $DialogLog
         $exit = -905
     }
 
@@ -1652,6 +1718,7 @@ function Invoke-VyxProcess {
         DialogCaught = $dialogCaught
         MemoryExceeded = $memoryExceeded
         PeakWorkingSetMB = $peakWorkingSetMB
+        PeakPrivateCommitMB = $peakPrivateCommitMB
         JobLimited = $jobLimited
         StdoutLog = $StdoutLog
         StderrLog = $StderrLog

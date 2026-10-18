@@ -26,6 +26,22 @@ function Read-TestLog {
 }
 
 try {
+    # A stale parent PID must not make an older, unrelated process a child.
+    $created = [DateTime]::UtcNow
+    function Get-CimInstance {
+        @(
+            [pscustomobject]@{ProcessId=12001;ParentProcessId=0;CreationDate=$created}
+            [pscustomobject]@{ProcessId=12002;ParentProcessId=12001;CreationDate=$created.AddSeconds(-1)}
+            [pscustomobject]@{ProcessId=12003;ParentProcessId=12001;CreationDate=$created.AddSeconds(1)}
+            [pscustomobject]@{ProcessId=12004;ParentProcessId=12003;CreationDate=$created.AddSeconds(2)}
+        )
+    }
+    try {
+        $tree = @(Get-VyxProcessTreeIds -RootPid 12001)
+        if (($tree -join ',') -ne '12001,12003,12004') { throw "stale PID contaminated process tree: $tree" }
+        if (@(Get-VyxProcessTreeIds -RootPid 99999).Count -ne 0) { throw 'missing root was treated as a live process' }
+    } finally { Remove-Item -LiteralPath Function:\Get-CimInstance }
+
     $exitScript = Join-Path $workRoot "exit_and_log.ps1"
     @'
 [Console]::Out.WriteLine("suspended launch stdout")
@@ -35,7 +51,15 @@ $stdin = [Console]::In.ReadToEnd()
 exit 7
 '@ | Set-Content -LiteralPath $exitScript -Encoding ascii
 
-    $positive = Invoke-VyxProcess `
+    $numericTreeSampler = ${function:Get-VyxProcessTreeWorkingSetBytes}
+    $script:numericTreeCalls = 0
+    function Get-VyxProcessTreeWorkingSetBytes {
+        param([int]$RootPid)
+        $script:numericTreeCalls += 1
+        return [int64](8GB)
+    }
+
+    try { $positive = Invoke-VyxProcess `
         -FilePath $powerShellPath `
         -ArgumentList @("-NoLogo", "-NoProfile", "-File", $exitScript) `
         -WorkingDirectory $workRoot `
@@ -45,6 +69,12 @@ exit 7
         -StdinText "suspended launch stdin" `
         -TimeoutSec 10 `
         -MemoryLimitMB 512
+    } finally { Set-Item -LiteralPath Function:\Get-VyxProcessTreeWorkingSetBytes -Value $numericTreeSampler }
+
+    if ($script:numericTreeCalls -ne 0) { throw 'memory Job sampling used an ambiguous numeric PID tree' }
+    if ($positive.PeakPrivateCommitMB -le 0 -or $positive.PeakPrivateCommitMB -ge 512) {
+        throw "positive private commit counter is invalid: $($positive.PeakPrivateCommitMB)"
+    }
 
     if ($positive.ExitCode -ne 7 -or $positive.TimedOut -or $positive.DialogCaught -or $positive.MemoryExceeded) {
         throw "positive launch semantics failed: exit=$($positive.ExitCode) timeout=$($positive.TimedOut) dialog=$($positive.DialogCaught) memory=$($positive.MemoryExceeded)"
@@ -141,9 +171,12 @@ exit $LASTEXITCODE
     }
 
     $passed = $true
-    Write-Host "vyx_test_process_memory_job PASS peak_mb=$($negative.PeakWorkingSetMB)"
+    Write-Host "vyx_test_process_memory_job PASS working_set_mb=$($negative.PeakWorkingSetMB) private_commit_mb=$($negative.PeakPrivateCommitMB)"
 } finally {
     if ($passed -and (Test-Path -LiteralPath $workRoot)) {
+        $resolvedRoot = [IO.Path]::GetFullPath($workRoot)
+        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolvedRoot.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'test cleanup escaped temporary directory' }
         Remove-Item -LiteralPath $workRoot -Recurse -Force
     } elseif (Test-Path -LiteralPath $workRoot) {
         Write-Host "vyx_test_process_memory_job retained_work_root=$workRoot"

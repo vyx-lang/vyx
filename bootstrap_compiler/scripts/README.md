@@ -33,6 +33,19 @@ SDK compiler outputs freshly built from this checkout and matching object record
 | `export_partitioned_ir.ps1` | Export partitioned MIR/LLVM IR for a project. |
 | [Linux compiler object exporter](emit_linux_boot_crate.ps1) | Cross-emit the SDK compiler crate as a checked ELF object from the current build's object records. |
 
+On Windows, `Invoke-VyxProcess -MemoryLimitMB N` assigns the process before it
+runs to a Windows Job, including its descendants. Memory sampling uses that
+Job's actual members; the fallback process walk also checks creation times so
+reused parent PIDs cannot include unrelated applications. `PeakWorkingSetMB`
+records sampled resident pages (shared pages can occur in more than one process);
+`PeakPrivateCommitMB` records the Job's private commit peak, including processes
+that exited between samples. A resident sample of zero means the process finished
+before sampling. The OS Job limit and timeout remain enforced independently.
+
+`VYX_BOOTSTRAP_PROFILE=2` reports timing and memory at Sema and streaming LLVM
+phase boundaries. Use these phase records alongside the process-group counters
+to distinguish frontend retention from LLVM and concurrent child work.
+
 After building the current SDK compiler target, run the exporter to produce
 a checked ELF object under `out/linux/`. It derives the source unit from that build's
 object records and rejects missing `bootstrap.*` dependencies before codegen.
