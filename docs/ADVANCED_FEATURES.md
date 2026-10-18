@@ -560,6 +560,11 @@ The conclusion is **try static first**. Introduce `dyn` only when the type genui
 
 `|>` feeds the value on the left into the **first** argument of the call on the right. It suits a chain of transforms that each take a single value.
 
+The prefix is evaluated first and supplies the first user parameter; that parameter's
+default expression is not evaluated. Remaining arguments may be named or defaulted.
+Pipes use ordinary call ownership rules: passing an owner by value makes the source
+unavailable, while passing a shared reference keeps the source available.
+
 ```vyx program
 fn double(value: i64) -> i64 { return value * 2; }
 fn add_ten(value: i64) -> i64 { return value + 10; }
@@ -634,7 +639,22 @@ The compiler will not report this class of mistake, because from the C ABI's poi
 
 `cfn(i32) -> i32` describes a C function pointer. A `fn(...)` function value can carry context and cannot be used directly as such a pointer. The example passes the named function `bump_c` and preserves its exported symbol with `@[no_mangle]`; this differs from a function value with captures. C callbacks must also match parameter types, return types, and calling convention.
 
-C variadics (`...`) are written on the last parameter of an `extern "C"` declaration.
+C variadics use a trailing `...` in the declaration. Fixed parameters may be named;
+the tail accepts positional arguments. Expressions are evaluated in source order,
+then arranged in ABI parameter order. The tail applies C default argument promotions:
+`f32` to `f64`, and `bool`, `i8`, `u8`, `i16`, `u16` to `i32`.
+
+```vyx program
+extern "C" { fn printf(format: rawptr, ...) -> i32; }
+fn main() -> i32 {
+    let fraction: f32 = 1.5;
+    unsafe { printf(format: "%d/%.1f\n".c_str(), -7 as i8, fraction); }
+    return 0;
+}
+```
+
+The format string must match the promoted argument types; the compiler does not
+check variadic arguments against the format string.
 
 ### Who is responsible for what
 

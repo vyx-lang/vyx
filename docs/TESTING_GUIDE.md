@@ -133,6 +133,16 @@ needs machine-readable records; keep the compiler's exit status as the failure
 signal. `--verify-hir2` and `--verify-mir2` check compiler IR invariants only;
 they supplement, and never replace, a compile/run contract for user programs.
 
+## Generated language combinations
+
+For bounded exhaustive language combinations, see the
+[composition generator](../probes/gates/language-composition/README.md).
+It enumerates ordered productions over an explicit depth and constant domain,
+compares runtime results and cleanup counts with an independent interpreter,
+and retains seeds, missing coverage, replay and reduction evidence. Unmodeled
+features remain explicit; passing this finite domain does not prove arbitrary
+program correctness. Keep the real project, DCI and self-hosting gates as well.
+
 ## Cross compilation (Windows host)
 
 When `vyxc` itself runs on Android/Termux, Android is the host platform.
@@ -232,25 +242,32 @@ The hello source must include `print("hello")`. On Windows, keep the temporary
 source in the compiler project and run from that directory:
 
 ```powershell
-$expected = 'mir2.unit functions=1 blocks=1 locals=1 places=1 values=6 instrs=2 cases=0 types=5'
 $helloGateCreated = $false
 Push-Location ./bootstrap_compiler
 try {
     if (Test-Path ./hello-gate-doc.vyx) { throw 'hello-gate-doc.vyx already exists' }
     Copy-Item ../probes/gates/hello_gate.vyx ./hello-gate-doc.vyx
     $helloGateCreated = $true
-    $summary = & $compiler --src=file ./hello-gate-doc.vyx --dump-mir2 2>$null |
-        Select-String '^mir2.unit'
-    if ($LASTEXITCODE -ne 0 -or $summary.Line -ne $expected) { throw 'hello MIR gate failed' }
-    $summary.Line
+    $dump = & $compiler --src=file ./hello-gate-doc.vyx --dump-mir2 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw 'hello MIR gate failed' }
+    $main = [regex]::Match($dump, '(?m)^  fn #(?<id>\d+) .*name=main .*block_count=1 ')
+    if (!$main.Success) { throw 'missing one-block main' }
+    foreach ($entry in @(@('block',1),@('local',1),@('place',1),@('value',6),@('instr',2))) {
+        $count = [regex]::Matches($dump, '(?m)^  '+$entry[0]+' #\d+ fn=#'+$main.Groups['id'].Value+' ').Count
+        if ($count -ne $entry[1]) { throw "hello main $($entry[0]) count drifted" }
+    }
+    [regex]::Match($dump, '(?m)^mir2\.unit .*$').Value
 } finally {
     if ($helloGateCreated) { Remove-Item ./hello-gate-doc.vyx -ErrorAction SilentlyContinue }
     Pop-Location
 }
 ```
 
-Compare the complete line, not just the presence of `mir2.unit`. In particular,
-`values=6 instrs=2` must not drift without an explained change. Gate A does not
+Library print adds declarations and reachable library bodies to the complete unit.
+The historical unit had `functions=1 ... values=6 instrs=2`; main still has one
+block, local and place, six values and two instructions. Record the full unit
+counts and explain changes. The fixed-point script with `-HelloGate` also checks
+that print targets an executable library function. Gate A does not
 replace executable tests or the self-host fixed point below.
 
 ### Language, interface, and scheduling gates

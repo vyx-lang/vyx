@@ -200,6 +200,30 @@ artifacts from the producer before consumption. Their contract belongs to
 the [DCI reference](DCI_SPEC.md); adapter operation and verification commands
 are in the [DCI SDK guide](../tools/dci/README.md).
 
+## Library calls and compiler primitives
+
+`print`, `println`, `panic`, `assert` and `assert_eq` are Vyx declarations in
+`std.console`. Formatting dispatches through `Display`, including user implementations.
+The core package also provides allocation declarations, process arguments and
+formatting helpers. `std.io` forwards its console API to these declarations.
+With implicit standard-library loading disabled, an absent declaration is an
+undefined name. A user declaration with the same name keeps its own signature.
+
+The lowering boundary requires an explicit callable target and ABI. It does not
+substitute a legacy StringBuilder factory, manufacture `zero`/`one`/string
+constants for a missing body, or pick an unrelated same-named method. Class
+identity includes its module and generic arguments. String, Option and Result
+ABI roles come from declaration facts. Missing DCI storage layout is an error.
+Multiple distinct `lang_item` providers for one slot are diagnosed.
+
+Size/layout queries, reflection, typed-pointer operations and string representation
+primitives still have explicit compiler lowering. Their recognized operations do
+not authorize unknown member names or guessed layouts. Cache misses can scan a
+declaration index again; the scan must obey the same identity and scope checks.
+The [library-call gate](../probes/gates/no-semantic-fallback/README.md) verifies the
+ordinary call path and negative diagnostics. The [StringBuilder gate](../probes/gates/stringbuilder-abi/README.md)
+checks factory and storage ABI across file/project compilation.
+
 ## Continue reading
 
 - Language behavior: [design](LANGUAGE_DESIGN.md) and [surface index](LANGUAGE_SURFACE.md).

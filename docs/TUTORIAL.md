@@ -368,6 +368,11 @@ A function with nothing to return omits `->`, as in `fn increment() { ... }`.
 
 The two combine.
 
+Named arguments bind to names in the declaration; the selected parameter still determines type and ownership rules.
+Unknown or repeated names are errors. Argument expressions are evaluated once, from left to right as written,
+after the method receiver or pipe prefix. A `fn(...)` / `cfn(...)` type carries no parameter names,
+so calls through these function values use positional arguments.
+
 ### Common mistakes
 
 - Leaving a parameter untyped.

@@ -163,6 +163,12 @@ Windows 上不要把 `--src=file` 的输入放在仓库根目录 `out/` 下。
 
 ## 按改动运行验证
 
+语法组合使用[生成门](../probes/gates/language-composition/README.md)：
+按规则、深度和常量域穷举有序组合，以独立解释器检查运行结果和清理次数。
+`suite.py plan` 查看规模，`generate` 生成语料，`run` 执行，`replay` / `reduce`
+重放与缩减失败。报告分别记录生成、执行和漏跑；未建模特性明确列出，不能用
+有限深度通过宣称任意程序正确。该门与真实项目、DCI、自举门共同使用。
+
 `tests/run_all_modules.ps1` 会分别统计成功、跳过和失败。只有明确绑定平台的 fixture
 （例如 x86_64 MSVC ABI descriptor）才可用退出码 `77` 标记不适用；跳过不会计为
 成功。
@@ -216,24 +222,31 @@ hello 必须包含 `print("hello")`。Windows 上将临时源放在编译器项�
 并在该目录运行：
 
 ```powershell
-$expected = 'mir2.unit functions=1 blocks=1 locals=1 places=1 values=6 instrs=2 cases=0 types=5'
 $helloGateCreated = $false
 Push-Location ./bootstrap_compiler
 try {
     if (Test-Path ./hello-gate-doc.vyx) { throw 'hello-gate-doc.vyx already exists' }
     Copy-Item ../probes/gates/hello_gate.vyx ./hello-gate-doc.vyx
     $helloGateCreated = $true
-    $summary = & $compiler --src=file ./hello-gate-doc.vyx --dump-mir2 2>$null |
-        Select-String '^mir2.unit'
-    if ($LASTEXITCODE -ne 0 -or $summary.Line -ne $expected) { throw 'hello MIR gate failed' }
-    $summary.Line
+    $dump = & $compiler --src=file ./hello-gate-doc.vyx --dump-mir2 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw 'hello MIR gate failed' }
+    $main = [regex]::Match($dump, '(?m)^  fn #(?<id>\d+) .*name=main .*block_count=1 ')
+    if (!$main.Success) { throw 'missing one-block main' }
+    foreach ($entry in @(@('block',1),@('local',1),@('place',1),@('value',6),@('instr',2))) {
+        $count = [regex]::Matches($dump, '(?m)^  '+$entry[0]+' #\d+ fn=#'+$main.Groups['id'].Value+' ').Count
+        if ($count -ne $entry[1]) { throw "hello main $($entry[0]) count drifted" }
+    }
+    [regex]::Match($dump, '(?m)^mir2\.unit .*$').Value
 } finally {
     if ($helloGateCreated) { Remove-Item ./hello-gate-doc.vyx -ErrorAction SilentlyContinue }
     Pop-Location
 }
 ```
 
-比较完整一行，尤其不能让 `values=6 instrs=2` 在没有解释的情况下漂移。
+`print` 现在调用标准库，因此完整 unit 包含库声明与可达函数体。历史 unit 计数
+为 `functions=1 ... values=6 instrs=2`；main 仍应是 1 block、1 local、1 place、
+6 values、2 instrs。保存完整 unit 计数并解释漂移。固定点脚本的 `-HelloGate`
+还检查 print 目标为有函数体的普通库函数。
 门 A 必须与可执行回归及门 B 自举固定点一起使用。
 
 ### 语言、接口和构建调度

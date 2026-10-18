@@ -331,7 +331,7 @@ d.remove("age");
 | `with_capacity(n)` | `static -> Dict<K,V>` | 指定初始容量 |
 | `put(key: K, val: V)` | | 插入/更新 |
 | `insert(key, val)` | | 同 put() |
-| `get(key: K)` | `-> V` | 获取值 |
+| `get(key: K)` | `-> V where V: Default + Clone` | 克隆值；缺少 key 时返回默认值 |
 | `contains(key: K)` | `-> bool` | 是否包含 key |
 | `remove(key: K)` | `-> bool` | 删除 |
 | `isEmpty()` | `-> bool` | 是否为空 |
@@ -343,6 +343,10 @@ d.remove("age");
 | `iter()` | `-> DictEntryIterator` | 迭代器 |
 | `clear()` | | 清空 |
 | `destroy()` | | 释放内存 |
+
+`Vec<T>` 在 `T: Clone` 时实现 `Clone`；`Dict<K,V>` 在键和值都满足 `Clone`
+且键满足 `Hashable + Eq` 时实现 `Clone`。这两个约束只限制克隆操作。
+`Dict.get()` 返回独立的克隆值；`get_ptr()` 借用表内槽位，使用期间不得使表扩容或销毁表。
 
 > 注意: `Dict<string, V>` 自动使用 content-based hash/eq（按字符串内容，非指针值）
 
@@ -406,6 +410,22 @@ let front = q.dequeue(); // → 1
 
 ## Iterator\<T\> (`std.iter`)
 
+Vec 的 for-in 经 `iter()` 取得视图，`next()` 调用元素的 Clone 并返回独立值。
+值形式、`&Vec<T>` 与 `&mut Vec<T>` 都保留源容器的元素；副本在每轮结束时清理，
+移出循环时转移清理责任。元素缺少 Clone 时拒绝实例化。
+`Vec.iter()` 和 `Iterator.from_raw()` 的源存储必须比迭代器活得更久。
+自定义迭代器可从声明的父类继承 `next() -> Option<Item>`。元素推导沿父类声明查找；
+当前类型声明的方法会遮蔽父类方法。字段布局相同不构成继承关系。
+
+固定数组的 for-in 保留源元素，通过 Clone 取得非平凡元素；嵌套数组按结构递归复制。
+每轮结束清理产生的拥有值，移出循环时转移清理责任。拥有元素的数组离开作用域时逆序清理。
+`[owner; N]` 不允许重复非 Copy 的资源句柄，需分别构造各元素。
+DCI shared_abi 展开帧目前拒绝拥有此类数组，因为数组的结构化异常清理尚未实现。
+
+`Display.display()` 可返回借用的 str 视图，或向调用方转移新建文本的所有权。
+控制台输出会在写完后释放新建的格式化文本。自定义实现引用已有存储时，须返回真正的
+借用视图，例如 `String.as_str()`，不能返回带拥有标记的别名。
+
 ```vyx
 let it = vec.iter();
 while (it.has_next()) {
@@ -417,13 +437,13 @@ for (item in vec) { ... }
 
 | 方法 | 说明 |
 |------|------|
-| `from_raw(data, len, pos)` | 从原始数据创建 |
-| `next() -> Result<T>` | 下一个元素 |
+| `from_raw(data, len)` | 从外部元素存储创建视图，初始位置为 0 |
+| `next() -> Option<T>` | Clone 下一个元素；耗尽返回 None |
 | `has_next() -> bool` | 是否有下一个 |
 | `reset()` | 重置位置 |
 | `collect() -> Vec<T>` | 收集为 Vec |
 | `count() -> i64` | 剩余元素数 |
-| `sum() -> T` | 求和 |
+| `sum() -> i64` | 求和 |
 | `for_each(fn)` | 遍历 |
 | `map(fn) -> Iterator` | 映射 |
 | `filter(fn) -> Iterator` | 过滤 |

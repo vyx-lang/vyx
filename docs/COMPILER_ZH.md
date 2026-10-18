@@ -7,6 +7,24 @@
 当前验收以原生 AOT 为基准。JIT 的能力对齐与性能属于后续任务，本文的 AOT
 结果不代表 JIT 已通过相同验收。
 
+## 标准库调用与编译器原语
+
+`print`、`println`、`panic`、`assert`、`assert_eq` 在 `std.console` 中用 Vyx 实现。
+打印通过 `Display` 调用基本类型或用户定义的实现；`std.io` 转发到这些声明。
+core 包也提供内存分配声明、进程参数和格式化函数。禁用隐式标准库后，缺少声明
+会报未定义名称。用户定义同名函数时，按用户函数的签名和返回类型编译。
+
+代码生成需要已绑定的调用目标与 ABI。缺少函数体时，不能按 `zero`、`one` 或
+字符串常量函数的名字生成值；也不能替换成旧 StringBuilder 接口，或从其他类型
+挑选同名方法。类的身份包含模块与泛型实参；String、Option、Result 的 ABI 角色
+来自声明事实。缺少 DCI 存储布局、同一 `lang_item` 有不同提供者时，编译器报错。
+
+布局查询、反射、类型化指针操作与字符串表示原语仍由编译器明确降低。
+这些已定义的操作不允许未知成员或猜测布局。声明索引未命中时可以重新扫描，
+但扫描必须遵守相同的身份和作用域规则。
+[标准库调用门](../probes/gates/no-semantic-fallback/README.md)检查实际调用与负例诊断；
+[StringBuilder 门](../probes/gates/stringbuilder-abi/README.md)检查工厂和存储 ABI。
+
 ## 从源码到原生程序
 
 ```text

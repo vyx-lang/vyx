@@ -301,11 +301,41 @@ invalidates it.
 
 `Vec.get` and `get_unchecked` return independent clones. Owning element types
 must provide `Clone`; `get_ref(i) -> &T` borrows an element without cloning.
+
+For-in on a Vec uses its `iter()` view. `Iterator.next() -> Option<T>` clones
+each element, and returns None at exhaustion. Value, shared-borrowed and
+mutable-borrowed Vec iteration preserve the stored elements. Each yielded owner
+is destroyed at iteration exit unless moved out. Missing Clone implementations
+are rejected. The source storage of `Vec.iter()` and `Iterator.from_raw(data,
+len)` must outlive the view.
+
+Custom iterators can inherit `next() -> Option<Item>` from a declared parent.
+Element inference follows parent declarations; a directly declared method hides
+the inherited one. Unrelated types with matching fields do not share methods.
+
+Fixed-array for-in preserves source elements. Nontrivial elements are cloned;
+nested arrays are cloned structurally. Each yielded owner is cleaned at the
+iteration boundary unless moved out. Owning arrays clean their elements in
+reverse order on scope exit. `[owner; N]` cannot duplicate non-Copy resource
+handles; construct each element separately. Owning fixed arrays are currently
+rejected in DCI shared-unwind frames because array EH cleanup is not implemented.
+
+`Display.display()` returns a borrowed `str` view or fresh owned text transferred
+to its caller. Console output releases fresh formatting results after writing.
+Custom implementations must return an actual borrowed view when referring to
+existing storage, such as `String.as_str()`, rather than an owning alias.
 `get_mut(i) -> &mut T` requires a mutable vector borrow and updates the stored
 element directly. Do not resize or remove storage while an element is borrowed.
 Keep the element alive and its storage stable while that reference is used.
 `push`, `set`, and `pop` transfer ownership. Replacing an element, clearing,
 shrinking, or destroying a vector runs the removed elements' destructors.
+
+`Vec<T>` implements `Clone` when `T: Clone`. `Dict<K,V>` implements it when
+both payload types implement `Clone` and the key implements `Hashable + Eq`.
+These bounds apply to cloning, without restricting which payloads a container
+can store. `Dict.get() -> V` requires `V: Default + Clone`: it returns an
+independent copy, or a default value when the key is absent. `get_ptr()` borrows
+a table slot; keep the table alive and prevent reallocation while using it.
 Growing `resize` and `filled` clone the seed separately for each new slot.
 Stored primitive `str` values release their buffers according to their allocator
 tag; literal and borrowed views are not freed. This applies to `Vec`, `Box`, and

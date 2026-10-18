@@ -106,6 +106,8 @@ LD_LIBRARY_PATH=out ./out/vyxc help
 - **门 A — hello**：使用含 `print("hello")` 和 `return 0` 的程序运行 `--dump-mir2`。
   历史计数是 `functions=1 blocks=1 locals=1 places=1 values=6 instrs=2 cases=0 types=5`。
   先记本树基线，修改后解释所有漂移，尤其 `values=6 instrs=2`。
+  `print` 改走标准库后，完整 unit 包含库声明与可达函数体；检查 main 的
+  `blocks=1 locals=1 places=1 values=6 instrs=2`，并确认 print 绑定到有函数体的普通库函数。
 - **门 B — self-host fixpoint**：Stage 0 构建 S1，S1 构建 S2，S2 构建 S3，要求 S2 == S3。
   若元数据抖动，明确记录原因，再用固定语料的 IR 哈希验证；不能静默换门。
 - **门 C — DCI E2E**：运行 `dci_cpp_trait`、`dci_rust_trait`、`dci_multilang`、`dci_zig_abi`

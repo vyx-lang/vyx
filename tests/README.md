@@ -51,6 +51,12 @@ tests/
 
 ## Commands
 
+For generated combinations, use the [language composition gate](../probes/gates/language-composition/README.md).
+It enumerates ordered rule products within an explicit depth and constant domain,
+checks an independent semantic oracle, records unexecuted combinations, and
+supports replay and failure reduction. It supplements the cases and real project
+fixtures; it does not infer complete language coverage from single-feature tests.
+
 DCI schema checks require the Python `jsonschema` package. Install the DCI SDK's
 `validate` extra in your chosen interpreter and set `VYX_DCI_PYTHON` to its executable.
 The `dci_rust_generic` runner also accepts `-Python` explicitly.
