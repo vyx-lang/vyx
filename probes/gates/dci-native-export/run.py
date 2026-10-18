@@ -37,6 +37,17 @@ def write(path, content):
     path.write_text(content, encoding="utf-8")
 
 
+def compiler_runtime_path(compiler, windows):
+    name = "vyx_runtime.lib" if windows else "libvyx_runtime.a"
+    # Source builds colocate the runtime in out/; installed SDKs keep it
+    # in lib/, alongside the bundled application link dependencies.
+    for directory in (compiler.parent, compiler.parent.parent / "lib"):
+        path = directory / name
+        if path.is_file():
+            return path
+    raise RuntimeError(f"matching compiler runtime not found: {name}")
+
+
 def verify_contract(path, expected_links, triplet):
     blob = path.read_bytes()
     document = dcib.decode(blob)
@@ -254,8 +265,7 @@ def main():
                 "compiler": str(compiler), "sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
                 "backend_sha256": hashlib.sha256((compiler.parent / ("vyx_compiler_backend.dll" if windows
                     else "libvyx_compiler_backend.so")).read_bytes()).hexdigest(),
-                "runtime_sha256": hashlib.sha256((compiler.parent / ("vyx_runtime.lib" if windows
-                    else "libvyx_runtime.a")).read_bytes()).hexdigest(),
+                "runtime_sha256": hashlib.sha256(compiler_runtime_path(compiler, windows).read_bytes()).hexdigest(),
                 "triplet": args.triplet, "result": "PASS", "file_aot": True, "project_aot": True,
                 "canonical_roundtrip": True, "deterministic": True,
                 "dependency_exports_filtered": True, "rejected_output_preserved": True,

@@ -22,6 +22,12 @@ builder/
 
 ## Where to change behavior
 
+During pipe construction, the right-hand call records its implicit first user
+argument in `expr_aux`. Default materialization and expected-type retries use
+this HIR edge after the temporary AST construction context has been restored.
+MIR evaluates the prefix through the enclosing pipe; the auxiliary edge records
+the binding and does not insert another argument or another evaluation.
+
 | Responsibility | Files / entry points |
 |---|---|
 | Register declarations, fields and function attributes | [declarations.vyx](declarations/declarations.vyx): `register_decl`, `register_decl_chain`; [attributes.vyx](declarations/attributes.vyx) |
@@ -78,6 +84,49 @@ cannot substitute for a failed closed-instance lookup.
 IDs in body ranges are not persistent references after discard. Preserve the
 checks for the latest owned range and the retained parameter/capture locals.
 Do not replace this flow with eager construction of every function body.
+
+## Iteration type closure
+
+`for-in` uses the declared element type: array elements, the verified Vec
+provider's `get` signature, or an iterator's `next() -> Option<Item>` signature.
+The first generic argument of an arbitrary collection is not its element type.
+Method return types must be closed and their provider metadata registered before
+the loop binding is typed. When an initializer closes in deferred resolution,
+that pass also refreshes the inferred loop local before MIR construction.
+An owned element carries the same destructor metadata as an ordinary local.
+MIR starts that local's lifetime on each iteration, and registers it inside the
+loop cleanup scope so break, continue, return and propagation clean it exactly
+once. Moving the element out disables its local drop.
+
+The verified Vec and String providers materialize their declared `iter` method
+and the returned iterator's methods. MIR calls `next` through the ordinary call
+ABI and branches on the actual Option tag; `has_next`, when declared, is only an
+additional bool guard. A next-only iterator is valid. Standard collection fast
+paths require declaration flags from `lang_item`, never a matching short name.
+Inherited method lookup also checks the declared class hierarchy through the
+builder handle. Field-prefix compatibility is an ABI check after that proof;
+it cannot make unrelated records inherit each other's methods.
+
+Sema defers the body of a proven variadic parameter iteration, and iteration of
+a declared open collection parameter, until HIR instantiation. A heterogeneous
+parameter pack is expanded once per concrete argument type; it has no homogeneous
+runtime element type. Pack recognition respects lexical local shadowing. Invalid
+instantiated member calls with no result type are rejected before LLVM with
+E2000 and the closed function/receiver identity. HIR still lacks per-expression
+source-file identity for imported generic bodies, so these diagnostics omit
+the misleading consumer-file line number. They are not early Sema checks.
+
+The generated [composition gate](../../../../probes/gates/language-composition/README.md)
+and its `check_edges.py` cover wide iterator payloads, propagation cleanup,
+temporary borrows, closed generic collections and pack shadowing.
+
+`core/sema/question.vyx` checks propagation protocols. For an unannotated
+closure it retains the question expressions until the return type is inferred,
+then validates and releases that closure's pending checks. Nested closures save
+and restore this context. Closure signatures use the return type collected by
+statement resolution, including returns inside loops and match arms; they do
+not run a second partial syntax search. MIR expands the closed `?` into explicit success and
+failure blocks, including scope cleanup on the outgoing return edge.
 
 ## Build boundary
 

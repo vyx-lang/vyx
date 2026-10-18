@@ -74,3 +74,9 @@ foreach ($level in @('O0', 'O2')) {
     & $exe
     if ($LASTEXITCODE -ne 0) { throw "$level inline stack cleanup failed: $LASTEXITCODE" }
 }
+$arrayLog = Join-Path $run 'reject-array-unwind.log'
+& $Compiler --src=file (Join-Path $PSScriptRoot 'reject_array_unwind.vyx') --emit=ir -o (Join-Path $run 'reject-array-unwind.ll') *> $arrayLog
+if ($LASTEXITCODE -ne 1 -or (Get-Content -LiteralPath $arrayLog -Raw) -notmatch 'shared unwind cleanup of owning fixed arrays is not supported') {
+    throw 'owning fixed-array unwind must be rejected until structural EH cleanup is implemented'
+}
+Write-Output 'owning fixed-array unwind rejected OK'

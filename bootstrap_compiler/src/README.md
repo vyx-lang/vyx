@@ -40,6 +40,10 @@ Use the [HIR builder map](hir/builder/README.md), [MIR map](mir/README.md),
 and [LLVM map](codegen/llvm/README.md) for method-level entry points.
 The [architecture guide](../../docs/COMPILER.md) explains the data flow.
 
+`core/sema/call_arguments.vyx` owns source argument binding and name diagnostics.
+HIR carries the source order and argument labels through inference and coercion;
+MIR evaluates named arguments in that order before arranging the ABI argument list.
+
 ## Source and build boundaries
 
 - Keep new behavior beside the operation that owns it. Do not place unrelated

@@ -251,10 +251,23 @@ function Assert-HelloGate {
         throw "hello gate compile failed: exit=$exitCode stdout=$stdoutLog stderr=$stderrLog"
     }
     $dump = Get-Content -LiteralPath $stdoutLog -Raw
-    if ($dump -notmatch 'mir2\.unit functions=1 blocks=1 locals=1 places=1 values=6 instrs=2') {
-        throw "hello gate MIR baseline drifted; see $stdoutLog"
+    $main = [regex]::Match($dump, '(?m)^  fn #(?<id>\d+) .* name=main ret=#\d+:i32 .*block_count=1 ')
+    if (!$main.Success) { throw "hello gate lacks one-block i32 main; see $stdoutLog" }
+    $mainId = $main.Groups['id'].Value
+    # print is a library call. The unit now includes its reachable library
+    # bodies and declarations; the original main-body counts remain unchanged.
+    foreach ($entry in @(@('block',1),@('local',1),@('place',1),@('value',6),@('instr',2))) {
+        $count = [regex]::Matches($dump, '(?m)^  '+$entry[0]+' #\d+ fn=#'+$mainId+' ').Count
+        if ($count -ne $entry[1]) {
+            throw "hello main $($entry[0]) count drifted: $count; see $stdoutLog"
+        }
     }
-    Write-Host "[hello] PASS mir2.unit values=6 instrs=2 compiler=$compilerFull"
+    $print = [regex]::Match($dump, '(?m)^  value #\d+ fn=#'+$mainId+' kind=11 .*target_kind=1 target=#(?<id>\d+) .*name=print::<str> ')
+    if (!$print.Success -or $dump -notmatch ('(?m)^  fn #'+$print.Groups['id'].Value+' .*ret=#\d+:void params=Ts args=str .*first_block=#[1-9]\d* ')) {
+        throw "hello print is not an executable standard-library function; see $stdoutLog"
+    }
+    $unit = [regex]::Match($dump, '(?m)^mir2\.unit .*$').Value
+    Write-Host "[hello] PASS main values=6 instrs=2; library print; $unit compiler=$compilerFull"
 }
 
 function Install-NamedSeed {
@@ -315,7 +328,7 @@ function Install-NamedSeed {
         "target=$(if ([string]::IsNullOrWhiteSpace($buildTarget)) { '<all>' } else { $buildTarget })",
         "seed_compiler=$seedPath",
         "work_root=$runRoot",
-        "validated=S2..S$Generations out+cache byte identity; optional hello dump-mir2 values=6 instrs=2"
+        "validated=S2..S$Generations out+cache byte identity; optional hello main dump-mir2 values=6 instrs=2 with library print"
     )
     $sidecarText = ($sidecar -join [Environment]::NewLine) + [Environment]::NewLine
     Set-Content -LiteralPath (Join-Path $dest "SHA256.txt") -Value $sidecarText -Encoding ascii

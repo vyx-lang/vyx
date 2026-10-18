@@ -36,6 +36,19 @@ mir/
 
 ## Where to change behavior
 
+`builder/flow/iteration_protocol.vyx` constructs typed, ordinary iterator calls
+and Option branches. Collection normalization uses verified Vec/String provider
+flags. The returned element enters the iteration cleanup scope; None never
+initializes an element owner. This preserves the normal ABI and ownership paths
+for aggregate payloads instead of rebuilding them inside LLVM foreach lowering.
+
+Fixed arrays use ordinary Clone calls for nontrivial elements and structural
+loops for nested arrays. `builder/lifetime/arrays.vyx` emits reverse element
+cleanup, including temporary construction guards. Array local/temporary drop
+metadata names the homogeneous leaf destructor; it must never be called with
+the array as its receiver. DCI shared-unwind registration currently rejects
+owning arrays until structural EH callbacks exist.
+
 | Operation | Entry point |
 |---|---|
 | Start HIR-to-MIR construction | [builder/mir_builder.vyx](builder/mir_builder.vyx): `MirUnitBuilder.create`, `create_for_codegen` |

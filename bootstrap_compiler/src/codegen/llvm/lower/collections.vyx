@@ -220,7 +220,24 @@ impl LlvmMirLowerer {
             self.report_error("foreach iterator method has no receiver: " + self.m.function_name(method_fn));
             return null;
         }
-        let args = malloc(8);
+        if (self.function_source_param_count(method_fn) != 1) {
+            self.report_error("foreach iterator method must take only its receiver: " + self.m.function_name(method_fn));
+            return null;
+        }
+        let return_type = self.m.function_return_type(method_fn);
+        let uses_sret = self.function_uses_hidden_sret(method_fn);
+        var argc: i32 = 1;
+        var return_slot: rawptr = null;
+        if (uses_sret) {
+            let return_storage = self.lower_storage_type(return_type);
+            if (return_storage == null) { return null; }
+            return_slot = vyx_rt_build_alloca(self.mod, return_storage, "foreach.sret".c_str(), 12);
+            if (return_slot == null) { return null; }
+            let alignment = self.value_storage_align(return_type);
+            if (alignment > 0) { vyx_rt_set_alignment(self.mod, return_slot, alignment as i32); }
+            argc = 2;
+        }
+        let args = malloc((argc * 8) as u64);
         if (args == null) {
             self.report_error("cannot allocate foreach iterator call arguments");
             return null;
@@ -249,17 +266,28 @@ impl LlvmMirLowerer {
             self.report_error("cannot lower foreach iterator receiver for " + self.m.function_name(method_fn));
             return null;
         }
-        ast_write_rawptr(args, receiver_arg);
+        var receiver_index: i32 = 0;
+        if (uses_sret) {
+            var sret_index: i32 = 0;
+            receiver_index = 1;
+            if (self.dci_member_sret_after_receiver(method_fn)) { sret_index = 1; receiver_index = 0; }
+            ast_write_rawptr(ptr_offset(args, sret_index * 8), return_slot);
+        }
+        ast_write_rawptr(ptr_offset(args, receiver_index * 8), receiver_arg);
         var call_label = result_name;
-        if (llvm_mir_type_kind(&self.m, self.m.function_return_type(method_fn)) == ty_VOID()) { call_label = ""; }
-        let out = vyx_rt_build_call(self.mod,
-                                    fn_type,
-                                    fn_value,
-                                    args,
-                                    1,
-                                    call_label.c_str(),
-                                    call_label.len as u64);
+        if (uses_sret || llvm_mir_type_kind(&self.m, return_type) == ty_VOID()) { call_label = ""; }
+        var out = self.build_abi_call(fn_type, fn_value, args, argc as u64, call_label, method_fn);
+        if (out != null && !self.apply_dci_callsite_abi_attrs(method_fn, out)) { out = null; }
+        if (out != null && !self.apply_native_c_aggregate_abi_attrs(method_fn, out)) { out = null; }
         free(args);
+        if (out != null && uses_sret) {
+            out = vyx_rt_build_load(self.mod, self.lower_type(return_type), return_slot,
+                                    result_name.c_str(), result_name.len as u64);
+        } else if (out != null && self.dci_abi_passing(self.dci_return_abi(method_fn)) == "coerce") {
+            out = self.dci_uncoerce_return_value(out, method_fn, return_type);
+        } else if (out != null && self.function_return_uses_c_sysv_coerce(method_fn)) {
+            out = self.c_sysv_uncoerce_value(out, return_type, result_name);
+        }
         return out;
     }
 
@@ -269,7 +297,7 @@ impl LlvmMirLowerer {
         let canonical_type = self.canonical_record_type_id(type_id);
         let text = llvm_mir_type_text(&self.m, type_id);
         if (policy_generic_call_has_args(text.clone()) == 0) { return false; }
-        if (self.last_path_segment(policy_generic_call_base(text.clone())) != "Iterator") { return false; }
+        if ((hir_type_table_flags(self.m.types, canonical_type) & hir_type_flag_std_iterator()) == 0) { return false; }
         let data_field = self.field_id_for_type_name(canonical_type, "data");
         let len_field = self.field_id_for_type_name(canonical_type, "len");
         let pos_field = self.field_id_for_type_name(canonical_type, "pos");
@@ -359,8 +387,7 @@ impl LlvmMirLowerer {
         let canonical_text = llvm_mir_type_text(&self.m, canonical_type);
         if (policy_generic_call_has_args(text.clone()) == 0
             && policy_generic_call_has_args(canonical_text.clone()) == 0) { return false; }
-        let base = self.last_path_segment(policy_generic_call_base(text.clone()));
-        if (base != "Vec") { return false; }
+        if ((hir_type_table_flags(self.m.types, canonical_type) & hir_type_flag_std_vec()) == 0) { return false; }
         if (self.field_id_for_type_name(canonical_type, "data") == mir_id_invalid()) { return false; }
         return self.field_id_for_type_name(canonical_type, "len") != mir_id_invalid();
     }
@@ -477,9 +504,8 @@ impl LlvmMirLowerer {
                       + policy_i64_to_string(instr_id as i64));
             return false;
         }
-        if (self.foreach_value_is_borrowed(iter_value)
-            && self.indexed_foreach_payload_requires_clone(payload_type)) {
-            self.report_error("borrowed Vec foreach of `"
+        if (self.indexed_foreach_payload_requires_clone(payload_type)) {
+            self.report_error("Vec foreach of `"
                       + llvm_mir_type_text(&self.m, payload_type)
                       + "` requires Clone lowering; refusing an ownership-unsafe raw copy");
             return false;
@@ -841,6 +867,7 @@ impl LlvmMirLowerer {
             return false;
         }
         vyx_rt_build_store(self.mod, cast_payload, dst_addr);
+        self.track_shared_unwind_owner(dst_place, dst_addr);
         return true;
     }
 
@@ -848,6 +875,10 @@ impl LlvmMirLowerer {
         let iter_value = self.m.instr_value(instr_id);
         if (!self.value_is_reflection_iterable(iter_value)) {
             let iter_type = self.m.value_type(iter_value);
+            if (self.type_is_array_iterable(iter_type)) {
+                self.lower_array_foreach_bind(instr_id);
+                return;
+            }
             let method_fn = self.foreach_method_for_iterator(iter_type, "next");
             let standard_iterator = self.type_is_standard_iterator_abi(iter_type);
             let standard_indexed = self.type_is_standard_indexed_iterable_abi(iter_type);
@@ -929,6 +960,10 @@ impl LlvmMirLowerer {
         let body_bb = llvm_mir_map_get(self.block_values, self.m.block_term_target(block_id));
         let exit_bb = llvm_mir_map_get(self.block_values, self.m.block_term_false(block_id));
         if (!self.value_is_reflection_iterable(iter_value)) {
+            if (self.type_is_array_iterable(self.m.value_type(iter_value))) {
+                self.lower_array_foreach_has_next(iter_value, self.m.block_term_aux(block_id), body_bb, exit_bb);
+                return;
+            }
             if (self.type_is_standard_iterator_abi(self.m.value_type(iter_value))) {
                 self.lower_standard_iterator_has_next(iter_value, body_bb, exit_bb);
                 return;

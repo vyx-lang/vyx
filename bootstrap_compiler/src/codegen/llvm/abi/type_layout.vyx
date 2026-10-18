@@ -219,7 +219,7 @@ impl LlvmMirLowerer {
         let right_has_args = policy_generic_call_has_args(right.clone()) != 0;
         if (left_has_args != right_has_args) { return false; }
         if (!left_has_args) {
-            return policy_type_name_equal(left, right);
+            return policy_type_name_equal_qualified(left, right);
         }
         let left_base = policy_generic_call_base(left.clone());
         let right_base = policy_generic_call_base(right.clone());
@@ -277,29 +277,30 @@ impl LlvmMirLowerer {
             }
             id = id + 1;
         }
-        // Pass 2 — last-dotted-segment fold, kept only for the qualified vs
-        // unqualified spelling gap (`t.Vec` vs `Vec`). It must NOT be used to
-        // guess between genuinely different records: nested records share
-        // their leaf name by construction (`Holder.Inner` / `Zolder.Inner`),
-        // so a non-unique outcome means the fold is ambiguous and borrowing
-        // either layout would mis-type the fields. Bail out instead.
-        var unique: i32 = mir_id_invalid();
-        id = 1;
-        while (id <= self.m.types.count) {
-            if (id != type_id
-                && llvm_mir_type_kind(&self.m, id) == ty_CLASS()
-                && policy_generic_call_has_args(llvm_mir_type_text(&self.m, id).clone()) == 0
-                && self.type_text_equivalent(base, llvm_mir_type_text(&self.m, id))
-                && self.record_layout_fields_are_closed(id)) {
-                if (unique != mir_id_invalid()) { return mir_id_invalid(); }
-                unique = id;
-            }
-            id = id + 1;
-        }
-        return unique;
+        return mir_id_invalid();
+    }
+
+    public fn refresh_type_fact_caches(self) {
+        if (self.type_fact_cache_types == self.m.types.count
+            && self.type_fact_cache_fields == self.m.field_count
+            && self.type_fact_cache_variants == self.m.variant_count) { return; }
+        // Streaming materialization publishes closed types and variants.
+        // Earlier misses/template aliases are no longer authoritative.
+        // Clear dense cache slots without re-scanning MIR functions/bodies.
+        let last = self.m.types.count;
+        llvm_mir_i32_map_clear_range(self.canonical_type_cache, 1, last);
+        llvm_mir_i32_map_clear_range(self.option_abi_cache, 1, last);
+        llvm_mir_i32_map_clear_range(self.result_abi_cache, 1, last);
+        llvm_mir_i32_map_clear_range(self.class_pointer_abi_cache, 1, last);
+        llvm_mir_i32_map_clear_range(self.value_struct_abi_cache, 1, last);
+        llvm_mir_i32_map_clear_range(self.c_sysv_classify_cache, 1, last);
+        self.type_fact_cache_types = self.m.types.count;
+        self.type_fact_cache_fields = self.m.field_count;
+        self.type_fact_cache_variants = self.m.variant_count;
     }
 
     public fn canonical_record_type_id(self, type_id: i32) -> i32 {
+        self.refresh_type_fact_caches();
         if (type_id == mir_id_invalid()) { return type_id; }
         let cached = llvm_mir_i32_map_get(self.canonical_type_cache, type_id);
         if (cached != 0) { return cached; }
@@ -350,18 +351,10 @@ impl LlvmMirLowerer {
             }
         }
         if (mir_unit_field_count_for_type(&self.m, type_id) <= 0) {
-            // A fieldless class entry is a forward/import placeholder with no
-            // authoritative layout: its own ABI flags are unreliable (a
-            // value-struct class referenced via a pointer/import may surface
-            // here as a CLASS placeholder that never received
-            // hir_type_flag_value_struct).  Prefer a nominal candidate whose
-            // value-struct ABI flag matches this entry, but fall back to any
-            // complete same-named CLASS layout so a fieldless value-struct
-            // placeholder still canonicalizes onto its real declaration
-            // instead of reporting field_count=0.
+            // A declaration may supply a forward type's layout only with
+            // the same canonical identity and ABI flags.
             let placeholder_is_value_struct =
                 (hir_type_table_flags(self.m.types, type_id) & hir_type_flag_value_struct()) != 0;
-            var nominal_fallback: i32 = mir_id_invalid();
             var id: i32 = 1;
             while (id <= self.m.types.count) {
                 if (id != type_id
@@ -375,24 +368,15 @@ impl LlvmMirLowerer {
                         llvm_mir_i32_map_put(self.canonical_type_cache, type_id, result);
                         return result;
                     }
-                    if (nominal_fallback == mir_id_invalid()) { nominal_fallback = id; }
                 }
                 id = id + 1;
-            }
-            if (nominal_fallback != mir_id_invalid()) {
-                result = nominal_fallback;
-                llvm_mir_i32_map_put(self.canonical_type_cache, type_id, result);
-                return result;
             }
             // Enums own variants instead of fields: map a variant-less
             // generic enum instance (or qualified alias) onto the
             // variant-bearing equivalent so variant-owner comparisons and
-            // payload layouts line up. Generic instances additionally match
-            // the argless template entry by base name, mirroring
-            // closed_template_layout_for_generic_instance for records.
+            // payload layouts line up. A closed enum must retain its type
+            // arguments; an open template is not its physical layout.
             if (mir_unit_variant_count_for_type(&self.m, type_id) <= 0) {
-                let has_args = policy_generic_call_has_args(text.clone()) != 0;
-                let base_text = policy_generic_call_base(text.clone());
                 var vid: i32 = 1;
                 while (vid <= self.m.types.count) {
                     if (vid != type_id
@@ -400,12 +384,6 @@ impl LlvmMirLowerer {
                         && mir_unit_variant_count_for_type(&self.m, vid) > 0) {
                         let vid_text = llvm_mir_type_text(&self.m, vid);
                         var matches = self.type_text_equivalent(text, vid_text);
-                        if (!matches
-                            && has_args
-                            && policy_generic_call_has_args(vid_text.clone()) == 0
-                            && self.type_text_equivalent(base_text, vid_text)) {
-                            matches = true;
-                        }
                         if (matches) {
                             result = vid;
                             llvm_mir_i32_map_put(self.canonical_type_cache, type_id, result);
@@ -432,8 +410,14 @@ impl LlvmMirLowerer {
     }
 
     public fn finalize_record_ty_body(self, type_id: i32, st: rawptr, field_count: i32) -> rawptr {
-        if (self.dci_type_uses_stable_value_layout(type_id)) {
-            let layout = self.dci_layout_object_for_type(type_id);
+        // Native C++ objects use handles at the Vyx call boundary, but their
+        // allocated storage still has the producer-measured size/alignment.
+        // Stable value ABI and physical object storage are separate facts.
+        var layout: rawptr = null;
+        if (self.type_is_foreign_dci(type_id)) {
+            layout = self.dci_layout_object_for_type(type_id);
+        }
+        if (layout != null) {
             let size_bytes = self.dci_json_i64(layout, "size");
             let alignment = self.dci_json_i64(layout, "alignment");
             if (size_bytes == 0) {
@@ -506,13 +490,8 @@ impl LlvmMirLowerer {
         var fields: rawptr = null;
         var final_field_count = field_count;
         if (self.type_is_foreign_dci(type_id) && final_field_count <= 0) {
-            fields = malloc(8);
-            if (fields == null) {
-                self.report_error("cannot allocate empty external DCI object layout for " + llvm_mir_type_text(&self.m, type_id));
-                return null;
-            }
-            ast_write_rawptr(fields, self.ty_i8);
-            final_field_count = 1;
+            self.report_error("foreign DCI value has no established layout: " + llvm_mir_type_text(&self.m, type_id));
+            return null;
         }
         if (field_count > 0) {
             fields = malloc((field_count * 8) as u64);
@@ -718,6 +697,7 @@ impl LlvmMirLowerer {
     }
 
     public fn type_is_class_pointer_abi(self, type_id: i32) -> bool {
+        self.refresh_type_fact_caches();
         // Native value classes do NOT use this predicate; they follow the
         // unique C aggregate rule in type_uses_indirect_c_abi (sret/byval vs
         // coerce). This flag is only for foreign-DCI types without a stable
@@ -735,7 +715,8 @@ impl LlvmMirLowerer {
             } else if (mir_unit_type_is_foreign_dci(&self.m, canonical_type)
                 && !self.dci_type_uses_stable_value_layout(canonical_type)) {
                 result = true;
-            } else if (!self.type_is_value_struct_abi(canonical_type)
+            } else if ((hir_type_table_flags(self.m.types, canonical_type) & hir_type_flag_reference_abi()) != 0
+                && !self.type_is_value_struct_abi(canonical_type)
                 && !self.type_is_str_abi(canonical_type)
                 && !self.type_is_dyn_trait(canonical_type)
                 && !self.type_is_option_abi(canonical_type)
@@ -767,8 +748,7 @@ impl LlvmMirLowerer {
 
     // A fieldless value-struct placeholder may reach lowering without ever
     // receiving hir_type_flag_value_struct (imported/forward class referenced
-    // through a pointer). The authoritative fallback is: does any type in the
-    // unit carry the value-struct flag under the same base name? Rather than
+    // through a pointer). Query the exact qualified nominal declaration. Rather than
     // rescan every type on each query (the historical O(types) walk, which
     // turned this hot predicate into an O(types^2) explosion once native
     // classes became value structs), collect the value-struct base names once
@@ -787,9 +767,8 @@ impl LlvmMirLowerer {
             if ((hir_type_table_flags(self.m.types, id) & hir_type_flag_value_struct()) != 0) {
                 var candidate_base = policy_generic_call_base(llvm_mir_type_text(&self.m, id).clone());
                 if (candidate_base.len == 0) { candidate_base = llvm_mir_type_text(&self.m, id); }
-                let candidate_last = self.last_path_segment(candidate_base);
-                if (candidate_last.len > 0) {
-                    llvm_mir_symbol_index_put_first(buf, cap, candidate_last, 1);
+                if (candidate_base.len > 0) {
+                    llvm_mir_symbol_index_put_first(buf, cap, self.normalize_type_text(candidate_base), 1);
                 }
             }
             id = id + 1;
@@ -807,13 +786,12 @@ impl LlvmMirLowerer {
         let text = llvm_mir_type_text(&self.m, canonical_type);
         var base = policy_generic_call_base(text.clone());
         if (base.len == 0) { base = text; }
-        let base_last = self.last_path_segment(base);
-        if (base_last.len == 0) { return false; }
+        if (base.len == 0) { return false; }
         self.ensure_value_struct_base_name_index();
         if (self.value_struct_base_name_index == null) { return false; }
         return llvm_mir_symbol_index_get(self.value_struct_base_name_index,
                                          self.value_struct_base_name_index_cap,
-                                         base_last) != mir_id_invalid();
+                                         self.normalize_type_text(base)) != mir_id_invalid();
     }
 
     public fn type_text_kind_key(self, kind: i32, text: string) -> string {
@@ -1164,9 +1142,11 @@ impl LlvmMirLowerer {
             if (self.type_is_value_struct_abi(canonical_type)) {
                 return self.get_or_create_record_ty(canonical_type);
             }
-            return self.ty_ptr;
+            self.report_error("class has no established ABI: " + text);
+            return null;
         }
-        return self.ty_ptr;
+        self.report_error("type has no LLVM representation: " + llvm_mir_type_text(&self.m, canonical_type));
+        return null;
     }
 
     public fn get_string_ty(self) -> rawptr {

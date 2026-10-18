@@ -39,6 +39,14 @@ def main():
         wait(lambda m: m.get('method') == 'textDocument/publishDiagnostics'
              and m.get('params', {}).get('uri') == uri)
 
+        # Keyword records are request-local borrowed views. Completion must
+        # not require Vec<LspSymbol>.get() to clone an owning symbol record.
+        for _ in range(3):
+            completion = request('textDocument/completion', {'textDocument': document,
+                'position': {'line': 1, 'character': 0}})
+            items = completion['items'] if isinstance(completion, dict) else completion
+            assert any(item['label'] == 'fn' for item in items), completion
+
         positions = []
         start = 0
         while (start := text.find('old_name', start)) >= 0:

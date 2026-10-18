@@ -1,5 +1,9 @@
 # DCI shared exception propagation — AOT
 
+`reject_array_unwind.vyx` checks an explicit boundary: owning fixed arrays are
+rejected in shared-unwind frames until structural array EH cleanup exists.
+Ordinary AOT array scope cleanup does not establish exception cleanup support.
+
 Run after building the tested SDK compiler from current source:
 
 ```powershell

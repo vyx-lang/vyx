@@ -1,0 +1,171 @@
+module bootstrap.mir_builder;
+
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.hir_ids;
+use bootstrap.hir_model;
+use bootstrap.hir_type_table;
+use bootstrap.mir_ids;
+use bootstrap.mir_model;
+use bootstrap.policy;
+
+@[vis(world)]
+impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn foreach_protocol_owner_type(self, type_id: i32) -> i32 {
+        var depth: i32 = 0;
+        while (type_id != mir_id_invalid() && depth <= self.h.types.count) {
+            let kind = hir_type_table_kind(self.h.types, type_id);
+            if (kind != ty_REF() && kind != ty_MUTREF()) { return type_id; }
+            type_id = hir_type_table_elem(self.h.types, type_id);
+            depth += 1;
+        }
+        return mir_id_invalid();
+    }
+
+    public fn foreach_protocol_method(self, type_id: i32, name: string) -> i32 {
+        return self.executable_method_target_by_receiver_type(self.foreach_protocol_owner_type(type_id), name);
+    }
+
+    public fn foreach_protocol_call(self, receiver: i32, function_id: i32, source_expr: i32, name: string) -> i32 {
+        if (!mir_unit_function_has_self_receiver_param(&self.unit, function_id)
+            || mir_unit_function_param_count(&self.unit, function_id) != 1) {
+            self.report_error("iteration method must take only its receiver: " + name);
+            return mir_id_invalid();
+        }
+        self.mark_function_reachable(function_id);
+        let result_type = self.unit.function_return_type(function_id);
+        let callee = self.unit.add_value(self.current_function_id, mir_value_target_ref(), result_type,
+            mir_id_invalid(), mir_target_function(), function_id, source_expr, 0, 0, 0, name, "");
+        self.unit.set_value_lhs(callee, receiver);
+        let call = self.unit.add_value(self.current_function_id, mir_value_call(), result_type,
+            mir_id_invalid(), mir_target_function(), function_id, source_expr, 0, 0, 0, name, "");
+        self.unit.set_value_lhs(call, callee);
+        return call;
+    }
+
+    public fn lower_collection_foreach_iterator(self, receiver: i32, source_expr: i32) -> i32 {
+        if (receiver == mir_id_invalid()) { return receiver; }
+        let owner = self.foreach_protocol_owner_type(self.unit.value_type(receiver));
+        let kind = hir_type_table_kind(self.h.types, owner);
+        let flags = hir_type_table_flags(self.h.types, owner);
+        if (kind != ty_STRING() && (flags & (hir_type_flag_std_string() | hir_type_flag_std_vec())) == 0) {
+            return receiver;
+        }
+        let iter_fn = self.foreach_protocol_method(owner, "iter");
+        if (iter_fn == mir_id_invalid()) {
+            self.report_error("collection provider has no executable iter method");
+            return mir_id_invalid();
+        }
+        return self.foreach_protocol_call(receiver, iter_fn, source_expr, "iter");
+    }
+
+    public fn foreach_standard_copy_fast_path(self, iterator_type: i32, element_type: i32) -> bool {
+        if (hir_type_table_kind(self.h.types, iterator_type) != ty_CLASS()
+            || (hir_type_table_flags(self.h.types, iterator_type) & hir_type_flag_std_iterator()) == 0) { return false; }
+        let k = hir_type_table_kind(self.h.types, element_type);
+        return k == ty_I8() || k == ty_I16() || k == ty_I32() || k == ty_I64()
+            || k == ty_U8() || k == ty_U16() || k == ty_U32() || k == ty_U64()
+            || k == ty_ISIZE() || k == ty_USIZE() || k == ty_F32() || k == ty_F64()
+            || k == ty_BOOL() || k == ty_CHAR() || k == ty_RAWPTR();
+    }
+
+    public fn foreach_array_clone_required(self, iterator: i32, element_type: i32) -> bool {
+        let owner = self.foreach_protocol_owner_type(self.unit.value_type(iterator));
+        if (hir_type_table_kind(self.h.types, owner) != ty_ARRAY()) { return false; }
+        var depth: i32 = 0;
+        while (hir_type_table_kind(self.h.types, element_type) == ty_ARRAY() && depth <= self.h.types.count) {
+            element_type = hir_type_table_elem(self.h.types, element_type);
+            depth += 1;
+        }
+        let kind = hir_type_table_kind(self.h.types, element_type);
+        return kind == ty_CLASS() || kind == ty_STRING();
+    }
+
+    public fn lower_array_foreach_clone(self, iterator: i32, index_place: i32, local: i32, stmt: i32) {
+        let source = self.h.stmt_cond(stmt);
+        let array_type = self.foreach_protocol_owner_type(self.unit.value_type(iterator));
+        let element_type = hir_type_table_elem(self.h.types, array_type);
+        var array_place = self.unit.value_place(iterator);
+        if (self.unit.value_type(iterator) != array_type) {
+            array_place = self.unit.add_place(self.current_function_id, mir_place_deref(), array_type,
+                mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), iterator, source, "foreach.array");
+        }
+        let position = self.add_read_value(index_place, source);
+        let element_place = self.unit.add_place(self.current_function_id, mir_place_index(), element_type,
+            mir_id_invalid(), array_place, mir_id_invalid(), position, source, "foreach.element");
+        let cloned = self.clone_fixed_array_element(element_place, stmt, source);
+        self.emit_assign(mir_i32_map_get(self.place_map, local), cloned, stmt, source);
+        self.emit_assign(index_place, self.add_binary_value(self.i64_type_id(), tk_PLUS(), position,
+            self.add_const_i64_value(1, source), source, "foreach.step"), stmt, source);
+    }
+
+    public fn clone_fixed_array_element(self, place: i32, stmt: i32, source: i32) -> i32 {
+        let type_id = self.unit.place_type(place);
+        if (hir_type_table_kind(self.h.types, type_id) != ty_ARRAY()) {
+            let clone_fn = self.foreach_protocol_method(type_id, "clone");
+            if (clone_fn == mir_id_invalid()
+                || !self.type_ids_equivalent(self.unit.function_return_type(clone_fn), type_id)) {
+                self.hir_codegen_error_count += 1;
+                diag_emit_at(diag_sev_ERROR(), diag_code_sema_undefined(), null,
+                    "fixed array element requires clone() returning its declared type: "
+                    + hir_type_table_text(self.h.types, type_id));
+                return mir_id_invalid();
+            }
+            return self.foreach_protocol_call(self.add_read_value(place, source), clone_fn, source, "clone");
+        }
+        let length = self.fixed_array_length(type_id);
+        if (length < 0) { self.report_error("array Clone requires a constant extent"); return mir_id_invalid(); }
+        let result = self.add_temp_place(type_id, source, "array.clone.result");
+        let position = self.add_temp_place(self.i64_type_id(), source, "array.clone.position");
+        self.emit_assign(position, self.add_const_i64_value(0, source), stmt, source);
+        let condition = self.add_block(stmt);
+        let body = self.add_block(stmt);
+        let exit = self.add_block(stmt);
+        self.terminate_current_goto(condition);
+        self.set_current_block(condition);
+        let index = self.add_read_value(position, source);
+        let more = self.add_binary_value(self.bool_type_id(), tk_LT(), index,
+            self.add_const_i64_value(length, source), source, "array.clone.more");
+        self.terminate_current(mir_term_branch(), more, body, exit, mir_id_invalid(), source);
+        self.set_current_block(body);
+        let element_type = hir_type_table_elem(self.h.types, type_id);
+        let input = self.unit.add_place(self.current_function_id, mir_place_index(), element_type,
+            mir_id_invalid(), place, mir_id_invalid(), index, source, "array.clone.input");
+        let output = self.unit.add_place(self.current_function_id, mir_place_index(), element_type,
+            mir_id_invalid(), result, mir_id_invalid(), index, source, "array.clone.output");
+        self.emit_assign(output, self.clone_fixed_array_element(input, stmt, source), stmt, source);
+        self.emit_assign(position, self.add_binary_value(self.i64_type_id(), tk_PLUS(), index,
+            self.add_const_i64_value(1, source), source, "array.clone.step"), stmt, source);
+        self.terminate_current_goto(condition);
+        self.set_current_block(exit);
+        return self.add_read_value(result, source);
+    }
+
+    public fn lower_foreach_protocol_condition(self, iterator: i32, next_fn: i32, stmt: i32, body: i32, exit: i32) -> i32 {
+        let source = self.h.stmt_cond(stmt);
+        let has_next = self.foreach_protocol_method(self.unit.value_type(iterator), "has_next");
+        if (has_next != mir_id_invalid()) {
+            if (hir_type_table_kind(self.h.types, self.unit.function_return_type(has_next)) != ty_BOOL()) {
+                self.report_error("iterator has_next must return bool");
+                return mir_id_invalid();
+            }
+            let has_value = self.foreach_protocol_call(iterator, has_next, source, "has_next");
+            let next_block = self.add_block(stmt);
+            self.terminate_current(mir_term_branch(), has_value, next_block, exit, mir_id_invalid(), source);
+            self.set_current_block(next_block);
+        }
+        let option_type = self.unit.function_return_type(next_fn);
+        self.ensure_layouts_for_type(option_type);
+        if ((hir_type_table_flags(self.h.types, option_type) & hir_type_flag_std_option()) == 0) {
+            self.report_error("iterator next must return the Option provider");
+            return mir_id_invalid();
+        }
+        let next = self.foreach_protocol_call(iterator, next_fn, source, "next");
+        let slot = self.add_temp_place(option_type, source, "foreach.next");
+        self.emit_assign(slot, next, stmt, source);
+        let value = self.add_read_value(slot, source);
+        let exhausted = self.add_try_projection(value, self.bool_type_id(), mir_op_try_is_failure(), source);
+        self.terminate_current(mir_term_branch(), exhausted, exit, body, mir_id_invalid(), source);
+        return value;
+    }
+}

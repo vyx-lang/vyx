@@ -8,6 +8,13 @@ groups them with the entry file into one module object.
 Start with the dispatch method for the MIR operation being changed, then follow
 its calls into the files below.
 
+Nontrivial iterator payloads use ordinary MIR calls and typed Option projections,
+including the selected method's hidden aggregate return storage and call-site
+ABI attributes. Destruction is scheduled by MIR. The standard Iterator copy fast
+path is limited to primitive numeric/bool/char/rawptr elements and requires the
+verified provider flag; a user type named Iterator does not qualify. Fixed-array
+storage reads still reject owning payloads until their Clone path is implemented.
+
 ```text
 llvm/
 ├── llvm_lower.vyx   context storage, construction and public API
@@ -52,9 +59,10 @@ llvm/
 | [global_storage.vyx](storage/global_storage.vyx) | Static initializers and HIR global storage |
 | [aggregates.vyx](lower/aggregates.vyx) | Arrays, tuples, class aggregates and explicit allocation |
 | [scalar_values.vyx](lower/scalar_values.vyx) | Casts, arithmetic, truthiness and scalar values |
-| [enum_values.vyx](lower/enum_values.vyx) | Enum, Option and Result layout, construction and `?` |
+| [enum_values.vyx](lower/enum_values.vyx) | Enum, Option and Result layout, construction and typed payload projections; `?` control flow and cleanup belong to MIR |
 | [pattern_matching.vyx](lower/pattern_matching.vyx) | Pattern conditions, payload binding and match branches |
 | [collections.vyx](lower/collections.vyx) | Vec element operations and indexed/method iterator lowering |
+| [array_iteration.vyx](lower/array_iteration.vyx) | Fixed array iteration using measured bounds and declared element types |
 | [ownership.vyx](storage/ownership.vyx) | Assignment retain/release, replacement storage and drop |
 | [closures.vyx](lower/closures.vyx) | Environments, function values and callback adapters |
 | [trait_dispatch.vyx](lower/trait_dispatch.vyx) | Dynamic trait layout, vtables, adapters and calls |
@@ -63,6 +71,13 @@ llvm/
 | [assertions.vyx](lower/assertions.vyx) | Runtime and static assertions |
 | [memory_intrinsics.vyx](lower/memory_intrinsics.vyx) | Allocation, raw memory operations and atomics |
 | [runtime_builtins.vyx](abi/runtime_builtins.vyx) | Runtime function declarations and ABI attributes |
+
+Function values use a logical signature with an environment pointer. Native
+definitions may instead use sret and indirect aggregate parameters. Value
+adapters marshal both shapes and forward the environment of an anonymous
+closure. An environment pointer alone does not prove the signatures agree.
+See the aggregate and inferred-closure cases in the
+[composition gate](../../../../probes/gates/language-composition/README.md).
 
 ## Strings and output
 
