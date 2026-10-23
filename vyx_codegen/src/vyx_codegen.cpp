@@ -60,7 +60,6 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
-#include <llvm/TargetParser/SubtargetFeature.h>
 #include <llvm/TargetParser/Triple.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
 #include <llvm/Transforms/IPO/Internalize.h>
@@ -619,13 +618,6 @@ static llvm::CodeGenOptLevel codeGenOptimizationLevelFromInt(int32_t level) {
     }
 }
 
-static bool targetTripleMatchesHostObjectFormat(const llvm::Triple& triple) {
-    const llvm::Triple host(llvm::sys::getDefaultTargetTriple());
-    return triple.getArch() == host.getArch() &&
-           triple.getSubArch() == host.getSubArch() &&
-           triple.getObjectFormat() == host.getObjectFormat();
-}
-
 static std::unique_ptr<llvm::TargetMachine>
 createModuleTargetMachine(VyxRtModule* m, int32_t opt_level = 2) {
     if (!m || !m->mod) return nullptr;
@@ -642,7 +634,7 @@ createModuleTargetMachine(VyxRtModule* m, int32_t opt_level = 2) {
         return nullptr;
     }
 
-    // Let each non-host backend select its own default CPU. Several LLVM
+    // Let each backend select its own default CPU. Several LLVM
     // backends (notably NVPTX) do not define a processor named "generic".
     std::string requestedCpu = m->requestedTargetCpu;
     // LLVM 22 recognizes CUDA kernels through the ptx_kernel calling
@@ -650,21 +642,16 @@ createModuleTargetMachine(VyxRtModule* m, int32_t opt_level = 2) {
     // optimization pipeline or final emission inspects the module.
     if (triple.isNVPTX())
         llvm::UpgradeNVVMAnnotations(*m->mod);
+    // AOT artifacts must run on the target baseline, not just the build CPU.
+    // Host probing here silently introduced AVX-512 into distributed x86_64
+    // SDKs and caused SIGILL when a later runner used that SDK. Leave CPU and
+    // features empty so each target selects its documented default ISA.
+    m->targetCpu.clear();
     m->targetFeatures.clear();
     if (!requestedCpu.empty() && triple.isNVPTX()) {
         m->targetCpu = requestedCpu;
         requestedCpu.clear();
     }
-    if (targetTripleMatchesHostObjectFormat(triple)) {
-        m->targetCpu = llvm::sys::getHostCPUName().str();
-        llvm::SubtargetFeatures features;
-        auto hostFeatures = llvm::sys::getHostCPUFeatures();
-        for (auto& f : hostFeatures) {
-            features.AddFeature(f.first(), f.second);
-        }
-        m->targetFeatures = features.getString();
-    }
-
     if (!requestedCpu.empty()) {
         m->lastError = "target CPU `" + m->requestedTargetCpu +
                        "` is only supported for NVPTX targets";

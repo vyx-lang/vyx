@@ -6,15 +6,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tomllib
 
 from common import REPO, bootstrap_asset, sha256
-
-
-def run(command, **kwargs):
-    print("+ " + " ".join(map(str, command)), flush=True)
-    subprocess.run(list(map(str, command)), check=True, **kwargs)
+from build_native import run
 
 
 def debian_version(label, base_version, *, now=None, compare=None):
@@ -49,6 +46,18 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    sdk = args.host_sdk.resolve()
+    compiler = sdk / "bin/.vyxc-bin"
+    if not compiler.is_file():
+        raise RuntimeError("Expected a Linux host SDK with bin/.vyxc-bin")
+    host_environment = os.environ.copy()
+    host_environment.update(LLVM_ROOT=str(sdk / "toolchain"),
+        LLVM_BIN=str(sdk / "toolchain/bin"), VYX_RUNTIME_ROOT=str(sdk / "lib"),
+        VYX_STD_PACKAGES=str(sdk / "std_packages"),
+        LD_LIBRARY_PATH=str(sdk / "bin") + ":" + str(sdk / "lib"))
+    run([sys.executable, REPO / "probes/gates/aot-portability/run.py",
+         "--backend", sdk / "bin/libvyx_compiler_backend.so", "--compiler", sdk / "bin/vyxc",
+         "--output", work / "host-sdk-smoke"], env=host_environment)
     name = "vyx-sdk-termux-aarch64.deb"
     base = args.base_package.resolve() if args.base_package else bootstrap_asset(
         args.bootstrap_tag, name, work / "downloads")
@@ -74,10 +83,6 @@ def main():
     manifest_path.write_text(manifest.replace(hook, "prebuild = []"), encoding="utf-8")
     run(["git", "clone", "--depth", "1", "--branch", "v2022.1.0",
          "https://github.com/oneapi-src/oneTBB.git", source / "runtime/vendor/oneTBB"])
-    sdk = args.host_sdk.resolve()
-    compiler = sdk / "bin/.vyxc-bin"
-    if not compiler.is_file():
-        raise RuntimeError("Expected a Linux host SDK with bin/.vyxc-bin")
     environment = os.environ.copy()
     environment.update(LLVM_ROOT=str(target_llvm),
         LLVM_BIN=str(args.ndk.resolve() / "toolchains/llvm/prebuilt/linux-x86_64/bin"),
@@ -97,6 +102,7 @@ def main():
     record = {"host": "android", "arch": "aarch64", "source_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         "host_compiler_sha256": sha256(compiler), "base_package_sha256": sha256(base),
+        "host_backend_sha256": sha256(sdk / "bin/libvyx_compiler_backend.so"),
         "base_package_version": base_version, "package_version": version,
         "compiler_sha256": sha256(source / "bootstrap_compiler/out/boot"),
         "archive_sha256": sha256(output / name), "archive_bytes": (output / name).stat().st_size,

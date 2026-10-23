@@ -56,6 +56,27 @@ def verify_debug_adapter(adapter, platform_name, patch):
         raise RuntimeError("CodeLLDB executable hash differs from its manifest; rebuild the adapter")
 
 
+def bootstrap_with_current_backend(sdk, backend, work, windows):
+    """Keep Stage 0's executable/runtime with the current ABI-compatible bridge.
+
+    Released Stage 0 bridges can emit build-CPU instructions. Merely linking
+    the new bridge into S1 does not change the bridge that emitted S1's code.
+    A separate loader directory makes every Stage 0 child use the new bridge.
+    """
+    overlay = work / "stage0-bridge"
+    overlay.mkdir(exist_ok=False)
+    name = "vyxc.exe" if windows else ".vyxc-bin"
+    shutil.copy2(sdk / "bin" / name, overlay / name)
+    shutil.copy2(backend, overlay / backend.name)
+    if windows:
+        # Keep seed DLL dependencies away from out/: the native TBB hook must
+        # be able to replace its output without a loaded-DLL sharing violation.
+        for dependency in (sdk / "bin").glob("*.dll"):
+            if dependency.name.lower() != backend.name.lower():
+                shutil.copy2(dependency, overlay / dependency.name)
+    return overlay / name
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bootstrap-tag", default="latest")
@@ -119,12 +140,25 @@ def main():
         "llvm_root": str(args.llvm_root.resolve()), "jobs": args.jobs, "vyx_slots": 1}
     manifest_path.write_text(bootstrap_manifest(original_manifest, sdk), encoding="utf-8")
     try:
+        # Build the bridge with native C++ first, then use it for all emitted
+        # Vyx objects. This also fixes ISA portability when Stage 0 is old.
+        run([compiler, "build", "--target", "vyx_compiler_backend", f"-j{args.jobs}"], cwd=build, env=environment)
+        backend = out / ("vyx_compiler_backend.dll" if windows else "libvyx_compiler_backend.so")
+        compiler = bootstrap_with_current_backend(sdk, backend, work, windows)
+        environment["VYX_RUNTIME_ROOT"] = str(sdk / "lib")
+        if not windows:
+            environment["LD_LIBRARY_PATH"] = str(compiler.parent) + ":" + environment["LD_LIBRARY_PATH"]
+        record["bootstrap_codegen_backend_sha256"] = sha256(backend)
+        run([sys.executable, REPO / "probes/gates/aot-portability/run.py", "--backend", backend,
+             "--output", work / "baseline-isa"], env=environment)
+        run([compiler, "--version"], env=environment)
         run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
     finally:
         manifest_path.write_text(original_manifest, encoding="utf-8")
     built_compiler = out / ("boot.exe" if windows else "boot")
     shutil.copy2(built_compiler, out / ("vyxc.exe" if windows else "vyxc"))
     environment["VYX_STD_PACKAGES"] = str(build / "std_packages")
+    environment["VYX_RUNTIME_ROOT"] = str(out)
     if not windows:
         # The source hook copies the library payload as libtbb.so. The ELF
         # SONAME must also be resolvable before running the freshly built SDK.
@@ -145,6 +179,18 @@ def main():
     if adapter is not None:
         arguments += ["-DebugAdapterRoot", adapter]
     run(arguments, env=environment)
+    packaged = output / leaf
+    smoke_environment = environment.copy()
+    smoke_environment.update(VYX_RUNTIME_ROOT=str(packaged / "lib"),
+                             VYX_STD_PACKAGES=str(packaged / "std_packages"),
+                             LLVM_ROOT=str(packaged / "toolchain"),
+                             LLVM_BIN=str(packaged / "toolchain/bin"))
+    if not windows:
+        smoke_environment["LD_LIBRARY_PATH"] = str(packaged / "bin") + ":" + str(packaged / "lib")
+    run([sys.executable, REPO / "probes/gates/aot-portability/run.py",
+         "--backend", packaged / "bin" / backend.name,
+         "--compiler", packaged / "bin" / ("vyxc.exe" if windows else "vyxc"),
+         "--output", work / "packaged-sdk-smoke"], env=smoke_environment)
     archive = output / name
     checksum_sidecar(archive)
     record.update(compiler_sha256=sha256(built_compiler), archive_sha256=sha256(archive),

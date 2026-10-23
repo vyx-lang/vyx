@@ -17,12 +17,21 @@ The build uses an isolated committed source snapshot, and its bootstrap-only
 manifest points `parallel_std_sources` at the Stage 0 SDK's `std`. Environment
 variables alone do not override that explicit source list. The manifest is
 restored before the current compiler builds tools or the SDK is packaged.
+The native C++ bridge is built first. Stage 0 then loads that bridge from a
+separate directory while keeping its own executable and application runtime.
+This prevents old Stage 0 bridges from embedding the build runner's optional
+CPU instructions in a portable SDK. A baseline-ISA emission gate runs before
+the compiler build, and a packaged SDK must build and run a StringBuilder
+project before its archive is accepted. The bootstrap bridge hash is recorded
+in `SDK-BUILD.*.json`.
 The new SDK packages the checkout's `std_packages`, and the newly
 built compiler builds LSP and, on x64, DAP. CodeLLDB comes from the verified
 Stage 0 bundle. AArch64 Linux has no DAP bundle. Termux is cross-built using
 the new Linux SDK and Android NDK r28c; its existing device LLVM 21 and oneTBB
 payloads are retained, with private ELF dependency isolation verified by the
-Termux packager. Android execution still requires a device.
+Termux packager. The downloaded Linux host SDK must pass the same project
+build/run gate on the Android build runner before cross-compilation starts.
+Android execution still requires a device.
 
 Each compiler build permits one Vyx child process and two memory slots. Native
 compilation uses four workers. Build caches are not shared between platforms.
