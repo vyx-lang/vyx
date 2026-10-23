@@ -52,7 +52,8 @@ def download(url, path):
 def bootstrap_asset(tag, name, directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    release = api(f"repos/{REPOSITORY}/releases/tags/{urllib.parse.quote(tag, safe='')}")
+    endpoint = "latest" if tag == "latest" else "tags/" + urllib.parse.quote(tag, safe="")
+    release = api(f"repos/{REPOSITORY}/releases/{endpoint}")
     assets = {item["name"]: item for item in release["assets"]}
     for key in (name, name + ".sha256"):
         if key not in assets:
@@ -63,7 +64,7 @@ def bootstrap_asset(tag, name, directory):
     if not match or match[2] != name or sha256(directory / name) != match[1].lower():
         raise RuntimeError(f"Bootstrap checksum mismatch: {name}")
     (directory / (name + ".input.json")).write_text(json.dumps({
-        "tag": tag, "release_id": release["id"], "asset_id": assets[name]["id"],
+        "tag": release["tag_name"], "release_id": release["id"], "asset_id": assets[name]["id"],
         "name": name, "sha256": match[1].lower(), "bytes": assets[name]["size"]
     }, indent=2) + "\n")
     return directory / name

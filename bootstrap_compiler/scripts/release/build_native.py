@@ -20,7 +20,7 @@ def run(command, *, cwd=REPO, env=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bootstrap-tag", default="1.0.0-alpha.1.fix")
+    parser.add_argument("--bootstrap-tag", default="latest")
     parser.add_argument("--bootstrap-sdk", type=Path)
     parser.add_argument("--llvm-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -47,7 +47,7 @@ def main():
     environment = os.environ.copy()
     environment.update(LLVM_ROOT=str(args.llvm_root.resolve()),
         LLVM_BIN=str(args.llvm_root.resolve() / "bin"),
-        VYX_STD_PACKAGES=str(REPO / "bootstrap_compiler/std_packages"),
+        VYX_STD_PACKAGES=str(sdk / "std_packages"),
         VYX_BUILD_VYX_SLOTS="1", VYX_BUILD_MEMORY_SLOTS="2", VYX_CGU_EMIT_THREADS="1",
         VYX_CODEGEN_UNITS="1")
     environment["PATH"] = str(args.llvm_root.resolve() / "bin") + os.pathsep + environment["PATH"]
@@ -60,11 +60,13 @@ def main():
         ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         "bootstrap_tag": args.bootstrap_tag,
         "bootstrap_compiler_sha256": sha256(compiler),
+        "bootstrap_manifest_sha256": sha256(sdk / "SDK-MANIFEST.json"),
         "bootstrap_version": subprocess.check_output([str(compiler), "--version"], env=environment, text=True).strip(),
         "llvm_root": str(args.llvm_root.resolve()), "jobs": args.jobs, "vyx_slots": 1}
     run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
     built_compiler = out / ("boot.exe" if windows else "boot")
     shutil.copy2(built_compiler, out / ("vyxc.exe" if windows else "vyxc"))
+    environment["VYX_STD_PACKAGES"] = str(REPO / "bootstrap_compiler/std_packages")
     if not windows:
         # The source hook copies the library payload as libtbb.so. The ELF
         # SONAME must also be resolvable before running the freshly built SDK.

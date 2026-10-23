@@ -2,9 +2,13 @@
 
 `SDK release` runs on each push to `main`. It builds Windows x64, Linux x64,
 Linux AArch64 and Android/Termux AArch64. Manual runs accept a compatible
-Stage 0 release tag; the default is `1.0.0-alpha.1.fix`.
+Stage 0 release tag; the default resolves the latest published SDK. Pin a tag
+for reproducing a previous bootstrap input.
 
-The native builds use LLVM 22 and a checksum-verified Stage 0 SDK. The newly
+The native builds use LLVM 22 and a checksum-verified Stage 0 SDK. Stage 0 uses
+its own matching standard library while building the current compiler source:
+the October Linux SDK cannot compile the newer typed container drop helpers.
+The new SDK packages the checkout's `std_packages`, and the newly
 built compiler builds LSP and, on x64, DAP. CodeLLDB comes from the verified
 Stage 0 bundle. AArch64 Linux has no DAP bundle. Termux is cross-built using
 the new Linux SDK and Android NDK r28c; its existing device LLVM 21 and oneTBB

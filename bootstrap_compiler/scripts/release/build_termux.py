@@ -20,7 +20,7 @@ def run(command, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bootstrap-tag", default="1.0.0-alpha.1.fix")
+    parser.add_argument("--bootstrap-tag", default="latest")
     parser.add_argument("--base-package", type=Path)
     parser.add_argument("--host-sdk", type=Path, required=True)
     parser.add_argument("--ndk", type=Path, required=True)
