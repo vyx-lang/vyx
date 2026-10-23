@@ -42,9 +42,15 @@ def download(url, path):
     # Public download URLs deliberately receive no API token. Redirects to
     # release object storage must not carry credentials to another host.
     request = urllib.request.Request(url, headers={"User-Agent": "vyx-sdk-release"})
+    print("Downloading " + path.name, flush=True)
     with urllib.request.urlopen(request, timeout=120) as source, temporary.open("wb") as target:
+        received, progress = 0, 0
         while chunk := source.read(1024 * 1024):
             target.write(chunk)
+            received += len(chunk)
+            if received - progress >= 64 * 1024 * 1024:
+                progress = received
+                print(f"  {path.name}: {received // (1024 * 1024)} MiB", flush=True)
     temporary.replace(path)
     return path
 

@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tarfile
 import tomllib
@@ -16,6 +15,24 @@ from common import REPO, bootstrap_asset, sha256
 def run(command, **kwargs):
     print("+ " + " ".join(map(str, command)), flush=True)
     subprocess.run(list(map(str, command)), check=True, **kwargs)
+
+
+def debian_version(label, base_version, *, now=None, compare=None):
+    # Older SDKs used 1.0.5 in Debian control despite compiler version
+    # 1.0.0-alpha.1. Preserve upgrade ordering when returning to the real version.
+    epoch = int(base_version.split(":", 1)[0]) if ":" in base_version else 0
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d%H%M%S")
+    version = label.replace("-", "~", 1) + "+" + stamp
+    candidate = (f"{epoch}:" if epoch else "") + version
+    if compare is None:
+        def compare(left, right):
+            result = subprocess.run(["dpkg", "--compare-versions", left, "gt", right], check=False)
+            if result.returncode not in (0, 1):
+                raise RuntimeError("dpkg could not compare SDK versions")
+            return result.returncode == 0
+    if not compare(candidate, base_version):
+        candidate = f"{epoch + 1}:" + version
+    return candidate
 
 
 def main():
@@ -71,8 +88,8 @@ def main():
         VYX_BUILD_VYX_SLOTS="1", VYX_BUILD_MEMORY_SLOTS="2", VYX_CGU_EMIT_THREADS="1")
     run([compiler, "build", "--target", "boot", "--triplet=aarch64-unknown-linux-android21",
          f"-j{args.jobs}"], cwd=source / "bootstrap_compiler", env=environment)
-    version = tomllib.loads(manifest)["package"]["version"].replace("-", "~", 1)
-    version += "+" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    base_version = subprocess.check_output(["dpkg-deb", "--field", str(base), "Version"], text=True).strip()
+    version = debian_version(tomllib.loads(manifest)["package"]["version"], base_version)
     run(["python3", source / "bootstrap_compiler/scripts/package_termux_sdk.py",
          "--base-package", base, "--compiler-out", source / "bootstrap_compiler/out",
          "--source-root", source, "--destination", output / name,
@@ -80,6 +97,7 @@ def main():
     record = {"host": "android", "arch": "aarch64", "source_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         "host_compiler_sha256": sha256(compiler), "base_package_sha256": sha256(base),
+        "base_package_version": base_version, "package_version": version,
         "compiler_sha256": sha256(source / "bootstrap_compiler/out/boot"),
         "archive_sha256": sha256(output / name), "archive_bytes": (output / name).stat().st_size,
         "ndk": str(args.ndk.resolve()), "jobs": args.jobs, "vyx_slots": 1,

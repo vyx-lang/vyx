@@ -40,3 +40,7 @@ Use new work/output directories for each build. `--bootstrap-sdk` and
 for public downloads but avoids GitHub API rate limits. Publishing requires a
 repository token with `contents: write`; it is only granted to the publish job.
 SDK files are distributed through GitHub Releases.
+
+Termux's Debian version preserves an epoch when needed to upgrade from the
+historical `1.0.5~android21...` package to the actual `1.0.0-alpha.1` version.
+Its control version includes a UTC build timestamp; the release tag uses UTC+8.

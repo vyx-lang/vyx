@@ -1,5 +1,5 @@
 """Release naming, collision handling and artifact integrity regression checks."""
-from datetime import date
+from datetime import date, datetime, timezone
 import json
 from pathlib import Path
 import tempfile
@@ -7,10 +7,20 @@ import unittest
 import urllib.error
 
 from common import checksum_sidecar, sha256
+from build_termux import debian_version
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_termux_upgrade_from_historically_misnumbered_package(self):
+        now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
+        version = debian_version("1.0.0-alpha.1", "1.0.5~android21.20261009", now=now,
+                                 compare=lambda left, right: False)
+        self.assertEqual(version, "1:1.0.0~alpha.1+20261023120000")
+        version = debian_version("1.0.0-alpha.1", "1:1.0.0~alpha.1+20261022120000", now=now,
+                                 compare=lambda left, right: True)
+        self.assertEqual(version, "1:1.0.0~alpha.1+20261023120000")
+
     def test_actual_version_and_same_day_suffix(self):
         day = date(2026, 10, 23)
         self.assertEqual(tag_candidate("1.0.0-alpha.1", day, 1), "1.0.0-alpha.1.26.10.23")

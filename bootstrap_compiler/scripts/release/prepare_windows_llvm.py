@@ -19,6 +19,8 @@ archive = download(asset["browser_download_url"], args.destination.parent / name
 if sha256(archive) != digest.removeprefix("sha256:"):
     raise RuntimeError("LLVM archive digest mismatch")
 args.destination.mkdir(parents=True, exist_ok=False)
+print("Extracting LLVM development files to " + str(args.destination), flush=True)
 subprocess.run(["tar", "-xf", str(archive), "--strip-components=1", "-C", str(args.destination)], check=True)
 if not (args.destination / "lib/LLVMCore.lib").is_file():
     raise RuntimeError("LLVM archive is missing development libraries")
+print("LLVM development files ready", flush=True)
