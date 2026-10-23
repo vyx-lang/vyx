@@ -5,6 +5,11 @@ Linux AArch64 and Android/Termux AArch64. Manual runs accept a compatible
 Stage 0 release tag; the default resolves the latest published SDK. Pin a tag
 for reproducing a previous bootstrap input.
 
+The debugger patch uses LF on every host through `.gitattributes`. CodeLLDB's
+platform, source patch, bundled patch and executable hashes are checked before
+compilation; packaging repeats its source patch and executable checks. A hash
+mismatch fails without rewriting the manifest or accepting different bytes.
+
 The native builds use LLVM 22 and a checksum-verified Stage 0 SDK. Stage 0 uses
 its own matching standard library while building the current compiler source:
 the October Linux SDK cannot compile the newer typed container drop helpers.

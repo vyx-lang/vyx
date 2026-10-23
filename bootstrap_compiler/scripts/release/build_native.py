@@ -41,6 +41,21 @@ def bootstrap_manifest(manifest, sdk):
     return manifest.replace(setting, "parallel_std_sources = " + json.dumps((sdk / "std").as_posix()))
 
 
+def verify_debug_adapter(adapter, platform_name, patch):
+    manifest = json.loads((adapter / "MANIFEST.json").read_text(encoding="utf-8"))
+    if manifest.get("platform") != platform_name:
+        raise RuntimeError(f"CodeLLDB platform mismatch: expected {platform_name}")
+    expected_patch = sha256(patch)
+    if manifest.get("patch_sha256") != expected_patch:
+        raise RuntimeError(f"CodeLLDB patch hash mismatch: manifest={manifest.get('patch_sha256')}, "
+                           f"source={expected_patch}; check patch checkout line endings or rebuild the adapter")
+    if sha256(adapter / "VYX-CHANGES.patch") != expected_patch:
+        raise RuntimeError("CodeLLDB bundled patch differs from the source patch")
+    executable = adapter / "adapter" / ("codelldb.exe" if platform_name.startswith("windows-") else "codelldb")
+    if sha256(executable) != manifest.get("binary_sha256"):
+        raise RuntimeError("CodeLLDB executable hash differs from its manifest; rebuild the adapter")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bootstrap-tag", default="latest")
@@ -64,6 +79,12 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     sdk = args.bootstrap_sdk.resolve() if args.bootstrap_sdk else unpack_sdk(
         bootstrap_asset(args.bootstrap_tag, name, work / "downloads"), work / "bootstrap")
+    tools = ["vyxc-lsp"] + (["vyxc-dap"] if arch == "x86_64" else [])
+    adapter = sdk / "bin/debugger" if "vyxc-dap" in tools else None
+    if adapter is not None:
+        verify_debug_adapter(adapter, f"{host}-{arch}",
+                             REPO / "tools/debugger/patches/codelldb-1.12.3-vyx.patch")
+        print("CodeLLDB source patch and executable verified before compilation", flush=True)
     # Invoke the ELF payload directly so its shell launcher cannot replace the
     # explicitly selected source-build LLVM_ROOT with the bundled SDK root.
     compiler = sdk / "bin" / ("vyxc.exe" if windows else ".vyxc-bin")
@@ -115,17 +136,13 @@ def main():
                 (out / soname[1]).symlink_to(tbb.name)
         environment["LD_LIBRARY_PATH"] = str(out) + (":" + environment["LD_LIBRARY_PATH"]
                                                     if environment.get("LD_LIBRARY_PATH") else "")
-    tools = ["vyxc-lsp"] + (["vyxc-dap"] if arch == "x86_64" else [])
     for target in tools:
         run([built_compiler, "build", "--target", target, f"-j{args.jobs}"], cwd=build, env=environment)
     arguments = ["pwsh", "-NoProfile", "-File", REPO / "bootstrap_compiler/scripts/package_sdk.ps1",
         "-CompilerPath", built_compiler, "-Destination", output / leaf,
         "-BootstrapRoot", build, "-OutDir", out,
         "-Arch", arch, "-BundleLlvm", "-Archive"]
-    if "vyxc-dap" in tools:
-        adapter = sdk / "bin/debugger"
-        if not (adapter / "MANIFEST.json").is_file():
-            raise RuntimeError("Bootstrap SDK has no verified CodeLLDB bundle")
+    if adapter is not None:
         arguments += ["-DebugAdapterRoot", adapter]
     run(arguments, env=environment)
     archive = output / name

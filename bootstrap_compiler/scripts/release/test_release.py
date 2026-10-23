@@ -4,18 +4,59 @@ import json
 import io
 from pathlib import Path
 import tarfile
+import subprocess
 import tempfile
 import unittest
 import urllib.error
 
-from common import checksum_sidecar, sha256
+from common import REPO, checksum_sidecar, sha256
 from build_termux import debian_version
-from build_native import bootstrap_manifest
+from build_native import bootstrap_manifest, verify_debug_adapter
 from prepare_windows_llvm import extract_development, relative_member
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_windows_checkout_preserves_debugger_patch_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            patch_relative = Path("tools/debugger/patches/codelldb-1.12.3-vyx.patch")
+            source = REPO / patch_relative
+            (root / patch_relative).parent.mkdir(parents=True)
+            (root / patch_relative).write_bytes(source.read_bytes())
+            (root / ".gitattributes").write_bytes((REPO / ".gitattributes").read_bytes())
+            for command in (["git", "init", "--quiet"],
+                            ["git", "config", "core.autocrlf", "true"],
+                            ["git", "add", ".gitattributes", patch_relative.as_posix()]):
+                subprocess.run(command, cwd=root, check=True, capture_output=True)
+            exported = root / "checkout"
+            subprocess.run(["git", "checkout-index", "--all", f"--prefix={exported.as_posix()}/"],
+                           cwd=root, check=True, capture_output=True)
+            self.assertEqual((exported / patch_relative).read_bytes(), source.read_bytes())
+            self.assertNotIn(b"\r\n", (exported / patch_relative).read_bytes())
+
+    def test_debug_adapter_rejects_checkout_and_binary_hash_mismatches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter = root / "adapter-bundle"
+            (adapter / "adapter").mkdir(parents=True)
+            patch = root / "source.patch"
+            patch.write_bytes(b"patch\ncontent\n")
+            (adapter / "VYX-CHANGES.patch").write_bytes(patch.read_bytes())
+            binary = adapter / "adapter/codelldb.exe"
+            binary.write_bytes(b"patched adapter fixture")
+            (adapter / "MANIFEST.json").write_text(json.dumps({
+                "platform": "windows-x86_64", "patch_sha256": sha256(patch),
+                "binary_sha256": sha256(binary)}))
+            verify_debug_adapter(adapter, "windows-x86_64", patch)
+            patch.write_bytes(b"patch\r\ncontent\r\n")
+            with self.assertRaisesRegex(RuntimeError, "patch hash mismatch"):
+                verify_debug_adapter(adapter, "windows-x86_64", patch)
+            patch.write_bytes(b"patch\ncontent\n")
+            binary.write_bytes(b"changed adapter")
+            with self.assertRaisesRegex(RuntimeError, "executable hash differs"):
+                verify_debug_adapter(adapter, "windows-x86_64", patch)
+
     def test_bootstrap_explicit_std_sources_use_stage0(self):
         manifest = 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std"\n'
         changed = bootstrap_manifest(manifest, Path("C:/SDK/Stage 0"))
