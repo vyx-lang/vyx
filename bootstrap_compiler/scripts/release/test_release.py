@@ -1,17 +1,52 @@
 """Release naming, collision handling and artifact integrity regression checks."""
 from datetime import date, datetime, timezone
 import json
+import io
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
 import urllib.error
 
 from common import checksum_sidecar, sha256
 from build_termux import debian_version
+from build_native import bootstrap_manifest
+from prepare_windows_llvm import extract_development, relative_member
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_bootstrap_explicit_std_sources_use_stage0(self):
+        manifest = 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std"\n'
+        changed = bootstrap_manifest(manifest, Path("C:/SDK/Stage 0"))
+        self.assertIn('parallel_std_sources = "C:/SDK/Stage 0/std"', changed)
+        self.assertEqual(manifest, 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std"\n')
+        with self.assertRaisesRegex(RuntimeError, "selection drifted"):
+            bootstrap_manifest("unexpected manifest", Path("sdk"))
+
+    def test_streamed_llvm_extraction_filters_unused_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "llvm.tar.xz"
+            with tarfile.open(archive, "w:xz") as bundle:
+                for name in ("include/llvm/IR/Module.h", "lib/LLVMCore.lib", "bin/clang.exe",
+                             "bin/lld-link.exe", "bin/llvm-ar.exe", "lib/clang/22/include/stddef.h",
+                             "bin/unused.exe", "lib/LLVMCore.pdb", "share/doc/index.html"):
+                    member = tarfile.TarInfo("llvm-root/" + name)
+                    member.size = 1
+                    bundle.addfile(member, io.BytesIO(b"x"))
+                link = tarfile.TarInfo("llvm-root/bin/clang++.exe")
+                link.type, link.linkname = tarfile.LNKTYPE, "llvm-root/bin/clang.exe"
+                bundle.addfile(link)
+            extract_development(archive, root / "llvm")
+            self.assertTrue((root / "llvm/bin/clang-cl.exe").is_file())
+            self.assertEqual((root / "llvm/bin/clang++.exe").read_bytes(), b"x")
+            self.assertFalse((root / "llvm/bin/unused.exe").exists())
+            self.assertFalse((root / "llvm/lib/LLVMCore.pdb").exists())
+            for unsafe in ("llvm/../escape", "/absolute/path", "C:/escape", "llvm/..\\escape"):
+                with self.assertRaises(ValueError):
+                    relative_member(unsafe)
+
     def test_termux_upgrade_from_historically_misnumbered_package(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
         version = debian_version("1.0.0-alpha.1", "1.0.5~android21.20261009", now=now,

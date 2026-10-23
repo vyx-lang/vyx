@@ -9,13 +9,36 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import time
 
 from common import REPO, bootstrap_asset, checksum_sidecar, sha256, unpack_sdk
 
 
 def run(command, *, cwd=REPO, env=None):
     print("+ " + " ".join(map(str, command)), flush=True)
-    subprocess.run(list(map(str, command)), cwd=cwd, env=env, check=True)
+    argv = list(map(str, command))
+    if sys.platform == "linux" and shutil.which("stdbuf"):
+        argv = ["stdbuf", "-oL", "-eL"] + argv
+    started = time.monotonic()
+    with subprocess.Popen(argv, cwd=cwd, env=env) as child:
+        while True:
+            try:
+                code = child.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                print(f"[release] {Path(str(command[0])).name} still running: "
+                      f"{time.monotonic() - started:.0f}s, pid={child.pid}", flush=True)
+        if code:
+            raise subprocess.CalledProcessError(code, argv)
+    print(f"[release] completed in {time.monotonic() - started:.1f}s", flush=True)
+
+
+def bootstrap_manifest(manifest, sdk):
+    setting = 'parallel_std_sources = "std"'
+    if manifest.count(setting) != 1:
+        raise RuntimeError("Bootstrap standard-library source selection drifted")
+    return manifest.replace(setting, "parallel_std_sources = " + json.dumps((sdk / "std").as_posix()))
 
 
 def main():
@@ -49,12 +72,22 @@ def main():
         LLVM_BIN=str(args.llvm_root.resolve() / "bin"),
         VYX_STD_PACKAGES=str(sdk / "std_packages"),
         VYX_BUILD_VYX_SLOTS="1", VYX_BUILD_MEMORY_SLOTS="2", VYX_CGU_EMIT_THREADS="1",
-        VYX_CODEGEN_UNITS="1")
+        VYX_CODEGEN_UNITS="1", VYX_BUILD_PROFILE="1")
     environment["PATH"] = str(args.llvm_root.resolve() / "bin") + os.pathsep + environment["PATH"]
     if not windows:
         environment["LD_LIBRARY_PATH"] = str(sdk / "bin") + ":" + str(sdk / "lib") + (
             ":" + environment["LD_LIBRARY_PATH"] if environment.get("LD_LIBRARY_PATH") else "")
-    build = REPO / "bootstrap_compiler"
+    # Keep bootstrap-only std selection out of the checkout and out of SDK
+    # source assets. The release always builds the exact committed source.
+    source = work / "source"
+    source.mkdir(exist_ok=False)
+    source_archive = work / "source.tar"
+    run(["git", "archive", "--format=tar", f"--output={source_archive}", "HEAD"])
+    with tarfile.open(source_archive) as bundle:
+        bundle.extractall(source, filter="data")
+    build = source / "bootstrap_compiler"
+    manifest_path = build / "Vyx.toml"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
     out = build / "out"
     record = {"host": host, "arch": arch, "source_commit": os.environ.get("VYX_RELEASE_SOURCE_COMMIT") or subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
@@ -63,10 +96,14 @@ def main():
         "bootstrap_manifest_sha256": sha256(sdk / "SDK-MANIFEST.json"),
         "bootstrap_version": subprocess.check_output([str(compiler), "--version"], env=environment, text=True).strip(),
         "llvm_root": str(args.llvm_root.resolve()), "jobs": args.jobs, "vyx_slots": 1}
-    run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
+    manifest_path.write_text(bootstrap_manifest(original_manifest, sdk), encoding="utf-8")
+    try:
+        run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
+    finally:
+        manifest_path.write_text(original_manifest, encoding="utf-8")
     built_compiler = out / ("boot.exe" if windows else "boot")
     shutil.copy2(built_compiler, out / ("vyxc.exe" if windows else "vyxc"))
-    environment["VYX_STD_PACKAGES"] = str(REPO / "bootstrap_compiler/std_packages")
+    environment["VYX_STD_PACKAGES"] = str(build / "std_packages")
     if not windows:
         # The source hook copies the library payload as libtbb.so. The ELF
         # SONAME must also be resolvable before running the freshly built SDK.
@@ -83,6 +120,7 @@ def main():
         run([built_compiler, "build", "--target", target, f"-j{args.jobs}"], cwd=build, env=environment)
     arguments = ["pwsh", "-NoProfile", "-File", REPO / "bootstrap_compiler/scripts/package_sdk.ps1",
         "-CompilerPath", built_compiler, "-Destination", output / leaf,
+        "-BootstrapRoot", build, "-OutDir", out,
         "-Arch", arch, "-BundleLlvm", "-Archive"]
     if "vyxc-dap" in tools:
         adapter = sdk / "bin/debugger"

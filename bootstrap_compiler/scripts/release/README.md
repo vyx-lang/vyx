@@ -8,6 +8,10 @@ for reproducing a previous bootstrap input.
 The native builds use LLVM 22 and a checksum-verified Stage 0 SDK. Stage 0 uses
 its own matching standard library while building the current compiler source:
 the October Linux SDK cannot compile the newer typed container drop helpers.
+The build uses an isolated committed source snapshot, and its bootstrap-only
+manifest points `parallel_std_sources` at the Stage 0 SDK's `std`. Environment
+variables alone do not override that explicit source list. The manifest is
+restored before the current compiler builds tools or the SDK is packaged.
 The new SDK packages the checkout's `std_packages`, and the newly
 built compiler builds LSP and, on x64, DAP. CodeLLDB comes from the verified
 Stage 0 bundle. AArch64 Linux has no DAP bundle. Termux is cross-built using
@@ -17,6 +21,10 @@ Termux packager. Android execution still requires a device.
 
 Each compiler build permits one Vyx child process and two memory slots. Native
 compilation uses four workers. Build caches are not shared between platforms.
+Windows LLVM preparation streams the XZ archive once and extracts only headers,
+static libraries, Clang resources and required tools. Prepared development files
+are cached by LLVM archive identity. Dependency preparation has a 15-minute
+limit; compiler steps print elapsed time every 30 seconds and retain failure logs.
 
 All four archives, their SHA-256 sidecars and source identities must be present
 before publishing. The tag reads `[package].version` from `Vyx.toml` and appends
