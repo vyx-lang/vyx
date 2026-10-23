@@ -17,8 +17,8 @@ Option/Result、借用、闭包、Vec、String 或 StringBuilder，再产生 i64
 三种类型构造器；默认穷举两层嵌套。例如 `Vec<Option<String>>` 和
 `Option<Vec<String>>` 都会构造真实值、取出拥有的 payload、检查内容和最终清理。
 `--type-context-depth 1` 把每棵类型树的观测值再交给全部一层表达式规则。
-当前默认域有 47 条表达式规则，共 13,776 个合法组合、3,168 个非法组合，合计
-16,944 个输入。随机样本另外计数，不包含在这个穷举数中。
+当前默认域有 49 条表达式规则，共 14,940 个合法组合、3,300 个非法组合，合计
+18,240 个输入。随机样本另外计数，不包含在这个穷举数中。
 
 合法程序的预期结果由 Python 解释规则树计算，**不从 Vyx 编译结果提取**。
 还检查调用次数、drop 次数、defer 次数及资源内容断言。负例在规则树叶子嵌入
@@ -38,7 +38,7 @@ Migrate、动态分发、裸指针、异常、浮点和独立库/VYI 链接。
 值参数取得传入资源的清理责任；函数正常返回时自动析构，`return` 转移或显式借用时由
 移动/借用事实停用参数清理。`owned_param_lifetime` 同时覆盖普通 class、Vec、共享借用
 和按值返回，检查不会泄漏也不会双重析构。
-`conditional_raw_param_lifetime` 覆盖值参数经 C `memcpy` / `memmove` 转入裸存储的路径：
+`conditional_raw_param_lifetime` 覆盖值参数经 `unsafe` 中的类型化赋值转入裸存储的路径：
 分支、提前返回、零次/一次循环、defer 和短路求值均分别执行转移与不转移两种情况。
 清理使用运行时所有权标记，不能因为函数体某处有拷贝就取消所有出口的参数析构。
 该夹具持有真实 String，并进入下述分配计数门，检查转移前后内容及最终分配/释放平衡。
@@ -49,12 +49,34 @@ Migrate、动态分发、裸指针、异常、浮点和独立库/VYI 链接。
 省略项使用声明中的默认值。未知名称和重复名称必须在 Sema 报错。
 `fn(...)` / `cfn(...)` 值的类型不包含参数名，间接调用只接受位置实参，不能静默忽略名称。
 `named_arguments`、`named_argument_order`、`named_owned_arguments` 与 `named_raw_param_lifetime`
-分别检查重载/默认值/泛型、求值顺序、拥有值与借用值交错，以及 C 字节拷贝转移。
+分别检查重载/默认值/泛型、求值顺序、拥有值与借用值交错，以及具名调用中的类型化存储。
 拥有值夹具同时验证普通函数、实例方法和泛型函数，进入真实 String 分配计数门。
 `named_c_varargs` 检查 C ellipsis 尾部完整传递及交错具名/位置实参的求值顺序，
 `c_vararg_promotions` 检查窄整数和 f32 的 C 默认类型提升，`named_pack` 检查 Vyx 异构参数包。
 `c_varargs` 规则通过 libc snprintf/strtoll 往返数值，独立检查格式前缀和调用次数，
 与其他产生式组合；它只覆盖这一有界缓冲区路径，不代表通用裸指针操作已建模。
+`raw_copy_param_lifetime` 检查 C memcpy/memmove 的零长度、部分和完整字节拷贝：
+字节拷贝不转移源对象的所有权，拥有参数仍须析构，不能根据 C 函数名取消清理。
+`str_move_iteration` 检查拥有的迭代文本移入另一 Vec 后仍有效；`str_typed_storage`
+检查带分配器标记的 str 在分支、defer、match、for 中的转移/不转移，以及字节拷贝
+保留调用方清理。两者均进入真实分配计数门，不用正常退出码代替内容和释放检查。
+`rvalue_pointer_index` 检查 cast/调用返回的指针可以直接索引读写，基址、索引和右值
+按顺序各求值一次；泛型写入转移拥有值，回收存储中的对象时恰好析构一次。
+单次循环的 break/return 允许转移拥有值；仍可能继续迭代的 continue 和内层循环的 break
+不能绕过外层移动检查。零次循环的拥有参数仍须清理。
+`owned_dict_lifetime` 检查覆盖、get/try_get 克隆、删除、值快照、清空和析构的拥有值清理；
+`owned_dict_keys` 检查查询键借用、缺失键插入时克隆、重复键释放和键快照的独立所有权。
+两者均进入真实分配计数门。普通返回值按声明类型取得清理责任，不能根据容器或方法名
+把拥有的 class 返回值改判为借用。
+`owned_match_payload` 检查命名的 class payload 在匹配分支退出时清理，返回或作为
+match 表达式结果时转移清理责任，guard 失败不析构；共享 self 的匹配保留借用。
+`bad_match_payload_reuse` 检查消费 payload 后不能再次读取原枚举。
+`owned_stack_lifetime` 和 `owned_queue_lifetime` 检查扩容、队列环绕、克隆读取、覆盖、
+移出、快照、清空、复用和重复销毁；`owned_stack_queue_moves` 检查无 Clone 的元素仍可
+插入、移出和清理。`owned_vec_from_array` 检查裸指针范围的多个元素被独立克隆。
+这些拥有 String 的路径均核对析构次数；前三种可克隆容器路径另进入真实分配计数门。
+`stack_queue_str_lifetime` 显式清理返回的拥有 str，检查容器内部按分配器标记清理。
+普通方法返回的 str 尚不能保证自动临时值/作用域清理，这个夹具不证明该边界已修复。
 普通参数名 `args` 与其他名字遵守相同的类型、参数个数和移动检查；只有语法中的
 `...` 标记定义参数包。对应正例覆盖具名调用、泛型、方法及真实 String 清理，负例
 检查类型错误、缺少/多余实参和移动后读取。`args_parameter` 将此路径纳入生成规则。
@@ -69,7 +91,7 @@ Migrate、动态分发、裸指针、异常、浮点和独立库/VYI 链接。
 python probes/gates/language-composition/check_edges.py --compiler $compiler --out .cache/grammar-edges
 ```
 
-Windows 的 `check_str_cleanup.py` 另外拦截生成 IR 中的 malloc/calloc/free 与运行时字符串
+Windows 的 `check_str_cleanup.py` 另外拦截生成 IR 中的 malloc/calloc/realloc/free 与运行时字符串
 分配、释放入口，转发给同次 SDK 的真实分配器。C++ 夹具自身的分配不被改写。
 Vec<str> 在值形式与共享借用中各遍历一次，必须观测到四个新字符串，并全部释放：
 
@@ -77,6 +99,7 @@ Vec<str> 在值形式与共享借用中各遍历一次，必须观测到四个�
 python probes/gates/language-composition/check_str_cleanup.py --compiler $compiler --out .cache/str-cleanup
 python probes/gates/language-composition/check_str_cleanup.py --compiler $compiler --cases str_clone_iteration,str_array_iteration,owned_array_clone,owned_array_lifetime,format_cleanup --out .cache/iteration-allocation
 python probes/gates/language-composition/check_str_cleanup.py --compiler $compiler --cases conditional_raw_param_lifetime --out .cache/raw-transfer-allocation
+python probes/gates/language-composition/check_str_cleanup.py --compiler $compiler --cases raw_copy_param_lifetime,str_move_iteration,str_typed_storage --out .cache/typed-storage-allocation
 ```
 
 此计数仅覆盖被测程序发起的分配，不是整个进程的泄漏审计；Linux 对应的拦截门尚未实现。
@@ -100,7 +123,10 @@ Option/Result 规则覆盖 Some/None、Ok/Err 分支和 `?` 的成功、提前�
 `inherited_iterator` 检查从声明父类取得 next 协议。负例加入数组移动后读取及重复资源初始化。
 `named_call` 将参数重排与泛型推导嵌入生成表达式，并检查子表达式调用次数。
 类型树仍主要覆盖 Some/Ok 构造和拥有 payload 的取出。泛型继承布局、其余整数宽度、
-Dict、带约束的复杂参数包等还未进入这个规则表。
+Dict 的拥有值插入、覆盖、读取、删除和析构已进入 `owned_dict` 规则；其余 Dict
+API 和带约束的复杂参数包等还未进入这个规则表。
+`owned_linear` 将 Stack → Queue 的拥有值转移、克隆读取、覆盖和清空纳入规则组合，
+独立计算观察值、Clone 调用数及析构数。
 这些范围不能从当前组合通过推断为已经验收。
 Vec 和标准 Iterator 的非平凡元素经真实的 next/Clone 方法产生独立值，缺少 Clone 时必须拒绝。
 固定数组的非平凡元素通过普通 MIR 调用 Clone；嵌套数组按结构递归复制和清理。

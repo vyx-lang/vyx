@@ -203,7 +203,8 @@ fn sym_get_name(p: rawptr) -> string {
     return from_cstr_view_len(buf, len);
 }
 
-fn sym_get_decl(p: rawptr) -> rawptr {
+// HIR uses declaration identity when classifying typed parameter stores.
+public fn sym_get_decl(p: rawptr) -> rawptr {
     if (p == null) { return null; }
     return ast_read_rawptr(ptr_offset(p, 16));
 }
@@ -9499,12 +9500,54 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         return false;
     }
 
+    fn stmt_loop_exit_flow(self, sp: rawptr) -> i32 {
+        // Outcomes relative to the current loop: fallthrough=1, break=2,
+        // continue=4, return=8. Do not descend into a nested loop: its break
+        // and continue do not exit the current iteration.
+        if (sp == null) { return 1; }
+        let kind = stmt_get_kind(sp);
+        if (kind == st_BREAK()) { return 2; }
+        if (kind == st_CONTINUE()) { return 4; }
+        if (kind == st_RETURN()) { return 8; }
+        if (kind == st_IF()) {
+            return self.stmt_loop_exit_flow(stmt_get_then_blk(sp))
+                | self.stmt_loop_exit_flow(stmt_get_else_blk(sp));
+        }
+        if (kind == st_BLOCK()) {
+            var flow: i32 = 1;
+            var cur = stmt_get_body(sp);
+            while (cur != null && (flow & 1) != 0) {
+                flow = (flow & ~1) | self.stmt_loop_exit_flow(cur);
+                cur = stmt_get_next(cur);
+            }
+            return flow;
+        }
+        if (kind == st_MATCH()) {
+            // Keep fallthrough until exhaustiveness is proven elsewhere, but
+            // retain continue paths from every arm and its optional guard.
+            var flow: i32 = 1;
+            var arm = stmt_get_body(sp);
+            while (arm != null) {
+                flow = flow | self.stmt_loop_exit_flow(stmt_get_body(arm));
+                arm = stmt_get_next(arm);
+            }
+            return flow;
+        }
+        if (kind == st_DEFER()) {
+            return 1 | (self.stmt_loop_exit_flow(stmt_get_init(sp)) & 4);
+        }
+        return 1;
+    }
+
     fn reject_loop_outer_ownership_transfer(self,
                                             pre_moved: rawptr,
                                             pre_fields: rawptr,
                                             pre_locals: rawptr,
                                             sp: rawptr,
                                             loop_word: string) {
+        var body = stmt_get_body(sp);
+        if (stmt_get_kind(sp) == st_FOR()) { body = stmt_get_then_blk(sp); }
+        if ((self.stmt_loop_exit_flow(body) & 5) == 0) { return; }
         // The loop body is sema-resolved once but executed many times, so an
         // outer local moved (or a field moved out of an outer local) inside
         // the body would be read-as-moved / double-dropped from the second
@@ -11547,6 +11590,39 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
         return sema_substitute_type_with_args(fn_ty,
                                               decl_get_generic_params(enum_decl),
                                               enum_args);
+    }
+
+    fn mark_match_payload_source_moved(self, subject: rawptr, first_arm: rawptr) {
+        if (subject == null) { return; }
+        let subject_type = expr_get_ty(subject);
+        if (subject_type == null || tref_get_kind(subject_type) == ty_REF()
+            || tref_get_kind(subject_type) == ty_MUTREF() || tref_get_kind(subject_type) == ty_PTR()) { return; }
+        let root = self.expr_root_local_entry(subject);
+        if (root == null) { return; }
+        if (sym_get_name(root) == "self" && self.cur_body_decl != null
+            && !sema_receiver_mode_is_consuming(sema_receiver_mode(decl_get_params(self.cur_body_decl)))) { return; }
+        var arm = first_arm;
+        while (arm != null) {
+            let pattern = stmt_get_init(arm);
+            if (pattern != null && expr_get_kind(pattern) == ex_CALL()
+                && expr_get_semantic_kind(pattern) == expr_sem_VARIANT()) {
+                var argument = expr_get_args(pattern);
+                while (argument != null) {
+                    let binding = stmt_get_init(argument);
+                    if (binding != null && expr_get_kind(binding) == ex_IDENT()
+                        && expr_get_name(binding) != "_"
+                        && self.type_is_move_only_heap_owning(expr_get_ty(binding))) {
+                        if (sym_get_shared_borrows(root) > 0 || sym_get_mutable_borrows(root) > 0) {
+                            self.report_error_coded(diag_code_v_borrow_invalidation(), expr_loc_ptr(subject),
+                                "cannot move enum payload while its source is borrowed");
+                        } else { self.mark_local_moved(root, sym_get_name(root)); }
+                        return;
+                    }
+                    argument = stmt_get_next(argument);
+                }
+            }
+            arm = stmt_get_next(arm);
+        }
     }
 
     public fn resolve_match_pattern(self, pat: rawptr, scrut_ty: rawptr) -> bool {
@@ -15559,6 +15635,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                 self.mark_field_moved(sym_get_decl(facc), sym_get_name(facc));
                 facc = sym_get_next(facc);
             }
+            self.mark_match_payload_source_moved(stmt_get_init(sp), stmt_get_body(sp));
             return;
         }
         if (k == st_DEFER()) {
@@ -16109,6 +16186,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                                     tref_create_kind(ty_I32()),
                                     null);
             }
+            self.mark_match_payload_source_moved(expr_get_lhs(ep), expr_get_args(ep));
             if (result_ty == null) { result_ty = tref_create_kind(ty_I32()); }
             expr_set_ty(ep, result_ty);
             return result_ty;

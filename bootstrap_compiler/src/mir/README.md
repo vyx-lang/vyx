@@ -49,6 +49,11 @@ metadata names the homogeneous leaf destructor; it must never be called with
 the array as its receiver. DCI shared-unwind registration currently rejects
 owning arrays until structural EH callbacks exist.
 
+Named owning enum payload bindings enter the selected match arm's drop and
+storage scope after its guard succeeds. Returning a binding or using it as the
+match expression result transfers that lifetime to the destination. Matching
+a borrowed receiver keeps payload bindings borrowed.
+
 | Operation | Entry point |
 |---|---|
 | Start HIR-to-MIR construction | [builder/mir_builder.vyx](builder/mir_builder.vyx): `MirUnitBuilder.create`, `create_for_codegen` |

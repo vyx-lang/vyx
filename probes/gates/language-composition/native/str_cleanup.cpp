@@ -36,6 +36,18 @@ extern "C" void* probe_calloc(std::size_t count, std::size_t size) {
     if (pointer) { live.insert(pointer); ++allocated; }
     return pointer;
 }
+extern "C" void* probe_realloc(void* old, std::size_t size) {
+    const bool tracked = live.erase(old) != 0;
+    void* pointer = std::realloc(old, size);
+    if (!pointer && size != 0) {
+        // A failed realloc leaves the original allocation live.
+        if (tracked) { live.insert(old); }
+        return nullptr;
+    }
+    if (tracked) { ++released; }
+    if (pointer) { live.insert(pointer); ++allocated; }
+    return pointer;
+}
 extern "C" void probe_free(void* pointer) {
     if (live.erase(pointer)) { ++released; }
     std::free(pointer);

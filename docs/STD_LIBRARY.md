@@ -9,9 +9,9 @@
 
 `bootstrap_compiler/std_packages/` is the single authority for std sources.
 `--src=file` loads implicit `std.*` through `bootstrap_compiler/std_packages/registry`,
-which forwards to each package's `.vyx` sources. The flat `bootstrap_compiler/std/`
-and root `std/` trees are frozen legacy snapshots pending deletion; they are
-not scanned when the registry is present and nothing syncs against them.
+which forwards to each package's `.vyx` sources. Make standard-library changes
+in `std_packages/`; the flattened `bootstrap_compiler/std/` and root `std/`
+trees are legacy sources, not implementation entry points.
 
 Authority check: `probes/gates/h/std_single_truth.sh` forbids the same
 non-FFI module basename from appearing in two packages, and probes that
@@ -295,12 +295,35 @@ compiler built-ins.
 | `Iterator<T>` | `std.iter` | iteration cursor operations |
 | `String` / `str` | `std.string` | owning/borrowed UTF-8 text and character/byte iteration |
 
+`Dict` owns occupied keys and values. Replacing a value, removing an entry,
+clearing the table and dropping the dictionary release the displaced owners.
+`get` and `try_get` return independent owned clones; `keys` and `values_vec`
+also clone their elements. These operations require the corresponding `Clone`
+implementation. `get_ptr` borrows its lookup key and clones it only when
+inserting a missing entry, together with an owned default value. Returned
+pointers are invalidated by removal, clearing, destruction or table growth.
+
 Do not modify a container's structure while an iterator is live. A `String`
 cursor also borrows the source storage: changing or destroying the source
 invalidates it.
 
 `Vec.get` and `get_unchecked` return independent clones. Owning element types
 must provide `Clone`; `get_ref(i) -> &T` borrows an element without cloning.
+
+`Stack` and `Queue` own stored elements. `push`/`enqueue` transfer ownership
+in, while `pop`/`dequeue` transfer ownership out without cloning. `peek`, `get`
+and `clone` require `Clone` and produce independent owners. `set` destroys
+the replaced value; `clear` and destruction destroy every remaining element.
+Move-only elements support insertion, removal and cleanup without implementing
+`Clone`. `get_ptr` borrows storage which must outlive the pointer and remain
+unmodified structurally. `Vec.from_array`, `Stack.from_array` and
+`Queue.from_array` clone a caller-provided raw range of `n` valid elements;
+the source retains ownership and must remain valid for the call.
+
+Primitive `str` has a remaining compiler limitation: arbitrary method returns
+do not always establish automatic lexical or temporary cleanup. An owning
+`str` returned by these APIs needs an explicit `str_drop` after use. Borrowed
+views must not be dropped as owners. Prefer `String` for automatic scope cleanup.
 
 For-in on a Vec uses its `iter()` view. `Iterator.next() -> Option<T>` clones
 each element, and returns None at exhaustion. Value, shared-borrowed and
@@ -319,6 +342,13 @@ iteration boundary unless moved out. Owning arrays clean their elements in
 reverse order on scope exit. `[owner; N]` cannot duplicate non-Copy resource
 handles; construct each element separately. Owning fixed arrays are currently
 rejected in DCI shared-unwind frames because array EH cleanup is not implemented.
+
+Transfer an owner into raw storage with a typed assignment, for example
+`unsafe { *(slot as *T) = value; }`. The caller must provide sufficient aligned
+storage and either destroy its previous value first or use uninitialized storage.
+The receiver takes responsibility for final cleanup. C `memcpy` and `memmove`
+only copy bytes, even for a complete object; they do not transfer the source's
+ownership. A byte copy of an owner must not be treated as a second independent owner.
 
 `Display.display()` returns a borrowed `str` view or fresh owned text transferred
 to its caller. Console output releases fresh formatting results after writing.

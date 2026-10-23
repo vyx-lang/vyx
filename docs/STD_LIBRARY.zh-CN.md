@@ -6,9 +6,8 @@
 > 结论，以 `docs/TESTING_GUIDE.md` 和最新命令输出为准；旧数字仅作历史背景。
 
 > `bootstrap_compiler/std_packages/` 是 std 源码的唯一权威。`--src=file` 经该目录
-> 根上的 `registry` 转发到各 package 的 `.vyx`。扁平的 `bootstrap_compiler/std/`
-> 与根目录 `std/` 是冻结的历史快照，待整体删除；registry 存在时不参与扫描，
-> 也没有任何同步要求。
+> 根上的 `registry` 转发到各 package 的 `.vyx`。标准库修改只落在 `std_packages/`；
+> 展平的 `bootstrap_compiler/std/` 和根目录 `std/` 都是旧源码，不作为实现入口。
 >
 > 权威门：`probes/gates/h/std_single_truth.sh` 要求非 FFI 模块 basename 不得
 > 出现在两个 package，并探测 SDK 编译器能导入真实 std 模块。
@@ -332,17 +331,24 @@ d.remove("age");
 | `put(key: K, val: V)` | | 插入/更新 |
 | `insert(key, val)` | | 同 put() |
 | `get(key: K)` | `-> V where V: Default + Clone` | 克隆值；缺少 key 时返回默认值 |
+| `try_get(key: K)` | `-> Option<V> where V: Clone` | 返回独立拥有的克隆，缺少 key 时返回 None |
+| `get_ptr(key: K)` | `-> *V where K: Clone, V: Default` | 返回存储指针；缺少 key 时克隆 key 并插入默认值 |
 | `contains(key: K)` | `-> bool` | 是否包含 key |
 | `remove(key: K)` | `-> bool` | 删除 |
 | `isEmpty()` | `-> bool` | 是否为空 |
 | `count()` | `-> i64` | 元素数量 |
 | `length()` | `-> i64` | 同 count() |
 | `size()` | `-> i64` | 同 count() |
-| `keys()` | `-> Vec<K>` | 所有 key |
-| `values()` | `-> Vec<V>` | 所有 value |
+| `keys()` | `-> Vec<K> where K: Clone` | 所有 key 的独立克隆 |
+| `values_vec()` | `-> Vec<V> where V: Clone` | 所有 value 的独立克隆 |
+| `values()` | `-> DictValIterator` | 旧的 i64 值迭代接口；泛型值使用 values_vec() |
 | `iter()` | `-> DictEntryIterator` | 迭代器 |
 | `clear()` | | 清空 |
 | `destroy()` | | 释放内存 |
+
+Dict 拥有存入的键和值。覆盖值会析构旧值，删除会析构键和值，清空及作用域结束会
+清理仍占用的条目。读取和快照返回的克隆由调用方清理，不能当作表内元素的借用。
+`get_ptr` 借用传入的查询键，只在缺失时克隆它；返回指针会因删除、清空、析构或扩容失效。
 
 `Vec<T>` 在 `T: Clone` 时实现 `Clone`；`Dict<K,V>` 在键和值都满足 `Clone`
 且键满足 `Hashable + Eq` 时实现 `Clone`。这两个约束只限制克隆操作。
@@ -386,25 +392,37 @@ let front = q.dequeue(); // → 1
 ```
 
 ### Stack 方法
+
 | 方法 | 说明 |
 |------|------|
 | `push(val: T)` | 入栈 |
-| `pop() -> T` | 出栈 |
-| `peek() -> T` | 查看栈顶 |
+| `pop() -> T` | 出栈，转移元素所有权 |
+| `peek() -> T where T: Clone` | 克隆栈顶，保留源元素 |
 | `isEmpty() -> bool` | 是否为空 |
-| `clear()` | 清空 |
-| `destroy()` | 释放 |
+| `clear()` | 析构全部剩余元素并清空 |
+| `destroy()` | 清空并释放存储，可重复调用 |
 
 ### Queue 方法
+
 | 方法 | 说明 |
 |------|------|
 | `enqueue(val: T)` | 入队 |
-| `dequeue() -> T` | 出队 |
-| `peek() -> T` | 查看队首 |
+| `dequeue() -> T` | 出队，转移元素所有权 |
+| `peek() -> T where T: Clone` | 克隆队首，保留源元素 |
 | `len() -> i64` | 长度 |
 | `isEmpty() -> bool` | 是否为空 |
-| `clear()` | 清空 |
-| `destroy()` | 释放 |
+| `clear()` | 析构全部剩余元素并清空 |
+| `destroy()` | 清空并释放存储，可重复调用 |
+
+`push` / `enqueue` 接管传入值；`get`、`peek` 和 `clone` 返回独立副本，要求 `T: Clone`。
+`set` 先析构旧值，再接管新值。只插入、移出和清理不可克隆元素时，不要求实现 Clone。
+`get_ptr` 借用容器存储，容器必须比指针存活得更久，借用期间不得扩容或移除元素。
+`Vec.from_array`、`Stack.from_array`、`Queue.from_array` 克隆调用方提供的裸指针范围，
+由调用方保证存在 `n` 个有效元素；源元素保留所有权，在调用结束前必须保持有效。
+
+原始 `str` 仍有编译器限制：普通方法的返回值未必取得自动作用域或临时值清理。
+通过这些 API 取得拥有存储的 `str` 后，使用完须显式调用 `str_drop`；借用视图不得按拥有值释放。
+需要自动作用域清理时使用 `String`。
 
 ---
 
@@ -421,6 +439,11 @@ Vec 的 for-in 经 `iter()` 取得视图，`next()` 调用元素的 Clone 并返
 每轮结束清理产生的拥有值，移出循环时转移清理责任。拥有元素的数组离开作用域时逆序清理。
 `[owner; N]` 不允许重复非 Copy 的资源句柄，需分别构造各元素。
 DCI shared_abi 展开帧目前拒绝拥有此类数组，因为数组的结构化异常清理尚未实现。
+
+裸存储中的拥有值通过类型化赋值转移，例如 `unsafe { *(slot as *T) = value; }`。
+调用者必须保证地址对齐、容量足够，并已清理旧值或使用未初始化的存储；接收方负责
+新值的最终清理。C `memcpy` / `memmove` 只复制字节，即使复制完整对象也不会转移
+源对象的所有权。不得把拥有值的字节副本再当成第二个独立拥有者。
 
 `Display.display()` 可返回借用的 str 视图，或向调用方转移新建文本的所有权。
 控制台输出会在写完后释放新建的格式化文本。自定义实现引用已有存储时，须返回真正的

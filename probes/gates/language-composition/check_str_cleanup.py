@@ -23,8 +23,13 @@ def main():
         return 77
     here = Path(__file__).resolve().parent
     clone_counts = {'str_clone_iteration': 4, 'str_array_iteration': 4,
+        'str_move_iteration': -1, 'str_typed_storage': -1, 'owned_dict_lifetime': -1,
+        'owned_dict_keys': -1, 'owned_match_payload': -1,
+        'owned_stack_lifetime': -1, 'owned_queue_lifetime': -1,
+        'owned_vec_from_array': -1, 'stack_queue_str_lifetime': -1,
         'owned_array_clone': -1, 'owned_array_lifetime': -1, 'format_cleanup': 5,
-        'conditional_raw_param_lifetime': -1, 'conditional_owned_param_lifetime': -1,
+        'conditional_raw_param_lifetime': -1, 'raw_copy_param_lifetime': -1,
+        'conditional_owned_param_lifetime': -1,
         'named_owned_arguments': -1, 'ordinary_args_ownership': -1}
     selected = args.cases.split(',')
     if len(set(selected)) != len(selected) or any(name not in clone_counts for name in selected):
@@ -49,7 +54,8 @@ def main():
                 'source_sha256': digest(source), 'build': build, 'pass': False}
             if succeeded(build):
                 text = ir.read_text(encoding='utf8')
-                hooks = {'malloc': 'probe_malloc', 'calloc': 'probe_calloc', 'free': 'probe_free'}
+                hooks = {'malloc': 'probe_malloc', 'calloc': 'probe_calloc',
+                         'realloc': 'probe_realloc', 'free': 'probe_free'}
                 for symbol, hook in hooks.items():
                     text = re.sub(r'@(vyx_runtime_'+symbol+'|'+symbol+r')(?=[(\s])', '@'+hook, text)
                 for symbol, hook in (('vyx_string_clone_len_abi', 'probe_clone'), ('vyx_string_alloc_abi', 'probe_string_alloc'),

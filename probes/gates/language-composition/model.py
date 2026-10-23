@@ -65,6 +65,8 @@ RULES = tuple(Rule(name, features) for name, features in [
     ("closure_loop", ("closure", "inferred_return", "while", "i64")),
     ("next_only_iterator", ("foreach", "Option_exhaustion", "next_only", "single_evaluation")),
     ("borrowed_owned_vec", ("Vec", "String", "Clone", "shared_borrow", "drop")),
+    ("owned_dict", ("Dict", "String", "Clone", "replace", "remove", "drop")),
+    ("owned_linear", ("Stack", "Queue", "String", "Clone", "move", "clear", "drop")),
     ("owned_array", ("array", "Clone", "shared_borrow", "drop", "single_evaluation")),
     ("inherited_iterator", ("foreach", "nominal_inheritance", "next_only", "Option_exhaustion")),
 ])
@@ -166,6 +168,8 @@ def oracle(case):
         elif rule == "closure_loop": value += 7
         elif rule == "next_only_iterator": value = 2 * value + 3; calls += 3
         elif rule == "borrowed_owned_vec": value += len(str(value)) + len("stable heap payload larger than inline storage")
+        elif rule == "owned_dict": value = 3 * value + 6; calls += 3; drops += 6
+        elif rule == "owned_linear": value = 3 * value + 2; calls += 3; drops += 6
         elif rule == "owned_array": value = 2 * value + 21; calls += 2; drops += 4
         elif rule == "inherited_iterator": value = 2 * value + 3; calls += 3
         else: raise ValueError(f"unknown production {rule}")
@@ -185,6 +189,98 @@ public fn report(id: str, value: i64) {
 }
 '''
 SUPPORT = {
+    "owned_linear": '''use std.clone;
+public class LinearOwned {
+    public value: i64;
+    public text: String;
+    public fn drop(&mut self) { drops += 1; self.text.drop(); }
+}
+public fn linear_owned_value(value: i64) -> LinearOwned {
+    return LinearOwned { value: value, text: String.from("linear container payload owns independent heap storage") };
+}
+impl Clone for LinearOwned {
+    fn clone(&self) -> LinearOwned {
+        calls += 1;
+        return LinearOwned { value: self.value, text: self.text.clone() };
+    }
+}
+public fn linear_owned_observation(value: i64) -> i64 {
+    var total: i64 = 0;
+    {
+        var stack = Stack::<LinearOwned>.new();
+        var queue = Queue::<LinearOwned>.new();
+        stack.push(linear_owned_value(value));
+        stack.push(linear_owned_value(value + 1));
+        queue.enqueue(stack.pop());
+        {
+            let copy = stack.peek();
+            if (copy.text.as_str() != "linear container payload owns independent heap storage") { rule_errors += 1; }
+            total += copy.value;
+        }
+        stack.set(0, linear_owned_value(value + 2));
+        {
+            let copy = queue.get(0);
+            if (copy.text.as_str() != "linear container payload owns independent heap storage") { rule_errors += 1; }
+            total += copy.value;
+        }
+        {
+            var snapshot = queue.clone();
+            let item = snapshot.dequeue();
+            if (item.text.as_str() != "linear container payload owns independent heap storage") { rule_errors += 1; }
+            total += item.value;
+        }
+        stack.clear();
+        queue.clear();
+    }
+    return total;
+}
+''',
+    "owned_dict": '''use std.clone;
+use std.defaults;
+public class DictOwned {
+    public value: i64;
+    public text: String;
+    public fn drop(&mut self) { drops += 1; self.text.drop(); }
+}
+public fn dict_owned_value(value: i64) -> DictOwned {
+    return DictOwned { value: value, text: String.from("owned dictionary payload must remain independent beyond inline capacity") };
+}
+impl Default for DictOwned {
+    static fn default_value() -> DictOwned { return dict_owned_value(0); }
+}
+impl Clone for DictOwned {
+    fn clone(&self) -> DictOwned {
+        calls += 1;
+        return DictOwned { value: self.value, text: self.text.clone() };
+    }
+}
+public fn dict_owned_observation(value: i64) -> i64 {
+    var total: i64 = 0;
+    {
+        var values = Dict::<i64, DictOwned>.new();
+        values.put(1, dict_owned_value(value));
+        values.put(1, dict_owned_value(value + 2));
+        {
+            let copy = values.get(1);
+            if (copy.text.as_str() != "owned dictionary payload must remain independent beyond inline capacity") { rule_errors += 1; }
+            total += copy.value;
+        }
+        {
+            match (values.try_get(1)) {
+                Some(copy) => { total += copy.value; }
+                None => { rule_errors += 1; }
+            }
+        }
+        {
+            let copies = values.values_vec();
+            total += copies.get_ref(0).value;
+        }
+        if (!values.remove(1)) { rule_errors += 1; }
+        values.put(2, dict_owned_value(value + 3));
+    }
+    return total;
+}
+''',
     "args_parameter": '''public fn args_identity<T>(args: T) -> T { return args; }
 ''',
     "pipe_default": '''public fn pipe_default_target(value: i64 = 999, delta: i64 = 3) -> i64 {
@@ -623,6 +719,8 @@ class Emitter:
             elif rule == "next_only_iterator": expr = f"sum_pull({expr})"
             elif rule == "owned_array": expr = f"sum_owned_array({expr})"
             elif rule == "inherited_iterator": expr = f"sum_inherited({expr})"
+            elif rule == "owned_dict": expr = f"dict_owned_observation({expr})"
+            elif rule == "owned_linear": expr = f"linear_owned_observation({expr})"
             elif rule == "borrowed_owned_vec":
                 x, obj, total = self.bind(expr), self.name("strings"), self.name("lengths")
                 stable = "stable heap payload larger than inline storage"
