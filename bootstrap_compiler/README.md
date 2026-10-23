@@ -150,7 +150,9 @@ The [source tree map](src/README.md) lists subsystem boundaries and entry points
 - [Linux x86_64](https://github.com/vyx-lang/vyx/releases/latest/download/vyx-sdk-linux-x86_64-llvm22.tar.gz)
 
 `scripts/package_sdk.ps1` writes local packages under the Git-ignored repository
-`dist/` directory. Published packages are downloaded through Releases.
+`dist/` directory. Automated builds and dated release tags are documented in
+[SDK releases](scripts/release/README.md).
+Published packages are downloaded through Releases.
 See [distribution verification](../docs/TESTING_GUIDE.md#distribution-packages).
 
 For editor tools, first build the current SDK compiler and matching runtime,
