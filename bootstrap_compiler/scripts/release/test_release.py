@@ -132,7 +132,7 @@ class ReleaseTests(unittest.TestCase):
             with patch.object(BrewDependencyResolver, "_install_name",
                               return_value=("/opt/homebrew/opt/z3/lib/libz3.4.16.dylib",)):
                 self.assertEqual(resolver._formula_library("z3", Path("lib/libz3.4.16.dylib")),
-                                 library)
+                                 library.resolve())
 
     def test_termux_upgrade_from_historically_misnumbered_package(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
