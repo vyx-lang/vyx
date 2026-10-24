@@ -111,8 +111,11 @@ def main():
         project = output / "project"
         shutil.copytree(Path(__file__).parent / "project", project)
         result = subprocess.run([str(compiler), "build", "--run=aot", "-j1"], cwd=project,
-                                text=True, capture_output=True, timeout=120, check=True)
+                                text=True, capture_output=True, timeout=120, check=False)
         print(result.stdout, end="", flush=True)
+        if result.stderr:
+            print(result.stderr, end="", flush=True)
+        result.check_returncode()
         if not re.search(r"(?m)^4429\r?$", result.stdout):
             raise AssertionError(f"StringBuilder project did not print 4429: {result.stderr}")
         print("PASS SDK project build and StringBuilder execution", flush=True)

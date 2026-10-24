@@ -39,6 +39,15 @@ Windows LLVM preparation streams the XZ archive once and extracts only headers,
 static libraries, Clang resources and required tools. Prepared development files
 are cached by LLVM archive identity. Dependency preparation has a 15-minute
 limit; compiler steps print elapsed time every 30 seconds and retain failure logs.
+The compile step has a 150-minute limit within the 180-minute native job, leaving
+time to upload diagnostics when compilation times out. Android depends on the
+Linux x64 job directly; it does not wait for Windows or Linux AArch64.
+
+The native bridge also runs the [string scan gate](../../../../probes/gates/runtime-string-scan/README.md)
+before compiling Vyx. Its POSIX compatibility scanner stops at NUL and bounds
+page checks by the requested input. A former fixed 1 MiB page walk caused
+millions of `mincore` calls during short string operations on Linux. The gate
+checks syscall count and read-protected page boundaries on the actual bridge.
 
 All four archives, their SHA-256 sidecars and source identities must be present
 before publishing. The tag reads `[package].version` from `Vyx.toml` and appends

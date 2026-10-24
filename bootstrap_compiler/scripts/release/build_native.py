@@ -151,6 +151,9 @@ def main():
         record["bootstrap_codegen_backend_sha256"] = sha256(backend)
         run([sys.executable, REPO / "probes/gates/aot-portability/run.py", "--backend", backend,
              "--output", work / "baseline-isa"], env=environment)
+        run([sys.executable, REPO / "probes/gates/runtime-string-scan/run.py", "--backend", backend,
+             "--cxx", args.llvm_root.resolve() / "bin" / ("clang++.exe" if windows else "clang++"),
+             "--output", work / "runtime-string-scan"], env=environment)
         run([compiler, "--version"], env=environment)
         run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
     finally:
