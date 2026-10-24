@@ -77,12 +77,12 @@ def dependency_rewrite(name, destination, prefix):
     """Expand bottle placeholders so dependency resolution is deterministic."""
     destination, prefix = Path(destination), Path(prefix)
     replacements = {
-        "@@HOMEBREW_PREFIX@@": str(prefix),
-        "@@HOMEBREW_CELLAR@@": str(prefix / "Cellar"),
-        "@@HOMEBREW_PREFIX@@/opt/llvm": str(destination),
-        "@@HOMEBREW_CELLAR@@/llvm/22.1.8": str(destination),
-        str(prefix / "opt" / "llvm"): str(destination),
-        str(prefix / "Cellar" / "llvm" / "22.1.8"): str(destination),
+        "@@HOMEBREW_PREFIX@@": prefix.as_posix(),
+        "@@HOMEBREW_CELLAR@@": (prefix / "Cellar").as_posix(),
+        "@@HOMEBREW_PREFIX@@/opt/llvm": destination.as_posix(),
+        "@@HOMEBREW_CELLAR@@/llvm/22.1.8": destination.as_posix(),
+        (prefix / "opt" / "llvm").as_posix(): destination.as_posix(),
+        (prefix / "Cellar" / "llvm" / "22.1.8").as_posix(): destination.as_posix(),
     }
     result = name
     # The longer substitutions must win over the generic placeholders.
