@@ -169,6 +169,13 @@ def relocate_dependencies(destination, prefix):
             if system_dependency(name):
                 continue
             dependency = resolver.resolve(name, source)
+            # A non-system @rpath can still resolve to a system dylib (for
+            # example libedit on macOS). Keep that dependency on the system
+            # path after removing the bottle's rpaths; never copy platform
+            # libraries into the SDK.
+            if system_dependency(str(dependency)):
+                changes += ["-change", name, str(dependency)]
+                continue
             try:
                 dependency.relative_to(destination)
                 library = dependency
@@ -188,11 +195,12 @@ def relocate_dependencies(destination, prefix):
             changes += ["-change", name, "@rpath/" + library.name]
         if target.suffix == ".dylib":
             changes += ["-id", "@rpath/" + target.name]
+        source_rpaths = macho_rpaths(source)
         desired = "@loader_path" if target.parent == destination / "lib" else "@loader_path/../lib"
-        for old in macho_rpaths(source):
+        for old in source_rpaths:
             if old != desired:
                 changes += ["-delete_rpath", old]
-        if desired not in macho_rpaths(source):
+        if desired not in source_rpaths:
             changes += ["-add_rpath", desired]
         if changes:
             subprocess.run(["install_name_tool", *changes, str(target)], check=True)
