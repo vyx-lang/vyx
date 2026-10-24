@@ -1,6 +1,12 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#endif
 
 #include <stdint.h>
 #include <stdlib.h>

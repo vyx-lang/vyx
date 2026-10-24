@@ -1,3 +1,9 @@
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE
+#  ifndef _XOPEN_SOURCE
+#    define _XOPEN_SOURCE 700
+#  endif
+#endif
 /**
  *  Runtime helpers for bootstrap-generated IR (string predicates, etc.).
  *  Linked into vyx_codegen.dll so boot_a / clang links resolve symbols.
@@ -83,6 +89,11 @@ extern "C" void vyx_rt_service_string_alias(void* base, void* text);
 #  include <ucontext.h>
 #  include <pthread.h>
 #  define VYX_RT_ABI __attribute__((visibility("default")))
+#  if defined(__APPLE__)
+#    include <mach/mach.h>
+#    include <mach/mach_host.h>
+#    include <sys/sysctl.h>
+#  endif
 #endif
 
 extern "C" VYX_RT_ABI int32_t vyx_bootstrap_link_ir_files(const char* inputs, const char* output) {
@@ -1901,12 +1912,19 @@ extern "C" VYX_RT_ABI int64_t vyx_rt_system_total_physical_bytes() {
     }
     return static_cast<int64_t>(status.ullTotalPhys);
 #else
+#if defined(__APPLE__)
+    uint64_t bytes = 0;
+    size_t size = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0 || bytes > INT64_MAX) return -1;
+    return static_cast<int64_t>(bytes);
+#else
     const long pages = sysconf(_SC_PHYS_PAGES);
     const long page_size = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_size <= 0) {
         return -1;
     }
     return static_cast<int64_t>(pages) * static_cast<int64_t>(page_size);
+#endif
 #endif
 }
 
@@ -1919,12 +1937,27 @@ extern "C" VYX_RT_ABI int64_t vyx_rt_system_available_physical_bytes() {
     }
     return static_cast<int64_t>(status.ullAvailPhys);
 #else
+#if defined(__APPLE__)
+    const mach_port_t host = mach_host_self();
+    vm_size_t page_size = 0;
+    vm_statistics64_data_t memory{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    const auto page_rc = host_page_size(host, &page_size);
+    const auto stats_rc = host_statistics64(host, HOST_VM_INFO64,
+        reinterpret_cast<host_info64_t>(&memory), &count);
+    mach_port_deallocate(mach_task_self(), host);
+    if (page_rc != KERN_SUCCESS || stats_rc != KERN_SUCCESS) return -1;
+    const uint64_t pages = static_cast<uint64_t>(memory.free_count) + memory.inactive_count;
+    if (page_size == 0 || pages > static_cast<uint64_t>(INT64_MAX) / page_size) return -1;
+    return static_cast<int64_t>(pages * page_size);
+#else
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long page_size = sysconf(_SC_PAGESIZE);
     if (pages <= 0 || page_size <= 0) {
         return -1;
     }
     return static_cast<int64_t>(pages) * static_cast<int64_t>(page_size);
+#endif
 #endif
 }
 

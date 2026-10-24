@@ -18,9 +18,12 @@ SDK_NAMES = (
     "vyx-sdk-linux-x86_64-llvm22.tar.gz",
     "vyx-sdk-linux-aarch64-llvm22.tar.gz",
     "vyx-sdk-termux-aarch64.deb",
+    "vyx-sdk-macos-aarch64-llvm22.tar.gz",
+    "vyx-sdk-macos-x86_64-llvm22.tar.gz",
 )
 RECORD_NAMES = ("SDK-BUILD.windows-x86_64.json", "SDK-BUILD.linux-x86_64.json",
-                "SDK-BUILD.linux-aarch64.json", "SDK-BUILD.android-aarch64.json")
+                "SDK-BUILD.linux-aarch64.json", "SDK-BUILD.android-aarch64.json",
+                "SDK-BUILD.macos-aarch64.json", "SDK-BUILD.macos-x86_64.json")
 
 
 def tag_candidate(version, day, ordinal):
@@ -112,7 +115,7 @@ def main():
         "tag_name": tag, "target_commitish": args.commit, "name": "Vyx " + tag,
         "draft": True, "prerelease": False,
         "body": f"SDK source: `{args.commit}`\n\n"
-                "Windows x64, Linux x64 / AArch64, Android Termux AArch64.\n"
+                "Windows x64, Linux x64 / AArch64, Android Termux AArch64, macOS Apple Silicon / Intel.\n"
                 "SHA-256 sidecars and build identities are attached.\n\n"
                 "Early access build; the date suffix identifies this build, not a new stability level.\n",
     })

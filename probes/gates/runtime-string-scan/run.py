@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 
 def main():
@@ -29,7 +30,7 @@ def main():
                str(Path(__file__).with_name("probe.cpp")), "-o", str(executable)]
     if args.unit:
         command += ["-DVYX_SCAN_UNIT"]
-    if os.name != "nt":
+    if sys.platform == "linux":
         command += ["-ldl", "-Wl,--export-dynamic"]
     subprocess.run(command, check=True)
     environment = os.environ.copy()

@@ -47,6 +47,12 @@ built SDK compiler with its matching backend/runtime to validate the checkout.
 See the [testing guide](../docs/TESTING_GUIDE.md) for Linux commands,
 fixed-point builds, runtime paths, and validation.
 
+macOS has two bootstrap entries: export Apple-target Mach-O objects from a
+Windows/Linux SDK and link them on a Mac, or build directly with a released
+native macOS SDK. Both continue through native self-hosting. See
+[macOS release builds](scripts/release/README.md#macos-bootstrap-paths) for
+Apple Silicon / Intel commands, required Apple tools, and package checks.
+
 ## Backend
 
 Project commands use one manifest builder:

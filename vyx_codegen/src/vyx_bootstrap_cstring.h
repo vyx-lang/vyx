@@ -11,6 +11,10 @@
 #else
 #  include <sys/mman.h>
 #  include <unistd.h>
+#  if defined(__APPLE__)
+#    include <mach/mach.h>
+#    include <mach/mach_vm.h>
+#  endif
 #endif
 
 // Compatibility for pointer-only bootstrap string APIs. Explicit registered
@@ -68,12 +72,27 @@ static uint64_t vyx_rt_readable_span(const char* s, uint64_t limit) {
     }
     std::fclose(maps);
     return std::min(limit, end - address);
+#elif defined(__APPLE__)
+    mach_vm_address_t end = address;
+    while (end - address < limit) {
+        mach_vm_address_t region = end;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const auto rc = mach_vm_region(mach_task_self(), &region, &size,
+            VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+        if (rc != KERN_SUCCESS || region > end || !(info.protection & VM_PROT_READ)) break;
+        end = region + size;
+    }
+    return std::min(limit, static_cast<uint64_t>(end - address));
 #else
     // Other POSIX hosts retain the mapping check, bounded by the requested
     // input length rather than prefetching a fixed 1 MiB for every operation.
     uint64_t span = first_page;
     while (span < limit) {
-        unsigned char residency = 0;
+        char residency = 0;
         if (mincore(reinterpret_cast<void*>(address + span), page, &residency) != 0) break;
         span += std::min(page, limit - span);
     }

@@ -134,7 +134,7 @@ class ReleaseTests(unittest.TestCase):
                 checksum_sidecar(package)
                 (directory / record).write_text(json.dumps({"source_commit": commit,
                     "archive_sha256": sha256(package), "archive_bytes": package.stat().st_size}))
-            self.assertEqual(len(validate_assets(directory, commit)), 12)
+            self.assertEqual(len(validate_assets(directory, commit)), 18)
             with self.assertRaisesRegex(ValueError, "identity mismatch"):
                 validate_assets(directory, "b" * 40)
             (directory / SDK_NAMES[0]).write_bytes(b"corrupt sdk")

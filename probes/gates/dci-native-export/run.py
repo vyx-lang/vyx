@@ -264,6 +264,7 @@ def main():
             write(cache / "verification.json", json.dumps({
                 "compiler": str(compiler), "sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
                 "backend_sha256": hashlib.sha256((compiler.parent / ("vyx_compiler_backend.dll" if windows
+                    else "libvyx_compiler_backend.dylib" if sys.platform == "darwin"
                     else "libvyx_compiler_backend.so")).read_bytes()).hexdigest(),
                 "runtime_sha256": hashlib.sha256(compiler_runtime_path(compiler, windows).read_bytes()).hexdigest(),
                 "triplet": args.triplet, "result": "PASS", "file_aot": True, "project_aot": True,
