@@ -81,6 +81,8 @@ def dependency_rewrite(name, destination, prefix):
         "@@HOMEBREW_CELLAR@@": str(prefix / "Cellar"),
         "@@HOMEBREW_PREFIX@@/opt/llvm": str(destination),
         "@@HOMEBREW_CELLAR@@/llvm/22.1.8": str(destination),
+        str(prefix / "opt" / "llvm"): str(destination),
+        str(prefix / "Cellar" / "llvm" / "22.1.8"): str(destination),
     }
     result = name
     # The longer substitutions must win over the generic placeholders.

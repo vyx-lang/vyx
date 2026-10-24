@@ -108,6 +108,10 @@ class ReleaseTests(unittest.TestCase):
         rewritten_zstd = dependency_rewrite(
             "@@HOMEBREW_PREFIX@@/opt/zstd/lib/libzstd.1.dylib", destination, prefix)
         self.assertTrue(rewritten_zstd.replace("\\", "/").endswith("/opt/homebrew/opt/zstd/lib/libzstd.1.dylib"))
+        rewritten_installed_llvm = dependency_rewrite(
+            prefix.as_posix().replace("\\", "/") + "/opt/llvm/lib/libLLVM.dylib",
+            destination, prefix)
+        self.assertTrue(rewritten_installed_llvm.replace("\\", "/").endswith("/tmp/llvm-22/lib/libLLVM.dylib"))
 
     def test_termux_upgrade_from_historically_misnumbered_package(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
