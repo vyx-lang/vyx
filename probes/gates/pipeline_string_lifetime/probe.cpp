@@ -40,28 +40,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "FAIL unknown direct-cache pointer reused stale length\n"); return 11;
     }
 
-    bool reused = false;
-    for (int attempt = 0; attempt < 1024 && !reused; ++attempt) {
-        char* first = static_cast<char*>(std::malloc(128));
-        if (!first) { return 12; }
-        std::strcpy(first, "first lifetime");
-        if (length(first) != 14) { std::free(first); return 13; }
-        const auto address = reinterpret_cast<std::uintptr_t>(first);
-        std::free(first);
-        char* next = static_cast<char*>(std::malloc(128));
-        if (!next) { return 14; }
-        std::strcpy(next, "a new heap allocation owns the reused address");
-        if (reinterpret_cast<std::uintptr_t>(next) == address) {
-            reused = true;
-            const auto size = static_cast<int64_t>(std::strlen(next));
-            if (length(next) != size || std::strcmp(copy(next), next) != 0) {
-                std::free(next);
-                std::fprintf(stderr, "FAIL new heap lifetime inherited old length\n"); return 15;
-            }
-        }
-        std::free(next);
+    // Reserve the exact same virtual address for a second allocation lifetime.
+    // malloc/free reuse depends on the CRT heap policy and is not guaranteed
+    // even after thousands of attempts, making that old probe inconclusive.
+    char* first = static_cast<char*>(VirtualAlloc(nullptr, 4096,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!first) return 12;
+    std::strcpy(first, "first lifetime");
+    if (length(first) != 14) return 13;
+    const auto address = reinterpret_cast<std::uintptr_t>(first);
+    if (!VirtualFree(first, 0, MEM_RELEASE)) return 14;
+    char* next = static_cast<char*>(VirtualAlloc(reinterpret_cast<void*>(address), 4096,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!next || reinterpret_cast<std::uintptr_t>(next) != address) {
+        std::fprintf(stderr, "could not reserve the same virtual address\n"); return 16;
     }
-    if (!reused) { std::fprintf(stderr, "heap address reuse not observed\n"); return 16; }
+    std::strcpy(next, "a new allocation owns the reused address");
+    if (length(next) != static_cast<int64_t>(std::strlen(next))
+        || std::strcmp(copy(next), next) != 0) {
+        std::fprintf(stderr, "FAIL new lifetime inherited old length\n"); return 15;
+    }
+    VirtualFree(next, 0, MEM_RELEASE);
 
     char registered[5] = {'a', '\0', 'b', 'c', '\0'};
     note(registered, 4);

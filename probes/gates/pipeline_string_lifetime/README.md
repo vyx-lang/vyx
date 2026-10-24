@@ -41,8 +41,9 @@ on that compatibility scanner.
 
 - Same stack address with different C-string lengths, including direct-cache
   lookup after another query.
-- A freed/reallocated heap address with a new string length; the probe requires
-  actual address reuse to occur.
+- An allocation released and recreated at the exact same virtual address with a
+  new string length. Explicit address reservation avoids dependence on CRT
+  heap reuse heuristics.
 - Registered embedded-NUL views, forget/re-query, explicit-length copies and
   null C strings.
 - A valid C string larger than 1 MiB, without silent truncation.

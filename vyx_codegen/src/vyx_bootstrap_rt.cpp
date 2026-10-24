@@ -1187,77 +1187,7 @@ static bool vyx_rt_arena_string_len(const char* s, uint64_t& out) {
     return false;
 }
 
-// Seed-compiled `.charAt` / `.substring` / concat only pass a `char*`.
-// Many compiler strings are length-bounded views (no trailing NUL).
-// Unbounded `strlen`/`strstr` into those views is the 0xC0000005.
-static uint64_t vyx_rt_readable_span(const char* s) {
-    if (!s) {
-        return 0;
-    }
-#ifdef _WIN32
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(s, &mbi, sizeof(mbi)) == 0) {
-        return 0;
-    }
-    if (mbi.State != MEM_COMMIT) {
-        return 0;
-    }
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
-        return 0;
-    }
-    const DWORD prot = mbi.Protect & 0xff;
-    const bool readable =
-        prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
-        prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
-        prot == PAGE_EXECUTE_WRITECOPY;
-    if (!readable) {
-        return 0;
-    }
-    const auto* begin = static_cast<const char*>(mbi.BaseAddress);
-    const auto* end = begin + mbi.RegionSize;
-    if (s < begin || s >= end) {
-        return 0;
-    }
-    return static_cast<uint64_t>(end - s);
-#else
-    const long page_long = sysconf(_SC_PAGESIZE);
-    const std::size_t page =
-        page_long > 0 ? static_cast<std::size_t>(page_long) : static_cast<std::size_t>(4096);
-    const auto addr = reinterpret_cast<std::uintptr_t>(s);
-    const auto page_end = (addr + page) & ~(static_cast<std::uintptr_t>(page) - 1u);
-    uint64_t span = static_cast<uint64_t>(page_end - addr);
-    constexpr uint64_t kCap = 1ull << 20;
-    auto* p = reinterpret_cast<unsigned char*>(page_end);
-    while (span < kCap) {
-        char vec = 0;
-        if (mincore(p, page, reinterpret_cast<unsigned char*>(&vec)) != 0) {
-            break;
-        }
-        span += static_cast<uint64_t>(page);
-        p += page;
-    }
-    return span > kCap ? kCap : span;
-#endif
-}
-
-static uint64_t vyx_rt_bounded_cstr_len(const char* s) {
-    constexpr uint64_t kScanCap = 1ull << 20;
-    uint64_t maxn = vyx_rt_readable_span(s);
-    if (maxn > kScanCap) {
-        maxn = kScanCap;
-    }
-    for (uint64_t i = 0; i < maxn; ++i) {
-        if (s[i] == '\0') {
-            return i;
-        }
-    }
-    return maxn;
-}
-
-static uint64_t vyx_rt_clip_string_len(const char* s, uint64_t len) {
-    const uint64_t span = vyx_rt_readable_span(s);
-    return len < span ? len : span;
-}
+#include "vyx_bootstrap_cstring.h"
 
 #ifdef _WIN32
 static LONG CALLBACK vyx_rt_av_veh(PEXCEPTION_POINTERS info) {
