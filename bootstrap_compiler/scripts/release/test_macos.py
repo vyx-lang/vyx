@@ -79,7 +79,7 @@ class MacOSInputs(unittest.TestCase):
                     resolve_dependency("@rpath/libLLVM.dylib", root / "clang", roots)
                 (roots[1] / "libLLVM.dylib").write_bytes(b"one")
                 self.assertEqual(resolve_dependency("@rpath/libLLVM.dylib", root / "clang", roots),
-                                 roots[0] / "libLLVM.dylib")
+                                 (roots[0] / "libLLVM.dylib").resolve())
 
 
 if __name__ == "__main__":

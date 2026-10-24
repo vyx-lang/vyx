@@ -58,13 +58,17 @@ def executable_content(path):
                            "sha256": hashlib.sha256(data[offset + 8:offset + 24]).hexdigest()})
             data[offset + 8:offset + 24] = b"\0" * 16
         elif command == 0x1D:  # LC_CODE_SIGNATURE
+            if length != 16:
+                raise ValueError("Invalid LC_CODE_SIGNATURE command")
             start, count = struct.unpack_from("<II", data, offset + 8)
-            if start + count > len(data):
+            if start < 32 + size or start + count != len(data):
                 raise ValueError("Invalid LC_CODE_SIGNATURE")
             fields.append({"kind": "LC_CODE_SIGNATURE", "offset": start, "size": count,
                            "sha256": hashlib.sha256(data[start:start + count]).hexdigest()})
             data[start:start + count] = b"\0" * count
         offset += length
+    if offset != 32 + size:
+        raise ValueError("Mach-O load command size mismatch")
     return {"content_sha256": hashlib.sha256(data).hexdigest(), "metadata": fields}
 
 

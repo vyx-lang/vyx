@@ -80,6 +80,7 @@ def export(args):
     record = {"schema": 1, "arch": args.arch, "triple": TRIPLES[args.arch],
               "source_commit": source_commit(), "objects": objects,
               "export_host": platform.platform(), "compiler_sha256": sha256(compiler),
+              "codegen_backend_sha256": sha256(sdk / "bin" / ("vyx_compiler_backend.dll" if os.name == "nt" else "libvyx_compiler_backend.so")),
               "sdk_manifest_sha256": sha256(sdk / "SDK-MANIFEST.json"),
               "compiler_version": subprocess.check_output([compiler, "--version"], env=environment, text=True).strip()}
     (output / "BOOTSTRAP.json").write_text(json.dumps(record, indent=2) + "\n")
