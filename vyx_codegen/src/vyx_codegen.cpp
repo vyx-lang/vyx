@@ -1635,6 +1635,40 @@ extern "C" VYX_API uint64_t vyx_rt_default_target_triple(char* buf, uint64_t cap
     return required;
 }
 
+extern "C" VYX_API int32_t vyx_rt_target_runtime_compatible(const char* target,
+                                                            uint64_t target_len,
+                                                            const char* host,
+                                                            uint64_t host_len) {
+    if (!target || !target_len || !host || !host_len) return 0;
+    const llvm::Triple requested(llvm::Triple::normalize(asStr(target, target_len)));
+    const llvm::Triple native(llvm::Triple::normalize(asStr(host, host_len)));
+    if (requested.getArch() == llvm::Triple::UnknownArch ||
+        native.getArch() == llvm::Triple::UnknownArch) return 0;
+    if (requested.str() == native.str()) return 1;
+    // Preserve the project driver's existing pc/unknown vendor equivalence,
+    // with every other parsed component unchanged.
+    const auto generic_vendor = [](llvm::Triple::VendorType vendor) {
+        return vendor == llvm::Triple::PC || vendor == llvm::Triple::UnknownVendor;
+    };
+    if (generic_vendor(requested.getVendor()) && generic_vendor(native.getVendor()) &&
+        requested.getArchName() == native.getArchName() &&
+        requested.getSubArch() == native.getSubArch() &&
+        requested.getOSName() == native.getOSName() &&
+        requested.getEnvironmentName() == native.getEnvironmentName() &&
+        requested.getObjectFormat() == native.getObjectFormat()) return 1;
+    // LLVM reports the host as Darwin, while an explicit deployment target
+    // uses macosx. Compare their parsed ABI, not version-bearing spellings.
+    // iOS, simulators, Catalyst, arm64e and foreign object formats stay separate.
+    return requested.isMacOSX() && native.isMacOSX() &&
+           requested.getVendor() == llvm::Triple::Apple &&
+           native.getVendor() == llvm::Triple::Apple &&
+           requested.getArch() == native.getArch() &&
+           requested.getSubArch() == native.getSubArch() &&
+           requested.getEnvironmentName() == native.getEnvironmentName() &&
+           requested.getObjectFormat() == llvm::Triple::MachO &&
+           native.getObjectFormat() == llvm::Triple::MachO;
+}
+
 extern "C" VYX_API uint64_t vyx_rt_validate_target_triple(const char* triple,
                                                             uint64_t triple_len,
                                                             char* buf,

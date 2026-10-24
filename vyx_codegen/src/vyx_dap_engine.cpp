@@ -5,7 +5,9 @@
 #include <string>
 #include <vector>
 
-#ifndef _WIN32
+// The in-process ptrace/DWARF engine is Linux-specific. Other hosts
+// report it unavailable. SDKs that ship DAP use the external LLDB adapter.
+#if defined(__linux__)
 #include <cerrno>
 #include <fcntl.h>
 #include <signal.h>
@@ -36,7 +38,7 @@ int copy_out(char* buf, int32_t cap, const std::string& text) {
     return use;
 }
 
-#ifndef _WIN32
+#if defined(__linux__)
 
 struct LineEntry {
     std::string file;
@@ -284,7 +286,7 @@ int wait_once(std::string& reason) {
 }  // namespace
 
 extern "C" VYX_API int32_t vyx_dap_engine_available(void) {
-#ifdef _WIN32
+#if !defined(__linux__)
     return 0;
 #else
     return 1;
@@ -292,7 +294,7 @@ extern "C" VYX_API int32_t vyx_dap_engine_available(void) {
 }
 
 extern "C" VYX_API int32_t vyx_dap_launch(const char* exe, const char* cwd) {
-#ifdef _WIN32
+#if !defined(__linux__)
     (void)exe;
     (void)cwd;
     return -1;
@@ -333,7 +335,7 @@ extern "C" VYX_API int32_t vyx_dap_launch(const char* exe, const char* cwd) {
 }
 
 extern "C" VYX_API int32_t vyx_dap_set_breakpoint(const char* file, int32_t line) {
-#ifdef _WIN32
+#if !defined(__linux__)
     (void)file;
     (void)line;
     return 0;
@@ -354,7 +356,7 @@ extern "C" VYX_API int32_t vyx_dap_set_breakpoint(const char* file, int32_t line
 }
 
 extern "C" VYX_API int32_t vyx_dap_clear_breakpoints(void) {
-#ifdef _WIN32
+#if !defined(__linux__)
     return 0;
 #else
     for (auto& bp : g_eng.breaks) {
@@ -366,7 +368,7 @@ extern "C" VYX_API int32_t vyx_dap_clear_breakpoints(void) {
 }
 
 extern "C" VYX_API int32_t vyx_dap_continue(void) {
-#ifdef _WIN32
+#if !defined(__linux__)
     return -1;
 #else
     if (g_eng.pid <= 0) {
@@ -378,7 +380,7 @@ extern "C" VYX_API int32_t vyx_dap_continue(void) {
 }
 
 extern "C" VYX_API int32_t vyx_dap_step_over(void) {
-#ifdef _WIN32
+#if !defined(__linux__)
     return -1;
 #else
     if (g_eng.pid <= 0) {
@@ -398,7 +400,7 @@ extern "C" VYX_API int32_t vyx_dap_step_out(void) {
 }
 
 extern "C" VYX_API int32_t vyx_dap_pause(void) {
-#ifdef _WIN32
+#if !defined(__linux__)
     return -1;
 #else
     if (g_eng.pid <= 0) {
@@ -409,7 +411,7 @@ extern "C" VYX_API int32_t vyx_dap_pause(void) {
 }
 
 extern "C" VYX_API int32_t vyx_dap_wait_stop(char* reason, int32_t cap) {
-#ifdef _WIN32
+#if !defined(__linux__)
     (void)reason;
     (void)cap;
     return -1;
@@ -424,7 +426,7 @@ extern "C" VYX_API int32_t vyx_dap_wait_stop(char* reason, int32_t cap) {
 }
 
 extern "C" VYX_API int32_t vyx_dap_stack_json(char* buf, int32_t cap) {
-#ifdef _WIN32
+#if !defined(__linux__)
     return copy_out(buf, cap, "{\"stackFrames\":[],\"totalFrames\":0}");
 #else
     if (g_eng.pid <= 0) {
@@ -470,7 +472,7 @@ extern "C" VYX_API int32_t vyx_dap_evaluate(const char* expr, char* buf, int32_t
 }
 
 extern "C" VYX_API void vyx_dap_disconnect(void) {
-#ifdef _WIN32
+#if !defined(__linux__)
     return;
 #else
     if (g_eng.pid > 0) {

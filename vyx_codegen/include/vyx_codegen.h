@@ -118,6 +118,10 @@ VYX_API uint64_t vyx_rt_normalize_target_triple(const char* triple,
                                                  char* buf,
                                                  uint64_t cap);
 VYX_API uint64_t vyx_rt_default_target_triple(char* buf, uint64_t cap);
+/* Whether the host runtime ABI can be selected for this target. Deployment
+ * minimums remain properties of the runtime objects and the native linker. */
+VYX_API int32_t vyx_rt_target_runtime_compatible(const char* target, uint64_t target_len,
+                                                const char* host, uint64_t host_len);
 VYX_API uint64_t vyx_rt_validate_target_triple(const char* triple,
                                                 uint64_t triple_len,
                                                 char* buf,

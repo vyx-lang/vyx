@@ -8,13 +8,11 @@ import subprocess
 import tempfile
 import unittest
 import urllib.error
-from unittest.mock import patch
 
 from common import REPO, checksum_sidecar, sha256
 from build_termux import debian_version
 from build_native import bootstrap_manifest, verify_debug_adapter
-from prepare_macos_llvm import (BrewDependencyResolver, brew_formula_and_relative,
-                                dependency_rewrite, extract_pinned_z3, selected_member)
+from prepare_macos_llvm import selected_member
 from prepare_windows_llvm import extract_development, relative_member
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
 
@@ -91,61 +89,11 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     relative_member(unsafe)
 
-    def test_macos_brew_paths_are_resolved_by_formula(self):
-        prefix = Path("/opt/homebrew")
-        self.assertEqual(
-            brew_formula_and_relative(prefix / "opt/z3/lib/libz3.4.16.dylib", prefix),
-            ("z3", Path("lib/libz3.4.16.dylib")))
-        self.assertEqual(
-            brew_formula_and_relative(prefix / "Cellar/zstd/1.5.6/lib/libzstd.1.dylib", prefix),
-            ("zstd", Path("lib/libzstd.1.dylib")))
-        self.assertIsNone(brew_formula_and_relative(Path("/usr/lib/libc++.1.dylib"), prefix))
-
-    def test_macos_bottle_placeholders_prefer_sdk_paths(self):
-        destination = Path("/tmp/llvm-22")
-        prefix = Path("/opt/homebrew")
-        rewritten_llvm = dependency_rewrite(
-            "@@HOMEBREW_PREFIX@@/opt/llvm/lib/libLLVM.dylib", destination, prefix)
-        self.assertTrue(rewritten_llvm.replace("\\", "/").endswith("/tmp/llvm-22/lib/libLLVM.dylib"))
-        rewritten_zstd = dependency_rewrite(
-            "@@HOMEBREW_PREFIX@@/opt/zstd/lib/libzstd.1.dylib", destination, prefix)
-        self.assertTrue(rewritten_zstd.replace("\\", "/").endswith("/opt/homebrew/opt/zstd/lib/libzstd.1.dylib"))
-        rewritten_installed_llvm = dependency_rewrite(
-            prefix.as_posix().replace("\\", "/") + "/opt/llvm/lib/libLLVM.dylib",
-            destination, prefix)
-        self.assertTrue(rewritten_installed_llvm.replace("\\", "/").endswith("/tmp/llvm-22/lib/libLLVM.dylib"))
-
     def test_macos_bottle_excludes_unused_lldb_and_mlir_trees(self):
         self.assertTrue(selected_member(Path("lib/libLLVM.dylib")))
         self.assertTrue(selected_member(Path("lib/clang/22/lib/darwin/libclang_rt.asan_osx_dynamic.dylib")))
         self.assertFalse(selected_member(Path("lib/liblldb.22.1.8.dylib")))
         self.assertFalse(selected_member(Path("lib/libMLIR.dylib")))
-
-    def test_macos_formula_library_follows_install_name_when_keg_filename_moves(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            library = root / "z3" / "lib" / "libz3.4.16.0.dylib"
-            library.parent.mkdir(parents=True)
-            library.write_bytes(b"Mach-O fixture")
-            resolver = BrewDependencyResolver(root / "llvm", root)
-            resolver.formula_roots["z3"] = root / "z3"
-            with patch.object(BrewDependencyResolver, "_install_name",
-                              return_value=("/opt/homebrew/opt/z3/lib/libz3.4.16.dylib",)):
-                self.assertEqual(resolver._formula_library("z3", Path("lib/libz3.4.16.dylib")),
-                                 library.resolve())
-
-    def test_macos_pinned_z3_bottle_extracts_only_the_required_library(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            archive = root / "z3.tar.gz"
-            with tarfile.open(archive, "w:gz") as bundle:
-                for name in ("z3/4.16.0/lib/libz3.4.16.dylib", "z3/4.16.0/bin/z3"):
-                    member = tarfile.TarInfo(name)
-                    member.size = 3
-                    bundle.addfile(member, io.BytesIO(b"z3!"))
-            extract_pinned_z3(archive, root / "sdk")
-            self.assertEqual((root / "sdk/lib/libz3.4.16.dylib").read_bytes(), b"z3!")
-            self.assertFalse((root / "sdk/bin/z3").exists())
 
     def test_termux_upgrade_from_historically_misnumbered_package(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)

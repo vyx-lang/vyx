@@ -252,6 +252,21 @@ def main():
                 if "source-dependency=ok" not in application:
                     raise RuntimeError(f"{application_target}: source package implementation was not executed")
 
+            # A source dependency must retain the implicit standard prelude.
+            # Only the consumer's explicit_std setting can disable it. Check
+            # this after a successful build to also exercise cache invalidation.
+            manifest_path = project / "Vyx.toml"
+            original_manifest = manifest_path.read_text(encoding="utf-8")
+            try:
+                manifest_path.write_text(original_manifest.replace(
+                    "[build]\n", "[build]\nexplicit_std=true\n", 1), encoding="utf-8")
+                rejected = checked([compiler, "build", "--target", "app", "--triplet", args.triplet,
+                                    "-j2"], project, env, success=False)
+                if "undefined or ambiguous function 'print'" not in rejected:
+                    raise RuntimeError("explicit_std did not reject the missing standard prelude")
+            finally:
+                manifest_path.write_text(original_manifest, encoding="utf-8")
+
             for fixture in ("unsupported_string.vyx", "unsupported_reference.vyx", "no_selection.vyx", "unproven_call.vyx",
                             "unproven_recursion.vyx",
                             "mixed_selected_method.vyx", "mixed_selected_module.vyx",
@@ -271,6 +286,7 @@ def main():
                 "canonical_roundtrip": True, "deterministic": True,
                 "dependency_exports_filtered": True, "rejected_output_preserved": True,
                 "source_dependency_executables": ["app", "partitioned_app"],
+                "source_dependency_implicit_prelude": True, "explicit_std_rejection": True,
                 "private_noinline_helper": True, "distinct_project_root_chunks": True,
                 "private_helper_not_in_interface": True,
                 "shared_graph_levels": 32, "shared_graph_seconds": shared_seconds,

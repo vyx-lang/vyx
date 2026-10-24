@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -14,18 +15,49 @@ from common import REPO, sha256
 
 def macho(path):
     with path.open("rb") as source:
-        return source.read(4) in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
-                                  b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")
+        magic = source.read(4)
+        if magic in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+            # A universal compiler-rt .a has the same FAT magic as a dylib.
+            # Its architecture slices contain ar archives, not load commands.
+            count = source.read(4)
+            if len(count) != 4 or struct.unpack(">I", count)[0] == 0:
+                return False
+            source.seek(16)
+            size = 8 if magic == b"\xca\xfe\xba\xbf" else 4
+            offset = source.read(size)
+            if len(offset) != size:
+                return False
+            source.seek(int.from_bytes(offset, "big"))
+            magic = source.read(4)
+        if magic not in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+            return False
+        header = source.read(12)
+        if len(header) != 12:
+            return False
+        kind = int.from_bytes(header[8:12], "little" if magic[0] == 0xCF else "big")
+        return kind in (2, 6, 8)  # MH_EXECUTE, MH_DYLIB, MH_BUNDLE
+
+
+def parse_dependencies(output):
+    # Universal otool output repeats non-indented "file (architecture ...)"
+    # headers. They are not dependencies, even though they contain " (".
+    return [row.strip().split(" (compatibility version", 1)[0]
+            for row in output.splitlines() if row[:1].isspace() and " (compatibility version" in row]
+
+
+def dylib_ids(path):
+    output = subprocess.check_output(["otool", "-D", path], text=True)
+    return {row.strip() for row in output.splitlines()[1:] if row.strip() and not row.endswith(":")}
 
 
 def dependencies(path):
     output = subprocess.check_output(["otool", "-L", path], text=True)
-    return [row.strip().split(" (", 1)[0] for row in output.splitlines()[1:] if " (" in row]
+    return list(dict.fromkeys(parse_dependencies(output)))
 
 
 def rpaths(path):
     output = subprocess.check_output(["otool", "-l", path], text=True)
-    return re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset", output)
+    return list(dict.fromkeys(re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset", output)))
 
 
 def system_library(name):
@@ -60,7 +92,7 @@ def relocate(root, sources, search, arch):
                 continue
             # otool -L lists LC_ID_DYLIB as its first entry; it is not an input.
             if original.suffix == ".dylib":
-                identity = subprocess.check_output(["otool", "-D", original], text=True).splitlines()[1:]
+                identity = dylib_ids(original)
                 if name in identity:
                     continue
             dependency = resolve_dependency(name, original, search)
@@ -95,7 +127,10 @@ def relocate(root, sources, search, arch):
         if ("arm64" if arch == "aarch64" else arch) not in arches:
             raise RuntimeError(f"SDK binary architecture mismatch: {target}: {arches}")
     for target in sources:
+        identity = dylib_ids(target) if target.suffix == ".dylib" else set()
         for name in dependencies(target):
+            if name in identity:
+                continue
             if not system_library(name) and not (name.startswith("@rpath/") and (root / "lib" / name[7:]).is_file()):
                 raise RuntimeError(f"SDK retains an external dependency: {target}: {name}")
 
@@ -141,6 +176,8 @@ def package(build, llvm, output, arch, environment, work):
     for name in ("LICENSE-MIT", "LICENSE-APACHE"):
         shutil.copy2(build.parent / name, root / "licenses" / name)
     shutil.copy2(build.parent / "runtime/vendor/oneTBB/LICENSE.txt", root / "licenses/oneTBB.txt")
+    shutil.copytree(llvm / "licenses", root / "licenses/toolchain")
+    shutil.copy2(llvm / "VYX-LLVM-INPUT.json", root / "toolchain/VYX-LLVM-INPUT.json")
     # clang's resource directory includes compiler-rt libraries, not only headers.
     shutil.copytree(llvm / "lib/clang", root / "toolchain/lib/clang", symlinks=True)
     for name in ("clang", "llvm-ar", "llvm-nm", "llvm-readobj", "llvm-strip"):
@@ -156,20 +193,6 @@ def package(build, llvm, output, arch, environment, work):
             sources[path] = llvm / path.relative_to(root / "toolchain")
     relocate(root, sources, [out, llvm / "lib"], arch)
     shutil.copy2(build.parent / "tools/debugger/LICENSE-LLVM.txt", root / "licenses/LLVM.txt")
-    kegs = set()
-    for original in sources.values():
-        parts = original.resolve().parts
-        if "Cellar" in parts:
-            index = parts.index("Cellar")
-            if len(parts) > index + 2:
-                kegs.add(Path(*parts[:index + 3]))
-    for keg in sorted(kegs):
-        notices = [path for path in keg.rglob("*") if path.is_file()
-                   and path.name.lower().startswith(("license", "copying", "notice"))]
-        if not notices:
-            raise RuntimeError(f"No license found for bundled Homebrew dependency: {keg}")
-        for index, notice in enumerate(sorted(notices)):
-            shutil.copy2(notice, root / "licenses" / f"{keg.parent.name}-{index}-{notice.name}")
     launcher(root / "bin/vyxc", ".vyxc-bin")
     launcher(root / "bin/vyxc-lsp", ".vyxc-lsp-bin")
     (root / "README.txt").write_text(

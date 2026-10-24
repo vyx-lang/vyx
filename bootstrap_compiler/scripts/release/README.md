@@ -94,7 +94,7 @@ non-object Mach-O files, path escapes and modified objects.
 python bootstrap_compiler/scripts/release/build_macos.py export --bootstrap-tag latest --arch aarch64 --work ./mac-export --output ./mac-bootstrap --jobs 4
 
 # On a matching Mac, after transferring mac-bootstrap/ and checking out the same commit:
-brew install cmake ninja zstd z3 xz
+brew install cmake ninja
 python -m pip install jsonschema
 python bootstrap_compiler/scripts/release/prepare_macos_llvm.py --destination /tmp/vyx-llvm22
 python bootstrap_compiler/scripts/release/build_macos.py native --cross-bundle ./mac-bootstrap --arch aarch64 --llvm-root /tmp/vyx-llvm22 --work /tmp/vyx-macos --output ./release-assets --jobs 4
@@ -111,13 +111,32 @@ Stage 0. Select `macos_bootstrap: native` in the manual workflow and pin
 `--cross-bundle` with `--bootstrap-tag <tag>` or `--bootstrap-sdk /path/to/sdk`.
 An absent native SDK fails explicitly; it does not select cross bootstrap.
 
-LLVM development inputs use SHA-256-verified official Homebrew 22.1.8 bottles
-from a pinned formula revision. This includes an Intel bottle, avoiding a full
-LLVM source build when the current Homebrew versioned formula has no Intel
-bottle. The prepared toolchain cache is separate for each architecture.
+LLVM 22.1.8, z3 4.16.0 and zstd 1.5.7 development inputs use SHA-256-verified
+official Homebrew bottles from the same pinned formula tree. This includes an
+Intel bottle. The scripts extract the dylib payloads and complete relative
+symlink chains, preserve their notices, and rewrite dependency paths into the
+prepared toolchain. They do not resolve libraries from the runner's rolling
+Homebrew installation. The prepared cache is separate for each architecture.
+Before accepting the cache, clang and llvm-config must load with no DYLD loader
+overrides; a C program and a C++ vector program must compile, link and run against
+the runner's real Apple SDK.
 
-After either Stage 0 starts, the Mac builds native S1, S2 and S3 with separate
-cold caches. S2/S3 object hashes must match. If executable hashes differ, the
+For a focused workflow dispatch, select `build_scope: macos` and
+`macos_stage: toolchain` to validate both toolchains without exporting compiler
+objects or rebuilding the other release platforms. Select `macos_stage: sdk`
+to run the complete cross/native macOS build. A focused run does not publish a
+release. Pushes to main retain the full platform matrix and release gates.
+
+After either Stage 0 starts, the Mac builds native S1, runs the hello and DCI
+gates, and packages the SDK. Repeated bug-fix runs do not rebuild S2/S3.
+For a cross handoff, the linked compiler already contains the current source;
+file/project runtime selection and DCIB AOT consumers run before building S1,
+then run on S1 again. This catches platform integration failures early while
+still checking the native build's output.
+For a fixed-point check, pass `--verify-fixpoint` or select `macos_fixpoint`
+in a manual workflow. This builds S2/S3 with separate cold caches. The build
+record explicitly distinguishes a passed fixed point from one not run.
+S2/S3 object hashes must match. If executable hashes differ, the
 only excluded bytes are measured `LC_UUID` and `LC_CODE_SIGNATURE` ranges;
 all other executable bytes and a fixed-corpus IR hash must match. The record
 reports the differing metadata rather than claiming executable byte identity.
@@ -128,6 +147,10 @@ the actual Mach-O dylib closure, rewrites install names and rpaths, signs the
 changed binaries, then moves the SDK to a path containing spaces and runs the
 StringBuilder AOT project, LSP startup, and a C++ standard-library program.
 These checks do not establish C++ / Rust / Zig ecosystem coverage on macOS.
+Failed native jobs preserve the complete command output as `vyx-macos.log`,
+alongside available compiler task lists and gate diagnostics. The compiler
+target explicitly links oneTBB on macOS, as it does on Windows and Linux;
+the initial handoff link alone does not validate that manifest dependency.
 
 Termux's Debian version preserves an epoch when needed to upgrade from the
 historical `1.0.5~android21...` package to the actual `1.0.0-alpha.1` version.

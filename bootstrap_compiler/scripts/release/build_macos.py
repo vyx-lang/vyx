@@ -183,6 +183,7 @@ def native(args):
         run([llvm / "bin/llvm-ar", "rcs", out / "libvyx_runtime.a", *objects["runtime"], *native_objects], env=environment)
         seed = work / "cross-stage0"
         seed.mkdir()
+        shutil.copy2(out / "libvyx_runtime.a", seed / "libvyx_runtime.a")
         compiler = seed / "vyxc"
         run([llvm / "bin/clang++", *objects["compiler"], cjson, "-L" + str(out),
              "-lvyx_runtime", "-lvyx_compiler_backend", "-ltbb", "-lpthread",
@@ -208,6 +209,17 @@ def native(args):
     record["bootstrap_version"] = subprocess.check_output([compiler, "--version"], env=environment, text=True).strip()
     run([sys.executable, REPO / "probes/gates/runtime-string-scan/run.py", "--backend", backend,
          "--cxx", llvm / "bin/clang++", "--output", work / "runtime-string-scan"], env=environment)
+    if args.cross_bundle:
+        # This executable contains the current checkout's Vyx source. Exercise
+        # both drivers before the native rebuild so a platform integration bug
+        # fails here instead of after another compiler build. Repeat the gates
+        # on S1 below to verify the newly emitted native compiler as well.
+        run([sys.executable, REPO / "probes/gates/host-runtime-targets/run.py", "--backend", backend,
+             "--compiler", compiler, "--triplet", TRIPLES[arch],
+             "--output", work / "cross-preflight"], env=environment)
+        run([sys.executable, REPO / "probes/gates/dci-native-export/run.py", "--compiler", compiler,
+             "--triplet", TRIPLES[arch]], env=environment)
+        record["cross_preflight"] = json.loads((work / "cross-preflight/verification.json").read_text())
     try:
         run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
     finally:
@@ -218,7 +230,8 @@ def native(args):
     # output paths fixed so their identities cannot create artificial drift.
     stages = []
     generation_objects = {}
-    for stage in ("s1", "s2", "s3"):
+    stage_names = ("s1", "s2", "s3") if args.verify_fixpoint else ("s1",)
+    for stage in stage_names:
         directory = work / stage
         directory.mkdir()
         shutil.copy2(out / "boot", directory / "vyxc")
@@ -226,7 +239,7 @@ def native(args):
         shutil.copy2(out / "libtbb.12.dylib", directory / "libtbb.12.dylib")
         environment["DYLD_LIBRARY_PATH"] = f"{directory}:{out}:{llvm / 'lib'}"
         stages.append(directory / "vyxc")
-        if stage != "s3":
+        if stage != stage_names[-1]:
             next_stage = "s2" if stage == "s1" else "s3"
             cache = ".cache-" + next_stage
             if original.count('cache_dir = ".cache"') != 1:
@@ -237,29 +250,35 @@ def native(args):
             finally:
                 manifest.write_text(original, encoding="utf-8")
             generation_objects[next_stage] = {path.name: sha256(path) for path in (build / cache).rglob("*.o")}
-    if not generation_objects["s2"] or generation_objects["s2"] != generation_objects["s3"]:
-        raise RuntimeError("macOS S2/S3 object fixed point failed")
-    record["selfhost_objects"] = generation_objects
-    record["selfhost_executable_equal"] = sha256(stages[1]) == sha256(stages[2])
-    if not record["selfhost_executable_equal"]:
-        # Account for every differing byte: only the measured LC_UUID and
-        # code-signature ranges may differ. Also require fixed-corpus IR.
-        content = [executable_content(path) for path in stages[1:]]
-        ir = []
-        probe = work / "fixpoint.vyx"
-        probe.write_text('fn main() -> i32 { print("hello"); return 0; }\n')
-        for executable in stages[1:]:
-            target = executable.parent / "fixpoint.ll"
-            run([executable, "--src=file", probe, "--emit=ir", "-o", target], env=environment)
-            ir.append(sha256(target))
-        if content[0]["content_sha256"] != content[1]["content_sha256"] or ir[0] != ir[1]:
-            raise RuntimeError("macOS S2/S3 executable content or fixed-corpus IR differs")
-        record["selfhost_metadata_drift"] = {"reason": "LC_UUID / LC_CODE_SIGNATURE only",
-                                             "executables": content, "fixed_corpus_ir_sha256": ir[0]}
-        print("S2/S3 differs only in measured UUID/signature ranges; objects and fixed-corpus IR match", flush=True)
+    record["selfhost_fixpoint"] = {"status": "not-run", "generations": 1}
+    if args.verify_fixpoint:
+        if not generation_objects["s2"] or generation_objects["s2"] != generation_objects["s3"]:
+            raise RuntimeError("macOS S2/S3 object fixed point failed")
+        record["selfhost_objects"] = generation_objects
+        record["selfhost_executable_equal"] = sha256(stages[1]) == sha256(stages[2])
+        if not record["selfhost_executable_equal"]:
+            # Account for every differing byte: only the measured LC_UUID and
+            # code-signature ranges may differ. Also require fixed-corpus IR.
+            content = [executable_content(path) for path in stages[1:]]
+            ir = []
+            probe = work / "fixpoint.vyx"
+            probe.write_text('fn main() -> i32 { print("hello"); return 0; }\n')
+            for executable in stages[1:]:
+                target = executable.parent / "fixpoint.ll"
+                run([executable, "--src=file", probe, "--emit=ir", "-o", target], env=environment)
+                ir.append(sha256(target))
+            if content[0]["content_sha256"] != content[1]["content_sha256"] or ir[0] != ir[1]:
+                raise RuntimeError("macOS S2/S3 executable content or fixed-corpus IR differs")
+            record["selfhost_metadata_drift"] = {"reason": "LC_UUID / LC_CODE_SIGNATURE only",
+                                                 "executables": content, "fixed_corpus_ir_sha256": ir[0]}
+            print("S2/S3 differs only in measured UUID/signature ranges; objects and fixed-corpus IR match", flush=True)
+        record["selfhost_fixpoint"] = {"status": "pass", "generations": 3}
     built = stages[-1]
     record["hello_gate"] = hello_gate(built, environment, work)
     record["selfhost_compilers"] = {path.parent.name: sha256(path) for path in stages}
+    run([sys.executable, REPO / "probes/gates/host-runtime-targets/run.py", "--backend", backend,
+         "--compiler", built, "--triplet", TRIPLES[arch], "--output", work / "host-runtime-targets"],
+        env=environment)
     for target in record["tools"]:
         run([built, "build", "--target", target, f"-j{args.jobs}"], cwd=build, env=environment)
     run([sys.executable, REPO / "probes/gates/dci-native-export/run.py", "--compiler", out / "boot",
@@ -285,6 +304,8 @@ def main():
     mac.add_argument("--cross-bundle", type=Path)
     mac.add_argument("--bootstrap-sdk", type=Path)
     mac.add_argument("--bootstrap-tag")
+    mac.add_argument("--verify-fixpoint", action="store_true",
+                     help="Also build native S2/S3 and verify their fixed point")
     for command in (cross, mac):
         command.add_argument("--arch", choices=TRIPLES, required=True)
         command.add_argument("--work", type=Path, required=True)
