@@ -12,7 +12,7 @@ import urllib.error
 from common import REPO, checksum_sidecar, sha256
 from build_termux import debian_version
 from build_native import bootstrap_manifest, verify_debug_adapter
-from prepare_macos_llvm import brew_formula_and_relative, dependency_rewrite
+from prepare_macos_llvm import brew_formula_and_relative, dependency_rewrite, selected_member
 from prepare_windows_llvm import extract_development, relative_member
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
 
@@ -112,6 +112,12 @@ class ReleaseTests(unittest.TestCase):
             prefix.as_posix().replace("\\", "/") + "/opt/llvm/lib/libLLVM.dylib",
             destination, prefix)
         self.assertTrue(rewritten_installed_llvm.replace("\\", "/").endswith("/tmp/llvm-22/lib/libLLVM.dylib"))
+
+    def test_macos_bottle_excludes_unused_lldb_and_mlir_trees(self):
+        self.assertTrue(selected_member(Path("lib/libLLVM.dylib")))
+        self.assertTrue(selected_member(Path("lib/clang/22/lib/darwin/libclang_rt.asan_osx_dynamic.dylib")))
+        self.assertFalse(selected_member(Path("lib/liblldb.22.1.8.dylib")))
+        self.assertFalse(selected_member(Path("lib/libMLIR.dylib")))
 
     def test_termux_upgrade_from_historically_misnumbered_package(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)

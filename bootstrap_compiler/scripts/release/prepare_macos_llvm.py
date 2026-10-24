@@ -21,6 +21,13 @@ BOTTLES = {
 }
 TOOLS = {"clang", "clang++", "clang-22", "llvm-ar", "llvm-nm", "llvm-readobj",
          "llvm-strip", "llvm-config", "llvm-ranlib"}
+# The SDK uses clang and the LLVM/Clang libraries for AOT.  The bottle also
+# carries LLDB/MLIR and their Python/runtime closure; extracting those would
+# make a compiler-only SDK depend on Homebrew's Python framework.
+CORE_SHARED_LIBS = {
+    "libLLVM.dylib", "libLLVM-22.dylib", "libLTO.dylib", "libRemarks.dylib",
+    "libclang-cpp.dylib", "libclang.dylib",
+}
 SYSTEM_PREFIXES = ("/usr/lib/", "/System/Library/")
 
 
@@ -28,6 +35,18 @@ def macho(path):
     with path.open("rb") as source:
         return source.read(4) in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
                                   b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")
+
+
+def selected_member(relative):
+    """Keep only compiler inputs; omit unused LLDB/MLIR dependency trees."""
+    relative = Path(relative)
+    if relative.parts[0] == "include":
+        return True
+    if relative.parts[0] == "bin" and relative.name in TOOLS:
+        return True
+    if relative.parts[0] != "lib":
+        return relative.name.lower().startswith(("license", "notice"))
+    return "clang" in relative.parts or relative.name in CORE_SHARED_LIBS
 
 
 def macho_dependencies(path):
@@ -256,11 +275,7 @@ def main():
             if len(parts) < 3 or parts[:2] != ("llvm", "22.1.8"):
                 continue
             relative = Path(*parts[2:])
-            if not (relative.parts[0] == "include" or
-                    (relative.parts[0] == "bin" and relative.name in TOOLS) or
-                    (relative.parts[0] == "lib" and
-                     ("clang" in relative.parts or relative.name.endswith(".dylib"))) or
-                    relative.name.lower().startswith(("license", "notice"))):
+            if not selected_member(relative):
                 continue
             item.name = relative.as_posix()
             # Hardlinks in bottles use paths relative to the archive root.
