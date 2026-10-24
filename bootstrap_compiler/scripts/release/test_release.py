@@ -14,7 +14,7 @@ from common import REPO, checksum_sidecar, sha256
 from build_termux import debian_version
 from build_native import bootstrap_manifest, verify_debug_adapter
 from prepare_macos_llvm import (BrewDependencyResolver, brew_formula_and_relative,
-                                dependency_rewrite, selected_member)
+                                dependency_rewrite, extract_pinned_z3, selected_member)
 from prepare_windows_llvm import extract_development, relative_member
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
 
@@ -133,6 +133,19 @@ class ReleaseTests(unittest.TestCase):
                               return_value=("/opt/homebrew/opt/z3/lib/libz3.4.16.dylib",)):
                 self.assertEqual(resolver._formula_library("z3", Path("lib/libz3.4.16.dylib")),
                                  library.resolve())
+
+    def test_macos_pinned_z3_bottle_extracts_only_the_required_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "z3.tar.gz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                for name in ("z3/4.16.0/lib/libz3.4.16.dylib", "z3/4.16.0/bin/z3"):
+                    member = tarfile.TarInfo(name)
+                    member.size = 3
+                    bundle.addfile(member, io.BytesIO(b"z3!"))
+            extract_pinned_z3(archive, root / "sdk")
+            self.assertEqual((root / "sdk/lib/libz3.4.16.dylib").read_bytes(), b"z3!")
+            self.assertFalse((root / "sdk/bin/z3").exists())
 
     def test_termux_upgrade_from_historically_misnumbered_package(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)

@@ -19,6 +19,10 @@ BOTTLES = {
     "aarch64": "5819a7751ca18dd6dd54e182464de9d3c911ccf13900ed94a631ce64e414d710",
     "x86_64": "2f07536754d0854565f9ac37436681bb3d04a4fbb15c45c51896933262df5e48",
 }
+Z3_BOTTLES = {
+    "aarch64": "08478660968932e8353796d24fee205a57321a4945d48991e8f82dae723d97a3",
+    "x86_64": "a520309ac4d170897f5bcd9b238231bdec1cbb4f0f326c62abe7eb06b7616975",
+}
 TOOLS = {"clang", "clang++", "clang-22", "llvm-ar", "llvm-nm", "llvm-readobj",
          "llvm-strip", "llvm-config", "llvm-ranlib"}
 # The SDK uses clang and the LLVM/Clang libraries for AOT.  The bottle also
@@ -108,6 +112,49 @@ def dependency_rewrite(name, destination, prefix):
     for old, new in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
         result = result.replace(old, new)
     return result
+
+
+def download_bottle(repository, digest, archive):
+    archive = Path(archive)
+    if archive.exists() and sha256(archive) == digest:
+        return
+    with urllib.request.urlopen(
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:" + repository + ":pull") as response:
+        token = json.load(response)["token"]
+    request = urllib.request.Request(
+        "https://ghcr.io/v2/" + repository + "/blobs/sha256:" + digest,
+        headers={"Authorization": "Bearer " + token})
+    class Redirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, *arguments):
+            redirected = super().redirect_request(request, *arguments)
+            if redirected is not None:
+                redirected.remove_header("Authorization")
+            return redirected
+    with urllib.request.build_opener(Redirect()).open(request, timeout=120) as response, archive.open("wb") as target:
+        received = 0
+        while data := response.read(8 * 1024 * 1024):
+            target.write(data)
+            received += len(data)
+            if received % (128 * 1024 * 1024) == 0:
+                print(f"LLVM bottle: {received // (1024 * 1024)} MiB", flush=True)
+    if sha256(archive) != digest:
+        raise RuntimeError(f"Homebrew bottle checksum mismatch: {repository}")
+
+
+def extract_pinned_z3(archive, destination):
+    destination = Path(destination)
+    destination.joinpath("lib").mkdir(parents=True, exist_ok=True)
+    extracted = False
+    with tarfile.open(archive, "r|gz") as bundle:
+        for item in bundle:
+            parts = Path(item.name).parts
+            if len(parts) < 3 or tuple(parts[-2:]) != ("lib", "libz3.4.16.dylib"):
+                continue
+            item.name = "lib/libz3.4.16.dylib"
+            bundle.extract(item, destination, filter="data")
+            extracted = True
+    if not extracted or not (destination / "lib/libz3.4.16.dylib").is_file():
+        raise RuntimeError("Pinned z3 bottle does not contain libz3.4.16.dylib")
 
 
 class BrewDependencyResolver:
@@ -207,6 +254,11 @@ def relocate_dependencies(destination, prefix):
     """Copy and rewrite the complete non-system Mach-O dependency closure."""
     destination, prefix = Path(destination).resolve(), Path(prefix).resolve()
     resolver = BrewDependencyResolver(destination, prefix)
+    # LLVM 22.1.8 was linked against z3 4.16.0.  Homebrew's rolling z3
+    # formula is not ABI-stable across releases, so the pinned bottle staged
+    # below is the authoritative formula root for this dependency.
+    if (destination / "lib/libz3.4.16.dylib").is_file():
+        resolver.formula_roots["z3"] = destination
     pending = [(path, path) for path in destination.rglob("*")
                if path.is_file() and not path.is_symlink() and macho(path)]
     copied = {}
@@ -312,6 +364,10 @@ def main():
                     raise RuntimeError("LLVM hardlink escapes bottle root")
                 item.linkname = item.linkname.removeprefix(prefix)
             bundle.extract(item, destination, filter="data")
+    z3_digest = Z3_BOTTLES[arch]
+    z3_archive = destination.parent / f"z3-4.16.0-{arch}.bottle.tar.gz"
+    download_bottle("homebrew/core/z3", z3_digest, z3_archive)
+    extract_pinned_z3(z3_archive, destination)
     prefix = Path(subprocess.check_output(["brew", "--prefix"], text=True).strip())
     try:
         relocate_dependencies(destination, prefix)
@@ -329,7 +385,8 @@ def main():
     subprocess.run([str(destination / "bin/clang"), "--version"], env=env, check=True)
     (destination / "VYX-LLVM-INPUT.json").write_text(json.dumps({
         "version": "22.1.8", "arch": arch, "sha256": expected, "url": url,
-        "formula_commit": FORMULA_COMMIT}, indent=2) + "\n")
+        "formula_commit": FORMULA_COMMIT, "z3": {"version": "4.16.0",
+        "sha256": z3_digest}}, indent=2) + "\n")
 
 
 if __name__ == "__main__":
