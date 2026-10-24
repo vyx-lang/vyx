@@ -286,7 +286,13 @@ def main():
                 item.linkname = item.linkname.removeprefix(prefix)
             bundle.extract(item, destination, filter="data")
     prefix = Path(subprocess.check_output(["brew", "--prefix"], text=True).strip())
-    relocate_dependencies(destination, prefix)
+    try:
+        relocate_dependencies(destination, prefix)
+    except Exception as error:
+        # Keep the failure reason visible in the Actions annotation even when
+        # the runner log is only available to authenticated maintainers.
+        print(f"::error title=LLVM dependency closure::{error}", flush=True)
+        raise
     for name in ("clang++", "llvm-ranlib"):
         path = destination / "bin" / name
         if not path.exists():
