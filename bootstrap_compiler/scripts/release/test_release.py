@@ -12,6 +12,7 @@ import urllib.error
 from common import REPO, checksum_sidecar, sha256
 from build_termux import debian_version
 from build_native import bootstrap_manifest, verify_debug_adapter
+from prepare_macos_llvm import brew_formula_and_relative, dependency_rewrite
 from prepare_windows_llvm import extract_development, relative_member
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
 
@@ -87,6 +88,26 @@ class ReleaseTests(unittest.TestCase):
             for unsafe in ("llvm/../escape", "/absolute/path", "C:/escape", "llvm/..\\escape"):
                 with self.assertRaises(ValueError):
                     relative_member(unsafe)
+
+    def test_macos_brew_paths_are_resolved_by_formula(self):
+        prefix = Path("/opt/homebrew")
+        self.assertEqual(
+            brew_formula_and_relative(prefix / "opt/z3/lib/libz3.4.16.dylib", prefix),
+            ("z3", Path("lib/libz3.4.16.dylib")))
+        self.assertEqual(
+            brew_formula_and_relative(prefix / "Cellar/zstd/1.5.6/lib/libzstd.1.dylib", prefix),
+            ("zstd", Path("lib/libzstd.1.dylib")))
+        self.assertIsNone(brew_formula_and_relative(Path("/usr/lib/libc++.1.dylib"), prefix))
+
+    def test_macos_bottle_placeholders_prefer_sdk_paths(self):
+        destination = Path("/tmp/llvm-22")
+        prefix = Path("/opt/homebrew")
+        rewritten_llvm = dependency_rewrite(
+            "@@HOMEBREW_PREFIX@@/opt/llvm/lib/libLLVM.dylib", destination, prefix)
+        self.assertTrue(rewritten_llvm.replace("\\", "/").endswith("/tmp/llvm-22/lib/libLLVM.dylib"))
+        rewritten_zstd = dependency_rewrite(
+            "@@HOMEBREW_PREFIX@@/opt/zstd/lib/libzstd.1.dylib", destination, prefix)
+        self.assertTrue(rewritten_zstd.replace("\\", "/").endswith("/opt/homebrew/opt/zstd/lib/libzstd.1.dylib"))
 
     def test_termux_upgrade_from_historically_misnumbered_package(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
