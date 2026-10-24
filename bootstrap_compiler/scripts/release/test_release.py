@@ -8,11 +8,13 @@ import subprocess
 import tempfile
 import unittest
 import urllib.error
+from unittest.mock import patch
 
 from common import REPO, checksum_sidecar, sha256
 from build_termux import debian_version
 from build_native import bootstrap_manifest, verify_debug_adapter
-from prepare_macos_llvm import brew_formula_and_relative, dependency_rewrite, selected_member
+from prepare_macos_llvm import (BrewDependencyResolver, brew_formula_and_relative,
+                                dependency_rewrite, selected_member)
 from prepare_windows_llvm import extract_development, relative_member
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
 
@@ -118,6 +120,19 @@ class ReleaseTests(unittest.TestCase):
         self.assertTrue(selected_member(Path("lib/clang/22/lib/darwin/libclang_rt.asan_osx_dynamic.dylib")))
         self.assertFalse(selected_member(Path("lib/liblldb.22.1.8.dylib")))
         self.assertFalse(selected_member(Path("lib/libMLIR.dylib")))
+
+    def test_macos_formula_library_follows_install_name_when_keg_filename_moves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            library = root / "z3" / "lib" / "libz3.4.16.0.dylib"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"Mach-O fixture")
+            resolver = BrewDependencyResolver(root / "llvm", root)
+            resolver.formula_roots["z3"] = root / "z3"
+            with patch.object(BrewDependencyResolver, "_install_name",
+                              return_value=("/opt/homebrew/opt/z3/lib/libz3.4.16.dylib",)):
+                self.assertEqual(resolver._formula_library("z3", Path("lib/libz3.4.16.dylib")),
+                                 library)
 
     def test_termux_upgrade_from_historically_misnumbered_package(self):
         now = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)

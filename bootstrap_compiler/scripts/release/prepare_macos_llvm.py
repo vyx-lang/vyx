@@ -141,6 +141,35 @@ class BrewDependencyResolver:
         candidate = self.destination.joinpath(relative)
         return candidate if candidate.is_file() else None
 
+    @staticmethod
+    def _install_name(path):
+        try:
+            output = subprocess.check_output(["otool", "-D", str(path)], text=True)
+        except subprocess.CalledProcessError:
+            return ()
+        return tuple(row.strip() for row in output.splitlines()[1:] if row.strip())
+
+    def _formula_library(self, formula, relative):
+        """Resolve a formula dylib by its Mach-O id when the keg path moved."""
+        root = self._formula_root(formula)
+        requested = Path(relative).name
+        direct = root / relative
+        if direct.is_file():
+            return direct.resolve()
+        parent = root / relative.parent
+        matches = []
+        if parent.is_dir():
+            for path in sorted(parent.glob("*.dylib")):
+                if requested in {Path(identity).name for identity in self._install_name(path)}:
+                    matches.append(path.resolve())
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise RuntimeError(
+                f"Homebrew formula {formula!r} does not provide Mach-O install name {requested!r}")
+        raise RuntimeError(
+            f"Homebrew formula {formula!r} provides multiple Mach-O libraries named {requested!r}: {matches}")
+
     def resolve(self, name, source):
         name = dependency_rewrite(name, self.destination, self.prefix)
         if name.startswith("@loader_path/"):
@@ -170,9 +199,7 @@ class BrewDependencyResolver:
             decoded = brew_formula_and_relative(Path(name), self.prefix)
             if decoded:
                 formula, relative = decoded
-                candidate = self._formula_root(formula) / relative
-                if candidate.is_file():
-                    return candidate.resolve()
+                return self._formula_library(formula, relative)
         raise RuntimeError(f"Cannot resolve Mach-O dependency {name!r} from {source}")
 
 
