@@ -80,31 +80,49 @@ def build_plan(build, target):
     expected = {(build / name).resolve() for name in [config["entry"], *config.get("sources", [])]
                 if name.endswith(".vyx")}
     cache = build / manifest.get("build", {}).get("cache_dir", ".cache")
+    # This is the build system's committed object/command database. Cost
+    # history is optional telemetry and is not produced on every platform.
+    record = cache / ".vyx_cache"
     candidates = {}
-    for record in cache.glob("*.vyx-cost"):
-        command = next((line for line in record.read_text(encoding="utf-8").splitlines()
-                        if "--src=file" in line and "--emit=obj" in line), None)
-        if command is None:
+    for line_number, line in enumerate(record.read_text(encoding="utf-8").splitlines(), 1):
+        if not line:
+            continue
+        fields = line.split("\t")
+        # Link/interface/emit rows have their own schemas. Only source-object
+        # records for this manifest target participate in the source recheck.
+        if (build / fields[0]).resolve() not in expected:
+            continue
+        if len(fields) != 4:
+            raise ValueError(f"Malformed build cache record at {record}:{line_number}")
+        source_name, object_name, _, command = fields
+        if "--src=file" not in command or "--emit=obj" not in command:
             continue
         args = split_command(command)
+        if "--src=file" not in args or "--emit=obj" not in args:
+            continue
         source = (build / option(args, "--src=file")).resolve()
-        if source not in expected:
+        if source != (build / source_name).resolve():
+            raise ValueError(f"Source/command mismatch at {record}:{line_number}")
+        artifact = build / object_name
+        if not artifact.is_file():
             continue
         # Old local caches can contain both COFF and ELF plans. The most recent
         # completed compile for this exact source is the relevant plan.
-        if source not in candidates or record.stat().st_mtime_ns > candidates[source][0]:
-            candidates[source] = (record.stat().st_mtime_ns, record, args)
+        if source not in candidates or artifact.stat().st_mtime_ns > candidates[source][0]:
+            candidates[source] = (artifact.stat().st_mtime_ns, line_number, artifact, args)
     covered = set()
     plans = []
-    for source, (_, record, args) in sorted(candidates.items()):
+    for source, (_, line_number, artifact, args) in sorted(candidates.items()):
         sources = {source}
-        unit_list = option(args, "--unit-sources")
-        if unit_list:
-            unit_file = build / unit_list
-            sources.update((build / line.strip()).resolve() for line in
-                           unit_file.read_text(encoding="utf-8").splitlines() if line.strip())
+        for flag in ("--unit-sources", "--project-unit-sources", "--interface-unit-sources"):
+            unit_list = option(args, flag)
+            if unit_list:
+                unit_file = build / unit_list
+                sources.update((build / line.strip()).resolve() for line in
+                               unit_file.read_text(encoding="utf-8").splitlines() if line.strip())
         covered.update(sources & expected)
-        plans.append({"record": str(record), "arguments": args,
+        plans.append({"record": str(record), "record_line": line_number,
+                      "artifact": str(artifact), "arguments": args,
                       "declared_function_bodies": sum(function_bodies(path) for path in sources),
                       "sources": {str(path): digest(path) for path in sorted(sources)}})
     missing = expected - covered
@@ -114,6 +132,48 @@ def build_plan(build, target):
     if not plans:
         raise ValueError("No compiler module plans were found")
     return plans, len(expected)
+
+
+def interface_plan(build, plans):
+    roots = {(build / option(plan["arguments"], "--interface-root")).resolve()
+             for plan in plans if option(plan["arguments"], "--interface-root")}
+    if len(roots) != 1:
+        raise ValueError("Compiler object plans must share one recorded interface root")
+    root = roots.pop()
+    primary = {(build / option(plan["arguments"], "--src=file")).resolve() for plan in plans}
+    database = Path(plans[0]["record"])
+    selected = {}
+    for number, line in enumerate(database.read_text(encoding="utf-8").splitlines(), 1):
+        fields = line.split("\t")
+        if not fields[0].startswith("__vyi:"):
+            continue
+        source = (build / fields[0].removeprefix("__vyi:")).resolve()
+        if source not in primary:
+            continue
+        if len(fields) != 4:
+            raise ValueError(f"Malformed interface record at {database}:{number}")
+        artifact = (build / fields[1]).resolve()
+        if not artifact.is_relative_to(root):
+            continue  # Another manifest target has its own interfaces.
+        command = split_command(fields[3])
+        if ("--emit=vyi" not in command or "--vyi-shallow" not in command
+                or (build / option(command, "--src=file")).resolve() != source):
+            raise ValueError(f"Invalid compiler interface command at {database}:{number}")
+        if not artifact.is_file():
+            raise ValueError(f"Missing published compiler interface: {artifact}")
+        if source in selected:
+            previous = selected[source]
+            if (previous["relative_output"] != str(artifact.relative_to(root))
+                    or previous["arguments"][1:] != command[1:]):
+                raise ValueError(f"Conflicting compiler interface plans for {source}")
+            continue
+        selected[source] = {"record": str(database), "record_line": number,
+                            "relative_output": str(artifact.relative_to(root)), "arguments": command}
+    missing = primary - selected.keys()
+    if missing:
+        raise ValueError("No completed interface plan for compiler modules:\n" +
+                         "\n".join(map(str, sorted(missing))))
+    return root, [selected[source] for source in sorted(selected)]
 
 
 def main():
@@ -144,7 +204,7 @@ def main():
         if path.is_file():
             report["companions"][name] = {"path": str(path), "sha256": digest(path)}
 
-    def execute(name, command, *, negative=False, declaration_only=False):
+    def execute(name, command, *, negative=False, declaration_only=False, interface_output=None):
         started = time.monotonic()
         row = {"name": name, "command": list(map(str, command))}
         if args.triplet:
@@ -168,9 +228,15 @@ def main():
         matches = re.findall(r"verified discarded_bodies=(\d+)", text)
         row["lowered_bodies"] = sum(map(int, matches))
         row["declaration_only"] = declaration_only
-        row["pass"] = (row["exit"] == 1 and "error: E3102:" in text if negative else
-                       row["exit"] == 0 and bool(matches)
-                       and (row["lowered_bodies"] > 0 or declaration_only))
+        if interface_output is not None:
+            row["kind"] = "interface"
+            row["pass"] = row["exit"] == 0 and interface_output.is_file() and interface_output.stat().st_size > 0
+            if row["pass"]:
+                row["interface_sha256"] = digest(interface_output)
+        else:
+            row["pass"] = (row["exit"] == 1 and "error: E3102:" in text if negative else
+                           row["exit"] == 0 and bool(matches)
+                           and (row["lowered_bodies"] > 0 or declaration_only))
         row["seconds"] = round(time.monotonic() - started, 3)
         rows.append(row)
         (output / "verification.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -178,6 +244,7 @@ def main():
               f"{row['seconds']:.1f}s", flush=True)
         if not row["pass"]:
             print(text[-12000:], flush=True)
+        return row["pass"]
 
     try:
         plans, source_count = build_plan(build, args.target)
@@ -191,6 +258,21 @@ def main():
                             ("top-level", ["--export-top-level-roots"])):
             execute("reject-" + mode, [compiler, "--src=file", fixture, "--emit=mir-verify",
                                       "--no-process-entry", *flags], negative=True)
+        _, interfaces = interface_plan(build, plans)
+        report["interface_plans"] = interfaces
+        fresh_root = output / "interfaces"
+        # Do not reuse Stage 0's .vyi files: they can expose different private
+        # declarations and hide errors that only the new compiler's build sees.
+        # Only compiler modules are emitted here; standard-library imports use
+        # the current VYX_STD_PACKAGES through normal package resolution.
+        for index, plan in enumerate(interfaces):
+            command = plan["arguments"].copy()
+            command[0] = str(compiler)
+            destination = fresh_root / plan["relative_output"]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            command[command.index("-o") + 1] = str(destination)
+            if not execute(f"interface-{index:03d}", command, interface_output=destination):
+                raise RuntimeError("New compiler failed to emit its source interfaces")
         for index, plan in enumerate(plans):
             command = plan["arguments"].copy()
             command[0] = str(compiler)
@@ -199,6 +281,7 @@ def main():
             # Existing bootstrap SDKs do not enable named roots in MIR verify.
             # The focused negatives above prevent hiding that bug in new SDKs.
             command.append("--export-all")
+            command[command.index("--interface-root") + 1] = str(fresh_root)
             if "-o" in command:
                 command[command.index("-o") + 1] = str(output / f"module-{index:03d}.unused")
             execute(f"module-{index:03d}", command,

@@ -40,6 +40,9 @@ Android execution still requires a device.
 
 Before tools and packaging, the new compiler [rechecks every module](../../../../probes/gates/compiler-self-source/README.md) in its own
 completed build plan with the streaming MIR verifier and current `std_packages`.
+It reads the committed `.vyx_cache` object records rather than optional memory
+telemetry. The new compiler first re-emits module interfaces in a separate
+directory, so Stage 0's visibility rules cannot hide missing declarations.
 The check requires real lowered bodies and complete manifest-source coverage;
 it also exercises rejection of escaped local storage through named/top-level
 export roots. This detects source/ownership failures in the new compiler before

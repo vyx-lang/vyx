@@ -10,7 +10,15 @@ python probes/gates/compiler-self-source/run.py --compiler bootstrap_compiler/ou
 
 On Windows, use `out/boot.exe`. Output must be a new directory. All declared Vyx
 sources in the selected manifest target must be accounted for by completed object
-plans; an absent module is a failure. Each module is checked through the streaming
+plans in `.cache/.vyx_cache`, with the published object present; an absent module
+is a failure. Optional `.vyx-cost` memory statistics and pending task files are
+not evidence of a completed build. Cached builds use the same committed records.
+Before checking bodies, the new compiler re-emits the compiler modules' shallow
+interfaces into a separate directory using the recorded interface commands.
+The checks use those fresh interfaces and the current standard-library packages.
+Stage 0 interfaces can leak private declarations that the new compiler no longer
+publishes; reusing them would miss undefined names in a subsequent build.
+Each module is checked through the streaming
 MIR path, one process at a time. At least one lowered body is required for every
 module containing function definitions. Declaration-only host-service modules
 are identified from their inputs and recorded separately. Commands,
