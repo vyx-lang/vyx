@@ -273,6 +273,7 @@ mir-verify hir-facts`。LLVM 是验收后端；`cpp` 是实验。
 | `@[no_mangle]` `@[export]` `@[export_name]` `@[link_name]` | C ABI / 符号名 | `sema_decl_is_c_abi_fn` |
 | `@[repr(C)]` `@[packed]` `@[align(N)]` / `repr(… packed … align(N))` | 布局标志 | `hir_builder_decl_has_repr_c` |
 | `@[borrow_args]` | 编译器内部；跳过部分 move 检查 | 编译器源 |
+| `@[ffi_returns_independent]` | C ABI 指针返回值的可信契约：返回存储不借用参数；仅限无函数体的外部声明，属性无参数；不代表所有权转移或静态生命周期；DCI 仍使用其描述符 | Effect 校验、HIR 签名事实、[原生回归](../probes/gates/foreign-return-storage/README.md) |
 | `@[version("x.y.z")]` `@[variant("tag")]` | 模块身份 `Name@x.y.z["tag"]` | `policy_module_identity_from_meta` |
 | `@[migrate(fromVer, fromField?, fromSig?, desc?)]` | 版本化 API/字段迁移 | `sema.vyx`（见下节） |
 | `@[discard(fromVer, desc?)]` | 当前拼写不可调用；要用 `@fromVer` | `report_discarded_callable` |

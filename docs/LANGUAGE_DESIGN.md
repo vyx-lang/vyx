@@ -296,6 +296,7 @@ The parser stores `@[…]` / `@ident` as declaration meta
 | `@[no_mangle]` `@[export]` `@[export_name]` `@[link_name]` | C ABI / symbol names | `sema_decl_is_c_abi_fn` |
 | `@[repr(C)]` `@[packed]` `@[align(N)]` / `repr(… packed … align(N))` | layout flags | `hir_builder_decl_has_repr_c` |
 | `@[borrow_args]` | compiler-internal; skip certain move checks | compiler sources |
+| `@[ffi_returns_independent]` | trusted C ABI pointer-result contract: returned storage does not borrow arguments; bodyless foreign declarations only, no arguments; does not transfer ownership or promise static lifetime; DCI uses its descriptor | Effect validation, HIR signature fact, [native regression](../probes/gates/foreign-return-storage/README.md) |
 | `@[version("x.y.z")]` `@[variant("tag")]` | module identity `Name@x.y.z["tag"]` | `policy_module_identity_from_meta` |
 | `@[migrate(fromVer, fromField?, fromSig?, desc?)]` | versioned API/field migration | `sema.vyx` (see below) |
 | `@[discard(fromVer, desc?)]` | current spelling is not callable; use `@fromVer` | `report_discarded_callable` |
