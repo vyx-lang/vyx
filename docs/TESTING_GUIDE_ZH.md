@@ -259,6 +259,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./probes/gates/generic_inter
 powershell -NoProfile -ExecutionPolicy Bypass -File ./probes/gates/generic_interfaces/extended.ps1 -Compiler $compiler
 powershell -NoProfile -ExecutionPolicy Bypass -File ./probes/gates/generic_interfaces/long-chains.ps1 -Compiler $compiler
 powershell -NoProfile -ExecutionPolicy Bypass -File ./probes/gates/compiler-industrial/run.ps1 -Compiler $compiler -Scale 8 -Jobs 4
+python probes/gates/platform-interfaces/run.py --compiler $compiler --out .cache/platform-interfaces
 ```
 
 分别覆盖 [match 值与负向诊断](../probes/gates/match-expression/README.md)、
@@ -266,6 +267,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./probes/gates/compiler-indu
 [模板 artifact 校验和双消费者链接](../probes/gates/generic_interfaces/README.md)、
 [冷/暖/增量构建](../probes/gates/compiler-industrial/README.md)。这些入口不会由
 `tests/run_all_modules.ps1` 或 `tests/checks/run_checks.ps1` 自动调用。
+平台接口门还会把 `.vyi` 的 `@[platform]`、嵌套 `extern "C"`、重复平台条件和
+外部返回存储契约带到 Windows、Linux、Android 与两个 macOS 目标，确认目标专属
+运行时声明不会泄漏到其他平台；详见 [平台接口门](../probes/gates/platform-interfaces/README.md)。
 8 模块 / 4 jobs 是已记录的 Windows smoke 规模；大工程性能结论还需要更大规模、
 重复采样、内存配置与真实工程。任务并发不代表共享一次前端或并发 LLVM lowering。
 
