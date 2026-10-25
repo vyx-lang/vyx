@@ -103,12 +103,11 @@ python bootstrap_compiler/scripts/release/build_macos.py native --cross-bundle .
 ```
 
 Use `--arch x86_64` for Intel on both ends. Work and handoff directories must
-be new. Cross bootstrap is the CI default until the first macOS SDK is published;
-the exporter downloads a verified Linux Stage 0 independently of the Linux SDK
-build, so macOS does not wait for another native compiler build first.
+be new. Cross bootstrap is an explicit recovery option. The exporter downloads
+a verified Linux Stage 0 independently of the Linux SDK build.
 
 **Native bootstrap** takes an existing macOS SDK of the same architecture as
-Stage 0. Select `macos_bootstrap: native` in the manual workflow and pin
+Stage 0. This is the default for pushes and manual workflows. Pin
 `bootstrap_tag` to a release containing both macOS archives. Locally, replace
 `--cross-bundle` with `--bootstrap-tag <tag>` or `--bootstrap-sdk /path/to/sdk`.
 An absent native SDK fails explicitly; it does not select cross bootstrap.
