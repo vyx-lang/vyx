@@ -8,6 +8,8 @@ use bootstrap.hir_model;
 use bootstrap.hir_type_table;
 use bootstrap.mir_ids;
 use bootstrap.mir_model;
+use bootstrap.policy;
+use bootstrap.sema;
 
 @[vis(world)]
 impl bootstrap.mir_builder.MirUnitBuilder {
@@ -145,20 +147,47 @@ impl bootstrap.mir_builder.MirUnitBuilder {
     public fn full_expression_borrow_mentions_stmt(self, stmt_id: i32) -> bool {
         if (stmt_id <= 0 || stmt_id == hir_id_invalid() || stmt_id > self.h.stmt_count) { return false; }
         var cur = stmt_id;
-        while (cur != hir_id_invalid()) {
-            let expr_id = self.h.stmt_expr(cur);
-            if (expr_id != hir_id_invalid()
-                && self.full_expression_borrow_mentions_owner(expr_id)) { return true; }
-            let cond_id = self.h.stmt_cond(cur);
-            if (cond_id != hir_id_invalid()
-                && self.full_expression_borrow_mentions_owner(cond_id)) { return true; }
-            let child = self.h.stmt_child(cur);
-            if (child != hir_id_invalid()
-                && self.full_expression_borrow_mentions_stmt(child)) { return true; }
-            let else_stmt = self.h.stmt_else(cur);
-            if (else_stmt != hir_id_invalid()
-                && self.full_expression_borrow_mentions_stmt(else_stmt)) { return true; }
-            cur = self.h.stmt_next(cur);
+        // A block's value comes from its tail, not from conditions or reads
+        // performed earlier while computing that value.
+        while (self.h.stmt_next(cur) != hir_id_invalid()) { cur = self.h.stmt_next(cur); }
+        let kind = self.h.stmt_kind(cur);
+        if (kind == hir_stmt_expr() || kind == hir_stmt_return()) {
+            return self.full_expression_borrow_mentions_owner(self.h.stmt_expr(cur));
+        }
+        if (kind == hir_stmt_block()) {
+            return self.full_expression_borrow_mentions_stmt(self.h.stmt_child(cur));
+        }
+        if (kind == hir_stmt_if()) {
+            return self.full_expression_borrow_mentions_stmt(self.h.stmt_child(cur))
+                || self.full_expression_borrow_mentions_stmt(self.h.stmt_else(cur));
+        }
+        return false;
+    }
+
+    public fn full_expression_call_returns_independent_str(self, expr_id: i32) -> bool {
+        if (self.h.expr_kind(expr_id) != ex_CALL()
+            || hir_type_table_kind(self.h.types, self.h.expr_type(expr_id)) != ty_STRING()) { return false; }
+        let callee = self.h.expr_lhs(expr_id);
+        var target_kind = self.h.expr_target_kind(expr_id);
+        var target = self.h.expr_target_id(expr_id);
+        if (target_kind == hir_target_none() && callee != hir_id_invalid()) {
+            target_kind = self.h.expr_target_kind(callee);
+            target = self.h.expr_target_id(callee);
+        }
+        if (target_kind == hir_target_builtin()) {
+            if (callee != hir_id_invalid() && self.h.expr_kind(callee) == ex_MEMBER()) {
+                let receiver = self.h.expr_lhs(callee);
+                return hir_type_table_kind(self.h.types, self.h.expr_type(receiver)) == ty_STRING()
+                    && policy_string_method_kind(self.h.expr_name(callee)) == 2;
+            }
+            return self.h.builtin_name(target) == "from_cstr_len";
+        }
+        if (target_kind == hir_target_function() && self.has_hir_codegen_builder) {
+            let result = hir_codegen_builder_handle_function_returns_independent_str(self.hir_codegen_builder, target);
+            // A demanded return summary may briefly resolve a concrete callee.
+            // Parameter/type registration can grow the shared HIR arenas.
+            self.refresh_from_codegen_builder();
+            return result;
         }
         return false;
     }
@@ -179,9 +208,20 @@ impl bootstrap.mir_builder.MirUnitBuilder {
         // Unconditionally walking lhs/rhs/aux lets literal nodes expose stale
         // positive IDs from a previous expression and falsely reject a later
         // `return 0` after a borrowed local was built.
-        if (k == ex_CALL() || k == ex_TERNARY() || k == ex_IF_EXPR()
-            || k == ex_MATCH_EXPR()) {
-            if (self.full_expression_borrow_mentions_owner(self.h.expr_lhs(expr_id))) { return true; }
+        if (k == ex_CALL()) {
+            var borrows = self.full_expression_borrow_mentions_owner(self.h.expr_lhs(expr_id))
+                || self.full_expression_borrow_mentions_owner(self.h.expr_aux(expr_id));
+            var arg = self.h.expr_first_arg(expr_id);
+            while (!borrows && arg != hir_id_invalid()) {
+                borrows = self.full_expression_borrow_mentions_owner(arg);
+                arg = self.h.expr_next_arg(arg);
+            }
+            return borrows && !self.full_expression_call_returns_independent_str(expr_id);
+        }
+        if (k == ex_BIN() && self.h.expr_op(expr_id) == tk_PIPEARROW()) {
+            return self.full_expression_borrow_mentions_owner(self.h.expr_rhs(expr_id));
+        }
+        if (k == ex_TERNARY()) {
             if (self.full_expression_borrow_mentions_owner(self.h.expr_rhs(expr_id))) { return true; }
             if (self.full_expression_borrow_mentions_owner(self.h.expr_aux(expr_id))) { return true; }
         }
@@ -189,11 +229,19 @@ impl bootstrap.mir_builder.MirUnitBuilder {
             || k == ex_DEREF() || k == ex_INDEX()) {
             if (self.full_expression_borrow_mentions_owner(self.h.expr_lhs(expr_id))) { return true; }
         }
-        if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
+        if (k == ex_IF_EXPR()) {
             if (self.full_expression_borrow_mentions_stmt(self.h.expr_stmt_rhs(expr_id))) { return true; }
             if (self.full_expression_borrow_mentions_stmt(self.h.expr_stmt_aux(expr_id))) { return true; }
+            if (self.full_expression_borrow_mentions_owner(self.h.expr_aux(expr_id))) { return true; }
         }
-        if (k == ex_CALL() || k == ex_STRUCT_INIT() || k == ex_TUPLE_LIT()
+        if (k == ex_MATCH_EXPR()) {
+            var arm = self.h.expr_stmt_rhs(expr_id);
+            while (arm != hir_id_invalid()) {
+                if (self.full_expression_borrow_mentions_stmt(self.h.stmt_child(arm))) { return true; }
+                arm = self.h.stmt_next(arm);
+            }
+        }
+        if (k == ex_STRUCT_INIT() || k == ex_TUPLE_LIT()
             || k == ex_ARRAY_LIT() || k == ex_TERNARY() || k == ex_IF_EXPR()
             || k == ex_MATCH_EXPR()) {
             var arg = self.h.expr_first_arg(expr_id);
@@ -232,6 +280,7 @@ impl bootstrap.mir_builder.MirUnitBuilder {
             }
         }
         if (!has_owner) { return; }
+        if (self.full_expression_call_returns_independent_str(expr_id)) { return; }
         // A view stored in a binding needs its backing temporary throughout
         // that binding's scope, including conditional construction guards.
         var node = self.full_expression_temps;
@@ -305,27 +354,312 @@ impl bootstrap.mir_builder.MirUnitBuilder {
     }
 
     public fn check_full_expression_return_borrow(self, expr_id: i32, type_id: i32) {
-        let expression_kind = self.h.expr_kind(expr_id);
-        var active_owner = false;
-        var temp = self.full_expression_temps;
-        while (temp != null) {
-            if (ast_read_i32(ptr_offset(temp, 20)) != 0) {
-                active_owner = true;
-                break;
-            }
-            temp = ast_read_rawptr(ptr_offset(temp, 8));
+        if (!self.full_expression_result_can_borrow(type_id)) {
+            self.full_expression_return_borrow_pending = false;
+            return;
         }
         let mentions_owner = self.full_expression_borrow_mentions_owner(expr_id);
-        let local_view = expression_kind == ex_IDENT() && mentions_owner;
         var invalid = self.full_expression_result_can_borrow(type_id)
             && (self.full_expression_return_borrow_pending
-                || (mentions_owner && (active_owner || local_view)));
+                || mentions_owner);
         if (invalid) {
-            diag_emit_codegen_at(hir_unit_expr_loc_ptr(self.h, expr_id),
-                "returned view borrows an owning temporary that is destroyed at function exit");
-            self.hir_codegen_error_count = self.hir_codegen_error_count + 1;
+            self.report_return_borrow_escape(expr_id);
         }
         self.full_expression_return_borrow_pending = false;
+    }
+
+    public fn report_return_borrow_escape(self, expr_id: i32) {
+            let saved_path = diag_current_file().clone();
+            let saved_source = diag_current_source();
+            var source_path: str = "";
+            if (self.has_hir_codegen_builder) {
+                source_path = hir_codegen_builder_handle_function_source_path(self.hir_codegen_builder,
+                                                                                self.current_hir_function_id);
+            }
+            let switched = source_path.len > 0 && source_path != saved_path;
+            if (switched) { diag_set_source_context(source_path, sema_source_read(source_path)); }
+            diag_emit_at(diag_sev_ERROR(), diag_code_v_borrow_escape(), hir_unit_expr_loc_ptr(self.h, expr_id),
+                "returned view borrows an owning temporary or local destroyed at function exit");
+            if (switched) { diag_set_source_context(saved_path, saved_source); }
+            self.hir_codegen_error_count = self.hir_codegen_error_count + 1;
+    }
+
+    // One bit per current MIR place, released before this function is emitted.
+    // Named view assignments need flow state: a stale initializer flag would
+    // reject a view overwritten by a literal, or miss a later borrowed value.
+    public fn return_borrow_state(self, source: rawptr) -> rawptr {
+        let bytes = ((self.unit.place_count + 1) as u64) * 4;
+        let state = mir_profile_malloc(bytes);
+        if (state == null) { self.report_error("cannot allocate return-borrow flow state"); return null; }
+        if (source == null) { memset(state, 0, bytes); }
+        else { memcpy(state, source, bytes); }
+        return state;
+    }
+
+    public fn return_borrow_merge(self, destination: rawptr, source: rawptr) -> bool {
+        if (destination == null || source == null) { return false; }
+        var changed = false;
+        var i: i32 = 1;
+        while (i <= self.unit.place_count) {
+            let at = ptr_offset(destination, (i as i64) * 4);
+            if (ast_read_i32(at) == 0 && ast_read_i32(ptr_offset(source, (i as i64) * 4)) != 0) {
+                ast_write_i32(at, 1);
+                changed = true;
+            }
+            i += 1;
+        }
+        return changed;
+    }
+
+    public fn return_borrow_set(self, state: rawptr, local: i32, borrowed: bool) {
+        let place = mir_i32_map_get(self.place_map, local);
+        if (state != null && place > 0 && place <= self.unit.place_count) {
+            ast_write_i32(ptr_offset(state, (place as i64) * 4), borrowed ? 1 : 0);
+        }
+    }
+
+    public fn return_borrow_expr(self, expr: i32, state: rawptr, control: rawptr) -> bool {
+        if (state == null || expr <= 0 || expr == hir_id_invalid()) { return false; }
+        let kind = self.h.expr_kind(expr);
+        let type_kind = hir_type_table_kind(self.h.types, self.h.expr_type(expr));
+        let carries = self.full_expression_result_can_borrow(self.h.expr_type(expr))
+            || type_kind == ty_CLASS() || type_kind == ty_ARRAY() || type_kind == ty_PTR() || type_kind == ty_RAWPTR();
+        if (kind == ex_IDENT() && self.h.expr_target_kind(expr) == hir_target_local()) {
+            let local = self.h.expr_target_id(expr);
+            let local_kind = hir_type_table_kind(self.h.types, self.h.local_type(local));
+            if ((local_kind == ty_CLASS() || local_kind == ty_ARRAY())
+                && (self.h.local_flags(local) & hir_local_flag_auto_drop()) != 0) { return true; }
+            let place = mir_i32_map_get(self.place_map, local);
+            return carries && place > 0 && place <= self.unit.place_count
+                && ast_read_i32(ptr_offset(state, (place as i64) * 4)) != 0;
+        }
+        if (kind == ex_ASSIGN()) {
+            let borrowed = self.return_borrow_expr(self.h.expr_rhs(expr), state, control);
+            let lhs = self.h.expr_lhs(expr);
+            if (self.h.expr_kind(lhs) == ex_IDENT() && self.h.expr_target_kind(lhs) == hir_target_local()) {
+                self.return_borrow_set(state, self.h.expr_target_id(lhs), borrowed);
+            }
+            return carries && borrowed;
+        }
+        if (kind == ex_TERNARY() || kind == ex_IF_EXPR()) {
+            self.return_borrow_expr(self.h.expr_lhs(expr), state, control);
+            let a = self.return_borrow_state(state);
+            let b = self.return_borrow_state(state);
+            if (a == null || b == null) { free(a); free(b); return false; }
+            var av = false;
+            var bv = false;
+            var ar = true;
+            var br = true;
+            if (kind == ex_TERNARY()) {
+                av = self.return_borrow_expr(self.h.expr_rhs(expr), a, control);
+                bv = self.return_borrow_expr(self.h.expr_aux(expr), b, control);
+            } else {
+                var result: i32 = 0;
+                ar = self.return_borrow_chain(self.h.expr_stmt_rhs(expr), a, control, to_rawptr(&result));
+                av = result != 0;
+                if (self.h.expr_aux(expr) != hir_id_invalid()) {
+                    bv = self.return_borrow_expr(self.h.expr_aux(expr), b, control);
+                } else {
+                    result = 0;
+                    br = self.return_borrow_chain(self.h.expr_stmt_aux(expr), b, control, to_rawptr(&result));
+                    bv = result != 0;
+                }
+            }
+            if (ar) { memcpy(state, a, ((self.unit.place_count + 1) as u64) * 4); }
+            else if (br) { memcpy(state, b, ((self.unit.place_count + 1) as u64) * 4); }
+            if (ar && br) { self.return_borrow_merge(state, b); }
+            free(a); free(b);
+            return carries && ((ar && av) || (br && bv));
+        }
+        if (kind == ex_MATCH_EXPR()) {
+            self.return_borrow_expr(self.h.expr_lhs(expr), state, control);
+            let merged = self.return_borrow_state(null);
+            if (merged == null) { return false; }
+            var borrowed = false;
+            var reaches = false;
+            var arm = self.h.expr_stmt_rhs(expr);
+            while (arm != hir_id_invalid()) {
+                let branch = self.return_borrow_state(state);
+                self.return_borrow_expr(self.h.stmt_cond(arm), branch, control);
+                var result: i32 = 0;
+                if (self.return_borrow_chain(self.h.stmt_child(arm), branch, control, to_rawptr(&result))) {
+                    reaches = true;
+                    borrowed = borrowed || result != 0;
+                    self.return_borrow_merge(merged, branch);
+                }
+                free(branch);
+                arm = self.h.stmt_next(arm);
+            }
+            if (reaches) { memcpy(state, merged, ((self.unit.place_count + 1) as u64) * 4); }
+            free(merged);
+            return carries && borrowed;
+        }
+        var borrowed = false;
+        if (kind == ex_CALL() || kind == ex_MEMBER() || kind == ex_CAST()
+            || kind == ex_DEREF() || kind == ex_ADDR_OF() || kind == ex_INDEX() || kind == ex_BIN()) {
+            var lhs = self.h.expr_lhs(expr);
+            if (kind == ex_CALL() && self.h.expr_kind(lhs) == ex_MEMBER()) { lhs = self.h.expr_lhs(lhs); }
+            borrowed = self.return_borrow_expr(lhs, state, control);
+        }
+        if (kind == ex_BIN() && (self.h.expr_op(expr) == tk_AND() || self.h.expr_op(expr) == tk_OR())) {
+            let branch = self.return_borrow_state(state);
+            self.return_borrow_expr(self.h.expr_rhs(expr), branch, control);
+            self.return_borrow_merge(state, branch);
+            free(branch);
+            return false;
+        }
+        if (kind == ex_BIN() || kind == ex_INDEX()) {
+            let rhs = self.return_borrow_expr(self.h.expr_rhs(expr), state, control);
+            if (kind == ex_BIN() && self.h.expr_op(expr) == tk_PIPEARROW()) { return carries && rhs; }
+            borrowed = borrowed || rhs;
+            if (kind == ex_BIN() && self.h.expr_op(expr) == tk_PLUS()
+                && hir_type_table_kind(self.h.types, self.h.expr_type(self.h.expr_lhs(expr))) == ty_STRING()
+                && hir_type_table_kind(self.h.types, self.h.expr_type(self.h.expr_rhs(expr))) == ty_STRING()) { return false; }
+        }
+        if (kind == ex_CALL()) {
+            borrowed = self.return_borrow_expr(self.h.expr_aux(expr), state, control) || borrowed;
+        }
+        if (kind == ex_CALL() || kind == ex_STRUCT_INIT() || kind == ex_TUPLE_LIT()
+            || kind == ex_ARRAY_LIT() || kind == ex_FSTRING()) {
+            var arg = self.h.expr_first_arg(expr);
+            while (arg != hir_id_invalid()) {
+                borrowed = self.return_borrow_expr(arg, state, control) || borrowed;
+                arg = self.h.expr_next_arg(arg);
+            }
+        }
+        if (kind == ex_CALL() && self.full_expression_call_returns_independent_str(expr)) { return false; }
+        if (kind == ex_FSTRING()) { return false; }
+        if (kind == ex_ADDR_OF()) {
+            let lhs = self.h.expr_lhs(expr);
+            if (self.h.expr_kind(lhs) == ex_IDENT() && self.h.expr_target_kind(lhs) == hir_target_local()) {
+                let local = self.h.expr_target_id(lhs);
+                // The reference points at this frame's slot even for a Copy
+                // scalar. Taking the address of a reference parameter's value
+                // is different from simply returning the parameter itself.
+                return true;
+            }
+        }
+        if ((type_kind == ty_CLASS() || type_kind == ty_ARRAY())
+            && hir_unit_expr_value_category(self.h, expr) == hir_value_cat_value()
+            && hir_unit_expr_drop_function(self.h, expr) != hir_id_invalid()) { return true; }
+        return carries && borrowed;
+    }
+
+    public fn return_borrow_chain(self, first: i32, state: rawptr, control: rawptr, result: rawptr) -> bool {
+        if (state == null) { return false; }
+        var stmt = first;
+        while (stmt != hir_id_invalid()) {
+            let kind = self.h.stmt_kind(stmt);
+            ast_write_i32(result, 0);
+            if (kind == hir_stmt_return()) {
+                let expr = self.h.stmt_expr(stmt);
+                if (self.return_borrow_expr(expr, state, control)) { self.report_return_borrow_escape(expr); }
+                return false;
+            } else if (kind == hir_stmt_let() || kind == hir_stmt_var()) {
+                self.return_borrow_set(state, self.h.stmt_local(stmt),
+                    self.return_borrow_expr(self.h.stmt_expr(stmt), state, control));
+            } else if (kind == hir_stmt_expr()) {
+                ast_write_i32(result, self.return_borrow_expr(self.h.stmt_expr(stmt), state, control) ? 1 : 0);
+            } else if (kind == hir_stmt_block()) {
+                if (!self.return_borrow_chain(self.h.stmt_child(stmt), state, control, result)) { return false; }
+            } else if (kind == hir_stmt_if()) {
+                self.return_borrow_expr(self.h.stmt_cond(stmt), state, control);
+                let a = self.return_borrow_state(state);
+                let b = self.return_borrow_state(state);
+                if (a == null || b == null) { free(a); free(b); return false; }
+                let ar = self.return_borrow_chain(self.h.stmt_child(stmt), a, control, result);
+                let br = self.return_borrow_chain(self.h.stmt_else(stmt), b, control, result);
+                if (ar) { memcpy(state, a, ((self.unit.place_count + 1) as u64) * 4); }
+                else if (br) { memcpy(state, b, ((self.unit.place_count + 1) as u64) * 4); }
+                if (ar && br) { self.return_borrow_merge(state, b); }
+                free(a); free(b);
+                if (!ar && !br) { return false; }
+            } else if (kind == hir_stmt_while() || kind == hir_stmt_for() || kind == hir_stmt_foreach()) {
+                if (kind == hir_stmt_for()) {
+                    if (!self.return_borrow_chain(self.h.stmt_child(stmt), state, control, result)) { return false; }
+                }
+                let entry = self.return_borrow_state(state);
+                let breaks = self.return_borrow_state(null);
+                let continues = self.return_borrow_state(null);
+                let frame = mir_profile_malloc(32);
+                if (frame == null || entry == null || breaks == null || continues == null) {
+                    if (frame == null) { self.report_error("cannot allocate return-borrow loop state"); }
+                    free(entry); free(breaks); free(continues); free(frame); return false;
+                }
+                ast_write_rawptr(frame, breaks);
+                ast_write_rawptr(ptr_offset(frame, 8), continues);
+                ast_write_rawptr(ptr_offset(frame, 16), control);
+                ast_write_i32(ptr_offset(frame, 24), stmt);
+                var changed = true;
+                while (changed) {
+                    let iteration = self.return_borrow_state(entry);
+                    self.return_borrow_expr(self.h.stmt_cond(stmt), iteration, frame);
+                    var body = self.h.stmt_child(stmt);
+                    if (kind == hir_stmt_for()) { body = self.h.stmt_aux(stmt); }
+                    let reaches = self.return_borrow_chain(body, iteration, frame, result);
+                    if (ast_read_i32(continues) != 0) { self.return_borrow_merge(iteration, continues); }
+                    if (reaches || ast_read_i32(continues) != 0) {
+                        if (kind == hir_stmt_for()) { self.return_borrow_chain(self.h.stmt_else(stmt), iteration, frame, result); }
+                        changed = self.return_borrow_merge(entry, iteration);
+                    } else { changed = false; }
+                    free(iteration);
+                }
+                memcpy(state, entry, ((self.unit.place_count + 1) as u64) * 4);
+                let cond = self.h.stmt_cond(stmt);
+                let always = cond != hir_id_invalid() && self.h.expr_kind(cond) == ex_BOOL_LIT()
+                    && self.h.expr_int_value(cond) != 0;
+                if (always) { memset(state, 0, ((self.unit.place_count + 1) as u64) * 4); }
+                self.return_borrow_merge(state, breaks);
+                let exits = !always || ast_read_i32(breaks) != 0;
+                free(entry); free(breaks); free(continues); free(frame);
+                if (!exits) { return false; }
+            } else if (kind == hir_stmt_break() || kind == hir_stmt_continue()) {
+                var frame = control;
+                let label = self.h.stmt_name(stmt);
+                while (frame != null && label.len > 0
+                    && self.h.stmt_name(ast_read_i32(ptr_offset(frame, 24))) != label) {
+                    frame = ast_read_rawptr(ptr_offset(frame, 16));
+                }
+                if (frame != null) {
+                    var destination = ast_read_rawptr(frame);
+                    if (kind == hir_stmt_continue()) { destination = ast_read_rawptr(ptr_offset(frame, 8)); }
+                    ast_write_i32(destination, 1);
+                    self.return_borrow_merge(destination, state);
+                }
+                return false;
+            } else if (kind == hir_stmt_match()) {
+                self.return_borrow_expr(self.h.stmt_cond(stmt), state, control);
+                var arm = self.h.stmt_child(stmt);
+                let merged = self.return_borrow_state(state);
+                if (merged == null) { return false; }
+                while (arm != hir_id_invalid()) {
+                    let branch = self.return_borrow_state(state);
+                    if (self.return_borrow_chain(self.h.stmt_child(arm), branch, control, result)) {
+                        self.return_borrow_merge(merged, branch);
+                    }
+                    free(branch);
+                    arm = self.h.stmt_next(arm);
+                }
+                memcpy(state, merged, ((self.unit.place_count + 1) as u64) * 4);
+                free(merged);
+            }
+            stmt = self.h.stmt_next(stmt);
+        }
+        return true;
+    }
+
+    public fn check_named_return_borrows(self, body: i32) -> bool {
+        if (!self.full_expression_result_can_borrow(self.h.function_return_type(self.current_hir_function_id))) { return true; }
+        let before = self.hir_codegen_error_count;
+        let state = self.return_borrow_state(null);
+        var result: i32 = 0;
+        let reaches = self.return_borrow_chain(body, state, null, to_rawptr(&result));
+        if (reaches && result != 0) {
+            let tail = self.implicit_return_stmt_for_body(body);
+            if (tail != hir_id_invalid()) { self.report_return_borrow_escape(self.h.stmt_expr(tail)); }
+        }
+        free(state);
+        return self.hir_codegen_error_count == before;
     }
 
     public fn finish_full_expression(self, mark: rawptr, stmt_id: i32) {

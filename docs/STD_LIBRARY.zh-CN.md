@@ -520,8 +520,17 @@ for (c in owned) { ... }
 owned.destroy();
 ```
 
-`str` 不拥有源存储；`String` 使用 SSO/堆存储并负责释放。`iter()`、`chars()` 和
+`String.raw()` / `as_str()` 返回的 `str` 不拥有源存储；`String` 使用 SSO/堆存储并负责释放。`iter()`、`chars()` 和
 `bytes()` 都返回借用游标，修改或销毁源 `String` 会使游标失效。
+
+`String.fromBytes(ptr, len)` 会复制字节并返回拥有存储的 String。返回其视图时，源存储
+必须在调用结束后仍然有效：可以返回 String 本身、克隆文本，或借用调用方持有的对象。
+返回局部 String 的视图会报 `E3102`；局部别名、后续赋值、条件分支和循环也参与检查。
+
+```vyx
+fn view_of(owner: &String) -> str { return owner.as_str(); }
+fn copy_of(owner: &String) -> str { return owner.as_str().clone(); }
+```
 
 ---
 

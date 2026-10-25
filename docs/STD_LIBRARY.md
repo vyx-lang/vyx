@@ -354,6 +354,18 @@ ownership. A byte copy of an owner must not be treated as a second independent o
 to its caller. Console output releases fresh formatting results after writing.
 Custom implementations must return an actual borrowed view when referring to
 existing storage, such as `String.as_str()`, rather than an owning alias.
+
+`String.fromBytes(ptr, len)` copies bytes into an owning String. Its `raw()` and
+`as_str()` methods borrow that String's current storage. A returned view must
+outlive the call: return the String itself, clone the text, or borrow an owner
+held by the caller. Returning a view into a local String is rejected with
+`E3102`, including aliases and assignments across branches or loops.
+
+```vyx
+fn view_of(owner: &String) -> str { return owner.as_str(); }
+fn copy_of(owner: &String) -> str { return owner.as_str().clone(); }
+```
+
 `get_mut(i) -> &mut T` requires a mutable vector borrow and updates the stored
 element directly. Do not resize or remove storage while an element is borrowed.
 Keep the element alive and its storage stable while that reference is used.

@@ -14,6 +14,36 @@ use bootstrap.sema;
 // String ownership for the HIR builder. See README.md.
 
 impl HirUnitBuilder {
+    fn str_return_has_control(self, e: rawptr, depth: i32) -> bool {
+        if (e == null) { return false; }
+        if (depth > 32) { return true; }
+        let kind = expr_get_kind(e);
+        if (kind == ex_IF_EXPR() || kind == ex_MATCH_EXPR()) { return true; }
+        if (kind == ex_BIN() || kind == ex_ASSIGN() || kind == ex_INDEX()) {
+            return self.str_return_has_control(expr_get_lhs(e), depth + 1)
+                || self.str_return_has_control(expr_get_rhs(e), depth + 1);
+        }
+        if (kind == ex_MEMBER() || kind == ex_CAST() || kind == ex_ADDR_OF()
+            || kind == ex_DEREF() || kind == ex_UNARY()) {
+            return self.str_return_has_control(expr_get_lhs(e), depth + 1);
+        }
+        if (kind == ex_TERNARY()) {
+            return self.str_return_has_control(expr_get_lhs(e), depth + 1)
+                || self.str_return_has_control(expr_get_rhs(e), depth + 1)
+                || self.str_return_has_control(expr_get_args(e), depth + 1);
+        }
+        if (kind == ex_CALL() || kind == ex_FSTRING() || kind == ex_STRUCT_INIT()
+            || kind == ex_TUPLE_LIT() || kind == ex_ARRAY_LIT()) {
+            if (kind == ex_CALL() && self.str_return_has_control(expr_get_lhs(e), depth + 1)) { return true; }
+            var arg = expr_get_args(e);
+            while (arg != null) {
+                if (self.str_return_has_control(stmt_get_init(arg), depth + 1)) { return true; }
+                arg = stmt_get_next(arg);
+            }
+        }
+        return false;
+    }
+
     fn primitive_str_init_is_fresh_owned_value(self, init_e: rawptr) -> bool {
         if (init_e == null) { return false; }
         let kind = expr_get_kind(init_e);
@@ -347,4 +377,252 @@ impl HirUnitBuilder {
         if (target.len == 0) { return false; }
         return !self.primitive_str_stmt_chain_has_unsafe_use(stmt_get_next(s), target);
     }
+}
+
+// Query the retained source AST, not another function's disposable HIR range.
+// Unknown or recursive result flows never establish an independent result.
+impl HirUnitBuilder {
+    fn independent_str_binding(self, first: rawptr, target: rawptr, depth: i32) -> rawptr {
+        if (target == null || depth > 32) { return null; }
+        var s = first;
+        while (s != null) {
+            let kind = stmt_get_kind(s);
+            if (kind == st_LET() && stmt_get_semantic_kind(s) == expr_sem_LOCAL()
+                && stmt_get_semantic_target(s) == target) { return stmt_get_init(s); }
+            var found: rawptr = null;
+            if (kind == st_BLOCK() || kind == st_WHILE() || kind == st_FOREACH()) {
+                found = self.independent_str_binding(stmt_get_body(s), target, depth + 1);
+            } else if (kind == st_IF() || kind == st_FOR()) {
+                found = self.independent_str_binding(stmt_get_then_blk(s), target, depth + 1);
+                if (found == null) { found = self.independent_str_binding(stmt_get_else_blk(s), target, depth + 1); }
+            } else if (kind == st_MATCH()) {
+                var arm = stmt_get_body(s);
+                while (arm != null && found == null) {
+                    found = self.independent_str_binding(stmt_get_body(arm), target, depth + 1);
+                    arm = stmt_get_next(arm);
+                }
+            }
+            if (found != null) { return found; }
+            s = stmt_get_next(s);
+        }
+        return null;
+    }
+
+    fn independent_str_return_expr(self, e: rawptr, body: rawptr, depth: i32) -> bool {
+        if (e == null || depth > 32) { return false; }
+        if (self.str_return_has_control(e, 0)) { return false; }
+        let kind = expr_get_kind(e);
+        if (kind == ex_STR_LIT() || kind == ex_FSTRING()) { return true; }
+        if (kind == ex_IDENT() && expr_get_semantic_kind(e) == expr_sem_LOCAL()) {
+            let init = self.independent_str_binding(body, expr_get_semantic_target(e), 0);
+            return init != null && self.independent_str_return_expr(init, body, depth + 1);
+        }
+        if (kind == ex_BIN() && expr_get_op(e) == tk_PLUS()) {
+            let ty = expr_get_ty(e);
+            let lhs_ty = expr_get_ty(expr_get_lhs(e));
+            let rhs_ty = expr_get_ty(expr_get_rhs(e));
+            return ty != null && tref_get_kind(ty) == ty_STRING()
+                && lhs_ty != null && tref_get_kind(lhs_ty) == ty_STRING()
+                && rhs_ty != null && tref_get_kind(rhs_ty) == ty_STRING();
+        }
+        if (kind == ex_TERNARY()) {
+            return self.independent_str_return_expr(expr_get_rhs(e), body, depth + 1)
+                && self.independent_str_return_expr(expr_get_args(e), body, depth + 1);
+        }
+        if (kind != ex_CALL()) { return false; }
+        let callee = expr_get_lhs(e);
+        if (callee == null) { return false; }
+        let semantic = expr_get_semantic_kind(e);
+        if (semantic == expr_sem_BUILTIN()) {
+            // These are resolved language builtins, not arbitrary functions
+            // whose last name happens to resemble a standard-library API.
+            if (expr_get_kind(callee) == ex_IDENT()) {
+                return expr_get_name(callee) == "from_cstr_len";
+            }
+            return expr_get_kind(callee) == ex_MEMBER()
+                && policy_string_method_kind(expr_get_name(callee)) == 2;
+        }
+        if (semantic != expr_sem_DIRECT_FN() && semantic != expr_sem_METHOD()) { return false; }
+        let target = expr_get_semantic_target(e);
+        if (target == null) { return false; }
+        let target_kind = decl_get_kind(target);
+        if (target_kind != de_FN() && target_kind != de_METHOD()) { return false; }
+        return self.independent_str_return_decl(target, depth + 1);
+    }
+
+    // Bits: 1 = at least one return; 2 = a return with unknown/borrowed origin.
+    fn independent_str_return_stmts(self, first: rawptr, body: rawptr, depth: i32) -> i32 {
+        if (depth > 32) { return 2; }
+        var result: i32 = 0;
+        var s = first;
+        while (s != null) {
+            let kind = stmt_get_kind(s);
+            if (kind == st_RETURN()) {
+                result = result | 1;
+                if (!self.independent_str_return_expr(stmt_get_init(s), body, depth + 1)) { return result | 2; }
+            } else if (kind == st_BLOCK()) {
+                result = result | self.independent_str_return_stmts(stmt_get_body(s), body, depth + 1);
+            } else if (kind == st_IF()) {
+                result = result | self.independent_str_return_stmts(stmt_get_then_blk(s), body, depth + 1)
+                    | self.independent_str_return_stmts(stmt_get_else_blk(s), body, depth + 1);
+            } else if (kind == st_WHILE() || kind == st_FOREACH()) {
+                result = result | self.independent_str_return_stmts(stmt_get_body(s), body, depth + 1);
+            } else if (kind == st_FOR()) {
+                result = result | self.independent_str_return_stmts(stmt_get_then_blk(s), body, depth + 1);
+            } else if (kind == st_LET() || kind == st_VAR() || kind == st_EXPR()) {
+                if (self.str_return_has_control(stmt_get_init(s), 0)) { return result | 2; }
+            } else if (kind != st_LET() && kind != st_VAR() && kind != st_EXPR()
+                && kind != st_BREAK() && kind != st_CONTINUE() && kind != st_DEFER()) {
+                // Do not prove a contract by overlooking an unhandled return
+                // carrier, for example a match arm or exception handler.
+                return result | 2;
+            }
+            if ((result & 2) != 0) { return result; }
+            s = stmt_get_next(s);
+        }
+        return result;
+    }
+
+    fn independent_str_return_decl(self, d: rawptr, depth: i32) -> bool {
+        if (d == null || depth > 32) { return false; }
+        let owner = hir_raw_owner_map_get(self.decl_owner_map, d);
+        if (hir_builder_generic_param_count(hir_builder_decl_template_params(d)) > 0
+            || hir_builder_generic_param_count(hir_builder_decl_template_params(owner)) > 0) { return false; }
+        let body_decl = self.raw_function_body_decl_for(d);
+        if (body_decl == null) { return false; }
+        let body = decl_get_body(body_decl);
+        if (body == null) { return false; }
+        let facts = self.independent_str_return_stmts(body, body, depth + 1);
+        // An implicit tail result is also a return. It cannot be ignored just
+        // because another branch already contained an explicit return.
+        var tail = body;
+        if (stmt_get_kind(tail) == st_BLOCK()) { tail = stmt_get_body(tail); }
+        if (tail == null) { return false; }
+        while (stmt_get_next(tail) != null) { tail = stmt_get_next(tail); }
+        if (stmt_get_kind(tail) == st_EXPR()) {
+            return (facts & 2) == 0
+                && self.independent_str_return_expr(stmt_get_init(tail), body, depth + 1);
+        }
+        return facts == 1;
+    }
+
+    fn function_returns_independent_str(self, function_id: i32) -> bool {
+        return self.function_returns_independent_str_depth(function_id, 0);
+    }
+
+    fn function_returns_independent_str_depth(self, function_id: i32, depth: i32) -> bool {
+        if (function_id == hir_id_invalid() || depth > 32
+            || hir_type_table_kind(self.unit.types, self.unit.function_return_type(function_id)) != ty_STRING()) { return false; }
+        if ((self.unit.function_flags(function_id) & hir_function_flag_independent_str_return()) != 0) { return true; }
+        let source = self.function_body_source_decl(null, function_id);
+        var independent = false;
+        let owner = hir_raw_owner_map_get(self.decl_owner_map, source);
+        if (hir_builder_generic_param_count(hir_builder_decl_template_params(source)) == 0
+            && hir_builder_generic_param_count(hir_builder_decl_template_params(owner)) == 0) {
+            independent = self.independent_str_return_decl(source, 0);
+        }
+        if (!independent) { independent = self.independent_str_hir_body(function_id, source, depth + 1); }
+        // A lazy concrete callee may not have been emitted yet. Resolve one
+        // linear return chain for its contract, retaining only signature facts
+        // and releasing each completed body. Do not drain its dependency queue
+        // or mark it code-generated: ordinary streaming still owns emission.
+        let attempted: i32 = 33554432;
+        if (!independent && self.unit.function_body(function_id) == hir_id_invalid()
+            && !self.function_body_codegen_is_done(function_id)
+            && (self.unit.function_flags(function_id) & attempted) == 0
+            && self.independent_str_linear_source(source)) {
+            self.unit.add_function_flags(function_id, attempted);
+            let stmt_mark = self.unit.stmt_count;
+            let expr_mark = self.unit.expr_count;
+            let local_mark = self.unit.local_count;
+            self.build_reachable_function_body_now(source, function_id, false);
+            independent = self.independent_str_hir_body(function_id, source, depth + 1);
+            self.discard_function_body_records_after_codegen(function_id, stmt_mark, expr_mark, local_mark);
+            self.invalidate_materialization_resolution_caches();
+        }
+        if (!independent) { return false; }
+        self.unit.add_function_flags(function_id, hir_function_flag_independent_str_return());
+        return true;
+    }
+
+    // Closed generic bodies are already resolved while their caller is built.
+    // Read that live range only; never rebuild a discarded body for this proof.
+    fn independent_str_hir_expr(self, e: i32, first: i32, depth: i32) -> bool {
+        if (e == hir_id_invalid() || depth > 32) { return false; }
+        let kind = self.unit.expr_kind(e);
+        if (kind == ex_STR_LIT() || kind == ex_FSTRING()) { return true; }
+        if (kind == ex_IDENT() && self.unit.expr_target_kind(e) == hir_target_local()) {
+            var s = first;
+            while (s != hir_id_invalid()) {
+                if (self.unit.stmt_kind(s) == hir_stmt_let()
+                    && self.unit.stmt_local(s) == self.unit.expr_target_id(e)) {
+                    return self.independent_str_hir_expr(self.unit.stmt_expr(s), first, depth + 1);
+                }
+                s = self.unit.stmt_next(s);
+            }
+            return false;
+        }
+        if (kind == ex_BIN() && self.unit.expr_op(e) == tk_PLUS()) {
+            return hir_type_table_kind(self.unit.types, self.unit.expr_type(self.unit.expr_lhs(e))) == ty_STRING()
+                && hir_type_table_kind(self.unit.types, self.unit.expr_type(self.unit.expr_rhs(e))) == ty_STRING();
+        }
+        if (kind != ex_CALL()) { return false; }
+        let callee = self.unit.expr_lhs(e);
+        var target_kind = self.unit.expr_target_kind(e);
+        var target = self.unit.expr_target_id(e);
+        if (target_kind == hir_target_none()) {
+            target_kind = self.unit.expr_target_kind(callee);
+            target = self.unit.expr_target_id(callee);
+        }
+        if (target_kind == hir_target_builtin()) {
+            if (self.unit.expr_kind(callee) == ex_MEMBER()) {
+                return hir_type_table_kind(self.unit.types, self.unit.expr_type(self.unit.expr_lhs(callee))) == ty_STRING()
+                    && policy_string_method_kind(self.unit.expr_name(callee)) == 2;
+            }
+            return self.unit.builtin_name(target) == "from_cstr_len";
+        }
+        return target_kind == hir_target_function()
+            && self.function_returns_independent_str_depth(target, depth + 1);
+    }
+
+    fn independent_str_linear_source(self, source: rawptr) -> bool {
+        var raw = decl_get_body(source);
+        if (raw == null) { return false; }
+        if (stmt_get_kind(raw) == st_BLOCK()) { raw = stmt_get_body(raw); }
+        while (raw != null && stmt_get_next(raw) != null) {
+            let kind = stmt_get_kind(raw);
+            if ((kind != st_LET() && kind != st_VAR() && kind != st_EXPR())
+                || self.str_return_has_control(stmt_get_init(raw), 0)) { return false; }
+            raw = stmt_get_next(raw);
+        }
+        return raw != null && (stmt_get_kind(raw) == st_RETURN() || stmt_get_kind(raw) == st_EXPR())
+            && !self.str_return_has_control(stmt_get_init(raw), 0);
+    }
+
+    fn independent_str_hir_body(self, function_id: i32, source: rawptr, depth: i32) -> bool {
+        if (depth > 32 || !self.independent_str_linear_source(source)) { return false; }
+        var stmt = self.unit.function_body(function_id);
+        if (stmt == hir_id_invalid()) { return false; }
+        if (self.unit.stmt_kind(stmt) == hir_stmt_block()) { stmt = self.unit.stmt_child(stmt); }
+        let first = stmt;
+        if (stmt == hir_id_invalid()) { return false; }
+        while (self.unit.stmt_next(stmt) != hir_id_invalid()) { stmt = self.unit.stmt_next(stmt); }
+        if (self.unit.stmt_kind(stmt) != hir_stmt_return() && self.unit.stmt_kind(stmt) != hir_stmt_expr()) { return false; }
+        return self.independent_str_hir_expr(self.unit.stmt_expr(stmt), first, depth + 1);
+    }
+}
+
+public fn hir_codegen_builder_handle_function_returns_independent_str(handle: rawptr, function_id: i32) -> bool {
+    if (handle == null) { return false; }
+    var builder = hir_codegen_builder_handle_load(handle);
+    let result = builder.function_returns_independent_str(function_id);
+    hir_codegen_builder_handle_store(handle, builder);
+    return result;
+}
+
+public fn hir_codegen_builder_handle_function_source_path(handle: rawptr, function_id: i32) -> str {
+    if (handle == null) { return ""; }
+    var builder = hir_codegen_builder_handle_load(handle);
+    let source = builder.function_body_source_decl(null, function_id);
+    return hir_builder_decl_source_path(source);
 }

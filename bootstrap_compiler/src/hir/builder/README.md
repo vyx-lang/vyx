@@ -44,7 +44,7 @@ the binding and does not insert another argument or another evaluation.
 | Build expressions, statements and patterns | [expressions.vyx](lower/expressions.vyx): `build_expr`; [statements.vyx](lower/statements.vyx): `build_stmt`; [patterns.vyx](lower/patterns.vyx) |
 | Expression targets, primitives and operators | [expression_targets.vyx](resolution/expression_targets.vyx), [builtins.vyx](lower/builtins.vyx), [operators.vyx](lower/operators.vyx) |
 | Parameters, construction, closures and packs | [parameters.vyx](lower/parameters.vyx), [constructors.vyx](lower/constructors.vyx), [closures.vyx](lower/closures.vyx), [packs.vyx](generics/packs.vyx) |
-| Borrow, move and drop metadata | [ownership.vyx](lifetime/ownership.vyx): `set_local_drop_for_type`; [string_ownership.vyx](lifetime/string_ownership.vyx) |
+| Borrow, move, drop and independent str-return facts | [ownership.vyx](lifetime/ownership.vyx): `set_local_drop_for_type`; [string_ownership.vyx](lifetime/string_ownership.vyx) |
 | Trait requirements and dynamic payloads | [traits.vyx](types/traits.vyx): `type_text_satisfies_dyn_trait`, `materialize_dyn_trait_impl_methods` |
 | Reflection and record layout | [reflection.vyx](metadata/reflection.vyx): `build_reflection_manifest`; [record_layout.vyx](types/record_layout.vyx): `class_storage_size` |
 | DCI producer metadata and overrides | [dci.vyx](metadata/dci.vyx): `build_dci_stub_specs`, `finalize_foreign_cpp_metadata`; lifecycle binding delegates to `bootstrap.dci_binder` |
@@ -84,6 +84,13 @@ cannot substitute for a failed closed-instance lookup.
 IDs in body ranges are not persistent references after discard. Preserve the
 checks for the latest owned range and the retained parameter/capture locals.
 Do not replace this flow with eager construction of every function body.
+
+Return-view checks retain independent-result facts on exact concrete signatures.
+An unresolved linear return chain can be queried on demand; each completed HIR
+body is discarded without marking its native body emitted. Queries do not drain
+the reachable queue. Consumers refresh HIR views because even a short query can
+register parameter types and grow shared arenas. A method's spelling alone,
+including `clone`, never establishes that its result owns independent storage.
 
 ## Iteration type closure
 
