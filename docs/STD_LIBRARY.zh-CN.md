@@ -265,8 +265,8 @@ let n = v.pop();                 // 弹出最后 → T
 | `new()` | `static -> Vec<T>` | 创建空 Vec |
 | `with_capacity(n)` | `static -> Vec<T>` | 指定初始容量 |
 | `push(val: T)` | | 追加元素 |
-| `get(i: i64)` | `-> T` | 克隆元素（越界 panic；拥有资源的 T 需实现 Clone） |
-| `get_unchecked(i)` | `-> T` | 克隆元素，无边界检查 |
+| `get(i: i64)` | `-> T where T: Clone` | 克隆元素（越界 panic） |
+| `get_unchecked(i)` | `-> T where T: Clone` | 克隆元素，无边界检查 |
 | `get_ref(i: i64)` | `-> &T` | 借用元素，不克隆（越界 panic） |
 | `get_mut(i: i64)` | `-> &mut T` | 通过可变 Vec 借用原地修改元素（越界 panic） |
 | `set(i: i64, val: T)` | | 设置元素 |
@@ -294,6 +294,9 @@ let n = v.pop();                 // 弹出最后 → T
 
 `push`、`set` 和 `pop` 转移元素所有权。`set` 会先析构被替换的元素；
 缩小 `resize` 会析构移除的元素，扩大时分别克隆填充值。
+用户定义的记录和枚举需要提供克隆实现，例如 `impl Clone for Type` 或 `@[derive(Clone)]`。
+非泛型类型中匹配的 `clone() -> Self` 成员也可按结构化 trait 规则满足约束。
+
 只读访问不能克隆的元素时用 `get_ref`；借用期间不要扩容、替换、移除或销毁该元素。
 原地修改元素时用 `get_mut`，它要求可变借用 Vec，不复制元素所有权。
 存入 `Vec`、`Box` 和 `Ref` 的原始 `str` 按分配器标记释放堆存储；字面量和借用视图不会被释放。

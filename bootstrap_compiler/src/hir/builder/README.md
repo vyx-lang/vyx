@@ -92,6 +92,12 @@ the reachable queue. Consumers refresh HIR views because even a short query can
 register parameter types and grow shared arenas. A method's spelling alone,
 including `clone`, never establishes that its result owns independent storage.
 
+Closed generic function and method instances check their declared `where`
+clauses against Sema's fact ledger and the complete owner/method environment.
+The ledger and borrowed source-symbol index remain available through codegen;
+the next analysis or service disposal releases the ledger. A rejected constraint
+stops the current body before MIR lowering, preserving its call-site diagnostic.
+
 ## Iteration type closure
 
 `for-in` uses the declared element type: array elements, the verified Vec

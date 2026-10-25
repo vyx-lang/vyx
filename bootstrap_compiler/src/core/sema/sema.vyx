@@ -1437,6 +1437,26 @@ public fn sema_env_dispose(env: rawptr) {
 
 var g_sema_cur_loc: rawptr = null;
 
+// The syntax arena and its symbol nodes outlive Sema through streaming codegen.
+// Keep only the immutable constraint inputs; no locals or function bodies are
+// retained here. The fact ledger is moved, not copied, and released on the next
+// analysis or service disposal.
+var g_constraint_unit: rawptr = null;
+var g_constraint_classes: rawptr = null;
+var g_constraint_class_count: i32 = 0;
+var g_constraint_facts: rawptr = null;
+var g_constraint_module: string = "";
+
+fn sema_constraint_query_reset() {
+    fact_base_dispose(g_constraint_facts);
+    g_constraint_facts = null;
+    g_constraint_unit = null;
+    g_constraint_classes = null;
+    g_constraint_class_count = 0;
+    g_constraint_module = "";
+}
+
+
 public fn sema_clear_cur_loc() {
     g_sema_cur_loc = null;
 }
@@ -4761,6 +4781,7 @@ fn sema_decl_is_constructor(d: rawptr) -> bool {
 }
 
 fn sema_decl_mark_trait_impl(cd: rawptr, trait_name: string) {
+
     if (cd == null || trait_name.len == 0) { return; }
     let key = sema_derive_trait_key(trait_name);
     let gp = decl_get_generic_params(cd);
@@ -13897,6 +13918,11 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
 
     public fn check_const_where_constraints(self, d: rawptr, cargs: string, args_head: rawptr, ctx: string) {
         if (d == null) { return; }
+        self.check_const_where_constraints_in_env(d, decl_get_generic_params(d), cargs, args_head, ctx);
+    }
+
+    fn check_const_where_constraints_in_env(self, d: rawptr, params: string,
+                                             cargs: string, args_head: rawptr, ctx: string) {
         let gp = decl_get_generic_params(d);
         let where_text = sema_where_text(gp);
         if (where_text.len == 0) { return; }
@@ -13909,8 +13935,8 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
             if (op.len == 0) { pos = pos + 1; }
         }
         if (op.len == 0) { return; }
-        let lhs = self.where_arith_value(gp, cargs, args_head, str_view_range(where_text, 0, pos));
-        let rhs = self.where_arith_value(gp, cargs, args_head, str_view_range(where_text, pos + op.len, where_text.len));
+        let lhs = self.where_arith_value(params, cargs, args_head, str_view_range(where_text, 0, pos));
+        let rhs = self.where_arith_value(params, cargs, args_head, str_view_range(where_text, pos + op.len, where_text.len));
         var ok: bool = false;
         if (op == ">") { ok = lhs > rhs; }
         else if (op == ">=") { ok = lhs >= rhs; }
@@ -13985,10 +14011,19 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
 
     public fn check_where_constraints(self, d: rawptr, cargs: string, args_head: rawptr, ctx: string) {
         if (d == null) { return; }
+        self.check_where_constraints_in_env(d, decl_get_generic_params(d), cargs, args_head, ctx);
+    }
+
+    // A method's where-clause can constrain its owner's parameters even when
+    // the method itself has no template parameters. Keep the declaration's
+    // lexical trait scope, but use the call's complete substitution environment.
+    fn check_where_constraints_in_env(self, d: rawptr, params: string,
+                                       cargs: string, args_head: rawptr, ctx: string) {
+        if (d == null) { return; }
         let gp = decl_get_generic_params(d);
         if (!string_contains(gp, "|where:")) { return; }
         if (!self.validate_where_trait_names(d, ctx)) { return; }
-        self.check_const_where_constraints(d, cargs, args_head, ctx);
+        self.check_const_where_constraints_in_env(d, params, cargs, args_head, ctx);
         var iface_cur = self.classes_buf;
         while (iface_cur != null) {
             let td = sym_get_decl(iface_cur);
@@ -14014,7 +14049,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                     }
                 }
                 var pi: i32 = 0;
-                var gname = generic_param_at(gp, pi);
+                var gname = generic_param_at(params, pi);
                 while (gname.len > 0) {
                     if (where_generic_requires_trait(gp, gname.clone(), trait_name.clone())
                         || (short_visible && where_generic_requires_trait(gp, gname.clone(), short_name.clone()))) {
@@ -14028,13 +14063,13 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                         }
                     }
                     pi = pi + 1;
-                    gname = generic_param_at(gp, pi);
+                    gname = generic_param_at(params, pi);
                 }
             }
             iface_cur = sym_get_next(iface_cur);
         }
         var ki: i32 = 0;
-        var kg = generic_param_at(gp, ki);
+        var kg = generic_param_at(params, ki);
         while (kg.len > 0) {
             let concrete = generic_arg_at(cargs, ki);
             if (concrete.len > 0 && !generic_list_contains(self.cur_generic_params, concrete.clone())) {
@@ -14050,7 +14085,7 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                 }
             }
             ki = ki + 1;
-            kg = generic_param_at(gp, ki);
+            kg = generic_param_at(params, ki);
         }
     }
 
@@ -17924,7 +17959,23 @@ fn sema_decl_source_path(self, d: rawptr) -> string {
                     }
                 }
                 let v = stmt_get_init(cell);
-                let field_ty = decl_get_ty(mp);
+                var field_ty = decl_get_ty(mp);
+                // A closed literal validates its fields in the owner's env,
+                // including nested types such as Box<T>, not just a bare T.
+                // Inherited fields keep their separate declaring-owner env.
+                let field_owner = self.class_decl_member_owner_deep(cd, fname, 0);
+                if (field_ty != null && field_owner == cd) {
+                    var owner_text = expr_get_name(ep);
+                    let literal_ty = expr_get_ty(ep);
+                    if (literal_ty != null && tref_get_kind(literal_ty) == ty_CLASS()) {
+                        owner_text = tref_get_name(literal_ty);
+                    }
+                    let owner_args = policy_generic_call_args(owner_text);
+                    if (owner_args.len > 0) {
+                        field_ty = sema_substitute_type_with_args(field_ty,
+                            decl_get_generic_params(cd), owner_args);
+                    }
+                }
                 if (v != null && field_ty != null) {
                     var got = expr_get_ty(v);
                     if (got == null) { got = self.resolve_expr(v); }
@@ -18725,6 +18776,21 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
                                            true)) {
             return tref_create_kind(ty_RAWPTR());
         }
+        let owner_params = decl_get_generic_params(selected_owner);
+        let method_params = decl_get_generic_params(method_decl);
+        var bound_args = recv_args.clone();
+        var bound_method_args = method_args.clone();
+        if (bound_method_args.len == 0 && generic_param_count(method_params) > 0) {
+            bound_method_args = self.infer_generic_args_from_call_args(method_params, method_decl, call_e);
+        }
+        if (bound_method_args.len > 0) {
+            if (bound_args.len > 0) { bound_args = bound_args + "," + bound_method_args; }
+            else { bound_args = bound_method_args; }
+        }
+        sema_stamp_loc_from_expr(call_e);
+        self.check_where_constraints_in_env(method_decl,
+            merge_generic_params(owner_params, method_params), bound_args,
+            expr_get_args(call_e), recv_name + "." + method_name);
         if (!self.prepare_hir_facts
             || self.sema_interface_body_needs_resolution(method_decl, selected_owner)) {
             let owner_imported = string_contains(decl_get_meta(selected_owner),
@@ -21799,6 +21865,7 @@ public fn sema_function_visibility_blocked(self, name: string) -> bool {
     }
 
     public fn derive_synthesize_clone(self, cd: rawptr) -> bool {
+
         if (cd == null) { return false; }
         if (self.derive_method_exists(cd, "clone")) {
             sema_decl_mark_trait_impl(cd, "Clone");
@@ -22832,7 +22899,16 @@ public fn analyze_unit_with_registry_options_codegen_roots(unit: rawptr,
     sema_string_state_map_dispose(s.loaded_paths);
     sema_string_state_map_dispose(s.forced_layout_targets);
     mono_scheduler_dispose(s.mono_scheduler);
-    fact_base_dispose(s.fact_base);
+    sema_constraint_query_reset();
+    if (prepare_hir_facts && s.error_count == 0) {
+        g_constraint_unit = unit;
+        g_constraint_classes = s.classes_buf;
+        g_constraint_class_count = s.class_count;
+        g_constraint_facts = s.fact_base;
+        g_constraint_module = s.file_module.clone();
+    } else {
+        fact_base_dispose(s.fact_base);
+    }
     effect_plan_dispose(s.effect_plan);
     lang_items_dispose(s.lang_items);
     return h;
@@ -22866,6 +22942,7 @@ public fn analyze_unit(unit: rawptr) -> rawptr {
 /// Long-running clients call this after extracting facts, before releasing the
 /// parse/service frame. Batch compilation keeps its caches through lowering.
 public fn sema_service_dispose() {
+    sema_constraint_query_reset();
     sema_clear_cur_loc();
     vyx_type_text_cache_clear();
     sym_lookup_cache_reset();
@@ -23182,6 +23259,33 @@ fn sema_impl_clause_text(meta: string) -> string {
         i = i + 1;
     }
     return "";
+}
+
+// Check lazy generic calls after substitution, without resolving a second AST
+// body or retaining MIR. params/args are the exact selected function's env.
+public fn sema_check_instantiated_constraints(unit: rawptr, d: rawptr,
+                                             params: string, args: string,
+                                             loc: rawptr) -> bool {
+    if (d == null || !string_contains(decl_get_generic_params(d), "|where:")) { return true; }
+    if (unit == null || unit != g_constraint_unit) {
+        diag_emit_at(diag_sev_ERROR(), diag_code_sema_trait_bound(), loc,
+            "constraint facts are unavailable for this compilation unit");
+        return false;
+    }
+    var query: Sema;
+    memset(to_rawptr(&query), 0, sizeof::<Sema>() as u64);
+    query.current_unit = unit;
+    query.classes_buf = g_constraint_classes;
+    query.class_count = g_constraint_class_count;
+    query.fact_base = g_constraint_facts;
+    query.file_module = g_constraint_module;
+    query.cur_body_decl = d;
+    query.prepare_hir_facts = true;
+    let saved_loc = g_sema_cur_loc;
+    g_sema_cur_loc = loc;
+    query.check_where_constraints_in_env(d, params, args, null, decl_get_name(d));
+    g_sema_cur_loc = saved_loc;
+    return query.error_count == 0;
 }
 
 public fn check_program(s_ptr: rawptr, unit: rawptr) -> i32 {

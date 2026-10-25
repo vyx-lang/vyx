@@ -129,7 +129,7 @@ def main() -> int:
     rejected.unlink(missing_ok=True)
     invoke("unclonable_payload-rejected", [compiler, "--src=file", gate / "unclonable_payload.vyx",
                                            "--emit=exe", "-o", rejected], expected_exit=1,
-           diagnostic="clone requires an explicit Clone implementation for owning type 'Unique'")
+           diagnostic="E1100: trait bound not satisfied")
     records.append({"name": "unclonable_payload-no-artifact", "pass": not rejected.exists()})
     report = {"compiler": str(compiler), "sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
               "records": records, "passed": sum(r["pass"] for r in records), "checks": len(records)}

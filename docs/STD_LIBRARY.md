@@ -307,8 +307,11 @@ Do not modify a container's structure while an iterator is live. A `String`
 cursor also borrows the source storage: changing or destroying the source
 invalidates it.
 
-`Vec.get` and `get_unchecked` return independent clones. Owning element types
-must provide `Clone`; `get_ref(i) -> &T` borrows an element without cloning.
+`Vec.get` and `get_unchecked` return independent clones and require `T: Clone`.
+User-defined records and enums provide a cloning implementation through
+`impl Clone for Type`, `@[derive(Clone)]`, or a matching structural member
+on a nongeneric type.
+`get_ref(i) -> &T` borrows an element without cloning.
 
 `Stack` and `Queue` own stored elements. `push`/`enqueue` transfer ownership
 in, while `pop`/`dequeue` transfer ownership out without cloning. `peek`, `get`
