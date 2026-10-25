@@ -5,6 +5,11 @@ Linux AArch64, Android/Termux AArch64, and macOS Apple Silicon / Intel. Manual r
 Stage 0 release tag; the default resolves the latest published SDK. Pin a tag
 for reproducing a previous bootstrap input.
 
+Distribution archives are built, packaged and published by this workflow.
+The normal release handoff is to commit and push `main`, then check the CI run
+for that exact commit and its Release assets. Local work covers source compiler
+builds and targeted regressions; it no longer includes building `dist` archives.
+
 The debugger patch uses LF on every host through `.gitattributes`. CodeLLDB's
 platform, source patch, bundled patch and executable hashes are checked before
 compilation; packaging repeats its source patch and executable checks. A hash
@@ -57,16 +62,13 @@ replaced. Uploads first go to a draft Release. A failed upload leaves that draft
 for inspection; rerunning allocates a new tag. A completed build of an older
 commit does not replace the latest main SDK release.
 
-Run locally on the corresponding native host (Python 3.12, PowerShell 7,
-LLVM 22 development files, CMake, Ninja, Git; MSVC/Windows SDK on Windows):
+Run the release-script unit tests locally with Python 3.12:
 
 ```sh
-python bootstrap_compiler/scripts/release/build_native.py --llvm-root /usr/lib/llvm-22 --work /tmp/vyx-build --output ./release-assets --jobs 4
-python bootstrap_compiler/scripts/release/build_termux.py --host-sdk ./release-assets/vyx-sdk-linux-x86_64-llvm22 --ndk /opt/android-ndk-r28c --work /tmp/vyx-termux --output ./release-assets --jobs 4
 python -m unittest discover -s bootstrap_compiler/scripts/release -p 'test_*.py'
 ```
 
-Use new work/output directories for each build. `--bootstrap-sdk` and
+CI uses new work/output directories for each build. `--bootstrap-sdk` and
 `--base-package` allow predownloaded bootstrap inputs. `GH_TOKEN` is optional
 for public downloads but avoids GitHub API rate limits. Publishing requires a
 repository token with `contents: write`; it is only granted to the publish job.

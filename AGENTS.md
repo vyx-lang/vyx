@@ -50,6 +50,13 @@
 
 ## 编译器：构建和验收
 
+### SDK 分发
+
+`dist` 分发包的构建、打包和发布统一交给
+`.github/workflows/sdk-release.yml` 的 `SDK release` 工作流。
+日常交付提交并推送 `main`，核对该提交对应的 CI 运行和 Release 产物。
+本地负责源码迭代、SDK 编译器构建和针对性回归，不再将本地打 dist 包作为交付步骤。
+
 ### 工具链身份
 
 Release SDK 的 `vyxc` 作为 **Stage 0** 构建本树 SDK 编译器；被测编译器必须来自这次构建。
