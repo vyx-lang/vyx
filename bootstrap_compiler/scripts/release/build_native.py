@@ -173,6 +173,9 @@ def main():
                 (out / soname[1]).symlink_to(tbb.name)
         environment["LD_LIBRARY_PATH"] = str(out) + (":" + environment["LD_LIBRARY_PATH"]
                                                     if environment.get("LD_LIBRARY_PATH") else "")
+    run([sys.executable, REPO / "probes/gates/compiler-self-source/run.py",
+         "--compiler", built_compiler, "--build-root", build,
+         "--output", work / "self-source"], env=environment)
     for target in tools:
         run([built_compiler, "build", "--target", target, f"-j{args.jobs}"], cwd=build, env=environment)
     arguments = ["pwsh", "-NoProfile", "-File", REPO / "bootstrap_compiler/scripts/package_sdk.ps1",

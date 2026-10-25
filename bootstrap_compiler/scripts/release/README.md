@@ -38,6 +38,14 @@ Termux packager. The downloaded Linux host SDK must pass the same project
 build/run gate on the Android build runner before cross-compilation starts.
 Android execution still requires a device.
 
+Before tools and packaging, the new compiler [rechecks every module](../../../../probes/gates/compiler-self-source/README.md) in its own
+completed build plan with the streaming MIR verifier and current `std_packages`.
+The check requires real lowered bodies and complete manifest-source coverage;
+it also exercises rejection of escaped local storage through named/top-level
+export roots. This detects source/ownership failures in the new compiler before
+the Linux archive is passed to the Android job. It does not rebuild a compiler
+generation. Per-module commands and results are retained in `self-source/`.
+
 Each compiler build permits one Vyx child process and two memory slots. Native
 compilation uses four workers. Build caches are not shared between platforms.
 Windows LLVM preparation streams the XZ archive once and extracts only headers,

@@ -274,6 +274,9 @@ def native(args):
             print("S2/S3 differs only in measured UUID/signature ranges; objects and fixed-corpus IR match", flush=True)
         record["selfhost_fixpoint"] = {"status": "pass", "generations": 3}
     built = stages[-1]
+    run([sys.executable, REPO / "probes/gates/compiler-self-source/run.py",
+         "--compiler", built, "--build-root", build,
+         "--output", work / "self-source"], env=environment)
     record["hello_gate"] = hello_gate(built, environment, work)
     record["selfhost_compilers"] = {path.parent.name: sha256(path) for path in stages}
     run([sys.executable, REPO / "probes/gates/host-runtime-targets/run.py", "--backend", backend,
