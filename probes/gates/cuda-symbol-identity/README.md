@@ -5,8 +5,10 @@ python probes/gates/cuda-symbol-identity/run.py --compiler bootstrap_compiler/ou
 ```
 
 The gate copies `tests/projects/cuda_kernel` into a fresh ignored result
-directory. Its three device sources retain the original kernel body and use no
+directory. Three device sources retain the original kernel body and use no
 module header, `module gpu.compute`, or a versioned module with a variant.
+A fourth project adds a second kernel to check that all manifest-discovered
+entries survive export-root selection and appear in the embedded symbol table.
 The original project stays unchanged.
 
 Each source is compiled by the SDK's NVPTX backend. On Windows with a CUDA

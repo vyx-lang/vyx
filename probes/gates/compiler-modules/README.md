@@ -36,6 +36,11 @@ Export and emission root lists are also checked as build inputs: nonexistent
 object artifact and name the missing file. Existing empty lists remain valid;
 nonempty lists must emit the selected function body.
 
+The [root list gate](../compiler-root-lists/README.md) checks comma-separated
+CLI/file lists against native LLVM definitions, AOT execution and CUDA PTX
+entries. It also covers the project worker's pipe syntax and commas inside
+generic root arguments.
+
 ## Symbol-index growth
 
 ```powershell

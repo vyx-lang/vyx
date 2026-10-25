@@ -87,6 +87,7 @@ def main() -> int:
         "plain": "",
         "module": "module gpu.compute;\n",
         "versioned-module": '@[version("2.0.0")]\n@[variant("device")]\nmodule gpu.compute;\n',
+        "multiple": "",
     }
     for name, prefix in variants.items():
         project = output / name
@@ -95,16 +96,24 @@ def main() -> int:
         (project / "src/host.vyx").write_bytes((original / "src/host.vyx").read_bytes())
         source = project / "device/kernel.vyx"
         source.write_text(prefix + (original / "device/kernel.vyx").read_text(encoding="utf-8"), encoding="utf-8")
+        expected_count = 1
+        roots = "scale_kernel"
+        if name == "multiple":
+            with source.open("a", encoding="utf-8") as device:
+                device.write('\n@[cuda_kernel]\npublic fn second_kernel(values: *i32, n: i32) {\n'
+                             '    unsafe { if (n > 0) { values[0] = 7; } }\n}\n')
+            expected_count = 2
+            roots += "|second_kernel"
         manifest = (original / "Vyx.toml").read_text(encoding="utf-8")
         manifest = manifest.replace('cuda_arch = "sm_120"', f'cuda_arch = "{args.arch}"')
         (project / "Vyx.toml").write_text(manifest, encoding="utf-8")
         ptx = project / "direct.ptx"
         if run(name + "-nvptx", [str(compiler), "--src=file", str(source), "--emit=obj", "-o", str(ptx),
                                 "--target=nvptx64-nvidia-cuda", "--target-cpu", args.arch,
-                                "--export-root-names", "scale_kernel"], repo):
+                                "--export-root-names", roots], repo):
             text = ptx.read_text(encoding="utf-8")
             entries = re.findall(r"(?m)^\.visible \.entry\s+([A-Za-z0-9_]+)\(", text)
-            check(name + "-direct-entry", len(entries) == 1, entries=entries)
+            check(name + "-direct-entry", len(entries) == expected_count, entries=entries)
         if not native_project_available:
             records.append({"name": name + "-project", "skip": True, "exit": 77,
                             "reason": "Windows CUDA toolkit with cuda.lib is required"})
@@ -116,8 +125,10 @@ def main() -> int:
         entries = re.findall(r"(?m)^\.visible \.entry\s+([A-Za-z0-9_]+)\(", cached_ptx.read_text(encoding="utf-8"))
         embedded = re.search(r'vyx_cuda_kernel_scale_kernel_symbol\(\) -> string \{ return "([A-Za-z0-9_]+)";',
                              embed.read_text(encoding="utf-8"))
-        check(name + "-embedded-identity", len(entries) == 1 and embedded is not None
-              and entries[0] == embedded.group(1), entries=entries,
+        embedded_all = re.findall(r'vyx_cuda_kernel_\w+_symbol\(\) -> string \{ return "([A-Za-z0-9_]+)";',
+                                  embed.read_text(encoding="utf-8"))
+        check(name + "-embedded-identity", len(entries) == expected_count and embedded is not None
+              and set(entries) == set(embedded_all), entries=entries,
               embedded_symbol=embedded.group(1) if embedded else "")
         ptxas = toolkit / "bin/ptxas.exe"
         if ptxas.is_file():
