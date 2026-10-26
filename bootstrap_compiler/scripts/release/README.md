@@ -49,6 +49,14 @@ export roots. This detects source/ownership failures in the new compiler before
 the Linux archive is passed to the Android job. It does not rebuild a compiler
 generation. Per-module commands and results are retained in `self-source/`.
 
+The [root-selection gate](../../../../probes/gates/compiler-root-lists/README.md)
+then checks the actual driver helper against the bootstrap interfaces, primitive
+Clone return/cleanup facts, scoped generic calls, and rejection of dangling
+views. After building LSP, the protocol smoke test exercises initialization,
+diagnostics, completion and live edits before packaging. Request and nested
+analysis locals must leave their lexical scopes before a service arena is
+reclaimed; otherwise later automatic destructors can release its storage twice.
+
 Each compiler build permits one Vyx child process and two memory slots. Native
 compilation uses four workers. Build caches are not shared between platforms.
 Windows LLVM preparation streams the XZ archive once and extracts only headers,

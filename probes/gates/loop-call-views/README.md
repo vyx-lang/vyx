@@ -23,6 +23,10 @@ The positive matrix covers O0/O2 and 1/4/8 code generation units:
 - One, two and three levels of loops passing a mutable owning object with a
   String field; independently computed state and sums must agree.
 - Borrowed-parameter returns, cloned string returns and owning String returns.
+- SSO and heap-sized copies returned after explicitly destroying a local String
+  and StringBuilder, through aliases, branches and repeated loop calls.
+- Primitive str clones returned from local String owners, including forwarding
+  helpers and repeated short/heap-sized results.
 - Generated functions containing 96, 224 and 416 call initializers, each followed
   by an accumulation statement. Mid-function output and exact call counts catch
   skipped statements, repeated evaluation and zero-initialized call results.

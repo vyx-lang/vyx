@@ -91,6 +91,23 @@ body is discarded without marking its native body emitted. Queries do not drain
 the reachable queue. Consumers refresh HIR views because even a short query can
 register parameter types and grow shared arenas. A method's spelling alone,
 including `clone`, never establishes that its result owns independent storage.
+Lexical primitive-str cleanup uses the same resolved-intrinsic return rules as
+HIR and MIR return checking. Ordinary calls need their selected declaration's
+return proof. The primitive destructor and consuming-call contract bind to
+`std.string::str_drop(str)`, so a user function with that short name remains an
+ordinary borrowed call.
+Signature-only primitive-str Clone implementations use the resolved
+`clone_trait` provider's independent-lifetime contract. This requires the
+primitive receiver, matching result, receiver-only parameters and provider
+module; unrelated inherent or downstream methods still need a body proof.
+The driver and LSP use explicit `from_cstr_len` copies when returning local
+builder storage, so older Release Stage 0 compilers can build these sources
+without relying on their incomplete shallow-interface Clone inference.
+
+Unbound free names in imported template bodies use an index keyed by declaring
+module, followed by that module's imports and declared lang-item providers.
+The recovered name identifies an overload family. Closed arguments select its
+actual declaration; lookup cannot use the first matching short name globally.
 
 Closed generic function and method instances check their declared `where`
 clauses against Sema's fact ledger and the complete owner/method environment.

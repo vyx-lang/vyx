@@ -87,7 +87,9 @@ def main():
                      "conditions": "conditions PASS\n", "nested_owner": "nested owner PASS\n",
                      "borrowed_return": "borrowed return PASS\n",
                      "view_results": "long input uses heap storage rather than inline storage\nview results PASS\n",
-                     "view_mutation": "view mutation PASS\n"}
+                     "view_mutation": "view mutation PASS\n",
+                     "builder_results": "builder results PASS\n",
+                     "clone_results": "clone results PASS\n"}
         for name, expected in positives.items():
             for opt in args.optimizations.split(","):
                 for cgu in args.cgus.split(","):

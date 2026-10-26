@@ -34,6 +34,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--build-root", type=Path, help="Also check the actual driver helper with bootstrap interfaces")
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     gate = Path(__file__).resolve().parent
@@ -58,9 +59,125 @@ def main():
         record.update(passed=record["passed"] and passed, **facts)
         print(record["name"] + (": PASS" if record["passed"] else ": FAIL"), flush=True)
         if not record["passed"]:
-            print(json.dumps(record, ensure_ascii=False), flush=True)
+            preview = dict(record)
+            for channel in ("stdout", "stderr"):
+                preview[channel + "_bytes"] = len(preview[channel].encode())
+                preview[channel] = preview[channel][:2048]
+            print(json.dumps(preview, ensure_ascii=False), flush=True)
 
     version = run("identity", [compiler, "--version"])
+    driver_identity = None
+    if args.build_root:
+        build = args.build_root.resolve(strict=True)
+        driver = build / "src/core/driver/main.vyx"
+        text = driver.read_text(encoding="utf-8")
+        start = text.index("fn cli_normalize_root_names(")
+        end = text.index("\n}\n", start) + 3
+        helper = text[start:end]
+        cases = [("first,second", "first|second"),
+                 (" first , second | third ", "first|second|third"),
+                 ("choose<i32,i64>,third", "choose<i32,i64>|third"),
+                 ("factory<(i32,i64),fn(i32,i64)->i32>,third",
+                  "factory<(i32,i64),fn(i32,i64)->i32>|third"),
+                 ("long_first_root_name_for_heap_storage, long_second_root_name_for_heap_storage",
+                  "long_first_root_name_for_heap_storage|long_second_root_name_for_heap_storage")]
+        source = output / "driver-helper.vyx"
+        assertions = "\n".join("    assert_eq(cli_normalize_root_names(" + json.dumps(value)
+                               + "), " + json.dumps(expected) + ");" for value, expected in cases)
+        source.write_text("use std.core;\nuse std.string;\n" + helper
+                          + "\nfn main() -> i32 {\n" + assertions + "\n    return 0;\n}\n", encoding="utf-8")
+        interfaces = build / "out/.vyx_interfaces/boot"
+        if not interfaces.is_dir():
+            raise ValueError(f"Missing bootstrap interface directory: {interfaces}")
+        record = run("driver-helper-bootstrap-interfaces", [compiler, "--src=file", source,
+                     "--interface-root", interfaces, "--emit=obj", "-o", output / "driver-helper.obj"])
+        check(record, record["exit"] == 0)
+        record = run("driver-helper-aot", [compiler, "--src=file", source, "--run=aot", "-O2"])
+        check(record, record["exit"] == 0)
+        views = gate.parent / "loop-call-views/fixtures"
+        record = run("primitive-clone-bootstrap-interfaces", [compiler, "--src=file", views / "clone_results.vyx",
+                     "--interface-root", interfaces, "--emit=obj", "-o", output / "clone-results.obj"])
+        check(record, record["exit"] == 0)
+        record = run("primitive-clone-provider-shadow", [compiler, "--src=file",
+                     views / "clone_interface_shadow.vyx", "--interface-root", interfaces,
+                     "--emit=obj", "-o", output / "clone-interface-shadow.obj"])
+        check(record, record["exit"] == 0)
+        ir = output / "clone-interface-cleanup.ll"
+        record = run("primitive-clone-interface-cleanup", [compiler, "--src=file",
+                     views / "clone_interface_cleanup.vyx", "--interface-root", interfaces,
+                     "--emit=ir", "-O0", "-o", ir])
+        ir_text = ir.read_text(encoding="utf-8") if ir.is_file() else ""
+        main_body = re.search(r"^define[^\n]*@main\([^\n]*\)[^\n]*\{\n(.*?)^\}", ir_text, re.M | re.S)
+        drops = re.findall(r"\b(?:call|invoke)\b[^\n]*@([\w.$]*_F_str_5Fdrop_[\w.$]*)\(",
+                           main_body.group(0) if main_body else "")
+        check(record, len(drops) == 2, main_str_drops=drops)
+        lifetime = gate.parent / "full-expression"
+        positives = [("builder-return", views / "builder_results.vyx", "builder results PASS\n"),
+                     ("clone-return", views / "clone_results.vyx", "clone results PASS\n"),
+                     ("borrowed-lookalikes", lifetime / "lookalike_string_calls.vyx",
+                      "borrowed class field must remain valid until its owner is dropped\n" * 9
+                      + "lookalike-string-calls=ok\n"),
+                     ("string-drop-identity", lifetime / "string_drop_identity.vyx", "string-drop-identity=ok\n"),
+                     ("string-control-flow", lifetime / "string_control_flow.vyx", "string-control-flow=ok\n")]
+        for name, source, expected in positives:
+            for optimization in (0, 2):
+                executable = output / (f"{name}-O{optimization}" + (".exe" if os.name == "nt" else ""))
+                record = run(f"{name}-O{optimization}-compile", [compiler, "--src=file", source,
+                             "--emit=exe", "-o", executable, f"-O{optimization}"])
+                check(record, record["exit"] == 0)
+                if record["passed"]:
+                    record = run(f"{name}-O{optimization}-run", [executable])
+                    check(record, record["stdout"].replace("\r\n", "\n") == expected)
+        for name in ("dangling_view", "dangling_alias", "dangling_call", "dangling_clone_name",
+                     "dangling_assignment", "dangling_loop", "dangling_branch", "dangling_scalar"):
+            artifact = output / (name + ".obj")
+            record = run(name, [compiler, "--src=file", views / (name + ".vyx"),
+                               "--emit=obj", "-o", artifact])
+            record["passed"] = record["exit"] == 1
+            check(record, "error: E3102:" in record["stdout"] + record["stderr"] and not artifact.exists())
+        artifact = output / "returned_string_slices.obj"
+        record = run("returned-string-slices", [compiler, "--src=file", lifetime / "returned_string_slices.vyx",
+                     "--emit=obj", "-o", artifact])
+        record["passed"] = record["exit"] == 1
+        diagnostics = record["stdout"] + record["stderr"]
+        check(record, all(fragment in diagnostics for fragment in
+                         ("error: E3102:", "return owner.substring(", "return owner.trim()")) and not artifact.exists())
+        imported = output / "interfaces/audit"
+        imported.mkdir(parents=True)
+        (imported / "borrowing.vyi").write_text(
+            "module audit.borrowing;\nuse std.string;\n"
+            "public class BorrowingOwner {\n    public data: String;\n"
+            "    public fn clone(&self) -> str;\n    public fn drop(&mut self);\n}\n", encoding="utf-8")
+        source = output / "imported-borrow.vyx"
+        source.write_text("use std.string;\nuse audit.borrowing;\nfn invalid() -> str {\n"
+                          "    let owner = BorrowingOwner { data: String.from(\"owned bytes\") };\n"
+                          "    return owner.clone();\n}\nfn main() -> i32 { print(invalid()); return 0; }\n",
+                          encoding="utf-8")
+        artifact = output / "imported-borrow.obj"
+        record = run("imported-clone-view-rejected", [compiler, "--src=file", source,
+                     "--interface-root", output / "interfaces", "--emit=obj", "-o", artifact])
+        record["passed"] = record["exit"] == 1
+        check(record, "error: E3102:" in record["stdout"] + record["stderr"] and not artifact.exists())
+        support = output / "interfaces/support"
+        support.mkdir(parents=True)
+        record = run("generic-scope-interface", [compiler, "--src=file", lifetime / "support/scoped_library.vyx",
+                     "--emit=vyi", "--vyi-shallow", "-o", support / "scoped_library.vyi"])
+        check(record, record["exit"] == 0)
+        for optimization in (0, 2):
+            executable = output / (f"generic-call-scope-O{optimization}" + (".exe" if os.name == "nt" else ""))
+            record = run(f"generic-call-scope-O{optimization}-compile", [compiler, "--src=file",
+                         lifetime / "generic_call_scope.vyx", "--interface-root", output / "interfaces",
+                         "--emit=exe", f"-O{optimization}", "-o", executable])
+            check(record, record["exit"] == 0)
+            if record["passed"]:
+                record = run(f"generic-call-scope-O{optimization}-run", [executable])
+                check(record, record["stdout"] == "generic-call-scope=ok\n")
+        artifact = output / "generic-call-no-overload.obj"
+        record = run("generic-call-no-overload", [compiler, "--src=file", lifetime / "generic_call_no_overload.vyx",
+                     "--interface-root", output / "interfaces", "--emit=obj", "-o", artifact])
+        record["passed"] = record["exit"] == 1
+        check(record, "error: E2200:" in record["stdout"] + record["stderr"] and not artifact.exists())
+        driver_identity = {"path": str(driver), "sha256": hashlib.sha256(driver.read_bytes()).hexdigest()}
     variants = {
         "single": ("first", ["first"]),
         "comma-two": ("first,second", ["first", "second"]),
@@ -136,8 +253,10 @@ def main():
     check(record, record["exit"] == 0)
     passed = all(record["passed"] for record in records)
     identity = {"compiler": str(compiler), "sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
-                "version": version["stdout"], "records": records, "passed": passed}
-    for name in ("vyx_compiler_backend.dll", "vyx_runtime.lib"):
+                "version": version["stdout"], "records": records, "passed": passed,
+                "driver_source": driver_identity}
+    for name in ("vyx_compiler_backend.dll", "vyx_runtime.lib", "libvyx_compiler_backend.so",
+                 "libvyx_compiler_backend.dylib", "libvyx_runtime.a"):
         path = compiler.parent / name
         if path.is_file():
             identity[name] = hashlib.sha256(path.read_bytes()).hexdigest()

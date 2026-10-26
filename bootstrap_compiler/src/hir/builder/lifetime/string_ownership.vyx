@@ -13,7 +13,65 @@ use bootstrap.sema;
 
 // String ownership for the HIR builder. See README.md.
 
+// Builder-only state. Cleared before a function reaches ownership/MIR passes;
+// this bit never becomes a public local ownership contract.
+fn hir_builder_pending_str_drop_flag() -> i32 { return 4096; }
+
 impl HirUnitBuilder {
+    fn resolved_str_initializer_is_fresh(self, e: i32) -> bool {
+        if (e == hir_id_invalid()
+            || hir_type_table_kind(self.unit.types, self.unit.expr_type(e)) != ty_STRING()) { return false; }
+        let kind = self.unit.expr_kind(e);
+        if (kind == ex_STR_LIT() || kind == ex_FSTRING()) { return true; }
+        if (kind == ex_BIN() && self.unit.expr_op(e) == tk_PLUS()) {
+            return hir_type_table_kind(self.unit.types, self.unit.expr_type(self.unit.expr_lhs(e))) == ty_STRING()
+                && hir_type_table_kind(self.unit.types, self.unit.expr_type(self.unit.expr_rhs(e))) == ty_STRING();
+        }
+        // A local/field read can alias an existing owner even if that owner's
+        // initializer was fresh. Only the call itself can establish a new result.
+        if (kind != ex_CALL()) { return false; }
+        let callee = self.unit.expr_lhs(e);
+        var target_kind = self.unit.expr_target_kind(e);
+        var target = self.unit.expr_target_id(e);
+        if (target_kind == hir_target_none()) {
+            target_kind = self.unit.expr_target_kind(callee);
+            target = self.unit.expr_target_id(callee);
+        }
+        if (target_kind == hir_target_builtin()) {
+            if (self.unit.expr_kind(callee) == ex_MEMBER()) {
+                return hir_type_table_kind(self.unit.types, self.unit.expr_type(self.unit.expr_lhs(callee))) == ty_STRING()
+                    && policy_string_intrinsic_returns_independent_storage(policy_string_method_kind(self.unit.expr_name(callee)));
+            }
+            return policy_string_builtin_returns_independent_storage(self.unit.builtin_name(target));
+        }
+        return target_kind == hir_target_function() && self.function_returns_independent_str(target);
+    }
+
+    fn bind_pending_primitive_str_locals(self, function_id: i32) {
+        // Body roots are allocated before their children. Inspect this
+        // materialization range, not earlier/discarded functions in the unit.
+        let end = self.unit.stmt_count;
+        var stmt = self.unit.function_body(function_id);
+        if (stmt == hir_id_invalid()) { return; }
+        while (stmt <= end) {
+            let kind = self.unit.stmt_kind(stmt);
+            if (self.unit.stmt_function(stmt) == function_id
+                && (kind == hir_stmt_let() || kind == hir_stmt_var())) {
+                let local = self.unit.stmt_local(stmt);
+                if (local != hir_id_invalid()
+                    && (self.unit.local_flags(local) & hir_builder_pending_str_drop_flag()) != 0) {
+                    self.unit.set_local_flags(local,
+                        self.unit.local_flags(local) & ~hir_builder_pending_str_drop_flag());
+                    if (self.resolved_str_initializer_is_fresh(self.unit.stmt_expr(stmt))) {
+                        self.unit.set_local_flags(local, self.unit.local_flags(local) | hir_local_flag_auto_drop());
+                        self.set_local_drop_for_type(local, self.unit.local_type(local));
+                    }
+                }
+            }
+            stmt += 1;
+        }
+    }
+
     fn str_return_has_control(self, e: rawptr, depth: i32) -> bool {
         if (e == null) { return false; }
         if (depth > 32) { return true; }
@@ -53,24 +111,31 @@ impl HirUnitBuilder {
         // lexical values; the aliasing gate below remains responsible for
         // rejecting copies of an existing owning local.
         if (kind == ex_STR_LIT() || kind == ex_FSTRING()) { return true; }
-        if (kind == ex_BIN() && expr_get_op(init_e) == tk_PLUS()) { return true; }
+        if (kind == ex_BIN() && expr_get_op(init_e) == tk_PLUS()) {
+            let lhs_type = expr_get_ty(expr_get_lhs(init_e));
+            let rhs_type = expr_get_ty(expr_get_rhs(init_e));
+            return lhs_type != null && rhs_type != null
+                && tref_get_kind(lhs_type) == ty_STRING() && tref_get_kind(rhs_type) == ty_STRING();
+        }
         if (kind != ex_CALL()) { return false; }
         let callee = expr_get_lhs(init_e);
         if (callee == null) { return false; }
-        if (expr_get_kind(callee) == ex_MEMBER()) {
-            let name = policy_generic_call_base(expr_get_name(callee));
-            return name == "toUpper" || name == "toLower"
-                || name == "to_upper" || name == "to_lower"
-                || name == "trim" || name == "replace"
-                || name == "substring" || name == "repeat"
-                || name == "clone";
+        if (expr_get_semantic_kind(init_e) == expr_sem_BUILTIN()) {
+            if (expr_get_kind(callee) == ex_MEMBER()) {
+                let receiver_type = expr_get_ty(expr_get_lhs(callee));
+                if (receiver_type == null || tref_get_kind(receiver_type) != ty_STRING()) { return false; }
+                let method = policy_string_method_kind(expr_get_name(callee));
+                // These resolved primitive intrinsics allocate. Library
+                // methods such as String.substring may instead return views;
+                // their selected function body must establish its own fact.
+                return policy_string_intrinsic_returns_independent_storage(method);
+            }
+            if (expr_get_kind(callee) != ex_IDENT()) { return false; }
+            return policy_string_builtin_returns_independent_storage(expr_get_name(callee));
         }
-        if (expr_get_kind(callee) != ex_IDENT()) { return false; }
-        let name = policy_generic_call_base(expr_get_name(callee));
-        return name == "int_to_string" || name == "bool_to_string"
-            || name == "float_to_string" || name == "str_concat"
-            || name == "str_dup" || name == "from_cstr_len"
-            || name == "readFile";
+        // An ordinary function can return an alias, regardless of its name.
+        // Reuse the selected declaration's return proof, never spelling alone.
+        return self.independent_str_return_expr(init_e, null, 0);
     }
 
     // Primitive str values have an explicit ownership tag.  A fresh
@@ -122,8 +187,14 @@ impl HirUnitBuilder {
         if (k == ex_IF_EXPR() || k == ex_MATCH_EXPR()) {
             if (self.primitive_str_expr_mentions_target(expr_get_lhs(e), target)) { return true; }
             if (k == ex_IF_EXPR()) {
-                return self.primitive_str_stmt_mentions_target(expr_get_rhs(e), target)
-                    || self.primitive_str_stmt_chain_mentions_target(expr_get_args(e), target);
+                if (self.primitive_str_stmt_mentions_target(expr_get_rhs(e), target)) { return true; }
+                let else_part = expr_get_args(e);
+                // elif/else-if stores an Expr; plain else stores one Stmt
+                // block. Never walk an Expr's type slot as a statement link.
+                if (else_part != null && expr_get_kind(else_part) == ex_IF_EXPR()) {
+                    return self.primitive_str_expr_mentions_target(else_part, target);
+                }
+                return self.primitive_str_stmt_mentions_target(else_part, target);
             }
             var match_arm = expr_get_args(e);
             while (match_arm != null) {
@@ -251,6 +322,16 @@ impl HirUnitBuilder {
         return !hir_builder_decl_is_foreign_dci(target);
     }
 
+    fn primitive_str_expr_has_scalar_type(self, e: rawptr) -> bool {
+        let ty = expr_get_ty(e);
+        if (ty == null) { return false; }
+        let kind = tref_get_kind(ty);
+        return kind == ty_I8() || kind == ty_I16() || kind == ty_I32() || kind == ty_I64()
+            || kind == ty_U8() || kind == ty_U16() || kind == ty_U32() || kind == ty_U64()
+            || kind == ty_ISIZE() || kind == ty_USIZE()
+            || kind == ty_F32() || kind == ty_F64() || kind == ty_BOOL() || kind == ty_CHAR();
+    }
+
     fn primitive_str_expr_has_unsafe_use(self, e: rawptr, target: string) -> bool {
         if (!self.primitive_str_expr_mentions_target(e, target)) { return false; }
         let k = expr_get_kind(e);
@@ -258,6 +339,12 @@ impl HirUnitBuilder {
         if (k == ex_BIN()) {
             return self.primitive_str_expr_has_unsafe_use(expr_get_lhs(e), target)
                 || self.primitive_str_expr_has_unsafe_use(expr_get_rhs(e), target);
+        }
+        if (k == ex_CAST() && self.primitive_str_expr_has_scalar_type(e)
+            && self.primitive_str_expr_has_scalar_type(expr_get_lhs(e))) {
+            // A numeric conversion of a length/query does not return a view.
+            // Keep pointer/address casts and unsafe operand uses as barriers.
+            return self.primitive_str_expr_has_unsafe_use(expr_get_lhs(e), target);
         }
         if (k == ex_ASSIGN()) {
             // `text = text + suffix` is the one reassignment form whose
@@ -382,6 +469,60 @@ impl HirUnitBuilder {
 // Query the retained source AST, not another function's disposable HIR range.
 // Unknown or recursive result flows never establish an independent result.
 impl HirUnitBuilder {
+    fn primitive_str_clone_provider_trait(self, d: rawptr) -> rawptr {
+        let trait_name = hir_builder_decl_impl_trait(d);
+        if (trait_name.len == 0) { return null; }
+        let module_name = self.decl_source_module(d);
+        var qualified = trait_name;
+        if (module_name.len > 0 && hir_builder_last_path_segment(trait_name) == trait_name) {
+            qualified = module_name + "." + trait_name;
+        }
+        let trait_decl = self.raw_class_decl_for_type_text(qualified);
+        if (trait_decl == null || self.decl_source_module(trait_decl) != module_name
+            || !hir_builder_decl_has_exact_attr(trait_decl, "lang_item(\"clone_trait\")")) { return null; }
+        return trait_decl;
+    }
+
+    fn imported_primitive_str_clone_contract(self, d: rawptr, function_id: i32) -> bool {
+        if (d != null && decl_get_kind(d) == de_METHOD() && decl_get_name(d) == "clone"
+            && vyx_bootstrap_profile_level() > 3) {
+            let owner_trace = hir_raw_owner_map_get(self.decl_owner_map, d);
+            let param_trace = decl_get_params(d);
+            let result_trace = decl_get_ty(d);
+            let trait_name_trace = hir_builder_decl_impl_trait(d);
+            let trait_trace = self.primitive_str_clone_provider_trait(d);
+            print("[hir-str-clone-contract] owner=" + decl_get_name(owner_trace)
+                  + " return-kind=" + self.i32_text(tref_get_kind(result_trace))
+                  + " return-name=" + hir_builder_type_ref_name(result_trace)
+                  + " param=" + decl_get_name(param_trace)
+                  + " method-module=" + self.decl_source_module(d)
+                  + " trait=" + trait_name_trace + " trait-module=" + self.decl_source_module(trait_trace)
+                  + " imported=" + self.i32_text(if (self.decl_effectively_imported(d)) { 1 } else { 0 })
+                  + " body=" + self.i32_text(if (decl_get_body(d) != null) { 1 } else { 0 }));
+        }
+        if (d == null || decl_get_kind(d) != de_METHOD()
+            || decl_get_name(d) != "clone" || decl_get_is_static(d)
+            || decl_get_body(d) != null || !self.decl_effectively_imported(d)) { return false; }
+        let param = decl_get_params(d);
+        if (param != null && (decl_get_name(param) != "self" || decl_get_next(param) != null)) { return false; }
+        let result = decl_get_ty(d);
+        if (result == null || tref_get_kind(result) != ty_STRING()) { return false; }
+        if (function_id == hir_id_invalid()) { return false; }
+        let receiver = self.unit.function_first_local(function_id);
+        if (receiver == hir_id_invalid()
+            || (self.unit.local_flags(receiver) & hir_local_flag_self_receiver()) == 0) { return false; }
+        var receiver_type = self.unit.local_type(receiver);
+        let receiver_kind = hir_type_table_kind(self.unit.types, receiver_type);
+        if (receiver_kind == ty_REF() || receiver_kind == ty_MUTREF()) {
+            receiver_type = hir_type_table_elem(self.unit.types, receiver_type);
+        }
+        if (hir_type_table_kind(self.unit.types, receiver_type) != ty_STRING()) { return false; }
+        // Clone's language contract provides an independent lifetime. Trust
+        // the signature-only primitive implementation shipped by that slot's
+        // provider, not arbitrary inherent methods or downstream impls.
+        return self.primitive_str_clone_provider_trait(d) != null;
+    }
+
     fn independent_str_binding(self, first: rawptr, target: rawptr, depth: i32) -> rawptr {
         if (target == null || depth > 32) { return null; }
         var s = first;
@@ -437,10 +578,13 @@ impl HirUnitBuilder {
             // These are resolved language builtins, not arbitrary functions
             // whose last name happens to resemble a standard-library API.
             if (expr_get_kind(callee) == ex_IDENT()) {
-                return expr_get_name(callee) == "from_cstr_len";
+                return policy_string_builtin_returns_independent_storage(expr_get_name(callee));
             }
-            return expr_get_kind(callee) == ex_MEMBER()
-                && policy_string_method_kind(expr_get_name(callee)) == 2;
+            if (expr_get_kind(callee) != ex_MEMBER()) { return false; }
+            let receiver_type = expr_get_ty(expr_get_lhs(callee));
+            if (receiver_type == null || tref_get_kind(receiver_type) != ty_STRING()) { return false; }
+            let method = policy_string_method_kind(expr_get_name(callee));
+            return policy_string_intrinsic_returns_independent_storage(method);
         }
         if (semantic != expr_sem_DIRECT_FN() && semantic != expr_sem_METHOD()) { return false; }
         let target = expr_get_semantic_target(e);
@@ -485,6 +629,7 @@ impl HirUnitBuilder {
 
     fn independent_str_return_decl(self, d: rawptr, depth: i32) -> bool {
         if (d == null || depth > 32) { return false; }
+        if (self.imported_primitive_str_clone_contract(d, hir_pointer_map_function(self.decl_map, d))) { return true; }
         let owner = hir_raw_owner_map_get(self.decl_owner_map, d);
         if (hir_builder_generic_param_count(hir_builder_decl_template_params(d)) > 0
             || hir_builder_generic_param_count(hir_builder_decl_template_params(owner)) > 0) { return false; }
@@ -514,6 +659,12 @@ impl HirUnitBuilder {
         if (function_id == hir_id_invalid() || depth > 32
             || hir_type_table_kind(self.unit.types, self.unit.function_return_type(function_id)) != ty_STRING()) { return false; }
         if ((self.unit.function_flags(function_id) & hir_function_flag_independent_str_return()) != 0) { return true; }
+        var declaration = hir_pointer_map_raw_for_function(self.decl_map, function_id);
+        if (declaration == null) { declaration = self.function_instances.decl_for_function(function_id); }
+        if (self.imported_primitive_str_clone_contract(declaration, function_id)) {
+            self.unit.add_function_flags(function_id, hir_function_flag_independent_str_return());
+            return true;
+        }
         let source = self.function_body_source_decl(null, function_id);
         var independent = false;
         let owner = hir_raw_owner_map_get(self.decl_owner_map, source);
@@ -576,10 +727,13 @@ impl HirUnitBuilder {
         }
         if (target_kind == hir_target_builtin()) {
             if (self.unit.expr_kind(callee) == ex_MEMBER()) {
-                return hir_type_table_kind(self.unit.types, self.unit.expr_type(self.unit.expr_lhs(callee))) == ty_STRING()
-                    && policy_string_method_kind(self.unit.expr_name(callee)) == 2;
+                if (hir_type_table_kind(self.unit.types, self.unit.expr_type(self.unit.expr_lhs(callee))) != ty_STRING()) {
+                    return false;
+                }
+                let method = policy_string_method_kind(self.unit.expr_name(callee));
+                return policy_string_intrinsic_returns_independent_storage(method);
             }
-            return self.unit.builtin_name(target) == "from_cstr_len";
+            return policy_string_builtin_returns_independent_storage(self.unit.builtin_name(target));
         }
         return target_kind == hir_target_function()
             && self.function_returns_independent_str_depth(target, depth + 1);

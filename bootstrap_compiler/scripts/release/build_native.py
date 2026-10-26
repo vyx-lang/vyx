@@ -176,8 +176,14 @@ def main():
     run([sys.executable, REPO / "probes/gates/compiler-self-source/run.py",
          "--compiler", built_compiler, "--build-root", build,
          "--output", work / "self-source"], env=environment)
+    run([sys.executable, REPO / "probes/gates/compiler-root-lists/run.py",
+         "--compiler", built_compiler, "--build-root", build,
+         "--output-dir", work / "root-lists"], env=environment)
     for target in tools:
         run([built_compiler, "build", "--target", target, f"-j{args.jobs}"], cwd=build, env=environment)
+        if target == "vyxc-lsp":
+            run([sys.executable, REPO / "tests/bootstrap/lsp_smoke/run.py",
+                 out / (target + (".exe" if windows else "")), "--runs", "1"], env=environment)
     arguments = ["pwsh", "-NoProfile", "-File", REPO / "bootstrap_compiler/scripts/package_sdk.ps1",
         "-CompilerPath", built_compiler, "-Destination", output / leaf,
         "-BootstrapRoot", build, "-OutDir", out,
