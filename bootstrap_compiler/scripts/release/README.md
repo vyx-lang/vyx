@@ -56,6 +56,11 @@ views. After building LSP, the protocol smoke test exercises initialization,
 diagnostics, completion and live edits before packaging. Request and nested
 analysis locals must leave their lexical scopes before a service arena is
 reclaimed; otherwise later automatic destructors can release its storage twice.
+POSIX builds also test directory enumeration and standard-library file copying
+against the host's native headers. Directory record layouts and Darwin inode
+symbol variants stay inside the native runtime boundary. LSP smoke tests drain
+stderr concurrently and retain scan traces under `lsp-smoke/`; a timeout reports
+the process status and recent stderr/trace output without changing its deadline.
 
 Each compiler build permits one Vyx child process and two memory slots. Native
 compilation uses four workers. Build caches are not shared between platforms.

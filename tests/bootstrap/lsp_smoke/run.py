@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import pathlib
 import queue
 import shutil
@@ -10,16 +11,49 @@ import threading
 
 
 class LspClient:
-    def __init__(self, executable: pathlib.Path, cwd: pathlib.Path):
+    def __init__(self, executable: pathlib.Path, cwd: pathlib.Path, trace_path=None):
+        environment = os.environ.copy()
+        self.trace_path = trace_path
+        if trace_path is not None:
+            environment["VYX_LSP_TRACE"] = str(trace_path)
         self.process = subprocess.Popen(
             [str(executable), "--stdio"],
             cwd=cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=environment,
         )
         self.responses = queue.Queue()
+        self.stderr_tail = bytearray()
+        self.stderr_lock = threading.Lock()
+        self.stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self.stderr_thread.start()
         threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_stderr(self):
+        while True:
+            data = self.process.stderr.read1(4096)
+            if not data:
+                break
+            with self.stderr_lock:
+                self.stderr_tail.extend(data)
+                del self.stderr_tail[:-65536]
+
+    def diagnostics(self):
+        with self.stderr_lock:
+            stderr = bytes(self.stderr_tail[-4096:]).decode(errors="replace")
+        trace = ""
+        if self.trace_path is not None and self.trace_path.is_file():
+            with self.trace_path.open("rb") as stream:
+                stream.seek(max(0, self.trace_path.stat().st_size - 4096))
+                trace = stream.read().decode(errors="replace")
+        return f"pid={self.process.pid} exit={self.process.poll()} stderr={stderr!r} trace={trace!r}"
+
+    def read_stderr(self):
+        self.stderr_thread.join(timeout=3)
+        with self.stderr_lock:
+            return bytes(self.stderr_tail)
 
     def _read_loop(self):
         try:
@@ -49,9 +83,12 @@ class LspClient:
         self.process.stdin.flush()
 
     def receive(self, timeout=15):
-        value = self.responses.get(timeout=timeout)
+        try:
+            value = self.responses.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"LSP response timed out after {timeout}s; {self.diagnostics()}") from None
         if isinstance(value, BaseException):
-            raise value
+            raise RuntimeError(f"LSP transport failed: {value}; {self.diagnostics()}") from value
         return value
 
     def receive_response(self, request_id, timeout=15):
@@ -75,7 +112,7 @@ class LspClient:
             self.process.wait(timeout=3)
 
 
-def run_once(executable: pathlib.Path, iteration: int):
+def run_once(executable: pathlib.Path, iteration: int, diagnostics_dir=None):
     # Exercise URI percent encoding used by real Windows workspaces such as
     # `E:/Dev/C++/...`; both '+' and spaces must round-trip through rootUri and
     # symbol/document URIs or cross-module completion silently disappears.
@@ -107,7 +144,12 @@ def run_once(executable: pathlib.Path, iteration: int):
     source_path = case / "main.vyx"
     source_path.write_text(source, encoding="utf-8")
     uri = source_path.as_uri()
-    client = LspClient(executable, case)
+    trace = None
+    if diagnostics_dir is not None:
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        trace = diagnostics_dir / f"lsp-{iteration}.trace.log"
+        trace.unlink(missing_ok=True)
+    client = LspClient(executable, case, trace)
     try:
         # LSP4J/JetBrains emits JSON-RPC request IDs as strings.  The server
         # must preserve the ID representation exactly in every response.
@@ -700,7 +742,7 @@ def run_once(executable: pathlib.Path, iteration: int):
         client.send({"jsonrpc": "2.0", "method": "exit", "params": {}})
         client.process.stdin.close()
         return_code = client.process.wait(timeout=3)
-        stderr = client.process.stderr.read()
+        stderr = client.read_stderr()
         assert return_code == 0
         assert not stderr
         print(
@@ -722,10 +764,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("executable", type=pathlib.Path)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--diagnostics-dir", type=pathlib.Path)
     args = parser.parse_args()
     executable = args.executable.resolve()
     for iteration in range(1, args.runs + 1):
-        run_once(executable, iteration)
+        run_once(executable, iteration, args.diagnostics_dir.resolve() if args.diagnostics_dir else None)
     print("LSP_SMOKE=PASS")
 
 
