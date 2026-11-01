@@ -28,6 +28,10 @@ deviation from real child-process samples and test baseline validation/regressio
 Additional cases cover source-library targets, DCI contracts and native artifacts,
 explicit multi-CGU emission through mixed-separator cache paths, owning String/Vec
 barriers, a large test list, output limits and complete JSON/XML serialization.
+Windows test and benchmark harnesses disable interactive CRT abort reporting
+inside each child. Crash isolation remains distinct from deadline expiry.
+Text fixtures and JSON reports use UTF-8 explicitly. On Windows installations
+with a legacy ANSI code page, also run the gate with `PYTHONUTF8=0`.
 The gate rejects fractional baseline counts/durations, mismatched sample counts
 or targets, duplicate JSON fields and decoded NUL. It independently recalculates
 the scaled-threshold variance and checks that a cached baseline survives several

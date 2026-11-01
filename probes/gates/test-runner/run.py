@@ -106,7 +106,7 @@ def main() -> None:
             ('exact-without-filter',['--exact']),('missing-path',['does-not-exist.vyx']),
             ('wrong-extension',['readme.txt']),('project-option-rejected',['--target','app']),
         ]:
-            if name == 'wrong-extension': (good/'readme.txt').write_text('text')
+            if name == 'wrong-extension': (good/'readme.txt').write_text('text',encoding='utf-8')
             check(name,good,arguments,2,contains=('error: test:',),absent=('test result: ok',))
         empty = project('empty',{'tests/helper.vyx':'fn helper() {}'})
         check('no-tests-is-not-green',empty,[],1,contains=('no tests selected',))
@@ -150,7 +150,14 @@ def main() -> None:
 @[test] fn endless() { while (true) {} }
 @[test] fn after_timeout() -> i32 { return 0; }
 '''})
-        check('failure-crash-timeout-isolation',mixed,['--timeout-ms','250'],1,contains=('::fails ... FAILED','::high_status ... FAILED','::crash ... FAILED','::after_crash ... ok','::endless ... TIMEOUT','::after_timeout ... ok','2 passed; 4 failed'))
+        # Leave room for Windows CI process startup; the deliberate infinite
+        # loop must still time out, while abort must terminate as a failure.
+        check('failure-crash-timeout-isolation',mixed,['--timeout-ms','2000'],1,contains=('::fails ... FAILED','::high_status ... FAILED','::crash ... FAILED','::after_crash ... ok','::endless ... TIMEOUT','::after_timeout ... ok','2 passed; 4 failed'))
+        if os.name=='nt':
+            headless_body='extern "C" { fn _set_abort_behavior(flags:u32,mask:u32)->u32; }\n@[test] fn headless(){assert((_set_abort_behavior(0,0)&3)==0);}\n'
+            headless=project('headless',{'tests/a.vyx':headless_body,'benches/a.vyx':headless_body.replace('@[test]','@[bench]')})
+            check('windows-test-crt-reporting-disabled',headless,[],contains=('1 passed; 0 failed',))
+            check('windows-bench-crt-reporting-disabled',headless,['--samples','3','--warmup-ms','1','--sample-ms','1'],contains=('1 passed; 0 failed',),kind='bench')
         check('fail-fast',mixed,['--fail-fast'],1,contains=('::fails ... FAILED','5 not run','remaining selection not run'),absent=('::after_crash ...','::after_timeout ...'))
         named=project('names',{'tests/a.vyx':'@[test] fn same_name() -> i32 {return 0;}','tests/b.vyx':'@[test] fn same_name() -> i32 {return 0;}'})
         check('same-name-separate-files',named,[],contains=('2 passed; 0 failed',))
@@ -160,7 +167,7 @@ def main() -> None:
         check('include-ignored',ignored,['--include-ignored'],1,contains=('1 passed; 1 failed',))
         check('compile-without-run',mixed,['--no-run'],contains=('0 passed; 0 failed','6 not run'),absent=('... ok (','... FAILED','... TIMEOUT'))
         check('repeat-isolation',entry,['--repeat','3','-j2','--report','repeated.json','--junit','repeated.xml'],contains=('3 passed; 0 failed',))
-        report=json.loads((entry/'repeated.json').read_text())
+        report=json.loads((entry/'repeated.json').read_text(encoding='utf-8'))
         import xml.etree.ElementTree as ET
         xml=ET.parse(entry/'repeated.xml').getroot()
         assert report['schema_version']==1 and len(report['results'])==3 and report['summary']['passed']==3
@@ -172,10 +179,10 @@ def main() -> None:
             ''.join(f'bytes[{i}]={v};' for i,v in enumerate(log_bytes))+
             'vyx_print_bytes_abi(to_rawptr(&bytes),13,0);}\n'})
         check('binary-log-keeps-nul-and-valid-utf8-reports',binary,['--report','binary.json','--junit','binary.xml'],contains=('1 passed; 0 failed',))
-        binary_result=json.loads((binary/'binary.json').read_text())['results'][0]
-        assert binary_result['stdout']=='A\x00B\ufffdé\ufffe😀',repr(binary_result['stdout'])
+        binary_result=json.loads((binary/'binary.json').read_text(encoding='utf-8'))['results'][0]
+        assert binary_result['stdout']=='A\x00B\ufffd\u00e9\ufffe\U0001f600',ascii(binary_result['stdout'])
         assert (binary/binary_result['stdout_path']).read_bytes()==bytes(log_bytes)
-        assert ET.parse(binary/'binary.xml').getroot().find('testcase/system-out').text=='AB\ufffdé😀'
+        assert ET.parse(binary/'binary.xml').getroot().find('testcase/system-out').text=='AB\ufffd\u00e9\U0001f600'
         check('report-write-failure',entry,['--report',str(entry)],1,contains=('cannot write complete runner report',))
         platform = 'windows' if os.name=='nt' else ('macos' if __import__('sys').platform=='darwin' else 'linux')
         other = 'posix' if os.name=='nt' else 'windows'
@@ -222,16 +229,16 @@ public fn value()->i32{return private_helper();}
         })
         (manifest/'target').mkdir()
         alias=manifest/'target'/('keep_original.exe' if os.name=='nt' else 'keep_original')
-        alias.write_text('do not replace')
+        alias.write_text('do not replace',encoding='utf-8')
         check('project-native-source-dependency-private-unit',manifest,['-j2','--report','project.json'],contains=('2 passed; 0 failed',))
-        assert alias.read_text()=='do not replace'
+        assert alias.read_text(encoding='utf-8')=='do not replace'
         check('project-source-library-target',manifest,['--target','source_library','--filter','private_unit','-j2'],contains=('1 passed; 0 failed',))
         check('build-jobs-independent-of-option-order',manifest,['--filter','private_unit','--build-jobs','8','-j2','--report','jobs.json'],contains=('1 passed; 0 failed',))
-        jobs=json.loads((manifest/'jobs.json').read_text())
+        jobs=json.loads((manifest/'jobs.json').read_text(encoding='utf-8'))
         prefix=jobs['results'][0]['stdout_path'].split('.case_')[0]
-        assert '8 thread(s)' in (manifest/(prefix+'.compile.stdout')).read_text()
+        assert '8 thread(s)' in (manifest/(prefix+'.compile.stdout')).read_text(encoding='utf-8')
         check('project-warm-build',manifest,['-j2'],contains=('2 passed; 0 failed',))
-        (manifest/'dependency/src/numbers.vyx').write_text('module support.numbers;\npublic fn answer()->i32{return 39;}\n')
+        (manifest/'dependency/src/numbers.vyx').write_text('module support.numbers;\npublic fn answer()->i32{return 39;}\n',encoding='utf-8')
         check('project-dependency-invalidation',manifest,['--filter','private_unit'],1,contains=('::private_unit ... FAILED',))
         bench=project('bench',{'benches/work.vyx':'''use std.benchmark;
 var input:i64=17;
@@ -241,7 +248,7 @@ fn main()->i32{return 9;}
         check('bench-help',bench,['--help'],contains=('--samples','--warmup-ms'),kind='bench')
         check('bench-list',bench,['--list'],contains=('::arithmetic','bench list: 1'),kind='bench')
         check('bench-real-sampling',bench,['--samples','5','--warmup-ms','10','--sample-ms','5','--report','bench.json'],contains=('ns/iter','samples 5','bench result: ok. 1 passed'),kind='bench')
-        measurement=json.loads((bench/'bench.json').read_text())['results'][0]['benchmark']
+        measurement=json.loads((bench/'bench.json').read_text(encoding='utf-8'))['results'][0]['benchmark']
         raw=measurement['raw']; assert len(raw)==5 and all(x['elapsed_ns']>0 and x['iterations']>0 for x in raw)
         import statistics,math
         values=[x['elapsed_ns']/x['iterations'] for x in raw]
@@ -251,11 +258,11 @@ fn main()->i32{return 9;}
         assert measurement['min']<=measurement['median']<=measurement['p95']<=measurement['max']
         baseline_args=['--samples','5','--warmup-ms','10','--sample-ms','5']
         check('bench-baseline-comparison',bench,[*baseline_args,'--baseline','bench.json','--max-regression-percent','1000','--report','comparison.json'],contains=('baseline mean change','bench result: ok'),kind='bench')
-        baseline=json.loads((bench/'bench.json').read_text())
+        baseline=json.loads((bench/'bench.json').read_text(encoding='utf-8'))
         baseline['results'][0]['benchmark']['raw']=[{'iterations':1073741824,'elapsed_ns':1} for _ in range(5)]
-        (bench/'fast.json').write_text(json.dumps(baseline))
+        (bench/'fast.json').write_text(json.dumps(baseline),encoding='utf-8')
         check('bench-regression-fails',bench,[*baseline_args,'--baseline','fast.json','--report','regression.json'],1,contains=('benchmark regression','0 passed; 1 failed'),kind='bench')
-        (bench/'malformed.json').write_text('{"schema_version":1} trailing garbage')
+        (bench/'malformed.json').write_text('{"schema_version":1} trailing garbage',encoding='utf-8')
         check('bench-invalid-baseline',bench,[*baseline_args,'--baseline','malformed.json'],2,contains=('invalid JSON document',),kind='bench')
         for label,mutate in [
             ('fractional-iterations',lambda d:d['results'][0]['benchmark']['raw'][0].update(iterations=1.5)),
@@ -263,21 +270,21 @@ fn main()->i32{return 9;}
             ('declared-sample-count',lambda d:d['results'][0]['benchmark'].update(samples=999)),
             ('baseline-target',lambda d:d.update(target='different-target')),
         ]:
-            doc=json.loads((bench/'bench.json').read_text());mutate(doc)
-            (bench/'invalid.json').write_text(json.dumps(doc))
+            doc=json.loads((bench/'bench.json').read_text(encoding='utf-8'));mutate(doc)
+            (bench/'invalid.json').write_text(json.dumps(doc),encoding='utf-8')
             check(label,bench,[*baseline_args,'--baseline','invalid.json'],2,contains=('benchmark baseline:',),absent=(' ... ok (',),kind='bench')
-        payload=(bench/'bench.json').read_text()
-        (bench/'duplicate.json').write_text(payload.replace('"schema_version":1','"schema_version":1,"schema_version":999',1))
+        payload=(bench/'bench.json').read_text(encoding='utf-8')
+        (bench/'duplicate.json').write_text(payload.replace('"schema_version":1','"schema_version":1,"schema_version":999',1),encoding='utf-8')
         check('duplicate-baseline-keys',bench,[*baseline_args,'--baseline','duplicate.json'],2,contains=('duplicate JSON field',),kind='bench')
         doc=json.loads(payload);doc['kind']='bench\x00suffix'
-        (bench/'decoded-nul.json').write_text(json.dumps(doc))
+        (bench/'decoded-nul.json').write_text(json.dumps(doc),encoding='utf-8')
         check('decoded-nul-is-not-truncated',bench,[*baseline_args,'--baseline','decoded-nul.json'],2,contains=('NUL-containing baseline',),kind='bench')
         doc=json.loads(payload)
         doc['results'][0]['benchmark']['samples']=3
         doc['results'][0]['benchmark']['raw']=[{'iterations':1,'elapsed_ns':50},{'iterations':1,'elapsed_ns':100},{'iterations':1,'elapsed_ns':150}]
-        (bench/'variable-reference.json').write_text(json.dumps(doc))
+        (bench/'variable-reference.json').write_text(json.dumps(doc),encoding='utf-8')
         check('threshold-scaled-baseline-variance',bench,['--samples','3','--warmup-ms','1','--sample-ms','1','--baseline','variable-reference.json','--max-regression-percent','100','--report','contrast.json'],(0,1),contains=('baseline mean change',),kind='bench')
-        contrast=json.loads((bench/'contrast.json').read_text())['results'][0]
+        contrast=json.loads((bench/'contrast.json').read_text(encoding='utf-8'))['results'][0]
         current=[v['elapsed_ns']/v['iterations'] for v in contrast['benchmark']['raw']]
         margin=4.303*math.sqrt(statistics.variance(current)/3+4*2500/3)
         excess=statistics.mean(current)-200
@@ -290,7 +297,7 @@ fn main()->i32{return 9;}
             for name in ('first','second','third')})
         check('multiple-benchmark-files',multi,['--samples','3','--sample-ms','1','--warmup-ms','1','--report','base.json'],contains=('3 passed; 0 failed',),kind='bench')
         check('baseline-cache-survives-file-arenas',multi,['--samples','3','--sample-ms','1','--warmup-ms','1','--baseline','base.json','--max-regression-percent','1000','--report','next.json'],contains=('3 passed; 0 failed',),kind='bench')
-        multi_results=json.loads((multi/'next.json').read_text())['results']
+        multi_results=json.loads((multi/'next.json').read_text(encoding='utf-8'))['results']
         assert len(multi_results)==3 and all(r['comparison']['baseline_sha256']==hashlib.sha256((multi/'base.json').read_bytes()).hexdigest() for r in multi_results)
         before=(bench/'bench.json').read_bytes()
         check('baseline-output-collision',bench,[*baseline_args,'--baseline','bench.json','--report','bench.json'],2,contains=('must not overwrite',),kind='bench')
@@ -317,17 +324,17 @@ fn main()->i32{return 9;}
             setup_env=dict(env,VYX_CODEGEN_UNITS='1')
             result=subprocess.run(command,cwd=dci,env=setup_env,capture_output=True,timeout=60)
             if result.returncode:raise RuntimeError(f'DCI producer {emit}: {result.stdout!r} {result.stderr!r}')
-        (dci/'Vyx.toml').write_text('[package]\nname="consumer"\nversion="0.1.0"\nentry="src/main.vyx"\n[build]\ncache_dir=".cache/mixed/cache"\n[target.consumer]\ntype="executable"\nentry="src/main.vyx"\ndci_file="api.dcib"\nlibs=['+json.dumps(str(native_object).replace("\\","/"))+']\n')
+        (dci/'Vyx.toml').write_text('[package]\nname="consumer"\nversion="0.1.0"\nentry="src/main.vyx"\n[build]\ncache_dir=".cache/mixed/cache"\n[target.consumer]\ntype="executable"\nentry="src/main.vyx"\ndci_file="api.dcib"\nlibs=['+json.dumps(str(native_object).replace("\\","/"))+']\n',encoding='utf-8')
         check('project-dci-contract-and-native-artifact',dci,['--target','consumer'],contains=('1 passed; 0 failed',),codegen_units=4)
         cgu_lists=list((dci/'.cache/mixed/cache/harness/consumer').glob('*.cgu.list'))
-        assert any(len(p.read_text().splitlines())>1 for p in cgu_lists),'CGU split was not exercised'
+        assert any(len(p.read_text(encoding='utf-8').splitlines())>1 for p in cgu_lists),'CGU split was not exercised'
         for listing in cgu_lists:
-            for item in listing.read_text().splitlines():
+            for item in listing.read_text(encoding='utf-8').splitlines():
                 assert '.tmp' not in item and (dci/item).is_file(),item
         check('project-dci-benchmark',dci,['--target','consumer','--samples','3','--warmup-ms','1','--sample-ms','1'],contains=('bench result: ok. 1 passed','ns/iter'),kind='bench',codegen_units=4)
         parallel=project('parallel',{'tests/a.vyx':'use std.time;\n@[test] fn a(){sleep_ms(500);}\n@[test] fn b(){sleep_ms(500);}\n@[test] fn c(){sleep_ms(500);}\n@[test] fn d(){sleep_ms(500);}\n'})
         check('bounded-parallel-execution',parallel,['-j3','--report','parallel.json'],contains=('4 passed; 0 failed',))
-        parallel_report=json.loads((parallel/'parallel.json').read_text())
+        parallel_report=json.loads((parallel/'parallel.json').read_text(encoding='utf-8'))
         events=[]
         for item in parallel_report['results']:
             events.extend([(item['started_ms'],1),(item['started_ms']+item['elapsed_ms'],-1)])
@@ -336,7 +343,7 @@ fn main()->i32{return 9;}
         assert 2<=peak<=3,peak
         noisy=project('noisy',{'tests/a.vyx':'@[test] fn excessive(){var n:i32=0;while(n<10000){print("'+('x'*1024)+'");n=n+1;}}\n@[test] fn after_output(){assert(true);}\n'})
         check('output-limit-isolation',noisy,['--output-limit-kb','64','--report','noise.json','--junit','noise.xml'],1,contains=('output_limit','::after_output ... ok','1 passed; 1 failed'))
-        noise_report=json.loads((noisy/'noise.json').read_text())
+        noise_report=json.loads((noisy/'noise.json').read_text(encoding='utf-8'))
         assert noise_report['results'][0]['status']=='output_limit' and noise_report['summary']['failed']==1
         assert ET.parse(noisy/'noise.xml').getroot().get('failures')=='1'
         nul=project('nul-source',{'tests/a.vyx':'@[test] fn valid(){}\x00garbage'})
@@ -354,7 +361,7 @@ use std.collections;
         check('black-box-owning-string-and-vector',typed,[],contains=('1 passed; 0 failed',))
         scaling=project('scaling',{'tests/many.vyx':'\n'.join(f'@[test] fn case_{index:04}(){{assert(true);}}' for index in range(128))})
         check('many-tests-bounded-workers',scaling,['-j4','--report','many.json'],contains=('128 passed; 0 failed',))
-        assert len(json.loads((scaling/'many.json').read_text())['results'])==128
+        assert len(json.loads((scaling/'many.json').read_text(encoding='utf-8'))['results'])==128
         source=(entry/'tests/app.vyx');original=source.read_bytes()
         check('report-cannot-overwrite-source',entry,['--report',source],2,contains=('must not overwrite',))
         assert source.read_bytes()==original
