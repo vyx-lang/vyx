@@ -93,7 +93,7 @@ MIR2LLVM 是受支持的自举后端。MIR2CPP/`--emit=cpp` 仍为实验性、�
 # 包命令（cwd 是 Vyx 包/探针夹具，不是编译器树）。
 & $compiler test                          # src/ 与 tests/ 下的 @[test]
 & $compiler bench                         # benches/ 下的 @[bench]；校准后统计 ns/op
-& $compiler fmt --check .\src\main.vyx    # token 重排；有差异则退出 1
+& $compiler fmt --check .\src\main.vyx    # 不写文件；有差异退出 1，输入或 IO 错误退出 2
 & $compiler doc .\src\main.vyx            # 从 /// 出 markdown
 ```
 

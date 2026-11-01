@@ -1,0 +1,209 @@
+module bootstrap.cli_tools;
+
+use std.fs;
+use std.string;
+use std.collections;
+use bootstrap.diag;
+use bootstrap.formatter;
+use bootstrap.build_source_index;
+
+extern "C" {
+    fn vyx_fmt_temp_file() -> rawptr;
+    fn vyx_fmt_temp_dispose(path: rawptr);
+    fn vyx_fmt_write_file(path: rawptr, expected: rawptr, old_len: i64,
+        replacement: rawptr, new_len: i64) -> i32;
+    fn vyx_fmt_write_stream(to_stderr: i32, text: rawptr, length: i64) -> i32;
+}
+
+class FormatArgs {
+    public paths: Vec<string>;
+    public check: bool;
+    public stdout: bool;
+    public tabs: bool;
+    public indent: i32;
+    public help: bool;
+    public ok: bool;
+}
+
+class FormatInputs {
+    public files: Vec<string>;
+    public ok: bool;
+}
+
+fn fr_error(message: string) {
+    let text = "error: fmt: " + message + "\n";
+    vyx_fmt_write_stream(1, text.c_str(), text.len);
+}
+
+fn fr_parse_args() -> FormatArgs {
+    var out = FormatArgs { paths: Vec::<string>.with_capacity(8), check: false,
+        stdout: false, tabs: false, indent: 4, help: false, ok: true };
+    var positional: bool = false;
+    var i: i32 = 2;
+    while (i < argCount()) {
+        let arg = getArg(i);
+        if (positional) { out.paths.push(arg); }
+        elif (arg == "--") { positional = true; }
+        elif (arg == "--help" || arg == "-h") { out.help = true; }
+        elif (arg == "--check") { out.check = true; }
+        elif (arg == "--stdout") { out.stdout = true; }
+        elif (arg == "--tabs") { out.tabs = true; }
+        elif (arg == "--indent-width" || arg.startsWith("--indent-width=")) {
+            var value: string = "";
+            if (arg == "--indent-width") {
+                if (i + 1 >= argCount()) {
+                    fr_error("missing value for --indent-width"); out.ok = false; return out;
+                }
+                i = i + 1; value = getArg(i);
+            } else { value = arg.substring(15, arg.len); }
+            let width = tr_timeout(value);
+            if (width < 1 || width > 16) {
+                fr_error("--indent-width must be an integer from 1 to 16"); out.ok = false;
+            } else { out.indent = width as i32; }
+        }
+        elif (arg.startsWith("-")) { fr_error("unknown option `" + arg + "`"); out.ok = false; }
+        else { out.paths.push(arg); }
+        i = i + 1;
+    }
+    if (out.check && out.stdout) { fr_error("--check and --stdout cannot be combined"); out.ok = false; }
+    return out;
+}
+
+fn fr_add_file(files: &mut Vec<string>, seen: &mut BuildSourceMap, path: string) {
+    var key = path;
+    if (ct_is_windows()) { key = key.toLower(); }
+    if (!seen.contains(key)) { seen.put(key, 1); files.push(path); }
+}
+
+fn fr_directory(path: string, files: &mut Vec<string>, seen: &mut BuildSourceMap) -> bool {
+    let temp = vyx_fmt_temp_file();
+    if (temp == null) { fr_error("cannot create directory inventory"); return false; }
+    let inventory = str_dup(from_cstr(temp));
+    let listed = vyx_bootstrap_list_vyx_deps(path.c_str(), inventory.c_str());
+    let size = fileSize(inventory);
+    let text = readFile(inventory);
+    vyx_fmt_temp_dispose(temp);
+    if (listed != 0 || size < 0 || text.len != size) {
+        fr_error("cannot enumerate directory: " + path); return false;
+    }
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= text.len) {
+        if (i == text.len || text.charAt(i) == 10) {
+            var end = i;
+            if (end > start && text.charAt(end - 1) == 13) { end = end - 1; }
+            if (end > start) {
+                let file = text.substring(start, end);
+                if (!fileExists(file) || !file.startsWith(path)) {
+                    fr_error("invalid directory inventory entry: " + file); return false;
+                }
+                let relative = file.substring(path.len, file.len);
+                if (file.endsWith(".vyx") && !ct_skip_path(relative)) {
+                    fr_add_file(files, seen, tr_abs(file));
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn fr_collect(args: &mut FormatArgs) -> FormatInputs {
+    var out = FormatInputs { files: Vec::<string>.with_capacity(64), ok: true };
+    var seen = BuildSourceMap.create(128);
+    if (args.paths.len == 0) {
+        if (isDir("src")) { args.paths.push("src"); }
+        if (isDir("tests")) { args.paths.push("tests"); }
+        if (isDir("benches")) { args.paths.push("benches"); }
+    }
+    var i: i64 = 0;
+    while (i < args.paths.len) {
+        let requested = args.paths.get(i);
+        let path = tr_abs(requested);
+        if (path.len == 0) { fr_error("cannot resolve path: " + requested); out.ok = false; }
+        elif (isDir(path)) {
+            if (!fr_directory(path, &mut out.files, &mut seen)) { out.ok = false; }
+        } elif (fileExists(path) && path.endsWith(".vyx")) {
+            fr_add_file(&mut out.files, &mut seen, path);
+        } else { fr_error("expected a .vyx file or directory: " + requested); out.ok = false; }
+        i = i + 1;
+    }
+    seen.destroy();
+    if (out.files.len == 0) {
+        fr_error("no source files; pass a path or run inside a package with src/, tests/ or benches/");
+        out.ok = false;
+    }
+    if (args.stdout && out.files.len != 1) { fr_error("--stdout requires exactly one source file"); out.ok = false; }
+    return out;
+}
+
+fn fr_format_file(path: string, args: &FormatArgs) -> i32 {
+    let size = fileSize(path);
+    if (size < 0 || size > 2147483647) { fr_error("cannot read source size: " + path); return 2; }
+    var file = File.open(path, FileOptions { read: true, write: false, create: false, truncate: false, binary: true });
+    if (!file.is_open()) { fr_error("cannot open source: " + path); return 2; }
+    var bytes = file.read_all_bytes();
+    file.close();
+    if (bytes.len != size || fileSize(path) != size) {
+        bytes.destroy(); fr_error("source changed or could not be read completely: " + path); return 2;
+    }
+    let original = from_cstr_len(bytes.data, bytes.len);
+    bytes.destroy();
+    var i: i32 = 0;
+    while (i < original.len) {
+        if (original.charAt(i) == 0) { fr_error("NUL byte in source: " + path); return 2; }
+        i = i + 1;
+    }
+    diag_set_source_context(path, original);
+    let result = format_source(original, args.indent, args.tabs);
+    if (!result.ok) { fr_error(path + ": " + result.message); return 2; }
+    if (args.stdout) {
+        if (vyx_fmt_write_stream(0, result.text.c_str(), result.text.len) != 0) {
+            fr_error("cannot write stdout"); return 2;
+        }
+        return 0;
+    }
+    if (result.text == original) { return 0; }
+    if (args.check) { print("would reformat: " + path); return 1; }
+    let rc = vyx_fmt_write_file(path.c_str(), original.c_str(), original.len,
+        result.text.c_str(), result.text.len);
+    if (rc != 0) {
+        var detail = "cannot atomically replace source";
+        if (rc == 2) { detail = "source changed during formatting"; }
+        elif (rc == 3) { detail = "refusing to replace a link or nonregular file; format its original file"; }
+        elif (rc == 4) { detail = "source is read-only"; }
+        fr_error(detail + ": " + path); return 2;
+    }
+    print("reformatted " + path);
+    return 0;
+}
+
+fn ct_fmt_main() -> i32 {
+    var args = fr_parse_args();
+    if (!args.ok) { args.paths.destroy(); return 2; }
+    if (args.help) {
+        print("Usage: " + ct_self_exe() + " fmt [--check | --stdout] [--indent-width N] [--tabs] [--] [path...]");
+        print("  Format .vyx sources, preserving tokens, comments and literal bytes.");
+        print("  Default roots: src/, tests/, benches/. Default indent: 4 spaces.");
+        print("  --check reports changes without writing; --stdout prints one formatted file.");
+        print("  Exit codes: 0 unchanged/success, 1 check found changes, 2 invalid input or IO failure.");
+        args.paths.destroy(); return 0;
+    }
+    var inputs = fr_collect(&mut args);
+    if (!inputs.ok) { inputs.files.destroy(); args.paths.destroy(); return 2; }
+    var status: i32 = 0;
+    var i: i64 = 0;
+    while (i < inputs.files.len) {
+        let path = inputs.files.get(i);
+        let frame = vyx_frontend_service_begin();
+        let rc = fr_format_file(path, &args);
+        if (rc > status) { status = rc; }
+        diag_set_source_context("", "");
+        diag_service_dispose();
+        vyx_frontend_service_end(frame);
+        i = i + 1;
+    }
+    inputs.files.destroy(); args.paths.destroy();
+    return status;
+}

@@ -144,6 +144,12 @@ lowering, or the roadmap's large-project performance targets.
 
 ## Source layout
 
+`vyxc fmt` formats `src/`, `tests/` and `benches/`, or explicitly supplied `.vyx`
+files/directories. `--check` checks without writing; `--stdout` prints one file.
+Comments and literal bytes are preserved, and syntax/token checks precede each
+atomic file replacement. The LSP uses the same formatter. See [formatting options](../docs/TOOLING.md#formatting)
+and the [formatter gate](../probes/gates/formatter/README.md).
+
 The [compiler architecture](../docs/COMPILER.md) / [中文架构说明](../docs/COMPILER_ZH.md)
 connects the HIR, MIR, LLVM, and CGU stages below.
 The [source tree map](src/README.md) lists subsystem boundaries and entry points.

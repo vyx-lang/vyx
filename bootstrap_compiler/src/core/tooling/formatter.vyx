@@ -1,0 +1,262 @@
+module bootstrap.formatter;
+
+use std.string;
+use std.collections;
+use bootstrap.ast;
+use bootstrap.lexer;
+use bootstrap.parser;
+use bootstrap.diag;
+use bootstrap.policy;
+
+public class FormatResult {
+    public ok: bool;
+    public text: string;
+    public message: string;
+}
+
+fn fmt_failure(message: string) -> FormatResult {
+    return FormatResult { ok: false, text: "", message: message };
+}
+
+fn fmt_diagnostic() -> string {
+    if (diag_capture_count() == 0) { return "invalid source"; }
+    return diag_capture_line(0).toString() + ":" + diag_capture_col(0).toString()
+        + ": " + diag_capture_message(0);
+}
+
+fn fmt_newlines(src: string, start: i32, end: i32) -> i32 {
+    var count: i32 = 0;
+    var i = start;
+    while (i < end) {
+        let c = src.charAt(i);
+        if (c == 10 || (c == 13 && src.charAt(i + 1) != 10)) { count = count + 1; }
+        i = i + 1;
+    }
+    if (count > 2) { return 2; }
+    return count;
+}
+
+fn fmt_eol(src: string) -> string {
+    var i: i32 = 0;
+    while (i < src.len) {
+        if (src.charAt(i) == 10) {
+            if (i > 0 && src.charAt(i - 1) == 13) { return "\r\n"; }
+            return "\n";
+        }
+        i = i + 1;
+    }
+    return "\n";
+}
+
+fn fmt_comment_eol(src: string, end: i32, default_eol: string) -> string {
+    if (src.charAt(end) == 13 && src.charAt(end + 1) == 10) { return "\r\n"; }
+    if (src.charAt(end) == 10) { return "\n"; }
+    return default_eol;
+}
+
+fn fmt_word(text: string) -> bool {
+    if (text.len == 0) { return false; }
+    let c = text.charAt(0);
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+        || (c >= 97 && c <= 122) || c == 95 || c >= 128;
+}
+
+fn fmt_prefix_context(text: string) -> bool {
+    return text.len == 0 || text == "(" || text == "[" || text == "{" || text == ","
+        || text == ";" || text == ":" || text == "=" || text == "->" || text == "=>"
+        || text == "return" || text == "yield" || text == "in" || text == "as"
+        || text == "&&" || text == "||" || text == "==" || text == "!="
+        || text == "+" || text == "-" || text == "*" || text == "/" || text == "%"
+        || text == "!" || text == "~" || text == "&" || text == "|" || text == "^";
+}
+
+// Type angles and expression operators share tokens. Keep their adjacency.
+fn fmt_ambiguous(text: string) -> bool {
+    return text == "<" || text == ">" || text == ">>" || text == "<<" || text == "|";
+}
+
+fn fmt_would_merge(prev: string, cur: string) -> bool {
+    let pair = prev + cur;
+    if (pair == "++" || pair == "--" || pair == "&&" || pair == "||" || pair == "//" || pair == "/*"
+        || pair == "==" || pair == "!=" || pair == "<=" || pair == ">=" || pair == "->" || pair == "=>"
+        || pair == "+=" || pair == "-=" || pair == "*=" || pair == "/=" || pair == "%="
+        || pair == "&=" || pair == "|=" || pair == "^=" || pair == "::" || pair == ".." || pair == "..=" || pair == "??") { return true; }
+    if (cur == "." && prev.len > 0 && prev.charAt(0) >= 48 && prev.charAt(0) <= 57) { return true; }
+    if (prev == "." && cur.len > 0 && cur.charAt(0) >= 48 && cur.charAt(0) <= 57) { return true; }
+    return false;
+}
+
+fn fmt_space(before: string, prev: string, cur: string, had_gap: bool) -> bool {
+    if (prev.len == 0) { return false; }
+    if (had_gap && fmt_would_merge(prev, cur)) { return true; }
+    if (fmt_ambiguous(prev) || fmt_ambiguous(cur)) { return had_gap; }
+    if (cur == ")" || cur == "]" || cur == "," || cur == ";" || cur == ":"
+        || cur == "." || cur == "::" || cur == "?") { return false; }
+    if (prev == "(" || prev == "[" || prev == "." || prev == "::" || prev == "@") { return false; }
+    if (cur == "(") {
+        if (prev == "if" || prev == "while" || prev == "for" || prev == "switch"
+            || prev == "match" || prev == "catch" || prev == "return" || prev == "yield" || prev == "throw") { return true; }
+        if (fmt_word(prev) || prev == ")" || prev == "]") { return false; }
+    }
+    if (cur == "[" && (fmt_word(prev) || prev == ")" || prev == "]")) { return false; }
+    if (prev == "!" || prev == "~") { return false; }
+    if ((prev == "&" || prev == "*" || prev == "-" || prev == "+") && fmt_prefix_context(before)) { return false; }
+    if (prev == ".." || prev == "..=" || cur == ".." || cur == "..=") { return false; }
+    if (prev == "++" || prev == "--" || cur == "++" || cur == "--") { return had_gap; }
+    if (prev == "{" && cur == "}") { return false; }
+    return true;
+}
+
+fn fmt_after_brace(cur: string) -> bool {
+    return cur == "else" || cur == "elif" || cur == "catch" || cur == "finally"
+        || cur == ";" || cur == "," || cur == ")" || cur == "]" || cur == "."
+        || cur == "(" || cur == "?" || cur == "+" || cur == "-" || cur == "*"
+        || cur == "/" || cur == "==" || cur == "!=" || cur == "&&" || cur == "||";
+}
+
+// Only gaps change; literal/comment interiors retain their exact bytes.
+fn fmt_layout(src: string, tokens: &SourceTokens, width: i32, tabs: bool) -> string {
+    var out = StringBuilder.withCapacity(src.len + 256);
+    var stack = Vec::<i32>.with_capacity(32);
+    let eol = fmt_eol(src);
+    var prev: string = "";
+    var before: string = "";
+    var prev_code: string = "";
+    var prev_kind: i32 = 0;
+    var prev_end: i32 = 0;
+    var previous_attribute = false;
+    var expected: i64 = 0;
+    var i: i64 = 0;
+    while (i < tokens.items.len) {
+        let token = tokens.items.get_ref(i);
+        let cur = str_view_range(src, token.start, token.end);
+        let comment = token.kind < 0;
+        var lines = fmt_newlines(src, prev_end, token.start);
+        var top: i32 = 0;
+        if (stack.len > 0) { top = stack.get(stack.len - 1); }
+        var closes_attribute = false;
+        if (!comment && (cur == "}" || cur == ")" || cur == "]")) {
+            if (stack.len > 0) {
+                let closed = stack.pop();
+                closes_attribute = closed == 4;
+            }
+        }
+        if (i == 0) { lines = 0; }
+        elif (prev_kind == -1) { if (lines == 0) { lines = 1; } }
+        elif (!comment) {
+            if (prev_code == "{" && cur != "}") { if (lines == 0) { lines = 1; } }
+            if (cur == "}" && prev_code != "{") { if (lines == 0) { lines = 1; } }
+            if (prev_code == ";" && (top == 0 || top == 1)) { if (lines == 0) { lines = 1; } }
+            if (prev_code == "," && top == 1) { if (lines == 0) { lines = 1; } }
+            if (prev_code == "}" && !fmt_after_brace(cur)) { if (lines == 0) { lines = 1; } }
+            if (previous_attribute) { if (lines == 0) { lines = 1; } }
+        }
+        // Trailing comments remain attached, even after semicolons/braces.
+        if (lines > 0) {
+            var line: i32 = 0;
+            while (line < lines) {
+                var separator = eol;
+                // The lexer retains CR in doc-comment payloads. Preserve the
+                // terminator of each comment even in mixed LF/CRLF sources.
+                if (line == 0 && prev_kind == -1) { separator = fmt_comment_eol(src, prev_end, eol); }
+                out.append(separator); expected = expected + separator.len;
+                line = line + 1;
+            }
+            var padding: i64 = stack.len;
+            if (!tabs) { padding = padding * width; }
+            var pad: i64 = 0;
+            while (pad < padding) {
+                if (tabs) { out.appendChar(9); } else { out.appendChar(32); }
+                expected = expected + 1;
+                pad = pad + 1;
+            }
+        } elif (i > 0 && (comment || prev_kind < 0 || fmt_space(before, prev, cur, token.start > prev_end))) {
+            out.appendChar(32); expected = expected + 1;
+        }
+        out.append(cur); expected = expected + cur.len;
+        if (!comment) {
+            if (cur == "{") { stack.push(1); }
+            elif (cur == "(") { stack.push(2); }
+            elif (cur == "[") { if (prev_code == "@") { stack.push(4); } else { stack.push(3); } }
+            before = prev_code;
+            prev_code = cur;
+            previous_attribute = closes_attribute;
+        }
+        prev = cur;
+        prev_kind = token.kind;
+        prev_end = token.end;
+        i = i + 1;
+    }
+    if (tokens.items.len > 0) { out.append(eol); expected = expected + eol.len; }
+    stack.destroy();
+    if (out.length() != expected) { return ""; }
+    let value = out.build();
+    return from_cstr_len(value.c_str(), value.len);
+}
+
+fn fmt_equivalent(a: string, left: &SourceTokens, b: string, right: &SourceTokens) -> string {
+    if (!right.ok) { return "output is not lexically valid"; }
+    if (left.items.len != right.items.len) { return "source token count changed"; }
+    var i: i64 = 0;
+    while (i < left.items.len) {
+        let x = left.items.get_ref(i);
+        let y = right.items.get_ref(i);
+        if (x.kind != y.kind || str_view_range(a, x.start, x.end) != str_view_range(b, y.start, y.end)) {
+            return "source token changed at byte " + x.start.toString();
+        }
+        i = i + 1;
+    }
+    let count = lex_token_count(left.handle);
+    if (count != lex_token_count(right.handle)) { return "parser token count changed"; }
+    var t: i32 = 0;
+    while (t < count) {
+        let x = lex_token_at(left.handle, t);
+        let y = lex_token_at(right.handle, t);
+        let location = token_line(x).toString() + ":" + token_col(x).toString();
+        if (token_kind(x) != token_kind(y) || token_lexeme(x) != token_lexeme(y)
+            || token_char_value(x) != token_char_value(y)) { return "literal value changed at " + location; }
+        if (token_doc_comment(x) != token_doc_comment(y)) { return "documentation changed at " + location; }
+        t = t + 1;
+    }
+    return "";
+}
+
+fn fmt_checked(src: string, width: i32, tabs: bool) -> FormatResult {
+    var tokens = lex_source_spans(src);
+    if (!tokens.ok) {
+        lexer_dispose(tokens.handle); tokens.items.destroy();
+        return fmt_failure(fmt_diagnostic());
+    }
+    let unit = parse_unit(tokens.handle);
+    if (unit == null) {
+        lexer_dispose(tokens.handle); tokens.items.destroy();
+        return fmt_failure(fmt_diagnostic());
+    }
+    let text = fmt_layout(src, &tokens, width, tabs);
+    var checked = lex_source_spans(text);
+    let difference = fmt_equivalent(src, &tokens, text, &checked);
+    lexer_dispose(checked.handle); checked.items.destroy();
+    lexer_dispose(tokens.handle); tokens.items.destroy();
+    if (difference.len > 0) { return fmt_failure("formatter verification failed: " + difference + "; source was not changed"); }
+    return FormatResult { ok: true, text: text, message: "" };
+}
+
+// Diagnostics are captured here so stdout remains usable for source output
+// and for the LSP transport. The caller owns the surrounding frontend arena.
+public fn format_source(src: string, indent_width: i32, use_tabs: bool) -> FormatResult {
+    if (indent_width < 1 || indent_width > 16) { return fmt_failure("indent width must be between 1 and 16"); }
+    if (src.len > 2147482623) { return fmt_failure("source exceeds the lexer's byte offset limit"); }
+    var i: i32 = 0;
+    while (i < src.len) {
+        if (src.charAt(i) == 0) { return fmt_failure("NUL byte in source"); }
+        i = i + 1;
+    }
+    let bom = src.len >= 3 && src.charAt(0) == 239 && src.charAt(1) == 187 && src.charAt(2) == 191;
+    var body = src;
+    if (bom) { body = str_view_range(src, 3, src.len); }
+    diag_capture_begin();
+    var result = fmt_checked(body, indent_width, use_tabs);
+    diag_capture_end();
+    if (bom && result.ok) { result.text = str_view_range(src, 0, 3) + result.text; }
+    return result;
+}

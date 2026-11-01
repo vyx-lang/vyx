@@ -277,9 +277,10 @@ mir-verify hir-facts`. LLVM is the acceptance backend; `cpp` is experimental.
   warmup, raw sample reports, distribution statistics and baseline comparisons.
   The `bench` keyword is unused; declaration marking is `@[bench]`.
   See the [test and benchmark contract](TESTING_GUIDE.md#sdk-test-and-benchmark-commands).
-- `fmt [--check] [path…]` — token-reprint `.vyx`. `//` and `/* */` are
-  dropped (the lexer does not keep them); `///` is rewritten. `--check`
-  exits 1 if a file would change. Not rustfmt.
+- `fmt [options] [path…]` — shared CLI/LSP formatting with syntax and token
+  preservation checks, comments and literal bytes retained, and atomic writes.
+  `--check` exits 1 if a file would change; invalid input or options exit 2.
+  See [formatter options and limits](TOOLING.md).
 - `doc [--out <dir>] [path…]` — markdown from `///` on the next
   `fn`/`class`/`struct`/`interface`/`enum`. Default stdout.
 

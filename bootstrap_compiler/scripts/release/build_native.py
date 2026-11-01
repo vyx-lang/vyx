@@ -191,6 +191,9 @@ def main():
             run([sys.executable, REPO / "tests/bootstrap/lsp_smoke/run.py",
                  out / (target + (".exe" if windows else "")), "--runs", "1",
                  "--diagnostics-dir", work / "lsp-smoke"], env=environment)
+            run([sys.executable, REPO / "probes/gates/formatter/run.py",
+                 "--compiler", built_compiler, "--lsp", out / (target + (".exe" if windows else "")),
+                 "--output", work / "formatter"], env=environment)
     arguments = ["pwsh", "-NoProfile", "-File", REPO / "bootstrap_compiler/scripts/package_sdk.ps1",
         "-CompilerPath", built_compiler, "-Destination", output / leaf,
         "-BootstrapRoot", build, "-OutDir", out,

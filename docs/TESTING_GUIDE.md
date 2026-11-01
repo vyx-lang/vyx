@@ -115,7 +115,7 @@ Use one explicit source mode and one output mode for a reproducible invocation:
 # Package commands (cwd is a Vyx package / fixture, not the compiler tree).
 & $compiler test                          # @[test] under tests/
 & $compiler bench                         # @[bench] under benches/; calibrated ns/op
-& $compiler fmt --check .\src\main.vyx    # token reprint; exits 1 if dirty
+& $compiler fmt --check .\src\main.vyx    # no writes; exits 1 if dirty, 2 on errors
 & $compiler doc .\src\main.vyx            # markdown from ///
 ```
 

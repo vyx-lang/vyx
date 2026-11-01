@@ -316,6 +316,8 @@ def native(args):
         if target == "vyxc-lsp":
             run([sys.executable, REPO / "tests/bootstrap/lsp_smoke/run.py",
                  out / target, "--runs", "1", "--diagnostics-dir", work / "lsp-smoke"], env=environment)
+            run([sys.executable, REPO / "probes/gates/formatter/run.py",
+                 "--compiler", built, "--lsp", out / target, "--output", work / "formatter"], env=environment)
     run([sys.executable, REPO / "probes/gates/dci-native-export/run.py", "--compiler", out / "boot",
          "--triplet", TRIPLES[arch]], env=environment)
     record["dci_native_export"] = json.loads((REPO / "probes/gates/dci-native-export/.cache/verification.json").read_text())

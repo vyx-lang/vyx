@@ -57,6 +57,61 @@ requests flush preceding changes and diagnostics carry document versions.
 See the [editor pressure gates](../probes/gates/editor-industrial/README.md)
 for sustained edits, token responses, synchronization and memory failure guards.
 
+## Formatting
+
+`vyxc fmt` formats `.vyx` files in place. With no paths, it visits the existing
+`src/`, `tests/` and `benches/` directories in the current working directory.
+Explicit paths can be files or directories; overlapping inputs are deduplicated.
+Directory traversal skips `.git`, `.cache`, `target`, `out`, `build` and
+`snapshots` subdirectories. It does not select sources from a manifest target.
+
+```sh
+vyxc fmt
+vyxc fmt src tests
+vyxc fmt --check src
+vyxc fmt --stdout src/main.vyx
+vyxc fmt --indent-width 2 src
+vyxc fmt --tabs src
+vyxc fmt -- -example.vyx
+```
+
+The default indent is four spaces. `--indent-width` accepts integers from 1 to
+16; `--tabs` uses one tab per nesting level. `--check` only reports files that
+would change. `--stdout` emits the formatted bytes of exactly one selected file,
+without status messages, and cannot be combined with `--check`. `--` ends option
+parsing, allowing paths that start with a hyphen.
+
+The formatter parses the input before making edits and checks the resulting
+token sequence against the original. Comments, literal contents and literal
+spelling are preserved, including multiline strings and interpolation. An
+existing UTF-8 BOM is kept. New whitespace follows the source's line-ending
+style; whitespace inside literals and comments is left untouched. Lexical or
+syntax errors and failed token checks produce an error without writing that file.
+
+Formatting adjusts indentation, statement/block breaks and token spacing. It
+does not reorder imports or wrap lines to a maximum width. Existing adjacency
+around ambiguous generic-angle and pipe tokens is retained. In mixed LF/CRLF
+files, individual line-comment terminators are kept to preserve doc-comment data.
+
+All path arguments are validated before formatting starts. A changed file is
+written to a unique sibling temporary file, then atomically replaces the source
+after its contents and identity have been checked again. Writing through symbolic
+links or hard links, and replacing read-only files, is refused. Use `--stdout`
+to inspect their formatted text. Existing backup files are not touched. Publication
+is atomic per file: an error in a later file does not roll back earlier files.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Formatting or stdout output succeeded; with `--check`, no changes are needed. |
+| `1` | `--check` found files that need formatting. |
+| `2` | Invalid arguments, missing input, syntax/token verification failure, or an IO error. |
+
+LSP document formatting uses the same formatter. The client's `tabSize` selects
+the indent width (1–16), and `insertSpaces: false` selects tabs. Invalid source
+returns a request error without edits. Range formatting is not supported:
+`documentRangeFormattingProvider` is false, and a range-format request is
+explicitly rejected rather than replacing the whole document.
+
 ## VS Code and Cursor
 
 The extension at `bootstrap_compiler/IDE-Plugins/vscode/vyx/` declares
