@@ -35,6 +35,10 @@ file-local compiler arenas. Binary stdout exercises NUL, malformed UTF-8, valid
 multibyte characters and XML-forbidden characters while preserving the raw log.
 Report/source/native-input collisions and independent build-job budgets are
 also covered.
+Filesystem identities resolve directory/file symlinks and existing hardlinks.
+Full `--exact` identities accept an alias of the same source; report and JUnit
+destinations cannot alias inputs or each other, including new destinations below
+symlinked parents. This covers macOS `/var` and `/private/var` spellings.
 
 For a repeatable discovery/report scaling measurement:
 

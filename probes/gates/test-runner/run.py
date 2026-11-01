@@ -74,6 +74,30 @@ def main() -> None:
         check('empty-filter-opt-in',good,['--filter','missing','--allow-empty'],contains=('no tests selected',))
         check('deduplicate-inputs',good,['--list','tests','tests/main.vyx','tests'],contains=('test list: 3 tests',))
         check('filter-full-identity',good,['--list','--exact','--filter',str(good/'tests/main.vyx').replace('\\','/')+'::alongside_main'],contains=('test list: 1 tests',))
+        # cwd and the user's absolute spelling can cross a directory symlink
+        # (/var -> /private/var on macOS). Use real filesystem aliases on every
+        # host that permits them; hardlinks exercise distinct path spellings too.
+        alias=root/'good-alias'
+        try:
+            alias.symlink_to(good,target_is_directory=True)
+        except OSError as error:
+            print(f'directory-symlink checks unavailable: {error}',flush=True)
+        else:
+            check('filter-through-directory-alias',good,['--list','--exact','--filter',str(alias/'tests/main.vyx').replace('\\','/')+'::alongside_main'],contains=('test list: 1 tests',))
+            check('deduplicate-directory-alias',good,['--list',good/'tests',alias/'tests'],contains=('test list: 3 tests',))
+            original=(good/'tests/main.vyx').read_bytes()
+            for option in ('--report','--junit'):
+                check('source-directory-alias-'+option[2:],good,[option,alias/'tests/main.vyx'],2,contains=('must not overwrite',))
+                assert (good/'tests/main.vyx').read_bytes()==original
+            check('new-output-directory-alias',good,['--report',good/'new.json','--junit',alias/'new.json'],2,contains=('must be distinct',))
+        hardlink=root/'source-hardlink.vyx'
+        os.link(good/'tests/main.vyx',hardlink)
+        check('filter-through-hardlink',good,['--list','--exact','--filter',str(hardlink).replace('\\','/')+'::alongside_main'],contains=('test list: 1 tests',))
+        check('deduplicate-file-hardlink',good,['--list',good/'tests/main.vyx',hardlink],contains=('test list: 1 tests',))
+        original=(good/'tests/main.vyx').read_bytes()
+        for option in ('--report','--junit'):
+            check('source-hardlink-'+option[2:],good,[option,hardlink],2,contains=('must not overwrite',))
+            assert (good/'tests/main.vyx').read_bytes()==original
         check('help',good,['--help'],contains=('--list','--timeout-ms','--allow-empty'))
         for name,arguments in [
             ('unknown',['--filtter','hello']),('missing-filter',['--filter']),
@@ -343,6 +367,9 @@ use std.collections;
         check('native-target-does-not-scan-unrelated-src',native_only,['--list'],1,contains=('no tests selected',),absent=('::unrelated',))
         native_source=native_only/'native.c';original=native_source.read_bytes()
         check('report-cannot-overwrite-native-input',native_only,['--allow-empty','--report',native_source],2,contains=('must not overwrite',))
+        assert native_source.read_bytes()==original
+        native_alias=root/'native-alias.c';os.link(native_source,native_alias)
+        check('report-cannot-overwrite-native-hardlink',native_only,['--allow-empty','--report',native_alias],2,contains=('must not overwrite',))
         assert native_source.read_bytes()==original
         with ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(lambda index:check(f'concurrent-invocation-{index}',good,['--filter','alongside_main','--exact'],contains=('1 passed; 0 failed',)),range(2)))
