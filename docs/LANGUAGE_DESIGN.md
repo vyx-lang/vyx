@@ -269,12 +269,14 @@ mir-verify hir-facts`. LLVM is the acceptance backend; `cpp` is experimental.
 
 `test` / `bench` / `fmt` / `doc` (`cli_tools.vyx`):
 
-- `test [--filter] [path…]` — find `@[test]` functions under `tests/` (or
-  explicit paths), wrap a `main` when the file has none, compile with this
-  SDK compiler (`--src=file --emit=exe`), run. Non-zero if any fail.
-- `bench [--filter] [path…]` — same with `@[bench]` under `benches/`; print
-  wall-clock milliseconds around the run. The `bench` **keyword** is still
-  unused.
+- `test [options] [path…]` — AST-based unit/integration discovery, manifest
+  build integration, isolated AOT processes, bounded workers/deadlines,
+  repetition, ignore selection and JSON/JUnit reports. Empty selections fail
+  unless explicitly accepted.
+- `bench [options] [path…]` — calibrated in-process monotonic-clock samples,
+  warmup, raw sample reports, distribution statistics and baseline comparisons.
+  The `bench` keyword is unused; declaration marking is `@[bench]`.
+  See the [test and benchmark contract](TESTING_GUIDE.md#sdk-test-and-benchmark-commands).
 - `fmt [--check] [path…]` — token-reprint `.vyx`. `//` and `/* */` are
   dropped (the lexer does not keep them); `///` is rewritten. `--check`
   exits 1 if a file would change. Not rustfmt.

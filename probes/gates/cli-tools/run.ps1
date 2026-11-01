@@ -1,12 +1,15 @@
 # CLI subcommands: test / bench / fmt / doc
+param([Parameter(Mandatory = $true)][string]$Compiler)
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
-$Boot = Join-Path $Root "bootstrap_compiler\out\boot.exe"
-$OutDir = Join-Path $Root "bootstrap_compiler\out"
+$Boot = (Resolve-Path -LiteralPath $Compiler).Path
+$OutDir = Split-Path -Parent $Boot
 $Llvm = Join-Path $Root "clang"
-$Fixture = Join-Path $PSScriptRoot "fixture"
-$Tmp = Join-Path $env:TEMP "vyx-cli-tools"
+$FixtureSource = Join-Path $PSScriptRoot "fixture"
+$Tmp = Join-Path $env:TEMP ("vyx-cli-tools-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
+$Fixture = Join-Path $Tmp "fixture"
+Copy-Item -LiteralPath $FixtureSource -Destination $Fixture -Recurse
 
 if (Test-Path $Llvm) {
     $env:LLVM_ROOT = (Resolve-Path $Llvm).Path
@@ -49,7 +52,7 @@ try {
     Write-Host "OK: test"
 
     $filterLog = Join-Path $Tmp "filter.log"
-    & $Boot test --filter no_such_name *> $filterLog
+    & $Boot test --filter no_such_name --allow-empty *> $filterLog
     if ($LASTEXITCODE -ne 0) { Fail "filtered test should exit 0" $filterLog }
     $filterOut = Get-Content $filterLog -Raw
     if ($filterOut -notmatch 'no tests') { Fail "filter should report no tests" $filterLog }
@@ -59,8 +62,8 @@ try {
     & $Boot bench *> $benchLog
     if ($LASTEXITCODE -ne 0) { Fail "bench exit=$LASTEXITCODE" $benchLog }
     $benchOut = Get-Content $benchLog -Raw
-    if ($benchOut -notmatch 'bench_spin' -or $benchOut -notmatch ' ms') {
-        Fail "bench output missing name / ms" $benchLog
+    if ($benchOut -notmatch 'bench_spin' -or $benchOut -notmatch 'ns/iter') {
+        Fail "bench output missing name / ns/iter" $benchLog
     }
     Write-Host "OK: bench"
 

@@ -1,0 +1,234 @@
+module bootstrap.cli_tools;
+
+use std.fs;
+use std.string;
+use bootstrap.policy;
+use bootstrap.build_source_index;
+use std.collections;
+
+// cJSON is already a compiler build input. Do not infer JSON structure through
+// substring/key searches or accept partial documents as benchmark evidence.
+extern "C" {
+    fn cJSON_ParseWithOpts(text: rawptr, end: rawptr, require_end: i32) -> rawptr;
+    fn cJSON_Delete(value: rawptr);
+    fn cJSON_GetObjectItemCaseSensitive(value: rawptr, key: rawptr) -> rawptr;
+    fn cJSON_GetArrayItem(value: rawptr, index: i32) -> rawptr;
+    fn cJSON_GetArraySize(value: rawptr) -> i32;
+    fn cJSON_IsNumber(value: rawptr) -> i32;
+    fn cJSON_IsArray(value: rawptr) -> i32;
+    fn cJSON_IsObject(value: rawptr) -> i32;
+    fn cJSON_IsString(value: rawptr) -> i32;
+    fn vyx_json_tree_first(value: rawptr) -> rawptr;
+    fn vyx_json_tree_next(value: rawptr) -> rawptr;
+    fn vyx_json_tree_key(value: rawptr) -> rawptr;
+    fn cJSON_GetNumberValue(value: rawptr) -> f64;
+    fn cJSON_GetStringValue(value: rawptr) -> rawptr;
+}
+
+var g_bench_comparison_failed: bool = false;
+
+fn br_json_number(value: rawptr, key: string) -> f64 {
+    let item = cJSON_GetObjectItemCaseSensitive(value, key.c_str());
+    if (cJSON_IsNumber(item) == 0) { return -1.0; }
+    return cJSON_GetNumberValue(item);
+}
+
+fn br_json_text(value: rawptr, key: string) -> string {
+    let item = cJSON_GetObjectItemCaseSensitive(value, key.c_str());
+    let text = cJSON_GetStringValue(item);
+    if (text == null) { return ""; }
+    return from_cstr(text);
+}
+
+fn br_comparison_error(message: string) -> string {
+    g_bench_comparison_failed = true;
+    print("error: benchmark baseline: " + message);
+    return ",\"comparison\":{\"error\":" + tr_json(message) + "}";
+}
+
+class BenchReference {
+    public name: string;
+    public usable: bool;
+    public count: i32;
+    public mean: f64;
+    public variance: f64;
+}
+
+var g_bench_references: Vec<BenchReference>;
+var g_bench_reference_index: BuildSourceMap;
+var g_bench_reference_ready: bool = false;
+var g_bench_baseline_hash: string = "";
+
+fn br_baseline_close() {
+    if (g_bench_reference_ready) {
+        g_bench_reference_index.destroy(); g_bench_references.destroy();
+        g_bench_reference_ready = false;
+    }
+}
+
+fn br_unique_keys(node: rawptr) -> bool {
+    if (cJSON_IsObject(node) != 0) {
+        var keys = BuildSourceMap.create(8);
+        var child = vyx_json_tree_first(node);
+        while (child != null) {
+            let key = from_cstr(vyx_json_tree_key(child));
+            if (keys.contains(key)) {
+                print("error: benchmark baseline: duplicate JSON field: " + key);
+                keys.destroy(); return false;
+            }
+            keys.put(key, 1);
+            if (!br_unique_keys(child)) { keys.destroy(); return false; }
+            child = vyx_json_tree_next(child);
+        }
+        keys.destroy();
+    } elif (cJSON_IsArray(node) != 0) {
+        var child = vyx_json_tree_first(node);
+        while (child != null) {
+            if (!br_unique_keys(child)) { return false; }
+            child = vyx_json_tree_next(child);
+        }
+    }
+    return true;
+}
+
+fn br_json_integer(node: rawptr, key: string, low: i64, high: i64) -> i64 {
+    let value = br_json_number(node, key);
+    if (!(value >= (low as f64) && value <= (high as f64))) { return -1; }
+    let integer = value as i64;
+    if ((integer as f64) != value) { return -1; }
+    return integer;
+}
+
+fn br_has_decoded_nul(text: string) -> bool {
+    var in_string: bool = false;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c == 34) { in_string = !in_string; }
+        elif (in_string && c == 92) {
+            if (i + 5 < text.len && text.substring(i + 1, i + 6) == "u0000") { return true; }
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn br_baseline_failure(document: rawptr, message: string) -> bool {
+    print("error: benchmark baseline: " + message);
+    cJSON_Delete(document); br_baseline_close(); return false;
+}
+
+fn br_baseline_open(args: TestArgs) -> bool {
+    br_baseline_close();
+    if (args.baseline.len == 0) { return true; }
+    let size = fileSize(args.baseline);
+    if (size < 0 || size > 16777216) { return br_baseline_failure(null, "cannot read baseline or report exceeds 16 MiB"); }
+    let text = readFile(args.baseline);
+    if (text.len as i64 != size || br_has_decoded_nul(text)) { return br_baseline_failure(null, "truncated or NUL-containing baseline"); }
+    let document = cJSON_ParseWithOpts(text.c_str(), null, 1);
+    if (document == null) { return br_baseline_failure(null, "invalid JSON document"); }
+    if (!br_unique_keys(document)) { return br_baseline_failure(document, "JSON fields must be unique"); }
+    let target = cJSON_GetObjectItemCaseSensitive(document, "target".c_str());
+    if (br_json_integer(document, "schema_version", 1, 1) != 1 || br_json_text(document, "kind") != "bench"
+        || br_json_number(document, "host_platform") != (vyx_bootstrap_platform() as f64)
+        || br_json_text(document, "host_triple") != policy_host_target_triple()
+        || br_json_text(document, "optimization") != args.optimize
+        || cJSON_IsString(target) == 0 || br_json_text(document, "target") != args.target) {
+        return br_baseline_failure(document, "schema, kind, host, target or optimization does not match");
+    }
+    let results = cJSON_GetObjectItemCaseSensitive(document, "results".c_str());
+    if (cJSON_IsArray(results) == 0) { return br_baseline_failure(document, "results must be an array"); }
+    let count = cJSON_GetArraySize(results);
+    g_bench_references = Vec::<BenchReference>.with_capacity(count as i64);
+    g_bench_reference_index = BuildSourceMap.create(count as i64 + 1);
+    g_bench_reference_ready = true;
+    var row = vyx_json_tree_first(results);
+    while (row != null) {
+        // The index outlives the cJSON document. Its keys must own their
+        // storage rather than retaining views into the document's strings.
+        let name = str_dup(br_json_text(row, "name"));
+        if (name.len == 0 || g_bench_reference_index.contains(name)) { return br_baseline_failure(document, "empty or duplicate benchmark identity"); }
+        var reference = BenchReference { name: name, usable: false, count: 0, mean: 0.0, variance: 0.0 };
+        let status = br_json_text(row, "status");
+        if (status == "passed") {
+            let benchmark = cJSON_GetObjectItemCaseSensitive(row, "benchmark".c_str());
+            let raw = cJSON_GetObjectItemCaseSensitive(benchmark, "raw".c_str());
+            let samples = br_json_integer(benchmark, "samples", 3, 10000);
+            if (br_json_text(benchmark, "unit") != "ns/iter" || cJSON_IsArray(raw) == 0
+                || samples < 3 || cJSON_GetArraySize(raw) as i64 != samples
+                || br_json_integer(benchmark, "warmup_ms", 1, 3600000) < 1
+                || br_json_integer(benchmark, "sample_target_ms", 1, 3600000) < 1) {
+                return br_baseline_failure(document, "invalid sample count or measurement configuration");
+            }
+            var sample = vyx_json_tree_first(raw);
+            var n: i64 = 0;
+            var mean: f64 = 0.0;
+            var m2: f64 = 0.0;
+            while (sample != null) {
+                let iterations = br_json_integer(sample, "iterations", 1, 1073741824);
+                let elapsed = br_json_integer(sample, "elapsed_ns", 1, 3600000000000);
+                if (iterations < 1 || elapsed < 1) { return br_baseline_failure(document, "sample iterations and elapsed_ns must be bounded positive integers"); }
+                let value = (elapsed as f64) / (iterations as f64);
+                n = n + 1;
+                let delta = value - mean;
+                mean = mean + delta / (n as f64); m2 = m2 + delta * (value - mean);
+                sample = vyx_json_tree_next(sample);
+            }
+            reference.usable = true; reference.count = n as i32; reference.mean = mean;
+            reference.variance = m2 / ((n - 1) as f64);
+        } elif (status.len == 0) { return br_baseline_failure(document, "missing result status"); }
+        g_bench_reference_index.put(name, g_bench_references.len);
+        g_bench_references.push(reference);
+        row = vyx_json_tree_next(row);
+    }
+    g_bench_baseline_hash = from_cstr(vyx_bootstrap_sha256_bytes(text.c_str(), text.len as i64));
+    cJSON_Delete(document);
+    return true;
+}
+
+fn br_compare(identity: string, mean: f64, variance: f64, args: TestArgs) -> string {
+    if (args.baseline.len == 0) { return ""; }
+    let index = g_bench_reference_index.get(identity);
+    if (index < 0) { return br_comparison_error("no successful baseline for " + identity); }
+    let reference = g_bench_references.get_ptr(index);
+    if (!reference[0].usable) { return br_comparison_error("no successful baseline for " + identity); }
+    let old_mean = reference[0].mean;
+    let old_variance = reference[0].variance;
+    let count = reference[0].count;
+    let change = (mean / old_mean - 1.0) * 100.0;
+    // Test mean(new) > scale * mean(old). Scaling the baseline mean must
+    // also scale its variance by scale^2; otherwise thresholds understate
+    // uncertainty and can report false regressions.
+    let scale = 1.0 + (args.regression_percent as f64) / 100.0;
+    let excess = mean - scale * old_mean;
+    let standard_error = br_sqrt(variance / (args.samples as f64)
+        + scale * scale * old_variance / (count as f64));
+    var df = args.samples - 1;
+    if (count - 1 < df) { df = count - 1; }
+    // Use a conservative t critical value at min(n1-1,n2-1) degrees of
+    // freedom, rounded upward. This also covers very small sample counts.
+    var critical: f64 = 1.980;
+    if (df == 2) { critical = 4.303; }
+    elif (df == 3) { critical = 3.183; }
+    elif (df == 4) { critical = 2.777; }
+    elif (df == 5) { critical = 2.571; }
+    elif (df < 10) { critical = 2.447; }
+    elif (df < 20) { critical = 2.229; }
+    elif (df < 30) { critical = 2.087; }
+    elif (df < 60) { critical = 2.043; }
+    elif (df < 120) { critical = 2.001; }
+    let margin_ns = standard_error * critical;
+    let margin = margin_ns / old_mean * 100.0;
+    let regression = excess > margin_ns;
+    g_bench_comparison_failed = regression;
+    print("  baseline mean change " + change.toString() + "%; threshold contrast " + excess.toString()
+        + " +/- " + margin_ns.toString() + " ns/iter (95% conservative t); limit " + args.regression_percent.toString() + "%");
+    if (regression) { print("  FAILED: benchmark regression exceeds the threshold and sampling uncertainty"); }
+    return ",\"comparison\":{\"baseline\":" + tr_json(args.baseline)
+        + ",\"baseline_sha256\":" + tr_json(g_bench_baseline_hash)
+        + ",\"threshold_contrast_ns\":" + excess.toString() + ",\"margin_ns\":" + margin_ns.toString()
+        + ",\"mean_change_percent\":" + change.toString() + ",\"margin_percent\":" + margin.toString()
+        + ",\"method\":\"scaled-independent-means-conservative-t95\",\"threshold_percent\":" + args.regression_percent.toString()
+        + ",\"regression\":" + regression.toString() + "}";
+}

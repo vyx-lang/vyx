@@ -114,7 +114,7 @@ Use one explicit source mode and one output mode for a reproducible invocation:
 
 # Package commands (cwd is a Vyx package / fixture, not the compiler tree).
 & $compiler test                          # @[test] under tests/
-& $compiler bench                         # @[bench] under benches/; prints ms
+& $compiler bench                         # @[bench] under benches/; calibrated ns/op
 & $compiler fmt --check .\src\main.vyx    # token reprint; exits 1 if dirty
 & $compiler doc .\src\main.vyx            # markdown from ///
 ```
@@ -428,3 +428,170 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\benchmarks\run.ps1 `
 `tests/.cache/`, `bootstrap_compiler/out/`, and `benchmarks/out/` are generated
 artifacts. Keep logs needed for a result, but do not commit binaries, caches, or
 benchmark CSV output.
+
+
+## SDK test and benchmark commands
+
+`vyxc test` and `vyxc bench` discover real AST declarations. Test names in comments,
+strings or another attribute's arguments are not executable tests. Generated
+children (`.cache`, `target`, `out`, `build`, `.git`, `snapshots`) are excluded.
+Explicit files/directories replace the default discovery roots; overlapping paths
+are deduplicated.
+
+Inside a `Vyx.toml` project, discovery uses the selected target's source/import
+closure plus `tests/` for tests or `benches/` for benchmarks. `--target NAME`
+selects the target; ambiguous projects require it. The normal manifest builder
+owns dependency resolution, native C/C++ inputs, DCI preparation, Effect schemas,
+compiler flags, hooks and linking. Harnesses append an entry in the tested file's
+module; source files retain their original paths and private helpers remain
+accessible. Existing `main` functions stay callable and do not determine results.
+Application output aliases are not overwritten by harness builds.
+
+Without a manifest, discovery uses `src/` plus `tests/` or `benches/` and compiles
+standalone files. `--standalone` explicitly selects this mode inside a project.
+Standalone mode does not inherit project dependency/link configuration.
+
+### Tests
+
+```vyx
+@[test]
+fn arithmetic() { assert(6 * 7 == 42); }
+
+@[test]
+fn status_test() -> i32 { return 0; }
+
+@[ignore("requires external hardware")]
+@[test]
+fn device_test() { /* assertions */ }
+```
+
+Functions must be synchronous free functions with a body, no parameters and no
+generic parameters, returning `void` (possibly omitted) or `i32`. Normal `void`
+return / integer zero passes. Every nonzero integer fails, including 256. Assertion
+failures, crashes, timeouts, spawn errors and excessive output fail individually.
+Async tests, methods and tests inside module blocks are rejected explicitly.
+
+```sh
+vyxc test --target app -j4
+vyxc test --list
+vyxc test tests/parser.vyx --filter arithmetic --exact
+vyxc test --repeat 10 --timeout-ms 5000 --fail-fast
+vyxc test --ignored
+vyxc test --include-ignored --nocapture
+vyxc test --no-run
+vyxc test --report results/test.json --junit results/test.xml
+```
+
+Filters match `absolute/path.vyx::function` by one-way substring; `--exact` matches
+the full identity or full function name. `--list` parses and validates without
+compiling. Empty selection fails unless `--allow-empty` is explicitly given; that
+option never suppresses discovery/build errors. `@[ignore]` is listed and counted
+as ignored by default. `--ignored` runs only ignored tests; `--include-ignored`
+runs both groups.
+
+Each file's harness is compiled once. Each test/repetition runs in a separate
+owned process. `-j N` / `--jobs N` bounds concurrency (1..64, default 1) and passes
+the same budget to project builds. `--build-jobs N` independently sets build
+concurrency (default 4), including benchmark builds. Files build sequentially; runtime cases from
+one file can run concurrently. Default runtime deadline is 30000 ms; build
+deadline is 300000 ms (`--build-timeout-ms`). Timeout cancellation terminates the
+owned process tree. Captured output defaults to 16 MiB per stream (`--output-limit-kb N`,
+1..1048576 KiB), checked at
+10 ms polling intervals; excessive output cancels that process. Failure output
+is printed; `--nocapture` also prints successful output after each process exits.
+The test working directory is the command's working directory.
+An explicit `--build-jobs` takes precedence over `-j` regardless of option order.
+
+`--fail-fast` stops scheduling new work after the first observed failure; already
+running tests finish. Unstarted cases in that file are recorded as `not_run`;
+remaining files are explicitly reported as unprocessed. `--no-run` records built
+cases as not run, never passed. Compilation failures and discovery failures have
+separate counters. Exit codes: 0 accepted success, 1 test/build/discovery/report
+failure, 2 invalid invocation or input path.
+
+JSON reports (`schema_version: 1`) contain command arguments, compiler identity,
+host, optimization, per-case status/timing, stdout/stderr and log paths. Test
+reports can also be exported as JUnit XML. Report publication errors fail the
+command. Full logs stay in `.cache/vyxc-cli/<kind>_<pid>_<time>/`; generated
+harnesses use content-addressed directories. The project builder validates its
+ordinary source/dependency caches; a previous test result is never reused.
+Separate-module project builds share unchanged module objects between harnesses;
+only the unit containing a harness gets a distinct object identity. A manifest
+that selects unity compilation still recompiles that translation unit when its
+harness changes. Test processes do not bypass the project's normal compilation
+strategy.
+
+The manifest context is resolved once per invocation; the report records the
+actual selected target, including when `--target` was omitted. Discovery uses
+indexed line spans and exact path/name hash tables. Report destinations must be
+distinct and cannot overwrite selected sources, configured native sources,
+`Vyx.toml` or the benchmark baseline. Log files retain exact bytes; embedded
+NUL does not truncate JSON text, and malformed UTF-8 is displayed as U+FFFD.
+JUnit omits characters forbidden by XML 1.0. Logs above 1 MiB are linked rather
+than embedded in reports.
+
+### Benchmarks
+
+```vyx
+use std.benchmark;
+var input: i64 = 17;
+
+@[bench]
+fn arithmetic_benchmark() {
+    let x = black_box(input);
+    let result = black_box(x * x + 3);
+    assert(result == 292);
+}
+```
+
+`black_box<T>` exposes inputs/results to an opaque, out-of-line memory barrier.
+Use it on work whose results could otherwise disappear during optimization. It
+is not a guarantee against every possible optimizer transformation. Benchmark
+functions have the same signature restrictions as tests; an `i32` result is a
+status, not a measured value. One call is one iteration; setup inside that call
+is included in its cost.
+
+```sh
+vyxc bench --target app --report results/base.json
+vyxc bench --filter arithmetic --samples 50 --warmup-ms 1000 --sample-ms 100
+vyxc bench --baseline results/base.json --max-regression-percent 5 --report results/current.json
+```
+
+Benchmarks compile at O2 by default (`-O0`..`-O3` override) and run serially.
+The child calibrates a batch by doubling iterations until its duration reaches
+the requested sample time. It then warms up and collects repeated in-process
+monotonic-clock samples. Compilation, process startup, calibration and warmup
+are excluded. Defaults: 30 samples, 1000 ms warmup, 100 ms target per sample.
+`--samples` accepts 3..10000; positive time options accept up to 3600000 ms. The
+runtime deadline still applies to the entire benchmark, so increase it for long
+sampling plans. Clock failure or nonpositive/invalid samples fail measurement.
+
+Reports retain every batch's iteration count and elapsed nanoseconds, plus
+ns/iteration mean, median, min/max, p95, sample standard deviation and coefficient
+of variation. No outlier is silently removed; CV above 10% prints a warning.
+Baseline comparison loads a report once (maximum 16 MiB), checks schema,
+platform/architecture, actual target, optimization and exact benchmark identity,
+then recomputes statistics from its raw samples. Duplicate JSON keys/identities,
+decoded NUL, fractional sample counters/durations, inconsistent sample counts
+and out-of-range values fail before any benchmark executes. Each comparison
+records the baseline SHA-256; missing successful entries also fail.
+
+For a percentage limit `p`, let `s = 1 + p/100`. The tested contrast is
+`mean(new) - s*mean(base)` with standard error
+`sqrt(var(new)/n + s*s*var(base)/m)`. A regression requires the contrast to exceed
+its conservative 95% t margin, using at most `min(n-1,m-1)` degrees of freedom.
+This applies the [independent-means test](https://www.itl.nist.gov/div898/handbook/eda/section3/eda353.htm)
+to the scaled baseline; scaling its mean also scales its variance by `s*s`.
+Reports retain the contrast and margin in ns/iteration. Sample sorting uses
+O(n log n) time, including at the 10000-sample limit.
+This interval assumes reasonably independent samples; it does not remove system
+load, autocorrelation or different-hardware bias. Use matching machines and quiet
+conditions when making release decisions.
+
+These commands are application test infrastructure. Compiler conformance,
+negative-diagnostic, generated-combination, DCI ecosystem and bootstrap gates
+remain in `tests/run_all_modules.ps1` and `probes/gates/`. Supported application
+surface and reproducible checks are in the [runner gate](../probes/gates/test-runner/README.md).
+Coverage instrumentation, async test execution, doc tests, automatic fixtures,
+parameterized test discovery and cross-device execution are not provided by this
+runner. Use ordinary helper functions/data loops for fixtures and cases.

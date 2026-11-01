@@ -88,6 +88,29 @@ def export(args):
     print(f"Exported {len(objects)} verified {args.arch} Mach-O objects to {output}", flush=True)
 
 
+def compiler_native_objects(build, llvm, environment, native, manifest):
+    """Link cross-exported Vyx objects with the same native sources as boot."""
+    target = manifest["target"]["boot"]
+    includes = ["-I" + str(build / path) for path in target.get("include_paths", [])]
+    objects = []
+    for path in target["sources"]:
+        source = build / path
+        suffix = source.suffix.lower()
+        if suffix == ".vyx":
+            continue
+        if suffix not in (".c", ".cc", ".cpp", ".cxx"):
+            raise ValueError(f"Unsupported macOS compiler native bootstrap input: {path}")
+        is_cxx = suffix != ".c"
+        flag_key = "cxxflags" if is_cxx else "cflags"
+        command = llvm / ("bin/clang++" if is_cxx else "bin/clang")
+        output = native / f"compiler-{len(objects)}.o"
+        run([command, "-c", source, "-O2", "-fPIC", "-mmacosx-version-min=15.0",
+             *includes, *target.get(flag_key, []), *target.get(flag_key + "_apple", []),
+             "-o", output], env=environment)
+        objects.append(output)
+    return objects
+
+
 def native_support(build, llvm, environment, jobs):
     """Build native support without depending on a running Vyx compiler."""
     manifest = tomllib.loads((build / "Vyx.toml").read_text(encoding="utf-8"))
@@ -124,10 +147,8 @@ def native_support(build, llvm, environment, jobs):
         run([command, "-c", source, "-o", target, "-O2", "-fPIC", "-mmacosx-version-min=15.0",
              "-DTBB_USE_EXCEPTIONS=0", "-D__TBB_NO_IMPLICIT_LINKAGE=1", "-I" + str(tbb / "include")], env=environment)
         objects.append(target)
-    cjson = native / "cJSON.o"
-    run([cc, "-c", build / "std_packages/serde/vendor/cJSON.c", "-O2", "-fPIC",
-         "-mmacosx-version-min=15.0", "-o", cjson], env=environment)
-    return out, objects, cjson
+    compiler_objects = compiler_native_objects(build, llvm, environment, native, manifest)
+    return out, objects, compiler_objects
 
 
 def hello_gate(compiler, environment, work):
@@ -170,7 +191,7 @@ def native(args):
     environment.update(SDKROOT=subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True).strip(),
                        MACOSX_DEPLOYMENT_TARGET="15.0")
     environment["DYLD_LIBRARY_PATH"] = str(build / "out") + ":" + str(llvm / "lib")
-    out, native_objects, cjson = native_support(build, llvm, environment, args.jobs)
+    out, native_objects, compiler_objects = native_support(build, llvm, environment, args.jobs)
     backend = out / "libvyx_compiler_backend.dylib"
     record = {"host": "macos", "arch": arch, "source_commit": source_commit(),
               "llvm_input": json.loads((llvm / "VYX-LLVM-INPUT.json").read_text()), "tools": ["vyxc-lsp"],
@@ -185,7 +206,7 @@ def native(args):
         seed.mkdir()
         shutil.copy2(out / "libvyx_runtime.a", seed / "libvyx_runtime.a")
         compiler = seed / "vyxc"
-        run([llvm / "bin/clang++", *objects["compiler"], cjson, "-L" + str(out),
+        run([llvm / "bin/clang++", *objects["compiler"], *compiler_objects, "-L" + str(out),
              "-lvyx_runtime", "-lvyx_compiler_backend", "-ltbb", "-lpthread",
              "-mmacosx-version-min=15.0", "-Wl,-rpath,@loader_path", "-o", compiler], env=environment)
     else:
@@ -280,6 +301,8 @@ def native(args):
     run([sys.executable, REPO / "probes/gates/compiler-root-lists/run.py",
          "--compiler", built, "--build-root", build,
          "--output-dir", work / "root-lists"], env=environment)
+    run([sys.executable, REPO / "probes/gates/test-runner/run.py",
+         "--compiler", built, "--output", work / "test-runner"], env=environment)
     run([sys.executable, REPO / "probes/gates/directory-enumeration/run.py",
          "--compiler", built, "--cc", llvm / "bin/clang",
          "--output", work / "directory-enumeration"], env=environment)

@@ -91,8 +91,8 @@ MIR2LLVM 是受支持的自举后端。MIR2CPP/`--emit=cpp` 仍为实验性、�
 & $compiler --src=file .\path\to\main.vyx --run=aot
 
 # 包命令（cwd 是 Vyx 包/探针夹具，不是编译器树）。
-& $compiler test                          # tests/ 下的 @[test]
-& $compiler bench                         # benches/ 下的 @[bench]；打印 ms
+& $compiler test                          # src/ 与 tests/ 下的 @[test]
+& $compiler bench                         # benches/ 下的 @[bench]；校准后统计 ns/op
 & $compiler fmt --check .\src\main.vyx    # token 重排；有差异则退出 1
 & $compiler doc .\src\main.vyx            # 从 /// 出 markdown
 ```
@@ -338,3 +338,130 @@ Windows 和 Linux SDK 均内置 LLVM 后端、runtime、标准库与 DCI 工具�
 IR snapshot corpus 仅用于迁移研究，未迁移前不能当作当前 bootstrap 通过门；benchmark
 也应传入刚构建的 `$compiler` 并使用 `-SkipHost`。完整英文说明见
 [TESTING_GUIDE.md](TESTING_GUIDE.md)。
+
+
+## SDK 测试与基准命令
+
+`vyxc test` / `vyxc bench` 从编译器 AST 发现函数，注释、字符串和其他属性参数中的
+名字不算测试。跳过 `.cache`、`target`、`out`、`build`、`.git`、`snapshots` 等生成目录。
+显式文件或目录替换默认扫描范围，重复绝对路径去重。
+
+有 `Vyx.toml` 时，扫描所选 target 的源码及导入闭包，再加入 `tests/` 或 `benches/`。
+多 target 无默认目标时必须提供 `--target`。测试沿用普通项目构建器的依赖解析、原生
+C/C++ 源码、DCI 准备、Effect schema、编译选项、hooks 和链接设置。调度入口追加到
+被测文件的逻辑模块中，保留原始源码位置和私有函数访问。原有 `main` 仍可作为普通
+函数调用，不会替代测试结果；测试构建也不会覆盖应用的输出别名。
+
+没有清单时，扫描 `src/` 与 `tests/` 或 `benches/`，按独立文件编译。在项目内使用
+`--standalone` 可明确选择此模式；它不继承项目依赖与链接配置。
+
+### 测试
+
+```vyx
+@[test]
+fn arithmetic() { assert(6 * 7 == 42); }
+
+@[test]
+fn status_test() -> i32 { return 0; }
+
+@[ignore("requires external hardware")]
+@[test]
+fn device_test() { /* assertions */ }
+```
+
+支持有函数体、无参数、无泛型参数的同步自由函数，返回 `void`（可省略）或 `i32`。
+正常返回或整数 0 通过；任何非 0 整数都失败，包括 256。断言、崩溃、超时、无法启动
+和输出超限均单独计为失败。异步测试、测试方法、模块块内测试会明确拒绝。
+
+```sh
+vyxc test --target app -j4
+vyxc test --list
+vyxc test tests/parser.vyx --filter arithmetic --exact
+vyxc test --repeat 10 --timeout-ms 5000 --fail-fast
+vyxc test --ignored
+vyxc test --include-ignored --nocapture
+vyxc test --no-run
+vyxc test --report results/test.json --junit results/test.xml
+```
+
+筛选对 `绝对路径.vyx::函数名` 作单向子串匹配；`--exact` 匹配完整身份或完整函数名。
+`--list` 只解析验证，不编译。空选择默认失败，只有 `--allow-empty` 才接受空结果，
+它不会吞掉发现或构建错误。`@[ignore]` 默认列出并计为忽略；`--ignored` 只运行这些
+测试，`--include-ignored` 同时运行两组。
+
+每个文件只编译一次，每项测试及每次重复独立启动子进程。`-j N` / `--jobs N` 限制
+并发数（1..64，默认 1），同时传给项目构建器；`--build-jobs N` 可独立调整构建并发数（默认 4），基准仍串行测量。文件之间顺序构建，同一文件的测试
+可并发运行。运行默认限时 30000 ms，构建默认限时 300000 ms，可分别用
+`--timeout-ms` / `--build-timeout-ms` 调整。超时终止自有进程树。每个输出流默认限
+16 MiB（`--output-limit-kb N`，1..1048576 KiB），每 10 ms 检查一次，超限会终止进程。失败时显示输出，`--nocapture` 在进程
+结束后也显示通过项的输出。工作目录就是执行命令的目录。
+显式 `--build-jobs` 的优先级高于 `-j`，不受参数顺序影响。
+
+`--fail-fast` 在首个已观察到的失败后停止发起新任务，已经运行的项正常收尾。
+同文件未开始的项记录为 `not_run`，后续文件注明未处理。`--no-run` 只编译，计为
+未运行，不能算通过。发现错误、构建错误和运行失败分别统计。退出码：0 接受成功，
+1 测试/发现/构建/报告失败，2 参数或输入路径无效。
+
+JSON 报告版本为 `schema_version: 1`，包含完整命令参数、编译器身份、宿主、优化等级、
+逐项状态与耗时、stdout/stderr 及日志位置；测试还可输出 JUnit XML。写报告失败会令
+命令失败。日志保留在 `.cache/vyxc-cli/<kind>_<pid>_<time>/`，调度源码使用内容寻址
+目录。项目构建器负责源码与依赖缓存失效；不会复用先前的测试通过结果。
+按模块构建时，不同调度器共享未变化的模块对象，只有加入调度入口的编译单元使用独立
+对象身份。清单选择 unity 编译时，入口变化仍需要重编该翻译单元；测试不会暗改项目的
+编译策略。
+
+清单上下文每次命令只解析一次；即使省略 `--target`，报告也记录实际选中的目标。
+发现过程复用行索引与按完整路径、名称比较的哈希表。JSON 与 JUnit 目的路径必须不同，
+且不能覆盖选中的源码、配置的原生源码、`Vyx.toml` 或基线文件。日志文件保留原始字节；
+JSON 内的 NUL 不会截断后续内容，无效 UTF-8 显示为 U+FFFD。JUnit 省略 XML 1.0 不允许
+的字符。超过 1 MiB 的日志在报告中给出路径，不内嵌全文。
+
+### 基准
+
+```vyx
+use std.benchmark;
+var input: i64 = 17;
+
+@[bench]
+fn arithmetic_benchmark() {
+    let x = black_box(input);
+    let result = black_box(x * x + 3);
+    assert(result == 292);
+}
+```
+
+`black_box<T>` 通过独立编译的内存屏障暴露输入与结果，避免无可见结果的计算直接
+消失；它不保证阻止所有优化。签名要求与测试相同，`i32` 返回值表示成败，不是测量值。
+一次函数调用是一轮操作；函数内的准备工作计入耗时。
+
+```sh
+vyxc bench --target app --report results/base.json
+vyxc bench --filter arithmetic --samples 50 --warmup-ms 1000 --sample-ms 100
+vyxc bench --baseline results/base.json --max-regression-percent 5 --report results/current.json
+```
+
+默认 O2，可用 `-O0`..`-O3` 覆盖。基准串行执行。子进程先将迭代批量翻倍到指定采样
+时长，再预热，最后重复采样单调时钟纳秒值。编译、进程启动、校准和预热不计入样本。
+默认 30 个样本、1000 ms 预热、每个样本目标 100 ms；`--samples` 范围 3..10000，
+时长参数为 1..3600000 ms。运行超时仍约束整个基准，长采样计划需相应提高限时。
+时钟失败、非正数或无效样本会报错。
+
+报告保留每批迭代数与总纳秒，并给出每轮平均值、中位数、最小/最大、p95、样本标准差
+和变异系数；不偷偷丢弃离群值，变异系数超过 10% 会提示。基线每次命令只加载一次，
+上限 16 MiB；验证格式、宿主平台及架构、实际目标、优化等级和完整基准身份，从原始
+样本重算统计。重复 JSON 字段或身份、解码后的 NUL、小数计数或时长、样本数不一致和
+数值越界均在执行基准前拒绝。比较结果包含基线 SHA-256；缺少成功的对应项也会失败。
+
+百分比阈值为 `p` 时，令 `s = 1 + p/100`，比较量为
+`mean(new) - s*mean(base)`，标准误为 `sqrt(var(new)/n + s*s*var(base)/m)`。
+比较量超过保守的 95% t 误差界才判为回退，自由度不大于 `min(n-1,m-1)`。
+这是对缩放后基线的[独立均值检验](https://www.itl.nist.gov/div898/handbook/eda/section3/eda353.htm)：
+基线均值缩放后，其方差也须乘以 `s*s`。报告保留比较量与误差界，单位均为 ns/iter；
+样本排序使用 O(n log n) 时间，支持上限 10000 个样本。区间依赖样本
+相对独立的假设，不能消除系统负载、自相关和硬件差异，发布判断应在同机稳定条件下做。
+
+应用测试入口和编译器的语言符合性、诊断、组合生成、DCI 生态及自举门不是同一层次，
+后者继续使用 `tests/run_all_modules.ps1` 和 `probes/gates/`。
+具体回归见[测试与基准执行器门](../probes/gates/test-runner/README.md)。
+当前不提供覆盖率插桩、异步测试执行、文档测试、自动 fixture、参数化发现或跨设备执行。
+测试准备和数据组合可用普通辅助函数与循环表达。

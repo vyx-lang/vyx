@@ -253,3 +253,21 @@ char *vyx_json_print(void *raw_owner, int32_t pretty) {
 }
 
 void vyx_json_string_free(void *value) { cJSON_free(value); }
+
+/* Borrowed cursors over a raw cJSON tree, used by the compiler's baseline
+ * validator. The root must stay alive; cursors must never be released as
+ * independent Json owners. These keep cJSON layout knowledge in native code. */
+const void *vyx_json_tree_first(const void *raw_node) {
+    const cJSON *node = (const cJSON *)raw_node;
+    return node == NULL ? NULL : node->child;
+}
+
+const void *vyx_json_tree_next(const void *raw_node) {
+    const cJSON *node = (const cJSON *)raw_node;
+    return node == NULL ? NULL : node->next;
+}
+
+const char *vyx_json_tree_key(const void *raw_node) {
+    const cJSON *node = (const cJSON *)raw_node;
+    return node == NULL ? NULL : node->string;
+}

@@ -179,6 +179,8 @@ def main():
     run([sys.executable, REPO / "probes/gates/compiler-root-lists/run.py",
          "--compiler", built_compiler, "--build-root", build,
          "--output-dir", work / "root-lists"], env=environment)
+    run([sys.executable, REPO / "probes/gates/test-runner/run.py",
+         "--compiler", built_compiler, "--output", work / "test-runner"], env=environment)
     if not windows:
         run([sys.executable, REPO / "probes/gates/directory-enumeration/run.py",
              "--compiler", built_compiler, "--cc", args.llvm_root / "bin/clang",

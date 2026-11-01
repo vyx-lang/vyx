@@ -1,0 +1,155 @@
+module bootstrap.cli_tools;
+
+use std.fs;
+use std.string;
+use std.collections;
+
+fn br_harness(file: TestFile, args: TestArgs) -> string {
+    var source = StringBuilder.create();
+    if (file.module_name.len > 0) { source.append("module " + file.module_name + ";\n"); }
+    source.append("use std.fs;\nuse std.string;\nextern \"C\" {\n"
+        + "fn vyx_rt_set_args(argc:i32, argv:rawptr);\nfn vyx_bench_now_ns()->i64;\n}\n");
+    var calls = RunnerLines.create(file.calls);
+    var returns = RunnerLines.create(file.returns);
+    var i: i32 = 0;
+    while (i < calls.count()) {
+        source.append("@[noinline]\nfn __vyxc_bench_batch_" + i.toString() + "(n:i64)->i32 {\n"
+            + "var i:i64=0; while(i<n){\n");
+        let call = calls.at(i) + "()";
+        if (returns.at(i) == "i32") { source.append("if(" + call + "!=0){return 1;}\n"); }
+        else { source.append(call + ";\n"); }
+        source.append("i=i+1;}return 0;}\n");
+        i = i + 1;
+    }
+    source.append("@[export_name(\"main\")]\nfn __vyxc_test_entry(argc:i32,argv:rawptr)->i32 {\n"
+        + "vyx_rt_set_args(argc,argv);\n");
+    i = 0;
+    while (i < calls.count()) {
+        let batch = "__vyxc_bench_batch_" + i.toString();
+        source.append("if(getArg(1)==\"" + i.toString() + "\"){\n"
+            + "var n:i64=1; var elapsed:i64=0; var start:i64=0; var end:i64=0;\n"
+            + "while(true){start=vyx_bench_now_ns(); if(start<0){return 3;}\n"
+            + "if(" + batch + "(n)!=0){return 1;} end=vyx_bench_now_ns();\n"
+            + "if(end<start){return 3;} elapsed=end-start;\n"
+            + "if(elapsed>=" + (args.sample_ms * 1000000).toString() + "){break;}\n"
+            + "if(n>=1073741824){return 4;} n=n*2;}\n"
+            + "let warm_start=vyx_bench_now_ns(); if(warm_start<0){return 3;}\nwhile(true){\n"
+            + "if(" + batch + "(n)!=0){return 1;}\n"
+            + "end=vyx_bench_now_ns(); if(end<warm_start){return 3;}\n"
+            + "if(end-warm_start>=" + (args.warmup_ms * 1000000).toString() + "){break;}}\n"
+            + "var rows=StringBuilder.create();rows.append(\"VYX_BENCH_V1\\n\"); var sample:i32=0;\n"
+            + "while(sample<" + args.samples.toString() + "){\n"
+            + "start=vyx_bench_now_ns(); if(start<0){return 3;}\n"
+            + "if(" + batch + "(n)!=0){return 1;} end=vyx_bench_now_ns();\n"
+            + "if(end<=start){return 3;}\n"
+            + "rows.appendI64(n);rows.append(\" \");rows.appendI64(end-start);rows.append(\"\\n\");sample=sample+1;}\n"
+            + "let data=rows.build();if(writeFile(getArg(2),data.as_str())!=0){return 5;} return 0;}\n");
+        i = i + 1;
+    }
+    source.append("return 2;}\n");
+    calls.destroy(); returns.destroy();
+    let value = source.build();
+    return from_cstr_len(value.c_str(), value.len);
+}
+
+fn br_positive_integer(text: string) -> i64 {
+    if (text.len == 0 || text.len > 18) { return -1; }
+    var value: i64 = 0;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c < 48 || c > 57) { return -1; }
+        value = value * 10 + (c - 48) as i64;
+        i = i + 1;
+    }
+    return value;
+}
+
+fn br_sqrt(value: f64) -> f64 {
+    if (value <= 0.0) { return 0.0; }
+    var guess = value;
+    if (guess < 1.0) { guess = 1.0; }
+    var i: i32 = 0;
+    while (i < 100) { guess = (guess + value / guess) * 0.5; i = i + 1; }
+    return guess;
+}
+
+fn br_sift_down(values: &mut Vec<f64>, start: i64, end: i64) {
+    var root = start;
+    while (root * 2 + 1 < end) {
+        var child = root * 2 + 1;
+        if (child + 1 < end && values.get(child) < values.get(child + 1)) { child = child + 1; }
+        if (values.get(root) >= values.get(child)) { return; }
+        let value = values.get(root);
+        values.set(root, values.get(child)); values.set(child, value);
+        root = child;
+    }
+}
+
+// O(n log n), including reverse-sorted or noisy inputs at --samples=10000.
+fn br_sort(values: &mut Vec<f64>) {
+    var root = values.len / 2;
+    while (root > 0) { root = root - 1; br_sift_down(values, root, values.len); }
+    var end = values.len;
+    while (end > 1) {
+        end = end - 1;
+        let value = values.get(0);
+        values.set(0, values.get(end)); values.set(end, value);
+        br_sift_down(values, 0, end);
+    }
+}
+
+// Protocol validation is independent of stdout. Every raw sample is retained;
+// outliers are not silently discarded and startup/warmup are never samples.
+fn br_result(path: string, identity: string, args: TestArgs) -> string {
+    g_bench_comparison_failed = false;
+    if (!fileExists(path) || fileSize(path) > 1048576) { return ""; }
+    let rows = readFile(path);
+    if (rows.len as i64 != fileSize(path)) { return ""; }
+    var row_index = RunnerLines.create(rows);
+    if (row_index.at(0) != "VYX_BENCH_V1" || row_index.count() != args.samples + 1) { row_index.destroy(); return ""; }
+    var values = Vec::<f64>.with_capacity(args.samples as i64);
+    var raw = StringBuilder.create();
+    var expected_raw: i64 = 0;
+    var mean: f64 = 0.0;
+    var m2: f64 = 0.0;
+    var i: i32 = 0;
+    while (i < args.samples) {
+        let row = row_index.at(i + 1);
+        let sep = row.indexOf(" ") as i32;
+        if (sep <= 0) { values.drop(); row_index.destroy(); return ""; }
+        let iterations = br_positive_integer(row.substring(0, sep));
+        let ns = br_positive_integer(row.substring(sep + 1, row.len));
+        if (iterations <= 0 || ns <= 0) { values.drop(); row_index.destroy(); return ""; }
+        let value = (ns as f64) / (iterations as f64);
+        let delta = value - mean;
+        mean = mean + delta / ((i + 1) as f64);
+        m2 = m2 + delta * (value - mean);
+        values.push(value);
+        if (i > 0) { raw.append(","); expected_raw = expected_raw + 1; }
+        let sample_record = "{\"iterations\":" + iterations.toString() + ",\"elapsed_ns\":" + ns.toString() + "}";
+        raw.append(sample_record); expected_raw = expected_raw + sample_record.len;
+        i = i + 1;
+    }
+    row_index.destroy();
+    br_sort(&mut values);
+    var median = values.get((args.samples / 2) as i64);
+    if (args.samples % 2 == 0) { median = (median + values.get((args.samples / 2 - 1) as i64)) * 0.5; }
+    let sd = br_sqrt(m2 / ((args.samples - 1) as f64));
+    let cv = sd / mean * 100.0;
+    let p95 = values.get(((args.samples * 95 + 99) / 100 - 1) as i64);
+    let minimum = values.get(0);
+    let maximum = values.get((args.samples - 1) as i64);
+    print("  " + median.toString() + " ns/iter (median); mean " + mean.toString()
+        + "; p95 " + p95.toString() + "; CV " + cv.toString() + "%; samples " + args.samples.toString());
+    if (cv > 10.0) { print("  warning: benchmark variation exceeds 10%; inspect raw samples before comparing"); }
+    values.drop();
+    if (raw.length() != expected_raw) { return ""; }
+    let raw_text = raw.build();
+    let comparison = br_compare(identity, mean, m2 / ((args.samples - 1) as f64), args);
+    return comparison + ",\"benchmark\":{\"unit\":\"ns/iter\",\"samples\":" + args.samples.toString()
+        + ",\"warmup_ms\":" + args.warmup_ms.toString() + ",\"sample_target_ms\":" + args.sample_ms.toString()
+        + ",\"mean\":" + mean.toString() + ",\"median\":" + median.toString() + ",\"min\":" + minimum.toString()
+        + ",\"max\":" + maximum.toString() + ",\"p95\":" + p95.toString()
+        + ",\"stddev\":" + sd.toString() + ",\"cv_percent\":" + cv.toString() + ",\"raw\":[" + raw_text.as_str() + "]}";
+}

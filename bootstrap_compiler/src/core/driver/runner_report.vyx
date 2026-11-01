@@ -1,0 +1,163 @@
+module bootstrap.cli_tools;
+
+use std.fs;
+use std.string;
+use bootstrap.build_system;
+use bootstrap.policy;
+
+var g_runner_cache: string = "";
+var g_runner_report_error: bool = false;
+var g_runner_write_xml: bool = false;
+
+extern "C" { fn vyx_bootstrap_file_content_stamp(path: rawptr) -> rawptr; }
+
+fn tr_json(text: string) -> string {
+    var out = StringBuilder.withCapacity(text.len + 16);
+    out.appendChar(34);
+    var expected: i64 = 2;
+    var i: i32 = 0;
+    let hex = "0123456789abcdef";
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c == 34 || c == 92) { out.appendChar(92); out.appendChar(c); expected = expected + 2; }
+        elif (c >= 0 && c < 32) {
+            out.append("\\u00"); out.appendChar(hex.charAt(c / 16)); out.appendChar(hex.charAt(c % 16));
+            expected = expected + 6;
+        } else { out.appendChar(c); expected = expected + 1; }
+        i = i + 1;
+    }
+    out.appendChar(34);
+    if (out.length() != expected) { g_runner_report_error = true; }
+    let value = out.build();
+    return from_cstr_len(value.c_str(), value.len);
+}
+
+fn tr_xml(text: string) -> string {
+    var out = StringBuilder.withCapacity(text.len + 16);
+    var expected: i64 = 0;
+    for (scalar in StrChars.from_str(text)) {
+        let c = scalar as i32;
+        if (c == 38) { out.append("&amp;"); expected = expected + 5; }
+        elif (c == 60) { out.append("&lt;"); expected = expected + 4; }
+        elif (c == 62) { out.append("&gt;"); expected = expected + 4; }
+        elif (c == 34) { out.append("&quot;"); expected = expected + 6; }
+        elif (c == 39) { out.append("&apos;"); expected = expected + 6; }
+        elif (c >= 128 && c != 65534 && c != 65535) {
+            let number = c.toString(); out.append("&#"); out.append(number); out.append(";");
+            expected = expected + number.len + 3;
+        }
+        elif ((c >= 32 && c < 128) || c == 9 || c == 10 || c == 13) { out.appendChar(c); expected = expected + 1; }
+    }
+    if (out.length() != expected) { g_runner_report_error = true; }
+    let value = out.build();
+    return from_cstr_len(value.c_str(), value.len);
+}
+
+// Logs are byte streams. Keep NUL and subsequent bytes, and decode malformed
+// UTF-8 with the standard cursor's U+FFFD policy. The original file stays exact.
+fn tr_log_text(text: string) -> string {
+    var out = StringBuilder.withCapacity(text.len + 16);
+    for (scalar in StrChars.from_str(text)) {
+        let c = scalar as i32;
+        if (c < 128) { out.appendChar(c); }
+        elif (c < 2048) { out.appendChar(192 | (c >> 6)); out.appendChar(128 | (c & 63)); }
+        elif (c < 65536) {
+            out.appendChar(224 | (c >> 12)); out.appendChar(128 | ((c >> 6) & 63)); out.appendChar(128 | (c & 63));
+        } else {
+            out.appendChar(240 | (c >> 18)); out.appendChar(128 | ((c >> 12) & 63));
+            out.appendChar(128 | ((c >> 6) & 63)); out.appendChar(128 | (c & 63));
+        }
+    }
+    let value = out.build();
+    return from_cstr_len(value.c_str(), value.len);
+}
+
+fn tr_log(path: string) -> string {
+    if (path.len == 0 || !fileExists(path)) { return ""; }
+    if (fileSize(path) > 1048576) { return "[output exceeds 1 MiB; see " + path + "]"; }
+    var file = File.open(path, FileOptions { read: true, write: false, create: false, truncate: false, binary: true });
+    var bytes = file.read_all_bytes();
+    file.close();
+    if (bytes.len != fileSize(path)) {
+        bytes.destroy(); g_runner_report_error = true;
+        return "[cannot read complete output; see " + path + "]";
+    }
+    let raw = from_cstr_len(bytes.data, bytes.len);
+    bytes.destroy();
+    return tr_log_text(raw);
+}
+
+fn tr_record(name: string, status: string, rc: i32, elapsed: i64,
+    stdout_path: string, stderr_path: string, extra: string) {
+    let stdout = tr_log(stdout_path);
+    let stderr = tr_log(stderr_path);
+    let record = "{\"name\":" + tr_json(name) + ",\"status\":" + tr_json(status)
+        + ",\"exit_code\":" + rc.toString() + ",\"elapsed_ms\":" + elapsed.toString()
+        + ",\"stdout_path\":" + tr_json(stdout_path) + ",\"stderr_path\":" + tr_json(stderr_path)
+        + ",\"stdout\":" + tr_json(stdout) + ",\"stderr\":" + tr_json(stderr) + extra + "}\n";
+    if (appendFile(ct_join(g_runner_cache, "records.jsonl"), record) != 0) { g_runner_report_error = true; }
+    if (!g_runner_write_xml) { return; }
+    var xml = "  <testcase name=" + "\"" + tr_xml(name) + "\"" + " time=\""
+        + ((elapsed as f64) / 1000.0).toString() + "\">";
+    if (status == "ignored" || status == "not_run" || status == "built" || status == "listed") {
+        xml = xml + "<skipped message=\"" + tr_xml(status) + "\"/>";
+    } elif (status == "build_error" || status == "discovery_error") {
+        xml = xml + "<error type=\"" + tr_xml(status) + "\" message=\"exit " + rc.toString() + "\">"
+            + tr_xml(stderr + stdout) + "</error>";
+    } elif (status != "passed") {
+        xml = xml + "<failure type=\"" + tr_xml(status) + "\" message=\"exit " + rc.toString() + "\">"
+            + tr_xml(stderr + stdout) + "</failure>";
+    }
+    xml = xml + "<system-out>" + tr_xml(stdout) + "</system-out><system-err>"
+        + tr_xml(stderr) + "</system-err></testcase>\n";
+    if (appendFile(ct_join(g_runner_cache, "records.xml"), xml) != 0) { g_runner_report_error = true; }
+}
+
+fn tr_finish_report(args: TestArgs, passed: i32, failed: i32, ignored: i32,
+    errors: i32, build_errors: i32, not_run: i32, selected: i32, unprocessed_files: i32, elapsed: i64) -> bool {
+    var records = StringBuilder.create();
+    let lines = readFile(ct_join(g_runner_cache, "records.jsonl"));
+    if (lines.len as i64 != fileSize(ct_join(g_runner_cache, "records.jsonl")) && selected > 0) { g_runner_report_error = true; }
+    var rows = RunnerLines.create(lines);
+    var i: i32 = 0;
+    while (i < rows.count()) {
+        if (i > 0) { records.append(",\n"); }
+        records.append(rows.at(i)); i = i + 1;
+    }
+    rows.destroy();
+    let records_text = records.build();
+    var argv = "[";
+    i = 0;
+    while (i < argCount()) {
+        if (i > 0) { argv = argv + ","; }
+        argv = argv + tr_json(getArg(i)); i = i + 1;
+    }
+    let body = "{\"schema_version\":1,\"kind\":" + tr_json(args.kind)
+        + ",\"compiler\":" + tr_json(ct_self_exe()) + ",\"argv\":" + argv + "]"
+        + ",\"compiler_content_stamp\":" + tr_json(from_cstr(vyx_bootstrap_file_content_stamp(ct_self_exe().c_str())))
+        + ",\"host_platform\":" + vyx_bootstrap_platform().toString()
+        + ",\"host_triple\":" + tr_json(policy_host_target_triple())
+        + ",\"optimization\":" + tr_json(args.optimize) + ",\"target\":" + tr_json(args.target)
+        + ",\"elapsed_ms\":" + elapsed.toString() + ",\"summary\":{\"passed\":" + passed.toString()
+        + ",\"failed\":" + failed.toString() + ",\"ignored\":" + ignored.toString()
+        + ",\"discovery_errors\":" + errors.toString() + ",\"build_errors\":" + build_errors.toString()
+        + ",\"not_run\":" + not_run.toString() + ",\"selected\":" + selected.toString()
+        + ",\"unprocessed_files\":" + unprocessed_files.toString() + "},\"results\":[\n" + records_text.as_str() + "]}\n";
+    var destination = args.report;
+    if (destination.len == 0) { destination = ct_join(g_runner_cache, "report.json"); }
+    if (build_harness_publish(destination, body) != 0) { g_runner_report_error = true; }
+    if (args.junit.len > 0) {
+        var xml_tests = passed + failed + ignored + not_run + build_errors + errors;
+        var xml_skipped = ignored + not_run;
+        if (args.list) { xml_tests = selected + build_errors + errors; xml_skipped = selected; }
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"vyxc test\" tests=\""
+            + xml_tests.toString()
+            + "\" failures=\"" + failed.toString() + "\" errors=\"" + (build_errors + errors).toString()
+            + "\" skipped=\"" + xml_skipped.toString() + "\">\n"
+            + readFile(ct_join(g_runner_cache, "records.xml")) + "</testsuite>\n";
+        if (build_harness_publish(args.junit, xml) != 0) { g_runner_report_error = true; }
+    }
+    if (g_runner_report_error) { print("error: cannot write complete runner report: " + destination); return false; }
+    print(args.kind + " report: " + destination);
+    return true;
+}

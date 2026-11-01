@@ -83,6 +83,18 @@ parity and performance are deferred; AOT results do not certify the JIT path.
 Target selection and cross-compilation are documented in the
 [testing guide](../docs/TESTING_GUIDE.md#cross-compilation-windows-host).
 
+## Testing application code
+
+`vyxc test` and `vyxc bench` use the selected manifest target's dependency,
+DCI, native-source and link configuration. Tests run in isolated processes with
+bounded parallelism, deadlines, repetition, ignore selection and JSON/JUnit
+reports. Benchmarks calibrate iteration batches, warm up, sample a monotonic
+nanosecond clock and retain raw samples; baseline comparisons account for sample
+variation. Empty selections and report failures return nonzero. Outside a project,
+or with `--standalone`, files compile independently. See the
+[test/benchmark contract](../docs/TESTING_GUIDE.md#sdk-test-and-benchmark-commands)
+and [runner gate](../probes/gates/test-runner/README.md).
+
 ## Current regression contracts
 
 The 2026-10-01 changes (`ef86b928`, `61d31e51`) add versioned, SHA-256 checked

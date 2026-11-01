@@ -1,0 +1,868 @@
+module bootstrap.cli_tools;
+
+use std.fs;
+use std.string;
+use bootstrap.ast;
+use bootstrap.diag;
+use bootstrap.lexer;
+use bootstrap.parser;
+use bootstrap.build_system;
+use bootstrap.policy;
+use bootstrap.build_source_index;
+use std.collections;
+
+extern "C" {
+    fn vyx_bootstrap_abs_path(path: rawptr) -> rawptr;
+    fn vyx_bootstrap_process_spawn_args(args: rawptr, cwd: rawptr, stdout_path: rawptr,
+        stderr_path: rawptr, env_name: rawptr, env_value: rawptr) -> i64;
+    fn vyx_bootstrap_process_is_running(id: i64) -> i32;
+    fn vyx_bootstrap_process_cancel(id: i64) -> i32;
+    fn vyx_bootstrap_sleep_ms(ms: i32);
+    fn vyx_frontend_service_begin() -> rawptr;
+    fn vyx_frontend_service_end(mark: rawptr);
+    fn vyx_bootstrap_sha256_bytes(data: rawptr, len: i64) -> rawptr;
+}
+@[platform(windows)]
+extern "C" { fn GetCurrentProcessId() -> u32; }
+@[platform(posix)]
+extern "C" { fn getpid() -> i32; }
+@[platform(windows)]
+fn tr_pid() -> i64 { return GetCurrentProcessId() as i64; }
+@[platform(posix)]
+fn tr_pid() -> i64 { return getpid() as i64; }
+
+// Immutable line spans: one scan, then O(1) lookup. Callers keep the source
+// text alive until destroy(), including across their file-local work.
+class RunnerLines {
+    public text: string;
+    public spans: Vec<i64>;
+
+    public static fn create(text: string) -> RunnerLines {
+        var out = RunnerLines { text: text, spans: Vec::<i64>.with_capacity(128) };
+        var start: i64 = 0;
+        var i: i64 = 0;
+        while (i <= text.len) {
+            if (i == text.len || text.charAt(i) == 10) {
+                if (i > start || i < text.len) { out.spans.push(start); out.spans.push(i); }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+    public fn count() -> i32 { return (self.spans.len / 2) as i32; }
+    public fn at(index: i32) -> string {
+        if (index < 0 || index >= self.count()) { return ""; }
+        let start = self.spans.get((index as i64) * 2);
+        let end = self.spans.get((index as i64) * 2 + 1);
+        return self.text.substring(start as i32, end as i32).trim();
+    }
+    public fn destroy() { self.spans.destroy(); }
+}
+
+class TestArgs {
+    public paths: string;
+    public filter: string;
+    public exact: bool;
+    public list: bool;
+    public allow_empty: bool;
+    public fail_fast: bool;
+    public timeout_ms: i64;
+    public output_limit: i64;
+    public kind: string;
+    public target: string;
+    public standalone: bool;
+    public project: bool;
+    public project_inputs: string;
+    public report: string;
+    public junit: string;
+    public jobs: i32;
+    public build_jobs: i32;
+    public repeat: i32;
+    public ignored: bool;
+    public include_ignored: bool;
+    public nocapture: bool;
+    public no_run: bool;
+    public samples: i32;
+    public warmup_ms: i64;
+    public sample_ms: i64;
+    public build_timeout_ms: i64;
+    public optimize: string;
+    public baseline: string;
+    public regression_percent: i32;
+    public ok: bool;
+}
+
+fn tr_parse_args(kind: string) -> TestArgs {
+    var out = TestArgs { paths: "", filter: "", exact: false, list: false,
+        allow_empty: false, fail_fast: false, timeout_ms: 30000, output_limit: 16777216, kind: kind,
+        target: "", standalone: false, project: false, project_inputs: "", report: "", junit: "", jobs: 1, build_jobs: 4, repeat: 1,
+        ignored: false, include_ignored: false, nocapture: false, no_run: false,
+        samples: 30, warmup_ms: 1000, sample_ms: 100, build_timeout_ms: 300000,
+        optimize: "-O2", baseline: "", regression_percent: 5, ok: true };
+    var explicit_build_jobs: bool = false;
+    var i: i32 = 2;
+    while (i < argCount()) {
+        let arg = getArg(i);
+        if (arg == "--list") { out.list = true; }
+        elif (arg == "--exact") { out.exact = true; }
+        elif (arg == "--allow-empty") { out.allow_empty = true; }
+        elif (arg == "--fail-fast") { out.fail_fast = true; }
+        elif (arg == "--standalone") { out.standalone = true; }
+        elif (arg == "--ignored") { out.ignored = true; }
+        elif (arg == "--include-ignored") { out.include_ignored = true; }
+        elif (arg == "--nocapture") { out.nocapture = true; }
+        elif (arg == "--no-run") { out.no_run = true; }
+        elif (arg == "-O0" || arg == "-O1" || arg == "-O2" || arg == "-O3") { out.optimize = arg; }
+        elif (arg.startsWith("-j") && arg.len > 2) {
+            let n = tr_timeout(arg.substring(2, arg.len));
+            if (n < 1 || n > 64) { out.ok = false; } else { out.jobs = n as i32; if (!explicit_build_jobs) { out.build_jobs = n as i32; } }
+        }
+        elif (arg.startsWith("-")) {
+            var key = arg;
+            var value: string = "";
+            let eq = arg.indexOf("=") as i32;
+            if (eq > 0) { key = arg.substring(0, eq); value = arg.substring(eq + 1, arg.len); }
+            if (key == "-j" || key == "--jobs" || key == "--filter" || key == "--timeout-ms"
+                || key == "--output-limit-kb" || key == "--build-timeout-ms" || key == "--target" || key == "--report"
+                || key == "--build-jobs" || key == "--junit" || key == "--repeat" || key == "--samples"
+                || key == "--warmup-ms" || key == "--sample-ms" || key == "--baseline" || key == "--max-regression-percent") {
+                if (eq < 0) {
+                    if (i + 1 >= argCount() || getArg(i + 1).startsWith("-")) {
+                        print("error: " + kind + ": missing value for " + key); out.ok = false; return out;
+                    }
+                    i = i + 1; value = getArg(i);
+                }
+                if (kind == "test" && (key == "--samples" || key == "--warmup-ms" || key == "--sample-ms"
+                    || key == "--max-regression-percent" || key == "--baseline")) {
+                    print("error: test: " + key + " is a benchmark option"); out.ok = false; return out;
+                }
+                if (value.len == 0) { out.ok = false; }
+                elif (key == "--filter") { out.filter = value; }
+                elif (key == "--target") { out.target = value; }
+                elif (key == "--report") { out.report = value; }
+                elif (key == "--junit") { out.junit = value; }
+                elif (key == "--baseline") { out.baseline = value; }
+                else {
+                    let n = tr_timeout(value);
+                    if (n <= 0) { out.ok = false; }
+                    elif (key == "--timeout-ms") { out.timeout_ms = n; }
+                    elif (key == "--output-limit-kb") { if(n>1048576){out.ok=false;}else{out.output_limit=n*1024;} }
+                    elif (key == "--build-timeout-ms") { out.build_timeout_ms = n; }
+                    elif (key == "-j" || key == "--jobs") { if(n > 64){out.ok=false;}else{out.jobs=n as i32;if(!explicit_build_jobs){out.build_jobs=n as i32;}} }
+                    elif (key == "--build-jobs") { if(n>64){out.ok=false;}else{out.build_jobs=n as i32;explicit_build_jobs=true;} }
+                    elif (key == "--repeat") { if(n > 10000){out.ok=false;}else{out.repeat=n as i32;} }
+                    elif (key == "--samples") { if(n < 3 || n > 10000){out.ok=false;}else{out.samples=n as i32;} }
+                    elif (key == "--warmup-ms") { out.warmup_ms = n; }
+                    elif (key == "--sample-ms") { out.sample_ms = n; }
+                    elif (key == "--max-regression-percent") { if(n>1000){out.ok=false;}else{out.regression_percent=n as i32;} }
+                }
+            } else { print("error: " + kind + ": unknown option `" + arg + "`"); out.ok = false; }
+        } else { out.paths = ct_append_line(out.paths, arg); }
+        i = i + 1;
+    }
+    if (out.exact && out.filter.len == 0) { out.ok = false; }
+    if (out.ignored && out.include_ignored) { out.ok = false; }
+    if (kind == "bench" && (out.jobs != 1 || out.repeat != 1 || out.junit.len > 0)) {
+        print("error: bench: measurements run serially; --jobs, --repeat and --junit are test options"); out.ok = false;
+    }
+    if (out.baseline.len > 0 && (kind != "bench" || !fileExists(out.baseline) || fileSize(out.baseline)>16777216)) { out.ok = false; }
+    if (!out.ok) { print("error: " + kind + ": invalid option value or conflicting options; see --help"); }
+    return out;
+}
+
+fn tr_timeout(text: string) -> i64 {
+    if (text.len == 0) { return -1; }
+    var n: i64 = 0;
+    var i: i32 = 0;
+    while (i < text.len) {
+        let c = text.charAt(i);
+        if (c < 48 || c > 57 || n > 360000) { return -1; }
+        n = n * 10 + (c - 48) as i64;
+        i = i + 1;
+    }
+    if (n > 3600000) { return -1; }
+    return n;
+}
+
+fn tr_abs(path: string) -> string {
+    let ptr = vyx_bootstrap_abs_path(path.c_str());
+    if (ptr == null) { return ""; }
+    return str_dup(from_cstr(ptr));
+}
+
+// Hashes locate buckets; full normalized path bytes decide identity.
+fn tr_add_discovered(files: &mut StringBuilder, seen: &mut BuildSourceMap, path: string) {
+    var key = path;
+    if (ct_is_windows()) { key = path.toLower(); }
+    if (!seen.contains(key)) { seen.put(key, 1); files.append(path); files.append("\n"); }
+}
+
+fn tr_prepare_context(args: TestArgs) -> TestArgs {
+    var out = args;
+    if (!args.ok) { return out; }
+    if (!args.standalone && fileExists("Vyx.toml")) {
+        let context = build_harness_context(args.target);
+        if (context == "|ERR|") { out.ok = false; return out; }
+        var rows = RunnerLines.create(context);
+        out.target = str_dup(rows.at(0));
+        let split = context.indexOf("\n") as i32;
+        if (split >= 0) { out.project_inputs = str_dup(context.substring(split + 1, context.len)); }
+        out.project = true;
+        rows.destroy();
+    } elif (args.target.len > 0) {
+        print("error: " + args.kind + ": --target requires Vyx.toml without --standalone"); out.ok = false;
+    }
+    return out;
+}
+
+fn tr_discover(args: TestArgs, cache: string) -> string {
+    var roots = args.paths;
+    var files = StringBuilder.create();
+    var seen = BuildSourceMap.create(128);
+    if (args.project && roots.len == 0) {
+        var sources = RunnerLines.create(args.project_inputs);
+        var k: i32 = 0;
+        while (k < sources.count()) {
+            let source = sources.at(k);
+            if (source.endsWith(".vyx")) { tr_add_discovered(&mut files, &mut seen, tr_abs(source)); }
+            k = k + 1;
+        }
+        sources.destroy();
+        if (isDir("tests") && args.kind == "test") { roots = "tests"; }
+        if (isDir("benches") && args.kind == "bench") { roots = "benches"; }
+    }
+    if (!args.project && roots.len == 0) {
+        if (isDir("src")) { roots = "src"; }
+        if (isDir("tests") && args.kind == "test") { roots = ct_append_line(roots, "tests"); }
+        if (isDir("benches") && args.kind == "bench") { roots = ct_append_line(roots, "benches"); }
+    }
+    var requested_roots = RunnerLines.create(roots);
+    var ok: bool = true;
+    var i: i32 = 0;
+    while (i < requested_roots.count() && ok) {
+        let requested = requested_roots.at(i);
+        let path = tr_abs(requested);
+        if (path.len == 0) {
+            print("error: test: cannot resolve path: " + requested); ok = false;
+        } elif (isDir(path)) {
+            let inventory = ct_join(cache, "inventory.txt");
+            if (vyx_bootstrap_list_vyx_deps(path.c_str(), inventory.c_str()) != 0) {
+                print("error: test: cannot enumerate directory: " + requested); ok = false;
+            } else {
+                let text = readFile(inventory);
+                if (fileSize(inventory) < 0 || text.len as i64 != fileSize(inventory)) {
+                    print("error: test: cannot read directory inventory: " + requested); ok = false;
+                } else {
+                    var rows = RunnerLines.create(text);
+                    var j: i32 = 0;
+                    while (j < rows.count()) {
+                        let file = rows.at(j);
+                        let relative = file.substring(path.len as i32, file.len as i32);
+                        if (file.endsWith(".vyx") && !ct_skip_path(relative)) {
+                            tr_add_discovered(&mut files, &mut seen, tr_abs(file));
+                        }
+                        j = j + 1;
+                    }
+                    rows.destroy();
+                }
+            }
+        } elif (fileExists(path) && path.endsWith(".vyx")) {
+            tr_add_discovered(&mut files, &mut seen, path);
+        } else { print("error: test: expected a .vyx file or directory: " + requested); ok = false; }
+        i = i + 1;
+    }
+    requested_roots.destroy(); seen.destroy();
+    if (!ok) { files.destroy(); return "|ERR|"; }
+    let value = files.build();
+    let result = from_cstr_len(value.c_str(), value.len);
+    files.destroy();
+    return result;
+}
+
+fn tr_path_key(path: string) -> string {
+    let absolute = ct_posix(tr_abs(path));
+    if (ct_is_windows()) { return absolute.toLower(); }
+    return absolute;
+}
+
+fn tr_validate_outputs(args: TestArgs, files: string) -> bool {
+    var inputs = BuildSourceMap.create(128);
+    var rows = RunnerLines.create(files + "\n" + args.project_inputs);
+    var i: i32 = 0;
+    while (i < rows.count()) {
+        let input = rows.at(i);
+        if (input.len > 0) { inputs.put(tr_path_key(input), 1); }
+        i = i + 1;
+    }
+    inputs.put(tr_path_key("Vyx.toml"), 1);
+    if (args.baseline.len > 0) { inputs.put(tr_path_key(args.baseline), 1); }
+    var ok: bool = true;
+    if (args.report.len > 0 && inputs.contains(tr_path_key(args.report))) { ok = false; }
+    if (args.junit.len > 0 && inputs.contains(tr_path_key(args.junit))) { ok = false; }
+    if (args.report.len > 0 && args.junit.len > 0 && tr_path_key(args.report) == tr_path_key(args.junit)) { ok = false; }
+    rows.destroy(); inputs.destroy();
+    if (!ok) { print("error: " + args.kind + ": report outputs must be distinct and must not overwrite source inputs, Vyx.toml or the baseline"); }
+    return ok;
+}
+
+// Attribute names are inspected only in the parser's attribute metadata.
+// Arguments and string literals cannot accidentally introduce a test marker.
+fn tr_attr_name_char(c: i32) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+        || (c >= 97 && c <= 122) || c == 95 || c == 46;
+}
+
+fn tr_attribute(decl: rawptr, wanted: string) -> string {
+    let meta = decl_get_meta(decl);
+    let start = meta.indexOf("|attrs:") as i32;
+    if (start < 0) { return ""; }
+    var i = start + 7;
+    while (i < meta.len) {
+        if (meta.charAt(i) == 124) { return ""; }
+        if (meta.charAt(i) != 64) { i = i + 1; continue; }
+        i = i + 1;
+        var bracket: bool = false;
+        if (i < meta.len && meta.charAt(i) == 91) { bracket = true; i = i + 1; }
+        let name_start = i;
+        while (i < meta.len && tr_attr_name_char(meta.charAt(i))) { i = i + 1; }
+        let matches = meta.substring(name_start, i) == wanted;
+        let payload_start = i;
+        // Parser-generated @doc(...) transports the exact declaration doc
+        // bytes, not a quoted attribute expression. Its extent is known from
+        // the AST, including apostrophes, parentheses and @ signs in prose.
+        if (meta.substring(name_start, i) == "doc") {
+            let doc = decl_get_doc(decl);
+            if (doc.len > 0 && i + doc.len + 2 <= meta.len
+                && meta.substring(i, i + 1) == "("
+                && meta.substring(i + 1, i + 1 + doc.len as i32) == doc
+                && meta.charAt(i + 1 + doc.len as i32) == 41) {
+                i = i + doc.len as i32 + 2;
+                continue;
+            }
+        }
+        // Skip complete attribute payloads, including synthetic @doc metadata.
+        // Re-lexing doc text would incorrectly diagnose prose as Vyx code.
+        var depth: i32 = 0;
+        var close: i32 = 0;
+        if (bracket) { depth = 1; close = 93; }
+        elif (i < meta.len && meta.charAt(i) == 40) { depth = 1; close = 41; i = i + 1; }
+        var quote: i32 = 0;
+        var escaped: bool = false;
+        while (i < meta.len && depth > 0) {
+            let c = meta.charAt(i);
+            if (quote != 0) {
+                if (escaped) { escaped = false; }
+                elif (c == 92) { escaped = true; }
+                elif (c == quote) { quote = 0; }
+            } elif (c == 34 || c == 39) { quote = c; }
+            elif ((close == 93 && c == 91) || (close == 41 && c == 40)) { depth = depth + 1; }
+            elif (c == close) { depth = depth - 1; }
+            i = i + 1;
+        }
+        if (matches) { return " " + meta.substring(payload_start, i); }
+    }
+    return "";
+}
+
+fn tr_has_attr(decl: rawptr, wanted: string) -> bool { return tr_attribute(decl, wanted).len > 0; }
+
+fn tr_platform_token_matches(token: string) -> bool {
+    let platform = vyx_bootstrap_platform();
+    if (token == "posix") { return platform == 2 || platform == 3 || platform == 4; }
+    let name = policy_target_platform_name(token);
+    return (name == "windows" && platform == 1) || (name == "linux" && platform == 2)
+        || (name == "android" && platform == 3) || (name == "macos" && platform == 4);
+}
+
+fn tr_platform_active(decl: rawptr) -> bool {
+    let attr = tr_attribute(decl, "platform");
+    if (attr.len == 0) { return true; }
+    var token: string = "";
+    var i: i32 = 0;
+    while (i <= attr.len) {
+        var c: i32 = 0;
+        if (i < attr.len) { c = attr.charAt(i); }
+        if (tr_attr_name_char(c)) { token = token + attr.substring(i, i + 1); }
+        else {
+            if (token.len > 0 && tr_platform_token_matches(token)) { return true; }
+            token = "";
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+class TestFile {
+    public source: string;
+    public names: string;
+    public returns: string;
+    public calls: string;
+    public ignored: string;
+    public module_name: string;
+    public ok: bool;
+}
+
+fn tr_decl_error(path: string, decl: rawptr, message: string) {
+    print(path + ":" + decl_loc_line(decl).toString() + ":"
+        + decl_loc_col(decl).toString() + ": error: test: " + message);
+}
+
+fn tr_selected(args: TestArgs, path: string, name: string) -> bool {
+    if (args.filter.len == 0) { return true; }
+    let identity = ct_posix(path) + "::" + name;
+    if (args.exact) { return args.filter == name || args.filter == identity; }
+    return ct_contains(identity, args.filter);
+}
+
+fn tr_validate_members(path: string, member: rawptr) -> bool {
+    var ok: bool = true;
+    var cur = member;
+    while (cur != null) {
+        if (tr_has_attr(cur, "test") || tr_has_attr(cur, "bench")) {
+            tr_decl_error(path, cur, "@[test] methods are unsupported; use a free test function");
+            ok = false;
+        }
+        if (!tr_validate_members(path, decl_get_members(cur))) { ok = false; }
+        cur = decl_get_next(cur);
+    }
+    return ok;
+}
+
+fn tr_scan(path: string, args: TestArgs) -> TestFile {
+    var out = TestFile { source: readFile(path), names: "", returns: "", calls: "", ignored: "", module_name: "", ok: false };
+    if (fileSize(path) < 0 || fileSize(path) != out.source.len as i64) {
+        print("error: cannot read complete test source (or embedded NUL): " + path);
+        return out;
+    }
+    diag_set_source_context(path, out.source);
+    let lex = lex_source(out.source);
+    if (lex == null) { print("error: test: cannot lex " + path); return out; }
+    if (lex_error_count(lex) > 0) { lexer_dispose(lex); return out; }
+    let unit = parse_unit(lex);
+    if (unit == null) { lexer_dispose(lex); return out; }
+    out.ok = true;
+    var names = StringBuilder.create();
+    var returns = StringBuilder.create();
+    var calls = StringBuilder.create();
+    var ignored_names = StringBuilder.create();
+    var seen = BuildSourceMap.create(128);
+    var decl = unit_get_decls(unit);
+    var block_module: bool = false;
+    while (decl != null) {
+        if (decl_get_name(decl) == "__vyxc_test_entry") {
+            tr_decl_error(path, decl, "reserved runner name: __vyxc_test_entry");
+            out.ok = false;
+        }
+        if (decl_get_kind(decl) == de_MODULE()) {
+            if (ct_contains(decl_get_meta(decl), "|module-block|")) { block_module = true; }
+            if (decl_get_name(decl) == "__module_end") { block_module = false; }
+        }
+        if (decl_get_kind(decl) == de_MODULE() && !block_module && decl_get_name(decl) != "__module_end") {
+            out.module_name = decl_get_name(decl);
+        }
+        if (tr_has_attr(decl, args.kind)) {
+            let name = decl_get_name(decl);
+            let ty = decl_get_ty(decl);
+            var return_kind = "void";
+            if (ty != null && tref_get_kind(ty) == ty_I32()) { return_kind = "i32"; }
+            elif (ty != null && tref_get_kind(ty) != ty_VOID()) { return_kind = "invalid"; }
+            if (decl_get_kind(decl) != de_FN() || decl_get_body(decl) == null
+                || decl_get_params(decl) != null || decl_get_generic_params(decl).len > 0
+                || return_kind == "invalid" || block_module || tr_has_attr(decl, "async")
+                || ct_contains(decl_get_meta(decl), "|marker:async")) {
+                tr_decl_error(path, decl, "@[test] requires a non-generic, synchronous free fn() -> void or i32 with a body");
+                out.ok = false;
+            } elif (tr_selected(args, path, name) && tr_platform_active(decl)
+                && (!args.ignored || tr_has_attr(decl, "ignore"))) {
+                let duplicate = seen.contains(name);
+                if (duplicate) {
+                    tr_decl_error(path, decl, "duplicate test identity: " + name);
+                    out.ok = false;
+                } else {
+                    seen.put(name, 1);
+                    names.append(name); names.append("\n");
+                    returns.append(return_kind); returns.append("\n");
+                    // The appended runner remains in the file's module scope.
+                    calls.append(name); calls.append("\n");
+                    if (tr_has_attr(decl, "ignore")) { ignored_names.append("yes\n"); }
+                    else { ignored_names.append("no\n"); }
+                }
+            }
+        }
+        if (!tr_validate_members(path, decl_get_members(decl))) { out.ok = false; }
+        decl = decl_get_next(decl);
+    }
+    let names_text = names.build();
+    let returns_text = returns.build();
+    let calls_text = calls.build();
+    let ignored_text = ignored_names.build();
+    out.names = from_cstr_len(names_text.c_str(), names_text.len);
+    out.returns = from_cstr_len(returns_text.c_str(), returns_text.len);
+    out.calls = from_cstr_len(calls_text.c_str(), calls_text.len);
+    out.ignored = from_cstr_len(ignored_text.c_str(), ignored_text.len);
+    seen.destroy();
+    lexer_dispose(lex);
+    return out;
+}
+
+fn tr_harness(file: TestFile, args: TestArgs) -> string {
+    if (args.kind == "bench") { return br_harness(file, args); }
+    // Disable the source-level process entry and export only this dispatcher
+    // with the native entry ABI. Calls to an existing main retain their meaning.
+    var source = StringBuilder.create();
+    if (file.module_name.len > 0) { source.append("module " + file.module_name + ";\n"); }
+    source.append("\nextern \"C\" { fn vyx_rt_set_args(argc: i32, argv: rawptr); }\n"
+        + "@[export_name(\"main\")]\n"
+        + "fn __vyxc_test_entry(argc: i32, argv: rawptr) -> i32 {\n"
+        + "    vyx_rt_set_args(argc, argv);\n");
+    var calls = RunnerLines.create(file.calls);
+    var returns = RunnerLines.create(file.returns);
+    var i: i32 = 0;
+    while (i < calls.count()) {
+        source.append("    if (getArg(1) == \"" + i.toString() + "\") {\n");
+        let call = calls.at(i) + "()";
+        if (returns.at(i) == "i32") {
+            // Normalize failure before the OS truncates process status to 8 bits.
+            source.append("        if (" + call + " != 0) { return 1; }\n");
+        } else { source.append("        " + call + ";\n"); }
+        source.append("        return 0;\n    }\n");
+        i = i + 1;
+    }
+    source.append("    return 2;\n}\n");
+    calls.destroy(); returns.destroy();
+    let value = source.build();
+    return from_cstr_len(value.c_str(), value.len);
+}
+
+fn tr_arg(args: string, value: string) -> string {
+    return args + value.len.toString() + ":" + value;
+}
+
+// All children use argv packing, never a shell command. Timeout cancellation
+// uses the same owned-process tree API as the project scheduler.
+fn tr_process(args: string, stdout_path: string, stderr_path: string, timeout_ms: i64, output_limit: i64) -> i32 {
+    let id = vyx_bootstrap_process_spawn_args(args.c_str(), "".c_str(), stdout_path.c_str(),
+        stderr_path.c_str(), "".c_str(), "".c_str());
+    if (id == 0) { return -1; }
+    let started = vyx_bootstrap_now_ms();
+    while (vyx_bootstrap_process_is_running(id) != 0) {
+        let too_much_output = fileSize(stdout_path) > output_limit || fileSize(stderr_path) > output_limit;
+        if (vyx_bootstrap_now_ms() - started >= timeout_ms || too_much_output) {
+            let cancelled = vyx_bootstrap_process_cancel(id);
+            vyx_bootstrap_process_close(id);
+            if (cancelled != 0) { print("error: child cancellation failed"); return -4; }
+            if (too_much_output) { return -3; }
+            return -2;
+        }
+        vyx_bootstrap_sleep_ms(10);
+    }
+    let status = vyx_bootstrap_process_wait(id);
+    // Closing also releases inherited handles and owned descendant processes.
+    vyx_bootstrap_process_close(id);
+    if (fileSize(stdout_path) > output_limit || fileSize(stderr_path) > output_limit) { return -3; }
+    return status;
+}
+
+class TestOutcome {
+    public passed: i32;
+    public failed: i32;
+    public not_run: i32;
+    public build_errors: i32;
+    public ignored: i32;
+}
+
+var g_runner_compile_rc: i32 = 1;
+
+class RunningTest {
+    public id: i64;
+    public ordinal: i32;
+    public started: i64;
+    public name: string;
+    public prefix: string;
+}
+
+fn tr_compile(file: TestFile, path: string, base: string, args: TestArgs) -> string {
+    g_runner_compile_rc = 1;
+    let harness = tr_harness(file, args);
+    let key_input = path + harness;
+    let key = str_dup(from_cstr(vyx_bootstrap_sha256_bytes(key_input.c_str(), key_input.len as i64)));
+    let directory = tr_abs(ct_join(ct_cache_dir(), "harnesses/" + key));
+    if (ct_mkdir(directory) != 0) { return ""; }
+    let source = ct_join(directory, "entry.vyx");
+    let executable = ct_join(directory, "runner" + ct_exe_suffix());
+    if (!fileExists(source) || readFile(source) != harness) {
+        if (writeFile(source, harness) != 0) { return ""; }
+    }
+    var command = tr_arg("", ct_self_exe());
+    if (args.project) {
+        command = tr_arg(command, "build");
+        command = tr_arg(tr_arg(command, "--target"), args.target);
+        command = tr_arg(tr_arg(command, "--harness-owner"), path);
+        command = tr_arg(tr_arg(command, "--harness-file"), source);
+        command = tr_arg(command, "-j" + args.build_jobs.toString());
+    } else {
+        let units = ct_join(directory, "sources.txt");
+        if (writeFile(units, path + "\n" + source + "\n") != 0) { return ""; }
+        command = tr_arg(tr_arg(command, "--src=file"), path);
+        command = tr_arg(tr_arg(command, "--unit-sources"), units);
+        command = tr_arg(command, "--emit=exe");
+        command = tr_arg(command, "--no-process-entry");
+        command = tr_arg(tr_arg(command, "--export-root-names"), "__vyxc_test_entry");
+    }
+    command = tr_arg(command, args.optimize);
+    command = tr_arg(tr_arg(command, "-o"), executable);
+    let rc = tr_process(command, base + ".compile.stdout", base + ".compile.stderr", args.build_timeout_ms, args.output_limit);
+    g_runner_compile_rc = rc;
+    if (rc != 0 || !fileExists(executable)) {
+        print("error: " + args.kind + ": compile failed: " + path + " (exit " + rc.toString() + ")");
+        print(tr_log(base + ".compile.stdout")); print(tr_log(base + ".compile.stderr"));
+        return "";
+    }
+    return executable;
+}
+
+fn tr_test_file(file: TestFile, path: string, cache: string, index: i32, args: TestArgs) -> TestOutcome {
+    var out = TestOutcome { passed: 0, failed: 0, not_run: 0, build_errors: 0, ignored: 0 };
+    var names = RunnerLines.create(file.names);
+    var ignored_names = RunnerLines.create(file.ignored);
+    let count = names.count();
+    let total = count * args.repeat;
+    let base = ct_join(cache, "file_" + index.toString());
+    var runnable: i32 = 0;
+    var i: i32 = 0;
+    while (i < count) {
+        if (ignored_names.at(i) != "yes" || args.include_ignored || args.ignored) { runnable = runnable + 1; }
+        i = i + 1;
+    }
+    var executable: string = "";
+    if (runnable > 0) {
+        executable = tr_compile(file, path, base, args);
+        if (executable.len == 0) {
+            out.not_run = total; out.build_errors = 1;
+            tr_record(ct_posix(path), "build_error", g_runner_compile_rc, 0, base + ".compile.stdout", base + ".compile.stderr", "");
+            var missed: i32 = 0;
+            while (missed < total) {
+                tr_record(ct_posix(path) + "::" + names.at(missed % count), "not_run", 0, 0, "", "", "");
+                missed = missed + 1;
+            }
+            names.destroy(); ignored_names.destroy();
+            return out;
+        }
+    }
+    var slots = Vec::<RunningTest>.with_capacity(args.jobs as i64);
+    i = 0;
+    while (i < args.jobs) {
+        slots.push(RunningTest { id: 0, ordinal: 0, started: 0, name: "", prefix: "" }); i = i + 1;
+    }
+    var cursor: i32 = 0;
+    var active: i32 = 0;
+    var stop: bool = false;
+    while (cursor < total || active > 0) {
+        i = 0;
+        while (i < args.jobs) {
+            var slot = slots.get_ptr(i as i64);
+            if (slot[0].id == 0 && cursor < total && !stop) {
+                let test_index = cursor % count;
+                var name = ct_posix(path) + "::" + names.at(test_index);
+                if (args.repeat > 1) { name = name + "#" + (cursor / count + 1).toString(); }
+                let ignored = ignored_names.at(test_index) == "yes" && !args.include_ignored && !args.ignored;
+                if (ignored) {
+                    out.ignored = out.ignored + 1; print(args.kind + " " + name + " ... ignored");
+                    tr_record(name, "ignored", 0, 0, "", "", "");
+                } elif (args.no_run) {
+                    out.not_run = out.not_run + 1; print(args.kind + " " + name + " ... built");
+                    tr_record(name, "built", 0, 0, "", "", "");
+                } else {
+                    slot[0].prefix = base + ".case_" + cursor.toString();
+                    slot[0].name = name;
+                    slot[0].ordinal = cursor;
+                    slot[0].started = vyx_bootstrap_now_ms();
+                    var argv = tr_arg(tr_arg("", executable), test_index.toString());
+                    if (args.kind == "bench") { argv = tr_arg(argv, slot[0].prefix + ".samples"); }
+                    slot[0].id = vyx_bootstrap_process_spawn_args(argv.c_str(), "".c_str(),
+                        (slot[0].prefix + ".stdout").c_str(), (slot[0].prefix + ".stderr").c_str(), "".c_str(), "".c_str());
+                    if (slot[0].id == 0) {
+                        out.failed = out.failed + 1;
+                        tr_record(name, "spawn_error", -1, 0, "", "", "");
+                        print(args.kind + " " + name + " ... FAILED (spawn)");
+                        if (args.fail_fast) { stop = true; }
+                    } else { active = active + 1; }
+                }
+                cursor = cursor + 1;
+            }
+            if (slot[0].id != 0) {
+                let elapsed = vyx_bootstrap_now_ms() - slot[0].started;
+                let running = vyx_bootstrap_process_is_running(slot[0].id) != 0;
+                let too_much_output = fileSize(slot[0].prefix + ".stdout") > args.output_limit
+                    || fileSize(slot[0].prefix + ".stderr") > args.output_limit;
+                if (!running || elapsed >= args.timeout_ms || too_much_output) {
+                    var rc: i32 = 0;
+                    var status = "passed";
+                    if (too_much_output && !running) {
+                        vyx_bootstrap_process_wait(slot[0].id); status = "output_limit"; rc = -3;
+                    } elif (running) {
+                        if (vyx_bootstrap_process_cancel(slot[0].id) != 0) { status = "cancel_error"; rc = -4; }
+                        elif (too_much_output) { status = "output_limit"; rc = -3; }
+                        else { status = "timeout"; rc = -2; }
+                    } else {
+                        rc = vyx_bootstrap_process_wait(slot[0].id);
+                        if (rc != 0) { status = "failed"; }
+                    }
+                    vyx_bootstrap_process_close(slot[0].id);
+                    slot[0].id = 0; active = active - 1;
+                    var extra: string = "";
+                    if (rc == 0 && args.kind == "bench") {
+                        extra = br_result(slot[0].prefix + ".samples", slot[0].name, args);
+                        if (g_bench_comparison_failed) { status = "regression_or_baseline_error"; rc = 1; }
+                        if (extra.len == 0) { status = "invalid_measurement"; rc = 1; }
+                    }
+                    extra = extra + ",\"started_ms\":" + slot[0].started.toString();
+                    tr_record(slot[0].name, status, rc, elapsed,
+                        slot[0].prefix + ".stdout", slot[0].prefix + ".stderr", extra);
+                    if (rc == 0) {
+                        out.passed = out.passed + 1;
+                        print(args.kind + " " + slot[0].name + " ... ok (" + elapsed.toString() + " ms)");
+                    } else {
+                        out.failed = out.failed + 1;
+                        if (status == "timeout") { print(args.kind + " " + slot[0].name + " ... TIMEOUT"); }
+                        else { print(args.kind + " " + slot[0].name + " ... FAILED (" + status + ", exit " + rc.toString() + ")"); }
+                        if (args.fail_fast) { stop = true; }
+                    }
+                    if (rc != 0 || args.nocapture) {
+                        print(tr_log(slot[0].prefix + ".stdout")); print(tr_log(slot[0].prefix + ".stderr"));
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        if (stop && active == 0) { break; }
+        if (active > 0) { vyx_bootstrap_sleep_ms(10); }
+    }
+    while (cursor < total) {
+        tr_record(ct_posix(path) + "::" + names.at(cursor % count), "not_run", 0, 0, "", "", "");
+        out.not_run = out.not_run + 1; cursor = cursor + 1;
+    }
+    slots.drop();
+    names.destroy(); ignored_names.destroy();
+    return out;
+}
+
+fn ct_runner_main(kind: string) -> i32 {
+    if (ct_wants_help()) {
+        print("Usage: " + ct_self_exe() + " " + kind + " [options] [file-or-directory...]");
+        print("  Discover @[test] free functions in src/ and tests/, compile once per file, run each in an isolated AOT process.");
+        print("  fn() / fn() -> void: assertions; fn() -> i32: zero passes, nonzero fails.");
+        print("  --list                List selected tests without compiling or running");
+        print("  --filter <substring>  Match path::function (one-way substring)");
+        print("  --exact               Match the full function name or path::function");
+        print("  --timeout-ms <N>      Per-test deadline, default 30000; compilation deadline 300000");
+        print("  --fail-fast           Stop after the first failing file or test");
+        print("  --allow-empty         Permit an empty selection (otherwise exit 1)");
+        print("  Vyx.toml projects reuse build dependencies, native sources, DCI and link settings.");
+        print("  --target <name>       Select the manifest target (required if ambiguous)");
+        print("  --standalone          Ignore the manifest and compile each file directly");
+        print("  -j N / --jobs N       Bounded parallel tests and project compilation (1..64)");
+        print("  --build-jobs N        Project build concurrency, default 4 (bench still measures serially)");
+        print("  --repeat N            Run each selected test N times");
+        print("  --ignored / --include-ignored   Run only ignored tests / also run ignored tests");
+        print("  --no-run              Compile harnesses without executing; reported as not run");
+        print("  --nocapture           Also print successful test output (captured per process)");
+        print("  --report <file>       Write versioned JSON including logs and individual results");
+        print("  --junit <file>        Write JUnit XML (test only)");
+        print("  --output-limit-kb N   Per-stream output limit (default 16384 KiB, max 1048576)");
+        print("  --build-timeout-ms N  Build deadline, default 300000");
+        print("  -O0/-O1/-O2/-O3       Optimization, default O2");
+        print("  bench: --samples N (3..10000, default 30), --warmup-ms N (1000), --sample-ms N (100)");
+        print("  Benchmarks run serially, calibrate iterations and retain all nanosecond samples.");
+        print("  bench: --baseline <report.json> --max-regression-percent N (default 5)");
+        return 0;
+    }
+    let args = tr_prepare_context(tr_parse_args(kind));
+    if (!args.ok) { return 2; }
+    let cache = ct_join(ct_cache_dir(), kind + "_" + tr_pid().toString() + "_" + vyx_bootstrap_now_ms().toString());
+    if (ct_mkdir(cache) != 0) { print("error: test: cannot create " + cache); return 2; }
+    g_runner_cache = cache;
+    g_runner_report_error = false;
+    g_runner_write_xml = args.junit.len > 0;
+    let started = vyx_bootstrap_now_ms();
+    if (!br_baseline_open(args)) { return 2; }
+    let files = tr_discover(args, cache);
+    if (files == "|ERR|") { br_baseline_close(); return 2; }
+    if (!tr_validate_outputs(args, files)) { br_baseline_close(); return 2; }
+    var file_rows = RunnerLines.create(files);
+    var ignored: i32 = 0;
+    var passed: i32 = 0;
+    var failed: i32 = 0;
+    var errors: i32 = 0;
+    var build_errors: i32 = 0;
+    var not_run: i32 = 0;
+    var selected: i32 = 0;
+    var listed: i32 = 0;
+    var stopped: bool = false;
+    var fi: i32 = 0;
+    while (fi < file_rows.count()) {
+        let path = file_rows.at(fi);
+        // Bound discovery allocations to a file, as in the language server.
+        let frame = vyx_frontend_service_begin();
+        {
+            let scan = tr_scan(path, args);
+            let count = ct_line_count(scan.names);
+            selected = selected + count;
+            if (!scan.ok) {
+                errors = errors + 1;
+                print("error: " + kind + " discovery failed: " + path);
+                tr_record(path, "discovery_error", 1, 0, "", "", "");
+                if (args.fail_fast) { stopped = true; }
+            } elif (count > 0) {
+                if (args.list) {
+                    var names = RunnerLines.create(scan.names);
+                    var i: i32 = 0;
+                    while (i < count) {
+                        print(ct_posix(path) + "::" + names.at(i));
+                        tr_record(ct_posix(path) + "::" + names.at(i), "listed", 0, 0, "", "", "");
+                        i = i + 1;
+                    }
+                    names.destroy();
+                    listed = listed + count;
+                } else {
+                    let outcome = tr_test_file(scan, path, cache, fi, args);
+                    ignored = ignored + outcome.ignored;
+                    passed = passed + outcome.passed;
+                    failed = failed + outcome.failed;
+                    build_errors = build_errors + outcome.build_errors;
+                    not_run = not_run + outcome.not_run;
+                    if (args.fail_fast && (outcome.failed > 0 || outcome.build_errors > 0)) { stopped = true; }
+                }
+            }
+        }
+        // These diagnostic buffers belong to this file's frontend arena.
+        diag_set_source_context("", "");
+        vyx_frontend_service_end(frame);
+        fi = fi + 1;
+        if (stopped) { break; }
+    }
+    br_baseline_close();
+    let unprocessed_files = file_rows.count() - fi;
+    file_rows.destroy();
+    if (!tr_finish_report(args, passed, failed, ignored, errors, build_errors, not_run, selected, unprocessed_files, vyx_bootstrap_now_ms() - started)) { return 1; }
+    if (errors > 0 || failed > 0 || build_errors > 0) {
+        print(kind + " result: FAILED. " + passed.toString() + " passed; " + failed.toString()
+            + " failed; " + errors.toString() + " discovery errors; "
+            + build_errors.toString() + " build errors; " + not_run.toString() + " not run");
+        if (stopped) { print("test: remaining selection not run (--fail-fast)"); }
+        print("test logs: " + cache);
+        return 1;
+    }
+    if (selected == 0) {
+        print("no tests selected; use --allow-empty to accept this result");
+        if (args.allow_empty) { return 0; }
+        return 1;
+    }
+    if (args.list) { print(kind + " list: " + listed.toString() + " tests"); }
+    else { print(kind + " result: ok. " + passed.toString() + " passed; 0 failed; " + ignored.toString() + " ignored; " + not_run.toString() + " not run"); }
+    return 0;
+}
+
+fn ct_test_main() -> i32 { return ct_runner_main("test"); }
+fn ct_bench_main() -> i32 { return ct_runner_main("bench"); }

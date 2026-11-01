@@ -5,16 +5,36 @@ from pathlib import Path
 import struct
 import tarfile
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
-from common import sha256
+from common import REPO, sha256
+from build_macos import compiler_native_objects
 from macos_common import CPUS, TRIPLES, executable_content, verify_bundle, verify_object
 from package_macos import macho, parse_dependencies, resolve_dependency
 from prepare_macos_llvm import extract_bottle, resolve_input
 
 
 class MacOSInputs(unittest.TestCase):
+    def test_cross_link_uses_current_manifest_native_compiler_inputs(self):
+        build = REPO / "bootstrap_compiler"
+        manifest = tomllib.loads((build / "Vyx.toml").read_text(encoding="utf-8"))
+        with patch("build_macos.run") as run:
+            objects = compiler_native_objects(build, Path("llvm"), {}, Path("objects"), manifest)
+        sources = {str(call.args[0][2]) for call in run.call_args_list}
+        expected = {str(build / path) for path in manifest["target"]["boot"]["sources"] if not path.endswith(".vyx")}
+        self.assertEqual(sources, expected)
+        self.assertIn(str(build / "std_packages/serde/native/json_bridge.c"), sources)
+        self.assertEqual(len(objects), len(expected))
+        for call in run.call_args_list:
+            self.assertIn("-I" + str(build / "std_packages/serde/vendor"), call.args[0])
+
+    def test_cross_link_rejects_unhandled_native_input(self):
+        manifest = {"target": {"boot": {"sources": ["unknown.asm"]}}}
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            compiler_native_objects(Path("build"), Path("llvm"), {}, Path("objects"), manifest)
+
     def test_universal_otool_headers_are_not_dylib_dependencies(self):
         output = ("/tmp/llvm/lib/clang/22/lib/darwin/runtime.dylib (architecture x86_64):\n"
                   "\t@rpath/runtime.dylib (compatibility version 1.0.0, current version 1.0.0)\n"
