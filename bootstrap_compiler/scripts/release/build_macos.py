@@ -298,6 +298,8 @@ def native(args):
     run([sys.executable, REPO / "probes/gates/compiler-self-source/run.py",
          "--compiler", built, "--build-root", build,
          "--output", work / "self-source"], env=environment)
+    run([sys.executable, REPO / "probes/gates/literal-artifact-types/run.py",
+         "--compiler", built, "--output", work / "literal-types"], env=environment)
     run([sys.executable, REPO / "probes/gates/compiler-root-lists/run.py",
          "--compiler", built, "--build-root", build,
          "--output-dir", work / "root-lists"], env=environment)
