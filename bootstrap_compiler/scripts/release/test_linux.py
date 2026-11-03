@@ -1,8 +1,11 @@
-"""Dependency preparation must stop before using failed or invalid downloads."""
+"""Linux bootstrap LLVM must use the verified SDK's exact dependency closure."""
 from contextlib import redirect_stdout
 import io
+import json
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -10,66 +13,89 @@ import prepare_linux_llvm as linux
 
 
 class LinuxPreparationTests(unittest.TestCase):
-    def invoke(self, fail_at=None):
-        commands = []
-        installed = {}
+    def fixture(self, root):
+        sdk = root / "sdk"
+        files = ["SDK-MANIFEST.json", "toolchain/include/llvm/IR/Module.h",
+                 "toolchain/include/llvm/IR/LLVMContext.h", "toolchain/include/llvm/Config/llvm-config.h",
+                 "toolchain/include/llvm-c/Core.h", "toolchain/lib/clang/22/include/stddef.h",
+                 "bin/libvyx_compiler_backend.so", "lib/libLLVM.so.22.1",
+                 "lib/libclang-cpp.so.22.1", "lib/libdep.so.1", "lib/libtbb.so.12",
+                 "lib/libz.so.1", "lib/libzstd.so.1"]
+        files += ["toolchain/bin/" + name for name in linux.TOOLS]
+        for name in files:
+            target = sdk / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(name.encode())
+        (sdk / "SDK-MANIFEST.json").write_text(json.dumps({"bundled_compiler_llvm_toolchain": True}))
+        return sdk.resolve()
 
-        def command(argv, *, check):
-            self.assertTrue(check)
-            commands.append(argv)
-            if argv[0] == "curl":
-                # A failed transfer may leave bytes on disk; they must not be
-                # imported just because the destination file exists.
-                Path(argv[argv.index("--output") + 1]).write_bytes(b"downloaded key")
-            if fail_at and fail_at(argv):
-                raise subprocess.CalledProcessError(6 if argv[0] == "curl" else 1, argv)
-            if argv[0] == "gpg":
-                Path(argv[argv.index("--output") + 1]).write_bytes(b"validated keyring")
-            if argv[:2] == ["sudo", "install"]:
-                installed[argv[-1]] = Path(argv[-2]).read_bytes()
-            return subprocess.CompletedProcess(argv, 0)
+    def dependencies(self, source):
+        return {
+            "libvyx_compiler_backend.so": ["libLLVM.so.22.1", "libtbb.so.12"],
+            "clang": ["libclang-cpp.so.22.1"],
+            "libLLVM.so.22.1": ["libdep.so.1", "libz.so.1", "libzstd.so.1", "libc.so.6"],
+            "libclang-cpp.so.22.1": ["libLLVM.so.22.1"],
+        }.get(source.name, [])
 
-        error = None
-        with patch.object(linux.subprocess, "run", side_effect=command), redirect_stdout(io.StringIO()):
-            try:
-                linux.prepare()
-            except subprocess.CalledProcessError as caught:
-                error = caught
-        return commands, installed, error
+    def test_failed_ubuntu_update_stops_package_installation(self):
+        failure = subprocess.CalledProcessError(100, ["apt-get", "update"])
+        with patch.object(linux, "run", side_effect=failure) as run, redirect_stdout(io.StringIO()):
+            with self.assertRaises(subprocess.CalledProcessError):
+                linux.install_system_dependencies()
+        self.assertEqual(run.call_count, 1)
 
-    def test_dns_failure_does_not_import_partial_key_or_change_system(self):
-        commands, installed, error = self.invoke(lambda argv: argv[0] == "curl")
-        self.assertEqual(error.returncode, 6)
-        self.assertEqual([argv[0] for argv in commands], ["curl"])
-        self.assertEqual(installed, {})
-        self.assertFalse(Path(commands[0][commands[0].index("--output") + 1]).exists())
+    def test_missing_sdk_dependency_is_not_resolved_from_host(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = self.fixture(root)
+            (sdk / "lib/libdep.so.1").unlink()
+            with patch.object(linux, "needed", side_effect=self.dependencies):
+                with self.assertRaises(FileNotFoundError):
+                    linux.prepare_sdk_llvm(sdk, root / "llvm")
+            self.assertFalse((root / "llvm").exists())
 
-    def test_invalid_key_does_not_change_system(self):
-        commands, installed, error = self.invoke(lambda argv: argv[0] == "gpg")
-        self.assertIsNotNone(error)
-        self.assertEqual([argv[0] for argv in commands], ["curl", "gpg"])
-        self.assertEqual(installed, {})
+    def test_ambiguous_llvm_dependency_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = self.fixture(Path(temporary))
+            with patch.object(linux, "needed", return_value=["libLLVM.so.22.1", "libLLVM-23.so"]):
+                with self.assertRaisesRegex(RuntimeError, "exactly one LLVM"):
+                    linux.llvm_dependency(sdk)
 
-    def test_failed_update_does_not_install_packages(self):
-        commands, installed, error = self.invoke(lambda argv: argv[-1] == "update")
-        self.assertIsNotNone(error)
-        self.assertEqual(commands[-1][-1], "update")
-        self.assertFalse(any(argv[:2] == ["sudo", "apt-get"] and "install" in argv for argv in commands))
+    def test_dependency_with_absolute_path_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = self.fixture(root)
+            def needed(source):
+                if source.name == "libLLVM.so.22.1": return ["/usr/lib/libdep.so.1"]
+                return self.dependencies(source)
+            with patch.object(linux, "needed", side_effect=needed):
+                with self.assertRaisesRegex(RuntimeError, "Non-relocatable"):
+                    linux.prepare_sdk_llvm(sdk, root / "llvm")
 
-    def test_success_installs_only_validated_key_and_signed_source(self):
-        commands, installed, error = self.invoke()
-        self.assertIsNone(error)
-        self.assertEqual(installed[linux.KEYRING], b"validated keyring")
-        source = installed[linux.SOURCE].decode()
-        self.assertIn(f"signed-by={linux.KEYRING}", source)
-        self.assertIn("llvm-toolchain-noble-22 main", source)
-        self.assertTrue(set(linux.PACKAGES).issubset(commands[-1]))
-        # Lock in the failure mode this fix addresses: DNS must be retried and
-        # APT must not accept a partial index update as success.
-        self.assertIn("--retry-all-errors", commands[0])
-        self.assertIn("--retry-max-time", commands[0])
-        self.assertIn("--max-time", commands[0])
-        self.assertIn("--error-on=any", commands[-2])
+    @unittest.skipUnless(os.name == "posix", "Linux SDK directory symlinks")
+    def test_exact_closure_excludes_stage0_application_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = self.fixture(root)
+            with patch.object(linux, "needed", side_effect=self.dependencies), \
+                 patch.object(linux, "verify", return_value="22.1.8"), redirect_stdout(io.StringIO()):
+                destination = linux.prepare_sdk_llvm(sdk, root / "llvm")
+            record = json.loads((destination / "VYX-LLVM-INPUT.json").read_text())
+            self.assertEqual(set(record["libraries"]), {"libLLVM.so.22.1", "libclang-cpp.so.22.1",
+                                                       "libdep.so.1", "libz.so.1", "libzstd.so.1"})
+            self.assertEqual((destination / "lib/libLLVM.so").resolve(), (sdk / "lib/libLLVM.so.22.1").resolve())
+            self.assertFalse((destination / "lib/libtbb.so.12").exists())
+
+    @unittest.skipUnless(os.name == "posix", "Linux SDK directory symlinks")
+    def test_version_probe_failure_does_not_mark_inputs_verified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = self.fixture(root)
+            with patch.object(linux, "needed", side_effect=self.dependencies), \
+                 patch.object(linux, "verify", side_effect=subprocess.CalledProcessError(1, ["input-check"])):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    linux.prepare_sdk_llvm(sdk, root / "llvm")
+            self.assertFalse((root / "llvm/VYX-LLVM-INPUT.json").exists())
 
 
 if __name__ == "__main__":

@@ -216,7 +216,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bootstrap-tag", default="latest")
     parser.add_argument("--bootstrap-sdk", type=Path)
-    parser.add_argument("--llvm-root", type=Path, required=True)
+    llvm_input = parser.add_mutually_exclusive_group(required=True)
+    llvm_input.add_argument("--llvm-root", type=Path)
+    llvm_input.add_argument("--use-sdk-llvm", action="store_true",
+                           help="Linux: use LLVM development inputs from the verified Stage 0 SDK")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--jobs", type=int, default=4)
@@ -227,6 +230,8 @@ def main():
     if arch is None or (windows and arch != "x86_64") or (not windows and sys.platform != "linux"):
         parser.error("Supported hosts: Windows x64, Linux x64 and Linux AArch64")
     host = "windows" if windows else "linux"
+    if windows and args.use_sdk_llvm:
+        parser.error("--use-sdk-llvm is supported on native Linux hosts")
     leaf = f"vyx-sdk-{host}-{arch}-llvm22"
     name = leaf + (".zip" if windows else ".tar.gz")
     work = args.work.resolve()
@@ -235,6 +240,9 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     sdk = args.bootstrap_sdk.resolve() if args.bootstrap_sdk else unpack_sdk(
         bootstrap_asset(args.bootstrap_tag, name, work / "downloads"), work / "bootstrap")
+    if args.use_sdk_llvm:
+        from prepare_linux_llvm import prepare_sdk_llvm
+        args.llvm_root = prepare_sdk_llvm(sdk, work / "llvm-22")
     tools = ["vyxc-lsp"] + (["vyxc-dap"] if arch == "x86_64" else [])
     adapter = sdk / "bin/debugger" if "vyxc-dap" in tools else None
     if adapter is not None:
@@ -252,7 +260,7 @@ def main():
         VYX_CODEGEN_UNITS="1", VYX_BUILD_PROFILE="1")
     environment["PATH"] = str(args.llvm_root.resolve() / "bin") + os.pathsep + environment["PATH"]
     if not windows:
-        environment["LD_LIBRARY_PATH"] = str(sdk / "bin") + ":" + str(sdk / "lib") + (
+        environment["LD_LIBRARY_PATH"] = str(args.llvm_root.resolve() / "lib") + ":" + str(sdk / "bin") + ":" + str(sdk / "lib") + (
             ":" + environment["LD_LIBRARY_PATH"] if environment.get("LD_LIBRARY_PATH") else "")
     # Keep bootstrap-only std selection out of the checkout and out of SDK
     # source assets. The release always builds the exact committed source.
@@ -273,6 +281,8 @@ def main():
         "bootstrap_manifest_sha256": sha256(sdk / "SDK-MANIFEST.json"),
         "bootstrap_version": subprocess.check_output([str(compiler), "--version"], env=environment, text=True).strip(),
         "llvm_root": str(args.llvm_root.resolve()), "jobs": args.jobs, "vyx_slots": 1}
+    if args.use_sdk_llvm:
+        record["llvm_input"] = json.loads((args.llvm_root / "VYX-LLVM-INPUT.json").read_text(encoding="utf-8"))
     manifest_path.write_text(bootstrap_manifest(original_manifest, sdk), encoding="utf-8")
     try:
         # Build the bridge with native C++ first, then use it for all emitted

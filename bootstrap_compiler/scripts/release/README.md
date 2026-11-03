@@ -15,12 +15,16 @@ platform, source patch, bundled patch and executable hashes are checked before
 compilation; packaging repeats its source patch and executable checks. A hash
 mismatch fails without rewriting the manifest or accepting different bytes.
 
-Ubuntu runners share `prepare_linux_llvm.py` for LLVM 22 APT preparation.
-The key download retries transport failures, including DNS, up to five times
-within a 180-second retry window, with a 45-second limit per attempt. It finishes
-before GPG is invoked or any system key/source file is installed. APT retries
-downloads three times; any failed index update stops preparation. Persistent
-network failures remain failures and do not select a different LLVM version.
+Ubuntu runners use `build_native.py --use-sdk-llvm`. The checksum-verified
+Stage 0 Release SDK already supplies LLVM 22 headers, Clang tools and shared
+libraries. `prepare_linux_llvm.py` builds a development view of those inputs,
+following exact ELF dependency names within the SDK. It excludes Stage 0's
+application runtime and oneTBB. A native C++ compile/link/run checks the LLVM
+headers, C++ ABI and runtime version before compiler construction. The input
+manifest and library hashes are recorded in `SDK-BUILD.*.json`.
+Ubuntu APT supplies only the non-LLVM build dependencies, with bounded retries
+and failure on an incomplete index update. No LLVM APT repository is added.
+`--llvm-root` remains available for an explicitly selected development toolchain.
 
 The native builds use LLVM 22 and a checksum-verified Stage 0 SDK. Stage 0 uses
 its own matching standard library while building the current compiler source:
