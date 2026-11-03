@@ -17,8 +17,8 @@ Option/Result、借用、闭包、Vec、String 或 StringBuilder，再产生 i64
 三种类型构造器；默认穷举两层嵌套。例如 `Vec<Option<String>>` 和
 `Option<Vec<String>>` 都会构造真实值、取出拥有的 payload、检查内容和最终清理。
 `--type-context-depth 1` 把每棵类型树的观测值再交给全部一层表达式规则。
-当前默认域有 49 条表达式规则，共 14,940 个合法组合、3,300 个非法组合，合计
-18,240 个输入。随机样本另外计数，不包含在这个穷举数中。
+当前默认域有 59 条表达式规则，共 21,480 个合法组合、3,960 个非法组合，合计
+25,440 个输入。随机样本另外计数，不包含在这个穷举数中。
 
 合法程序的预期结果由 Python 解释规则树计算，**不从 Vyx 编译结果提取**。
 还检查调用次数、drop 次数、defer 次数及资源内容断言。负例在规则树叶子嵌入
@@ -26,8 +26,38 @@ Option/Result、借用、闭包、Vec、String 或 StringBuilder，再产生 i64
 
 这是指定规则、常量域和深度内的穷举。它不穷尽任意程序，也不代表全部语言特性
 已经覆盖。`plan` 和 `suite.json` 明列未建模的 DCI ABI、async、Effect、Reflection、
-Migrate、动态分发、裸指针、异常、浮点和独立库/VYI 链接。
+Migrate、一般动态分发与对象安全、一般裸指针操作、异常和一般浮点运算。
 手写的真实项目门和 DCI 门仍需运行。
+
+调用身份规则 `operator_overload`、`operator_generic`、`index_overload` 在同一
+程序中交错调用同名重载和不同泛型实例，并再次调用较早的实例。每个重载返回不同的
+观测值，同时检查调用次数；只有数值正确但多调用一次也算失败。`pointer_index_owner`
+检查 `*T` 的存储索引不会调用 T 的 `operator[]`；`unary_operator` 检查惰性泛型
+一元运算符的返回类型和函数体。它们和其他规则一起进入有序组合，并非额外跑完的
+手写清单。浮点参数只用于识别重载；一般浮点运算依旧不在模型覆盖范围。
+`operator_overload` 的两个重载分别返回整数和带字段的 class，消费端读取 class 字段；
+仅选择正确函数体、却沿用另一个重载的返回类型，也会失败。
+`pointer_index_owner` 还通过 Box 借用同类对象，并比较泛型 Hashable 调用与公开整数
+hash 函数的结果，检查源码依赖的惰性 impl 和根命名空间文件的 `use` 归属。
+`short_circuit` 保留常量条件的跳过检查；`short_circuit_scan` 另外使用函数返回的动态
+条件，并在 while 扫描中调用函数。正负及奇偶输入分别核对结果和真正执行的调用数。
+`large_function` 生成 256 个独立局部量、256 次调用和 256 个分支，共 768 行主体，
+与其他产生式组合，检查函数中部语句、局部初始化和分支不会丢失。
+`overloaded_iterator` 在泛型类型上同时声明 `next()`、`next(i32)` 和 `has_next(i32)`，
+后两者不属于 for 协议；检查只有 receiver-only 的 next 被调用，且包括最终 None。
+`overloaded_array_clone` 对拥有 String 的数组元素声明两种 clone 重载，检查借用遍历
+选择返回原类型的 receiver-only 方法，源与副本各清理一次，并使用无括号的 `for item in &values`。
+`dynamic_overload` 经共享 dyn 借用交错调用接口重载：一个返回 i64，一个返回 24 字节
+class。两个泛型具体类型使用不同字段值，独立核对结果和六次调用；独立静态库布局还检查
+惰性恢复的泛型实现与借用类型的 trait 查询。拥有参数和返回值的动态调用另进入定向分配门。
+
+针对调用身份的较小生成集示例：
+
+```powershell
+python probes/gates/language-composition/suite.py generate --rules operator_overload,operator_generic,index_overload,pointer_index_owner,unary_operator --depth 2 --no-types --no-negative --out .cache/call-identities
+```
+
+这会生成 186 个输入；是否通过须查看执行报告，不能把生成数量当作执行结果。
 
 `check_edges.py` 补充拥有 payload 的 `?`、临时对象借用、参数包遮蔽、泛型集合遍历、
 推导返回类型的闭包、循环内返回、捕获环境与聚合参数/返回值，以及非法传播等定向输入。
@@ -169,7 +199,11 @@ python probes/gates/language-composition/suite.py generate --rules builder,drop,
 python probes/gates/language-composition/suite.py run --suite .cache/grammar-corpus/suite.json --compiler $compiler
 ```
 
-默认矩阵：单文件、项目同模块、项目跨模块 × O0/O2 × 默认/1/4 CGU，共 18 个单元。
+默认矩阵：单文件、项目同模块、项目跨模块、独立静态库/VYI 消费 × O0/O2 ×
+默认/1/4 CGU，共 24 个单元。`library` 将支持代码构建为独立依赖库，消费端通过
+其公开接口和泛型工件编译，不把库源码直接加入消费端的 unity 单元。
+库不配置输出目录，用于检查默认产物位置与依赖解析一致；支持代码与消费者都依赖
+标准库源码包，用于检查依赖实现不会作为当前包自己的 API 重复导出。
 项目路径调用 `--src=project ... --target probe -j20`。构建采用 2 个 Vyx slot，
 CGU 发射线程为 1，Windows 编译/运行进程树默认限额 2048 MiB private commit、120 秒。
 限额或超时失败单独记为 `resource`，不能记为语义诊断通过。
@@ -213,3 +247,17 @@ python probes/gates/language-composition/suite.py reduce --suite .cache/grammar-
 未知规则直接报错。新规则进入全部有序组合，不允许给已知编译器缺陷添加跳过项。
 新增更宽的类型域、生命周期流或生态协议时，应增设真实语义模型，不能靠返回一个
 固定整数宣称那项能力已覆盖。
+
+原生 Release 任务执行上述五条调用身份规则，以及 `short_circuit_scan`、`large_function`、
+`overloaded_iterator`、`overloaded_array_clone`、`dynamic_overload` 的两层组合，共 666 个输入，
+通过四种布局与 O0/O2 共八个配置。SDK 构建记录保留
+实际通过的 case/configuration 数和完整报告哈希。
+发布任务还执行 `for_collection_delimiters`、`bad_iteration_has_next_return`、
+`bad_iteration_next_args`、`str_array_iteration`、`owned_array_clone`、`nested_array_clone`、
+`bad_iterator_clone`、`bad_array_clone` 的 O0/O2 定向门，核对错误类别、正常输出与所用编译器身份。
+缺少 Clone 的 Vec 迭代在 HIR 实例化时报告 trait bound 错误，位置必须指向 for 的集合表达式。
+动态分发定向门覆盖同名重载、不同返回类型、泛型实现、拥有参数/返回值、基类提供的实现
+和与静态重载交错的调用；同样执行 O0/O2，并保存完整用例与配置集合。另以
+`dynamic_overload,operator_overload,overloaded_iterator` 生成 78 个输入，在独立静态库布局
+执行 O0/O2 × CGU 1/4，防止消费端将库的普通导出声明重新生成定义。
+这只是发布必跑子集；不能将其写成完整 25,440 个输入全部验收。

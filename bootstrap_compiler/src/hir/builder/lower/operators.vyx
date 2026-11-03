@@ -273,6 +273,28 @@ impl HirUnitBuilder {
         let op = self.unit.expr_op(expr_id);
         let lhs_type = self.unit.expr_type(self.unit.expr_lhs(expr_id));
         let rhs_type = self.unit.expr_type(self.unit.expr_rhs(expr_id));
+        // Operators must instantiate a lazy generic method just as an explicit
+        // member call does. MIR can only call bodies already materialized in
+        // HIR; looking up an operator there alone misses never-called methods.
+        if (self.type_id_kind_or_unknown(self.member_lookup_type_id(lhs_type)) == ty_CLASS()) {
+            let owner = self.member_lookup_type_name(lhs_type);
+            var method = sema_binop_operator_method_name(op);
+            if (method.len > 0 && owner.len > 0
+                && policy_primitive_type_kind(owner) == 0
+                && !self.type_text_has_open_template_atom(owner)) {
+                var target = self.concrete_operator_method_target(expr_id, owner, method);
+                if (target == hir_id_invalid() && op == tk_NEQ()) {
+                    method = "operator==";
+                    target = self.concrete_operator_method_target(expr_id, owner, method);
+                }
+                if (target != hir_id_invalid()) {
+                    self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), target);
+                    let result = self.unit.function_return_type(target);
+                    if (self.type_id_is_valid(result)) { self.set_expr_type_canonical(expr_id, result); }
+                    return;
+                }
+            }
+        }
         let bintype_trace = hir_builder_env_enabled("VYX_TRACE_BINTYPE");
         if (bintype_trace) {
             print("[bintype] expr=" + policy_i64_to_string(expr_id as i64)
@@ -491,7 +513,7 @@ impl HirUnitBuilder {
         return self.build_expr(call);
     }
 
-    fn concrete_assignment_method_target(self,
+    fn concrete_operator_method_target(self,
                                                 assign_expr_id: i32,
                                                 owner_type_text: string,
                                                 method_name: string) -> i32 {
@@ -503,7 +525,21 @@ impl HirUnitBuilder {
             method_decl = self.raw_template_method_decl_for_type_text(owner_type_text, method_name, false);
         }
         if (method_decl == null) { return hir_id_invalid(); }
-        // Assignment children have already been inferred.  Resolve the
+        // Owner/name alone cannot identify an operator overload or a method
+        // template instance. Score overloads against the closed RHS, then let
+        // normal method instantiation key its cache by all generic arguments.
+        if (self.raw_method_overload_count_for_type_text(owner_type_text, method_name, false) > 1) {
+            method_decl = self.raw_method_decl_for_call_on_class_tree(
+                self.raw_class_decl_for_type_text(owner_type_text), method_name, false,
+                null, assign_expr_id, owner_type_text, 0);
+            if (method_decl == null) {
+                diag_emit_at(diag_sev_ERROR(), diag_code_sema_no_overload(),
+                    self.unit.expr_loc_ptr(assign_expr_id),
+                    "cannot select a unique matching overload for `" + method_name + "`");
+                return hir_id_invalid();
+            }
+        }
+        // Operator children have already been inferred. Resolve the
         // generic method from their HIR types so overload closure never
         // depends on the raw AST TypeRef carried by a temporary synthetic
         // call node.
@@ -535,7 +571,7 @@ impl HirUnitBuilder {
             method_name = self.assign_method_name_for_op(self.unit.expr_op(expr_id));
         }
         if (method_name.len == 0) { return; }
-        let target_fn = self.concrete_assignment_method_target(expr_id, lhs_text, method_name);
+        let target_fn = self.concrete_operator_method_target(expr_id, lhs_text, method_name);
         if (target_fn == hir_id_invalid()) { return; }
         self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), target_fn);
         let ret_type = self.unit.function_return_type(target_fn);
@@ -546,14 +582,55 @@ impl HirUnitBuilder {
 
     fn resolve_unary_expr_type_after_child(self, expr_id: i32) {
         if (expr_id == hir_id_invalid()) { return; }
+        let lhs_type = self.unit.expr_type(self.unit.expr_lhs(expr_id));
+        if (self.type_id_kind_or_unknown(self.member_lookup_type_id(lhs_type)) == ty_CLASS()) {
+            let owner = self.member_lookup_type_name(lhs_type);
+            var method = "";
+            let op = self.unit.expr_op(expr_id);
+            if (op == tk_MINUS()) { method = "operator_neg"; }
+            else if (op == tk_NOT()) { method = "operator_not"; }
+            else if (op == tk_TILDE()) { method = "operator_bnot"; }
+            if (method.len > 0 && policy_primitive_type_kind(owner) == 0
+                && !self.type_text_has_open_template_atom(owner)) {
+                let target = self.concrete_operator_method_target(expr_id, owner, method);
+                if (target != hir_id_invalid()) {
+                    self.unit.set_expr_semantic(expr_id, expr_sem_METHOD(), hir_target_function(), target);
+                    self.set_expr_type_canonical(expr_id, self.unit.function_return_type(target));
+                    return;
+                }
+            }
+        }
         if (self.unit.expr_op(expr_id) == tk_NOT()) {
             self.set_expr_type_if_empty(expr_id, self.builtin_bool_type_id());
             return;
         }
-        let lhs_type = self.unit.expr_type(self.unit.expr_lhs(expr_id));
         if (self.type_id_is_valid(lhs_type)) {
             self.set_expr_type_if_empty(expr_id, lhs_type);
         }
+    }
+
+    fn resolve_array_literal_type_after_children(self, expr_id: i32) {
+        let existing = self.unit.expr_type(expr_id);
+        if (self.type_id_kind_or_unknown(existing) == ty_ARRAY()) { return; }
+        let first = self.unit.expr_first_arg(expr_id);
+        if (first == hir_id_invalid()) { return; }
+        let element = self.unit.expr_type(first);
+        if (!self.type_id_is_valid(element)) { return; }
+        var count: i64 = 0;
+        var argument = first;
+        while (argument != hir_id_invalid()) {
+            if (self.unit.expr_type(argument) != element) { return; }
+            count += 1;
+            argument = self.unit.expr_next_arg(argument);
+        }
+        let repeat = self.unit.expr_aux(expr_id);
+        if (repeat != hir_id_invalid()) {
+            if (self.unit.expr_kind(repeat) != ex_INT_LIT()) { return; }
+            count = self.unit.expr_int_value(repeat);
+            if (count < 0) { return; }
+        }
+        let text = "[" + hir_type_table_text(self.unit.types, element) + ";" + policy_i64_to_string(count) + "]";
+        self.unit.set_expr_type(expr_id, self.unit.types.intern(ty_ARRAY(), text, element, 0));
     }
 
     fn resolve_single_child_expr_type_after_child(self, expr_id: i32) {
@@ -625,18 +702,7 @@ impl HirUnitBuilder {
     }
 
     fn concrete_index_method_target(self, index_expr_id: i32, owner_type_text: string) -> i32 {
-        if (index_expr_id == hir_id_invalid() || owner_type_text.len == 0) { return hir_id_invalid(); }
-        var method_decl = self.raw_method_decl_for_type_text(owner_type_text, "operator[]");
-        if (method_decl == null) {
-            method_decl = self.raw_template_method_decl_for_type_text(owner_type_text, "operator[]", false);
-        }
-        if (method_decl == null) { return hir_id_invalid(); }
-        return self.ensure_method_instance_for_call(owner_type_text,
-                                                    "operator[]",
-                                                    null,
-                                                    index_expr_id,
-                                                    method_decl,
-                                                    false);
+        return self.concrete_operator_method_target(index_expr_id, owner_type_text, "operator[]");
     }
 
     fn resolve_index_expr_type_after_children(self, source_index: rawptr, expr_id: i32) {
@@ -644,7 +710,16 @@ impl HirUnitBuilder {
         let lhs_type = self.unit.expr_type(self.unit.expr_lhs(expr_id));
         if (!self.type_id_is_valid(lhs_type)) { return; }
         let lhs_kind = hir_type_table_kind(self.unit.types, lhs_type);
-        if (lhs_kind == ty_REF() || lhs_kind == ty_MUTREF() || lhs_kind == ty_PTR()) {
+        if (lhs_kind == ty_PTR()) {
+            // *T indexes storage containing T. It never invokes an operator
+            // belonging to T itself. This decision must precede reference
+            // receiver lookup, including in materialized generic bodies.
+            let element = hir_type_table_elem(self.unit.types, lhs_type);
+            if (self.type_id_is_valid(element)) { self.unit.set_expr_type(expr_id, element); }
+            self.unit.set_expr_semantic(expr_id, expr_sem_NONE(), hir_target_none(), hir_id_invalid());
+            return;
+        }
+        if (lhs_kind == ty_REF() || lhs_kind == ty_MUTREF()) {
             let pointee = hir_type_table_elem(self.unit.types, lhs_type);
             if (self.type_id_is_valid(pointee)) {
                 var indexed_type = pointee;

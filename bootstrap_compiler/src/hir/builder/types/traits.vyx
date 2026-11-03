@@ -150,6 +150,7 @@ impl HirUnitBuilder {
 
     fn type_text_satisfies_dyn_trait(self, actual_type: string, trait_name: string) -> bool {
         if (actual_type.len == 0 || trait_name.len == 0) { return false; }
+        actual_type = hir_builder_peel_handle_type_text(actual_type);
         let cached = hir_pair_id_map_get(self.dyn_trait_satisfaction_cache,actual_type, trait_name);
         if (cached == 2) { return true; }
         if (cached == 1) { return false; }
@@ -224,7 +225,7 @@ impl HirUnitBuilder {
         return iface_base;
     }
 
-    fn dyn_interface_method_target_for_callee_member(self, callee_expr_id: i32) -> i32 {
+    fn dyn_interface_method_target_for_callee_member(self, call_expr: rawptr, call_expr_id: i32, callee_expr_id: i32) -> i32 {
         if (callee_expr_id == hir_id_invalid()) { return hir_id_invalid(); }
         if (self.unit.expr_kind(callee_expr_id) != ex_MEMBER()) { return hir_id_invalid(); }
         let owner_expr_id = self.unit.expr_lhs(callee_expr_id);
@@ -235,7 +236,93 @@ impl HirUnitBuilder {
         let dyn_iface_name = self.dyn_interface_name_from_type_text(owner_type_name);
         if (dyn_iface_name.len == 0) { return hir_id_invalid(); }
         let member_name = policy_versioned_generic_call_base(self.unit.expr_name(callee_expr_id).clone());
-        return self.method_function_target_by_owner_type_and_method(dyn_iface_name, member_name);
+        let declaration = self.raw_interface_method_decl_for_call(
+            self.raw_interface_decl_for_trait_name(dyn_iface_name), member_name,
+            call_expr, call_expr_id, dyn_iface_name, 0);
+        if (declaration == null) { return hir_id_invalid(); }
+        let direct = hir_pointer_map_function(self.decl_map, declaration);
+        if (direct != hir_id_invalid() && !self.function_has_open_template_types(direct)) { return direct; }
+        return self.ensure_method_instance_for_call(dyn_iface_name, member_name, call_expr,
+            call_expr_id, declaration, false);
+    }
+
+    fn dyn_impl_decl_matches_prototype(self, actual_type: string, declaration: rawptr, prototype: i32) -> bool {
+        if (declaration == null || decl_get_is_static(declaration)) { return false; }
+        let owner = self.method_owner_decl_for_type_text(declaration, actual_type,
+            self.raw_class_decl_for_type_text(actual_type));
+        if (owner == null) { return false; }
+        var params = hir_builder_decl_template_params(owner);
+        var args = hir_builder_owner_args_for_params(params, actual_type);
+        params = hir_builder_append_csv(params, "Self");
+        args = hir_builder_append_csv(args, actual_type);
+        let result = self.type_id_from_ref_env(decl_get_ty(declaration), params, args);
+        if (result != self.unit.function_return_type(prototype)) { return false; }
+        var parameter = decl_get_params(declaration);
+        if (parameter != null && decl_get_name(parameter) == "self") { parameter = decl_get_next(parameter); }
+        var local = self.unit.function_first_local(prototype);
+        if (local != hir_id_invalid() && self.unit.local_name(local) == "self") { local = self.unit.local_next(local); }
+        while (parameter != null && local != hir_id_invalid()) {
+            if ((self.unit.local_flags(local) & hir_local_flag_param()) == 0) { break; }
+            if (hir_builder_variadic_param(parameter)
+                || self.type_id_from_ref_env(decl_get_ty(parameter), params, args) != self.unit.local_type(local)) { return false; }
+            parameter = decl_get_next(parameter);
+            local = self.unit.local_next(local);
+        }
+        return parameter == null && (local == hir_id_invalid()
+            || (self.unit.local_flags(local) & hir_local_flag_param()) == 0);
+    }
+
+    fn dyn_impl_decl_in_tree(self, owner: rawptr, actual_type: string, prototype: i32, depth: i32) -> rawptr {
+        if (owner == null || depth > 32) { return null; }
+        let prototype_decl = hir_pointer_map_raw_for_function(self.decl_map, prototype);
+        var selected: rawptr = null;
+        var member = decl_get_members(owner);
+        while (member != null) {
+            if (decl_get_kind(member) == de_METHOD()
+                && decl_get_name(member) == decl_get_name(prototype_decl)
+                && self.dyn_impl_decl_matches_prototype(actual_type, member, prototype)) {
+                if (selected != null && selected != member) {
+                    diag_emit_at(diag_sev_ERROR(), diag_code_sema_no_overload(), decl_loc_ptr(prototype_decl),
+                        "ambiguous implementation of dynamic interface method `" + decl_get_name(prototype_decl) + "`");
+                    return null;
+                }
+                selected = member;
+            }
+            member = decl_get_next(member);
+        }
+        if (selected != null) { return selected; }
+        var index: i32 = 0;
+        while (index < 16) {
+            let parent = self.class_nth_layout_parent(owner, index);
+            if (parent == null) { break; }
+            let inherited = self.dyn_impl_decl_in_tree(parent, actual_type, prototype, depth + 1);
+            if (inherited != null) {
+                if (selected != null && selected != inherited) {
+                    diag_emit_at(diag_sev_ERROR(), diag_code_sema_no_overload(), decl_loc_ptr(prototype_decl),
+                        "ambiguous inherited implementation of dynamic interface method `" + decl_get_name(prototype_decl) + "`");
+                    return null;
+                }
+                selected = inherited;
+            }
+            index += 1;
+        }
+        return selected;
+    }
+
+    fn ensure_dyn_implementation_for_prototype(self, actual_type: string, prototype: i32) -> i32 {
+        let prototype_decl = hir_pointer_map_raw_for_function(self.decl_map, prototype);
+        if (prototype_decl == null) { return hir_id_invalid(); }
+        self.ensure_concrete_type_text_ready(actual_type);
+        var owner = self.raw_class_decl_for_type_text(actual_type);
+        if (owner == null) { owner = self.raw_template_class_decl_for_type_text(actual_type); }
+        var declaration = self.dyn_impl_decl_in_tree(owner, actual_type, prototype, 0);
+        if (declaration == null) {
+            let inherited_default = self.raw_method_decl_for_type_text(actual_type, decl_get_name(prototype_decl));
+            if (self.dyn_impl_decl_matches_prototype(actual_type, inherited_default, prototype)) { declaration = inherited_default; }
+        }
+        if (declaration == null) { return hir_id_invalid(); }
+        return self.ensure_method_instance_for_call(actual_type, decl_get_name(prototype_decl),
+            null, hir_id_invalid(), declaration, false);
     }
 
     fn materialize_dyn_trait_impl_methods_on_trait(self,
@@ -251,7 +338,8 @@ impl HirUnitBuilder {
                 var method_start: i64 = 0;
                 let method_timing = hir_builder_env_enabled("VYX_HIR_DYN_MATERIALIZE_TIMING");
                 if (method_timing) { method_start = vyx_bootstrap_now_ms(); }
-                self.ensure_method_instance_for_type_text(actual_type_name, decl_get_name(member));
+                let prototype = hir_pointer_map_function(self.decl_map, member);
+                if (prototype != hir_id_invalid()) { self.ensure_dyn_implementation_for_prototype(actual_type_name, prototype); }
                 if (method_timing) {
                     let method_elapsed = vyx_bootstrap_now_ms() - method_start;
                     if (method_elapsed >= hir_builder_slow_expr_threshold_ms()) {

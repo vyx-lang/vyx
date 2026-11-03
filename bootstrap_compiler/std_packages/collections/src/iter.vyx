@@ -1,10 +1,12 @@
 module std.collections;
 
 use std.core;
+use std.clone;
+use std.hash;
 
 /// Vyx Standard Library — Iterator<T>
 ///
-/// Lazy iterator over a contiguous T-typed buffer with map/filter/take/collect.
+/// Cursor over a contiguous T-typed buffer; map/filter/take/skip are eager adapters.
 /// Element layout honors `sizeof::<T>()`, so Iterator<i32> / Iterator<string> /
 /// Iterator<SomeStruct> all work without hard-coded byte widths.
 ///
@@ -12,8 +14,7 @@ use std.core;
 /// `map`/`filter`/`for_each` take real function values (`fn(T) -> U`, ...) so
 /// the compiler can inline them and sema can type-check them.
 ///
-/// min()/max() work for any T that supports `<` / `>` (primitives: i8/i16/i32/i64/f32/f64).
-/// For struct/class T, call `.map(to_key)` to project to a comparable scalar first.
+/// min()/max() require Ord + Clone and return an independent selected value.
 ///
 /// Trait protocol (Phase 7): `trait Iter<T>` below formalises pull-style
 /// iteration — one method, `next() -> Option<T>`, which yields the next
@@ -27,8 +28,8 @@ use std.core;
 /// single name.  Relation summary:
 ///
 ///   * `trait Iter<T>`      — the *protocol*: anything with `next() -> Option<T>`.
-///   * `class Iterator<T>`  — the canonical stdlib *impl*: owns a
-///                            contiguous T-typed buffer, carries
+///   * `class Iterator<T>`  — the canonical stdlib *impl*: borrows a range or owns an adapter
+///                            buffer, carries
 ///                            map/filter/take/collect/etc.  Declares
 ///                            `: Iter<T>` conformance below.
 ///   * `trait Iterable`     — a *separate* concept (see collections.vyx):
@@ -63,187 +64,181 @@ class Iterator<T> : Iter<T> {
     public data: rawptr;
     public len: i64;
     public pos: i64;
-    // Iterator-invalidation guard. When non-null, `source_gen` points to
-    // the source container's generation counter (e.g. `&Vec<T>.gen`), and
-    // `gen_snapshot` is the value sampled at iter-creation time. If the
-    // source's counter has changed by the time `.next()` is called, the
-    // container was mutated (push/pop/insert/remove/clear/realloc-grow)
-    // and the cached `data` pointer is potentially dangling — we panic
-    // instead of silently reading corrupted memory.
-    //
-    // Iterators built via `Iterator.from_raw()` (no source) leave these
-    // zeroed, skipping the check.
     public source_gen: rawptr;
     public gen_snapshot: i64;
+    // Container iterators borrow storage. Eager adapters own independent
+    // cloned/mapped slots and must release both elements and storage.
+    public owns_data: bool;
 
+    /// The caller keeps this range alive and unchanged until the iterator dies.
     public static fn from_raw(data: rawptr, len: i64) -> Iterator<T> {
-        return Iterator::<T> { data: data, len: len, pos: 0, source_gen: null, gen_snapshot: 0 };
+        if (len < 0 || (len > 0 && data == null)) { panic("Iterator: invalid raw range"); }
+        return Iterator::<T> { data: data, len: len, pos: 0, source_gen: null, gen_snapshot: 0, owns_data: false };
     }
 
-    public fn has_next() -> bool {
-        return self.pos < self.len;
-    }
-
-    public fn reset() {
-        self.pos = 0;
+    static fn from_owned_vector(values: Vec<T>) -> Iterator<T> {
+        let data = values.data;
+        let len = values.len;
+        values.data = null; values.len = 0; values.cap = 0;
+        return Iterator::<T> { data: data, len: len, pos: 0, source_gen: null, gen_snapshot: 0, owns_data: true };
     }
 
     fn _check_invalidation() {
         if (self.source_gen == null) { return; }
-        var cur: i64 = 0;
-        memcpy(to_rawptr(&cur), self.source_gen, 8);
-        if (cur != self.gen_snapshot) {
+        var current: i64 = 0;
+        memcpy(to_rawptr(&current), self.source_gen, 8);
+        if (current != self.gen_snapshot) {
             panic("Iterator invalidated: source container was modified during iteration");
         }
     }
 
+    public fn has_next() -> bool { self._check_invalidation(); return self.pos < self.len; }
+    public fn reset() { self._check_invalidation(); self.pos = 0; }
+
     @[lazy]
-    public fn next() -> Option<T> {
+    public fn next() -> Option<T> where T: Clone {
         self._check_invalidation();
         if (self.pos >= self.len) { return None; }
         let slot = (self.data + self.pos * sizeof::<T>()) as *T;
-        let out = (*slot).clone();
-        self.pos = self.pos + 1;
-        return Some(out);
+        let value = (*slot).clone();
+        self.pos += 1;
+        return Some(value);
     }
 
     public fn count() -> i64 {
+        self._check_invalidation();
         let remaining = self.len - self.pos;
         self.pos = self.len;
         return remaining;
     }
 
-    public fn sum() -> i64 {
+    /// Compatibility i64 reduction, with numeric conversion per element.
+    @[lazy]
+    public fn sum() -> i64 where T: Copy {
+        self._check_invalidation();
         var total: i64 = 0;
-        let es = sizeof::<T>();
         while (self.pos < self.len) {
-            let slot = self.data + self.pos * es;
-            var val: i64 = 0;
-            memcpy(to_rawptr(&val), slot, es);
-            total = total + val;
-            self.pos = self.pos + 1;
+            let slot = (self.data + self.pos * sizeof::<T>()) as *T;
+            total += (*slot) as i64;
+            self.pos += 1;
         }
         return total;
     }
 
-    public fn for_each(f: fn(T) -> void) {
-        let es = sizeof::<T>();
+    @[lazy]
+    public fn for_each(f: fn(T) -> void) where T: Clone {
+        self._check_invalidation();
         while (self.pos < self.len) {
-            let slot = self.data + self.pos * es;
-            var val: T;
-            memcpy(to_rawptr(&val), slot, es);
-            f(val);
-            self.pos = self.pos + 1;
+            let slot = (self.data + self.pos * sizeof::<T>()) as *T;
+            self.pos += 1;
+            f((*slot).clone());
+            self._check_invalidation();
         }
     }
 
-    public fn map<U>(f: fn(T) -> U) -> Iterator<U> {
-        let remaining = self.len - self.pos;
-        let ts = sizeof::<T>();
-        let us = sizeof::<U>();
-        let new_data = malloc(remaining * us);
-        var i: i64 = 0;
-        while (i < remaining) {
-            let slot = self.data + (self.pos + i) * ts;
-            var val: T;
-            memcpy(to_rawptr(&val), slot, ts);
-            var mapped: U = f(val);
-            memcpy(new_data + i * us, to_rawptr(&mapped), us);
-            i = i + 1;
+    /// Eager: consumes the remaining cursor, not the source container.
+    @[lazy]
+    public fn map<U>(f: fn(T) -> U) -> Iterator<U> where T: Clone {
+        self._check_invalidation();
+        var output = Vec::<U>.with_capacity(self.len - self.pos);
+        while (self.pos < self.len) {
+            let slot = (self.data + self.pos * sizeof::<T>()) as *T;
+            self.pos += 1;
+            output.push(f((*slot).clone()));
+            self._check_invalidation();
         }
-        return Iterator::<U>.from_raw(new_data, remaining);
+        return Iterator::<U>.from_owned_vector(output);
     }
 
-    public fn filter(f: fn(T) -> bool) -> Iterator<T> {
-        let remaining = self.len - self.pos;
-        let es = sizeof::<T>();
-        let new_data = malloc(remaining * es);
-        var new_len: i64 = 0;
+    /// The predicate receives an independent value. Kept values are cloned
+    /// from the source after it returns, so consuming its argument is safe.
+    @[lazy]
+    public fn filter(f: fn(T) -> bool) -> Iterator<T> where T: Clone {
+        self._check_invalidation();
+        var output = Vec::<T>.with_capacity(self.len - self.pos);
+        while (self.pos < self.len) {
+            let index = self.pos;
+            let slot = (self.data + index * sizeof::<T>()) as *T;
+            self.pos += 1;
+            let keep = f((*slot).clone());
+            self._check_invalidation();
+            if (keep) { output.push((*slot).clone()); }
+        }
+        return Iterator::<T>.from_owned_vector(output);
+    }
+
+    @[lazy]
+    public fn take(n: i64) -> Iterator<T> where T: Clone {
+        self._check_invalidation();
+        var count = n;
+        if (count < 0) { count = 0; }
+        if (count > self.len - self.pos) { count = self.len - self.pos; }
+        var output = Vec::<T>.with_capacity(count);
         var i: i64 = 0;
-        while (i < remaining) {
-            let slot = self.data + (self.pos + i) * es;
-            var val: T;
-            memcpy(to_rawptr(&val), slot, es);
-            if (f(val)) {
-                memcpy(new_data + new_len * es, to_rawptr(&val), es);
-                new_len = new_len + 1;
+        while (i < count) {
+            let slot = (self.data + self.pos * sizeof::<T>()) as *T;
+            output.push((*slot).clone());
+            self.pos += 1; i += 1;
+        }
+        return Iterator::<T>.from_owned_vector(output);
+    }
+
+    /// Skip n and return an independent iterator over the rest; exhausts self.
+    @[lazy]
+    public fn skip(n: i64) -> Iterator<T> where T: Clone {
+        self._check_invalidation();
+        var count = n;
+        if (count < 0) { count = 0; }
+        if (count > self.len - self.pos) { count = self.len - self.pos; }
+        self.pos += count;
+        return self.take(self.len - self.pos);
+    }
+
+    @[lazy]
+    public fn collect() -> Vec<T> where T: Clone {
+        self._check_invalidation();
+        var output = Vec::<T>.with_capacity(self.len - self.pos);
+        while (self.pos < self.len) {
+            let slot = (self.data + self.pos * sizeof::<T>()) as *T;
+            output.push((*slot).clone());
+            self.pos += 1;
+        }
+        return output;
+    }
+
+    @[lazy]
+    fn _extreme(maximum: bool) -> Option<T> where T: Ord + Clone {
+        self._check_invalidation();
+        if (self.pos >= self.len) { return None; }
+        var best = self.pos;
+        self.pos += 1;
+        while (self.pos < self.len) {
+            let candidate = (self.data + self.pos * sizeof::<T>()) as *T;
+            let current = (self.data + best * sizeof::<T>()) as *T;
+            let ordering = (*candidate).compare(*current);
+            if ((maximum && ordering > 0) || (!maximum && ordering < 0)) { best = self.pos; }
+            self.pos += 1;
+        }
+        let slot = (self.data + best * sizeof::<T>()) as *T;
+        return Some((*slot).clone());
+    }
+
+    @[lazy]
+    public fn min() -> Option<T> where T: Ord + Clone { return self._extreme(false); }
+    @[lazy]
+    public fn max() -> Option<T> where T: Ord + Clone { return self._extreme(true); }
+
+    public fn drop() {
+        if (self.owns_data) {
+            self.owns_data = false;
+            var i: i64 = 0;
+            while (i < self.len) {
+                vec_drop_stored_value::<T>((self.data + i * sizeof::<T>()) as *T);
+                i += 1;
             }
-            i = i + 1;
+            free(self.data);
         }
-        self.pos = self.len;
-        return Iterator::<T> { data: new_data, len: new_len, pos: 0, source_gen: null, gen_snapshot: 0 };
-    }
-
-    public fn take(n: i64) -> Iterator<T> {
-        let es = sizeof::<T>();
-        var take_n = n;
-        let available = self.len - self.pos;
-        if (take_n < 0) { take_n = 0; }
-        if (take_n > available) { take_n = available; }
-        let new_data = malloc(take_n * es);
-        if (take_n > 0) {
-            memcpy(new_data, self.data + self.pos * es, take_n * es);
-        }
-        self.pos = self.pos + take_n;
-        return Iterator::<T> { data: new_data, len: take_n, pos: 0, source_gen: null, gen_snapshot: 0 };
-    }
-
-    public fn skip(n: i64) -> Iterator<T> {
-        var skip_n = n;
-        if (skip_n < 0) { skip_n = 0; }
-        self.pos = self.pos + skip_n;
-        if (self.pos > self.len) { self.pos = self.len; }
-        let remaining = self.len - self.pos;
-        let es = sizeof::<T>();
-        let new_data = malloc(remaining * es);
-        if (remaining > 0) {
-            memcpy(new_data, self.data + self.pos * es, remaining * es);
-        }
-        self.pos = self.len;
-        return Iterator::<T> { data: new_data, len: remaining, pos: 0, source_gen: null, gen_snapshot: 0 };
-    }
-
-    public fn collect() -> Vec<T> {
-        var out = Vec::<T>.new();
-        let es = sizeof::<T>();
-        while (self.pos < self.len) {
-            let slot = self.data + self.pos * es;
-            var val: T;
-            memcpy(to_rawptr(&val), slot, es);
-            out.push(val);
-            self.pos = self.pos + 1;
-        }
-        return out;
-    }
-
-    public fn min() -> Option<T> {
-        if (self.pos >= self.len) { return None; }
-        let es = sizeof::<T>();
-        var best: T;
-        memcpy(to_rawptr(&best), self.data + self.pos * es, es);
-        self.pos = self.pos + 1;
-        while (self.pos < self.len) {
-            var val: T;
-            memcpy(to_rawptr(&val), self.data + self.pos * es, es);
-            if (val < best) { best = val; }
-            self.pos = self.pos + 1;
-        }
-        return Some(best);
-    }
-
-    public fn max() -> Option<T> {
-        if (self.pos >= self.len) { return None; }
-        let es = sizeof::<T>();
-        var best: T;
-        memcpy(to_rawptr(&best), self.data + self.pos * es, es);
-        self.pos = self.pos + 1;
-        while (self.pos < self.len) {
-            var val: T;
-            memcpy(to_rawptr(&val), self.data + self.pos * es, es);
-            if (val > best) { best = val; }
-            self.pos = self.pos + 1;
-        }
-        return Some(best);
+        self.data = null; self.len = 0; self.pos = 0; self.source_gen = null;
     }
 }
 
@@ -287,7 +282,7 @@ class Iterator<T> : Iter<T> {
 /// `f`, returns the final accumulator.  Consumes the iterator.
 public fn fold<T, I, Acc>(it: I, init: Acc, f: fn(Acc, T) -> Acc) -> Acc where I: Iter<T> {
     var acc = init;
-    var cur = it.next();
+    var cur: Option<T> = it.next();
     while (cur.isSome()) {
         acc = f(acc, cur.unwrap());
         cur = it.next();
@@ -299,10 +294,10 @@ public fn fold<T, I, Acc>(it: I, init: Acc, f: fn(Acc, T) -> Acc) -> Acc where I
 /// `Some(acc)` otherwise where `acc = f(f(f(e0, e1), e2), ...)`.  Consumes
 /// the iterator.
 public fn reduce<T, I>(it: I, f: fn(T, T) -> T) -> Option<T> where I: Iter<T> {
-    let first = it.next();
+    let first: Option<T> = it.next();
     if (first.isNone()) { return None; }
     var acc = first.unwrap();
-    var cur = it.next();
+    var cur: Option<T> = it.next();
     while (cur.isSome()) {
         acc = f(acc, cur.unwrap());
         cur = it.next();
@@ -317,7 +312,7 @@ public fn reduce<T, I>(it: I, f: fn(T, T) -> T) -> Option<T> where I: Iter<T> {
 /// dispatcher would have no signal to pick between them).
 public fn count_iter<T, I>(it: I) -> i64 where I: Iter<T> {
     var n: i64 = 0;
-    var cur = it.next();
+    var cur: Option<T> = it.next();
     while (cur.isSome()) { n = n + 1; cur = it.next(); }
     return n;
 }
@@ -325,7 +320,7 @@ public fn count_iter<T, I>(it: I) -> i64 where I: Iter<T> {
 /// Short-circuiting disjunction: `true` iff `pred(e)` is `true` for any
 /// element.  Stops at the first `true`.
 public fn any<T, I>(it: I, pred: fn(T) -> bool) -> bool where I: Iter<T> {
-    var cur = it.next();
+    var cur: Option<T> = it.next();
     while (cur.isSome()) {
         if (pred(cur.unwrap())) { return true; }
         cur = it.next();
@@ -337,7 +332,7 @@ public fn any<T, I>(it: I, pred: fn(T) -> bool) -> bool where I: Iter<T> {
 /// element.  Stops at the first `false`.  Returns `true` on an empty
 /// iterator (vacuous truth, matching Rust's `Iterator::all`).
 public fn all<T, I>(it: I, pred: fn(T) -> bool) -> bool where I: Iter<T> {
-    var cur = it.next();
+    var cur: Option<T> = it.next();
     while (cur.isSome()) {
         if (!pred(cur.unwrap())) { return false; }
         cur = it.next();

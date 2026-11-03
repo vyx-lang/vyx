@@ -504,6 +504,8 @@ VYX_API void* vyx_rt_build_fcmp(void* h, int32_t pred,
                                 const char* name, uint64_t len);
 VYX_API void* vyx_rt_build_fp_to_si(void* h, void* val, void* dst_ty, const char* name, uint64_t len);
 VYX_API void* vyx_rt_build_si_to_fp(void* h, void* val, void* dst_ty, const char* name, uint64_t len);
+VYX_API void* vyx_rt_build_ui_to_fp(void* h, void* val, void* dst_ty, const char* name, uint64_t len);
+VYX_API void* vyx_rt_build_fp_to_ui(void* h, void* val, void* dst_ty, const char* name, uint64_t len);
 VYX_API void* vyx_rt_build_fp_ext(void* h, void* val, void* dst_ty, const char* name, uint64_t len);
 VYX_API void* vyx_rt_build_fp_trunc(void* h, void* val, void* dst_ty, const char* name, uint64_t len);
 

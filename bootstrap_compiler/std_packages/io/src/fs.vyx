@@ -2,6 +2,7 @@ module std.fs;
 
 use std.string;
 use std.collections;
+use std.core;
 
 /// std/fs.vyx — File System Module
 /// High-level file I/O built on C stdio
@@ -14,8 +15,8 @@ extern "C" {
     fn fgetc(fp: rawptr) -> i32;
     fn fputc(c: i32, fp: rawptr) -> i32;
     fn feof(fp: rawptr) -> i32;
-    fn fseek(fp: rawptr, offset: i64, whence: i32) -> i32;
-    fn ftell(fp: rawptr) -> i64;
+    fn ferror(fp: rawptr) -> i32;
+    fn fflush(fp: rawptr) -> i32;
     fn remove(filename: rawptr) -> i32;
     fn rename(oldname: rawptr, newname: rawptr) -> i32;
     fn calloc(count: i64, size: i64) -> rawptr;
@@ -25,14 +26,27 @@ extern "C" {
 
 @[platform("windows")]
 extern "C" {
-    fn FindFirstFileA(pattern: rawptr, data: rawptr) -> rawptr;
-    fn FindNextFileA(handle: rawptr, data: rawptr) -> i32;
+    fn _fseeki64(fp: rawptr, offset: i64, whence: i32) -> i32;
+    fn _ftelli64(fp: rawptr) -> i64;
+    fn _wmkdir(path: rawptr) -> i32;
+    fn _wrmdir(path: rawptr) -> i32;
+    fn _wfopen(path: rawptr, mode: rawptr) -> rawptr;
+    fn _wremove(path: rawptr) -> i32;
+    fn _wrename(oldpath: rawptr, newpath: rawptr) -> i32;
+    fn MultiByteToWideChar(page: u32, flags: u32, input: rawptr, len: i32, output: rawptr, count: i32) -> i32;
+    fn WideCharToMultiByte(page: u32, flags: u32, input: rawptr, len: i32, output: rawptr, count: i32, replacement: rawptr, used: rawptr) -> i32;
+    fn FindFirstFileW(pattern: rawptr, data: rawptr) -> rawptr;
+    fn FindNextFileW(handle: rawptr, data: rawptr) -> i32;
     fn FindClose(handle: rawptr) -> i32;
-    fn GetFileAttributesA(path: rawptr) -> u32;
+    fn GetFileAttributesW(path: rawptr) -> u32;
 }
 
 @[platform("posix")]
 extern "C" {
+    fn fseeko(fp: rawptr, offset: i64, whence: i32) -> i32;
+    fn ftello(fp: rawptr) -> i64;
+    fn mkdir(path: rawptr, mode: u32) -> i32;
+    fn rmdir(path: rawptr) -> i32;
     fn opendir(name: rawptr) -> rawptr;
     fn closedir(dirp: rawptr) -> i32;
     fn vyx_posix_directory_open(name: rawptr) -> rawptr;
@@ -40,10 +54,24 @@ extern "C" {
     fn vyx_posix_directory_close(dirp: rawptr) -> i32;
 }
 
-error FSError { FileNotFound, PermissionDenied, IOError }
+error FSError { FileNotFound, PermissionDenied, IOError, InvalidInput, AllocationFailed }
+
+@[platform("windows")]
+fn fs_seek(fp: rawptr, offset: i64, whence: i32) -> i32 { return _fseeki64(fp, offset, whence); }
+@[platform("posix")]
+fn fs_seek(fp: rawptr, offset: i64, whence: i32) -> i32 { return fseeko(fp, offset, whence); }
+@[platform("windows")]
+fn fs_tell(fp: rawptr) -> i64 { return _ftelli64(fp); }
+@[platform("posix")]
+fn fs_tell(fp: rawptr) -> i64 { return ftello(fp); }
 
 fn fs_c_path(path: string) -> rawptr {
     if (path.len < 0) { return null; }
+    var i: i64 = 0;
+    while (i < path.len) {
+        if (path.charAt(i) == 0) { return null; }
+        i += 1;
+    }
     let buf = calloc(path.len + 1, 1);
     if (buf == null) { return null; }
     if (path.len > 0) {
@@ -51,6 +79,34 @@ fn fs_c_path(path: string) -> rawptr {
     }
     return buf;
 }
+
+@[platform("windows")]
+fn fs_wide_path(path: rawptr) -> rawptr {
+    if (path == null) { return null; }
+    let length = MultiByteToWideChar(65001 as u32, 8 as u32, path, -1, null, 0);
+    if (length <= 0) { return null; }
+    let output = calloc(length as i64, 2);
+    if (output == null) { return null; }
+    if (MultiByteToWideChar(65001 as u32, 8 as u32, path, -1, output, length) != length) {
+        free(output);
+        return null;
+    }
+    return output;
+}
+
+@[platform("windows")]
+fn fs_open_cpath(path: rawptr, mode: rawptr) -> rawptr {
+    let wide_path = fs_wide_path(path);
+    let wide_mode = fs_wide_path(mode);
+    if (wide_path == null || wide_mode == null) {
+        free(wide_path); free(wide_mode); return null;
+    }
+    let file = _wfopen(wide_path, wide_mode);
+    free(wide_path); free(wide_mode);
+    return file;
+}
+@[platform("posix")]
+fn fs_open_cpath(path: rawptr, mode: rawptr) -> rawptr { return fopen(path, mode); }
 
 /// Open-time behavior for File. Set binary=true for protocol data such as DCI.
 public struct FileOptions {
@@ -67,6 +123,15 @@ public class File {
     private readable: bool;
     private writable: bool;
 
+    public static fn try_open(path: string, options: FileOptions) -> Result<File, FSError> {
+        if ((!options.read && !options.write) || ((options.create || options.truncate) && !options.write)) {
+            return Err(FSError.InvalidInput);
+        }
+        var result = File.open(path, options);
+        if (!result.is_open()) { return Err(FSError.IOError); }
+        return Ok(result);
+    }
+
     public static fn open(path: string, options: FileOptions) -> File {
         if (!options.read && !options.write) {
             return File { handle: null, readable: false, writable: false };
@@ -76,20 +141,20 @@ public class File {
         var handle: rawptr = null;
         if (options.read && options.write) {
             if (options.truncate) {
-                handle = if (options.binary) { fopen(cpath, "w+b".c_str()) } else { fopen(cpath, "w+".c_str()) };
+                handle = if (options.binary) { fs_open_cpath(cpath, "w+b".c_str()) } else { fs_open_cpath(cpath, "w+".c_str()) };
             } else {
-                handle = if (options.binary) { fopen(cpath, "r+b".c_str()) } else { fopen(cpath, "r+".c_str()) };
+                handle = if (options.binary) { fs_open_cpath(cpath, "r+b".c_str()) } else { fs_open_cpath(cpath, "r+".c_str()) };
             }
         } else if (options.write) {
             if (options.truncate) {
-                handle = if (options.binary) { fopen(cpath, "wb".c_str()) } else { fopen(cpath, "w".c_str()) };
+                handle = if (options.binary) { fs_open_cpath(cpath, "wb".c_str()) } else { fs_open_cpath(cpath, "w".c_str()) };
             } else if (options.create) {
-                handle = if (options.binary) { fopen(cpath, "ab".c_str()) } else { fopen(cpath, "a".c_str()) };
+                handle = if (options.binary) { fs_open_cpath(cpath, "ab".c_str()) } else { fs_open_cpath(cpath, "a".c_str()) };
             } else {
-                handle = if (options.binary) { fopen(cpath, "r+b".c_str()) } else { fopen(cpath, "r+".c_str()) };
+                handle = if (options.binary) { fs_open_cpath(cpath, "r+b".c_str()) } else { fs_open_cpath(cpath, "r+".c_str()) };
             }
         } else {
-            handle = if (options.binary) { fopen(cpath, "rb".c_str()) } else { fopen(cpath, "r".c_str()) };
+            handle = if (options.binary) { fs_open_cpath(cpath, "rb".c_str()) } else { fs_open_cpath(cpath, "r".c_str()) };
         }
         free(cpath);
         // r+ does not create files. Honor create without changing existing
@@ -97,7 +162,7 @@ public class File {
         if (handle == null && options.create && options.read && options.write && !options.truncate) {
             let create_path = fs_c_path(path);
             if (create_path != null) {
-                handle = if (options.binary) { fopen(create_path, "w+b".c_str()) } else { fopen(create_path, "w+".c_str()) };
+                handle = if (options.binary) { fs_open_cpath(create_path, "w+b".c_str()) } else { fs_open_cpath(create_path, "w+".c_str()) };
                 free(create_path);
             }
         }
@@ -106,33 +171,55 @@ public class File {
 
     public fn is_open() -> bool { return self.handle != null; }
 
+    /// Explicit result: an empty file is Ok(empty), never an I/O error.
+    public fn try_read_all_bytes() -> Result<Vec<u8>, FSError> {
+        if (self.handle == null || !self.readable) { return Err(FSError.InvalidInput); }
+        if (fs_seek(self.handle, 0, 2) != 0) { return Err(FSError.IOError); }
+        let size = fs_tell(self.handle);
+        if (size < 0 || fs_seek(self.handle, 0, 0) != 0) { return Err(FSError.IOError); }
+        var bytes = Vec::<u8>.with_capacity(size);
+        if (size > 0) {
+            let read = fread(bytes.data, 1, size, self.handle);
+            if (read != size || ferror(self.handle) != 0) { return Err(FSError.IOError); }
+            bytes.len = size;
+        }
+        return Ok(bytes);
+    }
+
+    public fn try_read_all_text() -> Result<string, FSError> {
+        if (self.handle == null || !self.readable) { return Err(FSError.InvalidInput); }
+        if (fs_seek(self.handle, 0, 2) != 0) { return Err(FSError.IOError); }
+        let size = fs_tell(self.handle);
+        if (size < 0 || size == 9223372036854775807 || fs_seek(self.handle, 0, 0) != 0) {
+            return Err(FSError.IOError);
+        }
+        let buffer = calloc(size + 1, 1);
+        if (buffer == null) { return Err(FSError.AllocationFailed); }
+        let read = fread(buffer, 1, size, self.handle);
+        if (ferror(self.handle) != 0 || (read != size && feof(self.handle) == 0)) {
+            free(buffer);
+            return Err(FSError.IOError);
+        }
+        let result = from_cstr_len(buffer, read);
+        free(buffer);
+        return Ok(result);
+    }
+
     /// Read the whole stream from offset zero as raw bytes.
     public fn read_all_bytes() -> Vec<u8> {
-        let empty = Vec::<u8>.new();
-        if (self.handle == null || !self.readable) { return empty; }
-        if (fseek(self.handle, 0, 2) != 0) { return empty; }
-        let size = ftell(self.handle);
-        if (size < 0 || fseek(self.handle, 0, 0) != 0 || size == 0) { return empty; }
-        var bytes = Vec::<u8>.with_capacity(size);
-        if (bytes.data == null) { return empty; }
-        let read = fread(bytes.data, 1, size, self.handle);
-        if (read != size) { bytes.destroy(); return empty; }
-        bytes.len = size;
-        return bytes;
+        match (self.try_read_all_bytes()) {
+            Ok(bytes) => { return bytes; }
+            Err(_) => { return Vec::<u8>.new(); }
+        }
     }
 
     /// Read the whole stream from offset zero as text. Text mode permits the
     /// platform's newline translation; binary protocols must use bytes.
     public fn read_all_text() -> string {
-        if (self.handle == null || !self.readable) { return ""; }
-        if (fseek(self.handle, 0, 2) != 0) { return ""; }
-        let size = ftell(self.handle);
-        if (size <= 0 || fseek(self.handle, 0, 0) != 0) { return ""; }
-        let buffer = calloc(size + 1, 1);
-        if (buffer == null) { return ""; }
-        let read = fread(buffer, 1, size, self.handle);
-        if (read != size) { free(buffer); return ""; }
-        return from_cstr(buffer);
+        match (self.try_read_all_text()) {
+            Ok(text) => { return text; }
+            Err(_) => { return ""; }
+        }
     }
 
     /// Write every byte at the current stream position.
@@ -160,25 +247,32 @@ public class File {
         self.handle = null;
         return result;
     }
+
+    public fn flush() -> i32 {
+        if (self.handle == null) { return -1; }
+        return fflush(self.handle);
+    }
+    public fn drop() { self.close(); }
 }
 
 /// Read entire file into a string. Returns empty string on failure.
 public fn readFile(path: string) -> string {
     let cpath = fs_c_path(path);
     if (cpath == null) { return ""; }
-    let fp = fopen(cpath, "rb".c_str());
+    let fp = fs_open_cpath(cpath, "rb".c_str());
     free(cpath);
     if (fp == null) { return ""; }
-    fseek(fp, 0, 2);
-    let size = ftell(fp);
-    fseek(fp, 0, 0);
+    fs_seek(fp, 0, 2);
+    let size = fs_tell(fp);
+    fs_seek(fp, 0, 0);
     if (size <= 0) { fclose(fp); return ""; }
     let buffer = calloc(size + 1, 1);
     if (buffer == null) { fclose(fp); return ""; }
     let read = fread(buffer, 1, size, fp);
     fclose(fp);
     if (read != size) { free(buffer); return ""; }
-    let result = from_cstr(buffer);
+    let result = from_cstr_len(buffer, read);
+    free(buffer);
     return result;
 }
 
@@ -186,12 +280,12 @@ public fn readFile(path: string) -> string {
 public fn writeFile(path: string, content: string) -> i32 {
     let cpath = fs_c_path(path);
     if (cpath == null) { return -1; }
-    let fp = fopen(cpath, "wb".c_str());
+    let fp = fs_open_cpath(cpath, "wb".c_str());
     free(cpath);
     if (fp == null) { return -1; }
     let written = fwrite(content.c_str(), 1, content.len as i64, fp);
-    fclose(fp);
-    if (written != content.len as i64) { return -1; }
+    let closed = fclose(fp);
+    if (written != content.len as i64 || closed != 0) { return -1; }
     return 0;
 }
 
@@ -201,11 +295,12 @@ public fn appendFile(path: string, content: string) -> i32 {
     let mode = "ab";
     let cpath = fs_c_path(path);
     if (cpath == null) { return -1; }
-    let fp = fopen(cpath, mode.c_str());
+    let fp = fs_open_cpath(cpath, mode.c_str());
     free(cpath);
     if (fp == null) { return -1; }
-    fwrite(content.c_str(), 1, content.len as i64, fp);
-    fclose(fp);
+    let written = fwrite(content.c_str(), 1, content.len as i64, fp);
+    let closed = fclose(fp);
+    if (written != content.len as i64 || closed != 0) { return -1; }
     return 0;
 }
 
@@ -214,7 +309,7 @@ public fn fileExists(path: string) -> bool {
     let mode = "r";
     let cpath = fs_c_path(path);
     if (cpath == null) { return false; }
-    let fp = fopen(cpath, mode.c_str());
+    let fp = fs_open_cpath(cpath, mode.c_str());
     free(cpath);
     if (fp == null) { return false; }
     fclose(fp);
@@ -222,6 +317,7 @@ public fn fileExists(path: string) -> bool {
 }
 
 /// Delete a file
+@[platform("posix")]
 public fn deleteFile(path: string) -> i32 {
     let cpath = fs_c_path(path);
     if (cpath == null) { return -1; }
@@ -231,6 +327,7 @@ public fn deleteFile(path: string) -> i32 {
 }
 
 /// Rename/move a file
+@[platform("posix")]
 public fn renameFile(oldpath: string, newpath: string) -> i32 {
     let cold = fs_c_path(oldpath);
     if (cold == null) { return -1; }
@@ -245,16 +342,40 @@ public fn renameFile(oldpath: string, newpath: string) -> i32 {
     return rc;
 }
 
+@[platform("windows")]
+public fn deleteFile(path: string) -> i32 {
+    let cpath = fs_c_path(path);
+    let wide_path = fs_wide_path(cpath);
+    free(cpath);
+    if (wide_path == null) { return -1; }
+    let result = _wremove(wide_path);
+    free(wide_path);
+    return result;
+}
+
+@[platform("windows")]
+public fn renameFile(oldpath: string, newpath: string) -> i32 {
+    let old_cpath = fs_c_path(oldpath);
+    let new_cpath = fs_c_path(newpath);
+    let old_wide = fs_wide_path(old_cpath);
+    let new_wide = fs_wide_path(new_cpath);
+    free(old_cpath); free(new_cpath);
+    if (old_wide == null || new_wide == null) { free(old_wide); free(new_wide); return -1; }
+    let result = _wrename(old_wide, new_wide);
+    free(old_wide); free(new_wide);
+    return result;
+}
+
 /// Get file size in bytes. Returns -1 on failure.
 public fn fileSize(path: string) -> i64 {
     let mode = "rb";
     let cpath = fs_c_path(path);
     if (cpath == null) { return -1; }
-    let fp = fopen(cpath, mode.c_str());
+    let fp = fs_open_cpath(cpath, mode.c_str());
     free(cpath);
     if (fp == null) { return -1; }
-    fseek(fp, 0, 2);
-    let size = ftell(fp);
+    fs_seek(fp, 0, 2);
+    let size = fs_tell(fp);
     fclose(fp);
     return size;
 }
@@ -278,13 +399,13 @@ public fn copyFile(src: string, dst: string) -> i32 {
     let out_mode = "wb";
     let in_path = fs_c_path(src);
     if (in_path == null) { return -1; }
-    let input = fopen(in_path, in_mode.c_str());
+    let input = fs_open_cpath(in_path, in_mode.c_str());
     free(in_path);
     if (input == null) { return -1; }
 
     let out_path = fs_c_path(dst);
     if (out_path == null) { fclose(input); return -1; }
-    let output = fopen(out_path, out_mode.c_str());
+    let output = fs_open_cpath(out_path, out_mode.c_str());
     free(out_path);
     if (output == null) { fclose(input); return -1; }
 
@@ -294,21 +415,34 @@ public fn copyFile(src: string, dst: string) -> i32 {
 
     while (true) {
         let read = fread(buffer, 1, buffer_size, input);
-        if (read < 0) { free(buffer); fclose(output); fclose(input); return -1; }
-        if (read == 0) { break; }
+        if (read == 0) {
+            if (ferror(input) != 0) { free(buffer); fclose(output); fclose(input); return -1; }
+            break;
+        }
         let written = fwrite(buffer, 1, read, output);
         if (written != read) { free(buffer); fclose(output); fclose(input); return -1; }
     }
 
     free(buffer);
-    fclose(output);
-    fclose(input);
+    let output_result = fclose(output);
+    let input_result = fclose(input);
+    if (output_result != 0 || input_result != 0) { return -1; }
     return 0;
 }
 
 @[platform("windows")]
 fn fs_win_find_data_name(data: rawptr) -> string {
-    return from_cstr(data + 44);
+    let input = data + 44;
+    let length = WideCharToMultiByte(65001 as u32, 0 as u32, input, -1, null, 0, null, null);
+    if (length <= 0) { panic("fs: invalid directory entry name"); }
+    let output = calloc(length as i64, 1);
+    if (output == null) { panic("fs: directory entry allocation failed"); }
+    if (WideCharToMultiByte(65001 as u32, 0 as u32, input, -1, output, length, null, null) != length) {
+        free(output); panic("fs: directory entry conversion failed");
+    }
+    let result = from_cstr_len(output, (length - 1) as i64);
+    free(output);
+    return result;
 }
 
 @[platform("windows")]
@@ -318,8 +452,11 @@ public fn copyFilesWithExtension(src_dir: string, dst_dir: string, extension: st
     if (cpattern == null) { return -1; }
     let data = calloc(592, 1);
     if (data == null) { free(cpattern); return -1; }
-    let handle = FindFirstFileA(cpattern, data);
+    let wide_pattern = fs_wide_path(cpattern);
     free(cpattern);
+    if (wide_pattern == null) { free(data); return -1; }
+    let handle = FindFirstFileW(wide_pattern, data);
+    free(wide_pattern);
     if (handle == null || handle as i64 == -1) { free(data); return -1; }
 
     var copied: i32 = 0;
@@ -332,7 +469,7 @@ public fn copyFilesWithExtension(src_dir: string, dst_dir: string, extension: st
             if (copyFile(src, dst) != 0) { FindClose(handle); free(data); return -1; }
             copied = copied + 1;
         }
-        keep_going = FindNextFileA(handle, data) != 0;
+        keep_going = FindNextFileW(handle, data) != 0;
     }
 
     FindClose(handle);
@@ -366,31 +503,57 @@ public fn copyFilesWithExtension(src_dir: string, dst_dir: string, extension: st
     return copied;
 }
 
-// --- Directory operations (via system() for portability) ---
-
-extern "C" {
-    fn system(cmd: rawptr) -> i32;
-}
-
 /// Create a directory. Returns 0 on success.
+@[platform("windows")]
 public fn makeDir(path: string) -> i32 {
     if (isDir(path)) { return 0; }
-    let cmd = "mkdir \"" + path + "\"";
-    return system(cmd.c_str());
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return -1; }
+    let wide_path = fs_wide_path(cpath);
+    free(cpath);
+    if (wide_path == null) { return -1; }
+    let result = _wmkdir(wide_path);
+    free(wide_path);
+    return result;
 }
-
-/// Remove an empty directory. Returns 0 on success.
+@[platform("posix")]
+public fn makeDir(path: string) -> i32 {
+    if (isDir(path)) { return 0; }
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return -1; }
+    let result = mkdir(cpath, 511 as u32);
+    free(cpath);
+    return result;
+}
+@[platform("windows")]
 public fn removeDir(path: string) -> i32 {
-    let cmd = "rmdir \"" + path + "\"";
-    return system(cmd.c_str());
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return -1; }
+    let wide_path = fs_wide_path(cpath);
+    free(cpath);
+    if (wide_path == null) { return -1; }
+    let result = _wrmdir(wide_path);
+    free(wide_path);
+    return result;
+}
+@[platform("posix")]
+public fn removeDir(path: string) -> i32 {
+    let cpath = fs_c_path(path);
+    if (cpath == null) { return -1; }
+    let result = rmdir(cpath);
+    free(cpath);
+    return result;
 }
 
 @[platform("windows")]
 public fn isDir(path: string) -> bool {
     let cpath = fs_c_path(path);
     if (cpath == null) { return false; }
-    let attrs = GetFileAttributesA(cpath);
+    let wide_path = fs_wide_path(cpath);
     free(cpath);
+    if (wide_path == null) { return false; }
+    let attrs = GetFileAttributesW(wide_path);
+    free(wide_path);
     if (attrs == 4294967295 as u32) { return false; }
     return (attrs & 16 as u32) != 0 as u32;
 }

@@ -43,14 +43,11 @@ impl LlvmMirLowerer {
         let ids = malloc(bytes);
         let sizes = malloc(bytes);
         let keys = malloc(bytes);
-        let sig_off = malloc(bytes);
         let marks = malloc((next * CGU_RETAIN_STRIDE * 4) as u64);
         if (ids != null) { memset(ids, 0, bytes); }
         if (sizes != null) { memset(sizes, 0, bytes); }
         if (keys != null) { memset(keys, 0, bytes); }
         if (marks != null) { memset(marks, 0, (next * CGU_RETAIN_STRIDE * 4) as u64); }
-        // 0xFF per byte is -1 per i32: "no signature snapshot for this slot".
-        if (sig_off != null) { memset(sig_off, 255, bytes); }
         if (self.cgu_collected_ids != null && ids != null) {
             memcpy(ids, self.cgu_collected_ids, (self.cgu_collected_n * 4) as u64);
             free(self.cgu_collected_ids);
@@ -63,10 +60,6 @@ impl LlvmMirLowerer {
             memcpy(keys, self.cgu_collected_keys, (self.cgu_collected_n * 4) as u64);
             free(self.cgu_collected_keys);
         }
-        if (self.dyn_sig_off != null && sig_off != null) {
-            memcpy(sig_off, self.dyn_sig_off, (self.cgu_collected_n * 4) as u64);
-            free(self.dyn_sig_off);
-        }
         if (self.cgu_retain_marks != null && marks != null) {
             memcpy(marks, self.cgu_retain_marks,
                    (self.cgu_collected_n * CGU_RETAIN_STRIDE * 4) as u64);
@@ -76,91 +69,9 @@ impl LlvmMirLowerer {
         self.cgu_collected_sizes = sizes;
         self.cgu_collected_keys = keys;
         self.cgu_retain_marks = marks;
-        self.dyn_sig_off = sig_off;
         self.cgu_collected_cap = next;
     }
 
-    public fn grow_dyn_sig_buf(self, min_need: i32) {
-        var next = self.dyn_sig_cap * 2;
-        if (next < 256) { next = 256; }
-        while (next < min_need) { next = next * 2; }
-        let bytes = (next * 4) as u64;
-        let buf = malloc(bytes);
-        if (buf == null) { return; }
-        if (self.dyn_sig_buf != null) {
-            memcpy(buf, self.dyn_sig_buf, (self.dyn_sig_n * 4) as u64);
-            free(self.dyn_sig_buf);
-        }
-        self.dyn_sig_buf = buf;
-        self.dyn_sig_cap = next;
-    }
-
-    // Snapshot `[arity, param0_type, param1_type, ...]` for one partition slot.
-    // Runs while the body is still materialized (immediately before the body is
-    // released), which is the only point where the parameter locals of a
-    // function owned by another unit can be read safely.
-    public fn cgu_record_dyn_signature(self, slot: i32, function_id: i32) {
-        if (self.dyn_sig_off == null) { return; }
-        if (self.cgu_shell_sweep) { return; }
-        var arity = self.function_source_param_count(function_id);
-        if (arity < 1) { arity = 0; }
-        let need = arity + 1;
-        if (self.dyn_sig_buf == null || self.dyn_sig_n + need > self.dyn_sig_cap) {
-            self.grow_dyn_sig_buf(self.dyn_sig_n + need);
-            if (self.dyn_sig_buf == null) { return; }
-        }
-        let base = self.dyn_sig_n;
-        ast_write_i32(ptr_offset(self.dyn_sig_buf, base * 4), arity);
-        var i: i32 = 0;
-        while (i < arity) {
-            ast_write_i32(ptr_offset(self.dyn_sig_buf, (base + 1 + i) * 4),
-                          self.function_source_param_type(function_id, i));
-            i = i + 1;
-        }
-        self.dyn_sig_n = base + need;
-        ast_write_i32(ptr_offset(self.dyn_sig_off, slot * 4), base);
-    }
-
-    // Index one partition slot under its method name for the `dyn` fallback.
-    // The index stores `slot + 1` -- everything downstream needs the slot, not
-    // just the function id, because the signature snapshot lives in a parallel
-    // array -- and slot 0 has to survive the index's "id 0 means empty" guard.
-    // Reached either from the one-shot pass below or incrementally from
-    // `cgu_record_function`, which de-duplicates through `cgu_member_map`, so a
-    // slot is never indexed twice.  Walking the whole partition on every lookup
-    // is what made an earlier version of this fallback exhaust the string pool
-    // while compiling the compiler.
-    public fn remember_dyn_partition_slot(self, slot: i32) {
-        if (self.dyn_partition_index == null) { return; }
-        if (self.cgu_collected_ids == null) { return; }
-        if (slot < 0 || slot >= self.cgu_collected_n) { return; }
-        let fn_id = ast_read_i32(ptr_offset(self.cgu_collected_ids, slot * 4));
-        if (fn_id == mir_id_invalid()) { return; }
-        if (mir_unit_function_owner_item_kind(&self.m, fn_id) == hir_item_interface()) { return; }
-        let method_name = self.function_method_name(fn_id);
-        if (method_name.len == 0) { return; }
-        llvm_mir_method_candidate_index_put(self.dyn_partition_index,
-                                            self.dyn_partition_index_cap,
-                                            method_name,
-                                            slot + 1);
-    }
-
-    // Fold any not-yet-indexed partition slots into `dyn_partition_index`.  The
-    // index is built lazily so a build that never needs the `dyn` fallback pays
-    // nothing, and it is extended incrementally so a lookup never rescans the
-    // slots it has already seen.  Only the function *record* is read here (name,
-    // owner, item kind); signatures come from `dyn_sig_off`, which was filled in
-    // at record time while the bodies were still live.
-    public fn ensure_dyn_partition_index(self) {
-        if (self.dyn_partition_index == null || self.cgu_collected_ids == null) { return; }
-        while (self.dyn_partition_index_n < self.cgu_collected_n) {
-            self.remember_dyn_partition_slot(self.dyn_partition_index_n);
-            self.dyn_partition_index_n = self.dyn_partition_index_n + 1;
-        }
-    }
-
-    // Returns the collected slot the function was given, or -1 when it was not
-    // recorded (invalid id, already a member, or the arrays could not grow).
     public fn cgu_record_function(self, function_id: i32, instr_delta: i32) -> i32 {
         if (function_id == mir_id_invalid()) { return -1; }
         if (llvm_mir_i32_map_get(self.cgu_member_map, function_id) != 0) { return -1; }
@@ -174,10 +85,6 @@ impl LlvmMirLowerer {
         ast_write_i32(ptr_offset(self.cgu_collected_keys, self.cgu_collected_n * 4), key_id);
         self.cgu_collected_n = self.cgu_collected_n + 1;
         llvm_mir_i32_map_put(self.cgu_member_map, function_id, 1);
-        // Snapshot the parameter signature right here: this is the last moment
-        // at which the body is still materialized, and a body registered for a
-        // sibling unit is released before that unit's `dyn` vtables are lowered.
-        self.cgu_record_dyn_signature(self.cgu_collected_n - 1, function_id);
         if (policy_phase_summary_enabled() && ((self.cgu_collected_n % 256) == 0)) {
             print("[llvm-cgu] collect-fns=" + policy_i64_to_string(self.cgu_collected_n as i64));
         }
@@ -307,9 +214,8 @@ impl LlvmMirLowerer {
         var i = self.cgu_collected_n - 1;
         while (i >= 0) {
             let fn_id = ast_read_i32(ptr_offset(self.cgu_collected_ids, i * 4));
-            // Only slots that actually kept a body.  `cgu_collect_from_shells`
-            // appends functions with no body of their own, and their zeroed
-            // marks would rewind the arena to the very bottom.
+            // Only release slots that actually retained a body. A zeroed
+            // retention record must never rewind the arena to its beginning.
             if (llvm_mir_i32_map_get(self.cgu_retain_slot, fn_id) != i + 1) {
                 i = i - 1;
                 continue;
@@ -328,43 +234,6 @@ impl LlvmMirLowerer {
                 self.m = builder.unit;
             }
             i = i - 1;
-        }
-    }
-
-    public fn cgu_collect_from_shells(self, builder: &mut MirUnitBuilder) {
-        if (self.cgu_member_map == null) {
-            self.cgu_member_map = llvm_mir_alloc_i32_map(self.m.function_count + 1);
-        }
-        // Every function this sweep records has already had its body released by
-        // the collect-only walk, so its parameter locals cannot be read (see
-        // `cgu_shell_sweep` on `cgu_record_dyn_signature`).  Suppress the
-        // snapshot instead of walking a dead `local_next` chain.
-        self.cgu_shell_sweep = true;
-        var fn_id: i32 = 1;
-        let n = self.m.function_count;
-        while (fn_id <= n) {
-            if (builder.function_is_partition_external_root(fn_id)
-                || builder.function_is_partition_declaration_only(fn_id)) {
-                fn_id = fn_id + 1;
-                continue;
-            }
-            let hir_fn = builder.unit.function_hir_id(fn_id);
-            if (hir_fn == hir_id_invalid()) {
-                fn_id = fn_id + 1;
-                continue;
-            }
-            let flags = mir_unit_function_flags(&builder.unit, fn_id);
-            if ((flags & hir_function_flag_imported_body()) != 0) {
-                fn_id = fn_id + 1;
-                continue;
-            }
-            self.cgu_record_function(fn_id, 1);
-            fn_id = fn_id + 1;
-        }
-        self.cgu_shell_sweep = false;
-        if (policy_phase_summary_enabled()) {
-            print("[llvm-cgu] shells=" + policy_i64_to_string(n as i64)
-                  + " collected=" + policy_i64_to_string(self.cgu_collected_n as i64));
         }
     }
 
@@ -643,8 +512,6 @@ impl LlvmMirLowerer {
         self.reflected_method_adapter_head = null;
         llvm_mir_free_raw_chain(self.dyn_vtable_head, 16);
         self.dyn_vtable_head = null;
-        llvm_mir_free_raw_chain(self.dyn_trait_impl_cache_head, 16);
-        self.dyn_trait_impl_cache_head = null;
         self.null_llvm_cached_handles();
         llvm_mir_dispose_symbol_index(self.function_symbol_index,
                                       self.function_symbol_index_cap,

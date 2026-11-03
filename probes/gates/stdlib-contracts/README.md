@@ -1,0 +1,102 @@
+# Standard-library contracts
+
+Run from the repository root with a compiler built from the current source
+and its matching backend/runtime:
+
+```sh
+python probes/gates/stdlib-contracts/run.py --compiler /path/to/vyxc --output .cache/stdlib-contracts --negative --model
+```
+
+The default runs every listed project at O0 and O2. `--projects` selects an
+explicit comma-separated subset, and `--opt 0` selects one optimization level.
+An empty or unknown selection fails. A timeout, missing success marker or
+nonzero exit fails. Logs and `verification.json` retain commands, compiler and
+companion hashes, package manifests, elapsed times and individual results.
+
+The inventory checks manifest sources against the implicit registry. It does
+not measure API coverage or establish correctness for modules a project never
+calls. New package manifests are discovered automatically; behavioral coverage
+must be added explicitly.
+
+Projects cover:
+
+| Project | Contract |
+|---|---|
+| `std_text_contracts` | bounded text views, embedded NUL equality/order/search/replacement |
+| `std_ownership_contracts` | discarded Result/enum payloads, match expressions, guards, early returns, borrowed receivers and multiple payloads |
+| `std_sync_contracts` | u8/i64/owning messages, ring wrap, full/empty/closed states, failed-send ownership, unread destruction, three concurrent producers and exactly-once receipt |
+| `std_owned_collections` | Deque/List/Slice owning reads, clone, replacement, iteration, clear, reuse, repeated destruction and embedded-NUL StringView conversion |
+| `std_value_collections` | Eq/Hashable/Ord value semantics, independent string storage, signed/unsigned/float order, owning sorting and a worst-case comparison bound |
+| `std_iterator_contracts` | owned callback arguments/returns, borrowed callbacks, eager adapters, selected values, independent storage and unread buffer destruction |
+| `std_priority_queue_contracts` | typed heap order, nonempty min/max rebuild, growth, Clone/transfer distinction, move-only owning values, comparison bounds, exactly-once cleanup and over-aligned storage |
+| `std_ordered_contracts` | move-only owning map/set keys, borrowed queries, replacement/removal cleanup, sorted storage, independent result/collection clones and binary text keys |
+| `std_testing_contracts` | bool/integer expectations and repeated mock queries that preserve their logs |
+| `std_fs_contracts` | binary/text lengths, embedded NUL, explicit empty/error results, append/copy, invalid paths, literal directory names and close |
+| `std_scalar_contracts` | bit boundaries, negative hex, strict Base64/hex errors, all-byte round trips, independent PCG reference sequence and range extremes |
+| `std_generic_contracts` | a real static library with generic trait-bound methods and a separate consumer |
+| `std_serde_contracts` | quoted multiline CSV, CRLF, blank/trailing fields, embedded NUL, escaped quotes and located malformed-input errors |
+| Existing collections/JSON/miniz/I/O/umbrella projects | package resolution and resource/error contracts already maintained by those projects |
+
+The PCG sequence is computed independently with unsigned 64-bit state,
+multiplier 6364136223846793005, initial state zero, increment 85, one step,
+addition of seed 42, and another step. Tests compare XSH-RR outputs with the
+stored vector, rather than using a second call to the Vyx implementation as
+the oracle.
+
+`--negative` checks missing trait implementations, moved callback arguments,
+iterator invalidation and checked swap bounds. Compiler rejection must contain
+a semantic error and leave no executable; a backend failure does not count as
+the intended rejection. Runtime checks compile first and must then fail with
+the expected panic message.
+
+`--model` generates 800 operations across i32/i64/u64/f64/string Vecs, including
+growth, insertion, removal, replacement, cloning, lookup, clear, reverse and
+sort. Expected lengths and contents come from Python lists. The report stores
+the seed, generator hash and generated source hash; `--model-seed` reproduces
+or changes a trace. This is reproducible model testing, not exhaustive language
+or standard-library coverage.
+
+Checks share a typed verification function and operation traces cross borrowed
+function boundaries. `--model-only` runs just the generated projects.
+`--model-block-size 128` keeps each type's full trace in one function for
+compiler stress investigation; the default is 16. Neither option changes the
+operations or the complete contents checked after each step.
+Generated models have a separate 600-second compile/run budget
+(`--model-timeout`); ordinary projects default to 180 seconds (`--timeout`).
+The larger budget is a test limit, not a compiler performance claim. Compiler
+phase timings should be measured separately; the initial monolithic traces
+exceeded the ordinary budget on the development host.
+
+Release builds on native Windows, Linux and macOS run this gate before
+packaging and retain a checks/passed count and report hash in the SDK build
+record. Failed runs upload the detailed reports with compiler diagnostics.
+The runner checks source hashes before and after execution; editing sources
+during a run invalidates that run. Timeouts terminate the owned fixture process
+tree.
+On Windows each invocation has a private Job Object; timeout and close terminate
+its descendants without relying on WMI process-tree discovery. The runner's
+unit checks verify prompt termination as well as seed reproducibility,
+unchanged operations across function boundaries and duplicate source ownership.
+
+Protocol interoperability remains in
+[network-protocols](../network-protocols/README.md). GPU bindings require
+their native backend and device. These checks do not certify those packages,
+Android execution, all allocation-failure paths, or every public standard-library
+API. CI must record each actually executed platform.
+
+Native OpenSSL checks are opt-in because the default SDK gate does not install
+OpenSSL. With the native link libraries installed, run:
+
+```powershell
+python probes/gates/stdlib-contracts/run.py --compiler /path/to/vyxc --projects std_priority_queue_contracts --native-crypto --native-bin E:/vcpkg/installed/x64-windows/bin --output .cache/stdlib-native-crypto
+```
+
+This adds `std_security_package`, which calls real OpenSSL against independent
+hash/HMAC known answers (including NUL and UTF-8), and `std_crypto_faults`,
+which injects allocation, digest, HMAC and RNG failures to verify error results
+and exactly-once context cleanup. The injection fixture does not establish
+cryptographic correctness; the real-library fixture provides that separate
+evidence. On Windows the runner deploys the explicitly selected OpenSSL DLLs
+beside a private executable and records their source paths and SHA-256 hashes.
+Each Windows invocation gets a separate deployment directory. On POSIX configure
+the native loader search path for the chosen OpenSSL installation.

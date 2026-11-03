@@ -1,161 +1,204 @@
 module std.channel;
 
-/// Vyx Standard Library — Channel (thread-safe message passing)
-/// Provides both generic class API and legacy function API for compatibility.
+use std.core;
+use std.string;
+use std.sync;
 
 extern "C" {
-    fn malloc(size: i64) -> rawptr;
-    fn free(ptr: rawptr);
     fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
-    fn memset(dst: rawptr, val: i32, n: i64) -> rawptr;
+    fn vyx_aligned_alloc_abi(size: i64, alignment: i64) -> rawptr;
+    fn vyx_aligned_free_abi(ptr: rawptr);
 }
 
-// ---------- Generic class API ----------
-class Channel<T> {
-    public buffer: rawptr;
-    public cap: i64;
-    public head: i64;
-    public tail: i64;
-    public count: i64;
+fn channel_take<T>(slot: *T) -> T {
+    var value: T;
+    memcpy(to_rawptr(&value), to_rawptr(slot), sizeof::<T>());
+    return value;
+}
+fn channel_drop<T>(slot: *T) { let value: T = channel_take::<T>(slot); }
+fn channel_drop<str>(slot: *str) { str_drop(*slot); }
 
-    public static fn new() -> Channel<T> {
-        return Channel.withCapacity(256);
+public enum ChannelError { Empty, Closed }
+
+/// A rejected send returns the original value, including its ownership.
+public class ChannelSendError<T> {
+    value: T;
+    active: bool;
+    public closed: bool;
+
+    public fn get_ref(&self) -> &T {
+        if (!self.active) { panic("ChannelSendError: value already recovered"); }
+        return &self.value;
     }
-
-    public static fn withCapacity(c: i64) -> Channel<T> {
-        var cap = c;
-        if (cap < 4) { cap = 4; }
-        let buf = malloc(cap * 8);
-        if (buf != null) { memset(buf, 0, cap * 8); }
-        return Channel { buffer: buf, cap: cap, head: 0, tail: 0, count: 0 };
+    public fn into_inner() -> T {
+        if (!self.active) { panic("ChannelSendError: value already recovered"); }
+        self.active = false;
+        return channel_take::<T>(to_rawptr(&self.value) as *T);
     }
-
-    fn send(val: T) -> bool {
-        if (self.count >= self.cap) { return false; }
-        memcpy(self.buffer + self.tail * 8, to_rawptr(&val), 8);
-        self.tail = (self.tail + 1) % self.cap;
-        self.count = self.count + 1;
-        return true;
+    public fn drop() {
+        if (self.active) {
+            self.active = false;
+            channel_drop::<T>(to_rawptr(&self.value) as *T);
+        }
     }
-
-    fn recv() -> i64 {
-        if (self.count == 0) { return 0; }
-        var out: i64 = 0;
-        memcpy(to_rawptr(&out), self.buffer + self.head * 8, 8);
-        self.head = (self.head + 1) % self.cap;
-        self.count = self.count - 1;
-        return out;
-    }
-
-    fn len() -> i64 { return self.count; }
-    fn isEmpty() -> bool { return self.count == 0; }
-    fn isFull() -> bool { return self.count >= self.cap; }
-
-    fn destroy() {
-        if (self.buffer != null) { free(self.buffer); }
-        self.buffer = null;
-        self.cap = 0;
-        self.head = 0;
-        self.tail = 0;
-        self.count = 0;
-    }
-
-    /// SSS Drop — idempotent via `self.buffer == null` sentinel.
-    fn drop() { self.destroy(); }
 }
 
-// ---------- Legacy function API ----------
-
-struct _Channel {
+/// Bounded, nonblocking multi-producer/multi-consumer queue.
+/// Every queue operation holds the same OS mutex. close() prevents new sends;
+/// queued values remain receivable. Destroy only after all users have joined.
+/// The channel owns queued elements and drops unread values at destruction.
+public class Channel<T> {
     buffer: rawptr;
     cap: i64;
     head: i64;
     tail: i64;
     count: i64;
+    lock_h: rawptr;
+    closed: bool;
+
+    public static fn new() -> Channel<T> { return Channel::<T>.withCapacity(256); }
+
+    public static fn withCapacity(capacity: i64) -> Channel<T> {
+        if (capacity <= 0) { panic("Channel: capacity must be positive"); }
+        let size = sizeof::<T>();
+        if (size <= 0 || capacity > 9223372036854775807 / size) {
+            panic("Channel: allocation size overflow");
+        }
+        let buffer = vyx_aligned_alloc_abi(capacity * size, alignof::<T>());
+        if (buffer == null) { panic("Channel: allocation failed"); }
+        let lock_h = mutex_new();
+        if (lock_h == null) {
+            vyx_aligned_free_abi(buffer);
+            panic("Channel: mutex allocation failed");
+        }
+        return Channel::<T> { buffer: buffer, cap: capacity, head: 0,
+            tail: 0, count: 0, lock_h: lock_h, closed: false };
+    }
+
+    fn check_alive(&self) {
+        if (self.lock_h == null) { panic("Channel: use after destroy"); }
+    }
+
+    @[lazy]
+    public fn try_send(value: T) -> Result<bool, ChannelSendError<T>> {
+        self.check_alive();
+        mutex_lock(self.lock_h);
+        defer mutex_unlock(self.lock_h);
+        if (self.closed || self.count == self.cap) {
+            return Err(ChannelSendError::<T> { value: value, active: true, closed: self.closed });
+        }
+        let slot = self.buffer + self.tail * sizeof::<T>();
+        unsafe { *(slot as *T) = value; }
+        self.tail = (self.tail + 1) % self.cap;
+        self.count += 1;
+        return Ok(true);
+    }
+
+    /// Consumes value even on failure. Use try_send to recover rejected values.
+    public fn send(value: T) -> bool {
+        match (self.try_send(value)) {
+            Ok(_) => { return true; }
+            Err(_) => { return false; }
+        }
+    }
+
+    @[lazy]
+    public fn try_recv() -> Result<T, ChannelError> {
+        self.check_alive();
+        mutex_lock(self.lock_h);
+        defer mutex_unlock(self.lock_h);
+        if (self.count == 0) {
+            if (self.closed) { return Err(ChannelError.Closed); }
+            return Err(ChannelError.Empty);
+        }
+        let value = channel_take::<T>((self.buffer + self.head * sizeof::<T>()) as *T);
+        self.head = (self.head + 1) % self.cap;
+        self.count -= 1;
+        return Ok(value);
+    }
+
+    public fn recv() -> Option<T> {
+        match (self.try_recv()) {
+            Ok(value) => { return Some(value); }
+            Err(_) => { return None; }
+        }
+    }
+
+    public fn close() {
+        self.check_alive();
+        mutex_lock(self.lock_h);
+        self.closed = true;
+        mutex_unlock(self.lock_h);
+    }
+    public fn is_closed() -> bool {
+        self.check_alive();
+        mutex_lock(self.lock_h);
+        let result = self.closed;
+        mutex_unlock(self.lock_h);
+        return result;
+    }
+    public fn len() -> i64 {
+        self.check_alive();
+        mutex_lock(self.lock_h);
+        let result = self.count;
+        mutex_unlock(self.lock_h);
+        return result;
+    }
+    public fn isEmpty() -> bool { return self.len() == 0; }
+    public fn isFull() -> bool { return self.len() == self.cap; }
+
+    public fn destroy() {
+        if (self.lock_h == null) { return; }
+        // No concurrent users may remain; user destructors run without a lock.
+        while (self.count > 0) {
+            channel_drop::<T>((self.buffer + self.head * sizeof::<T>()) as *T);
+            self.head = (self.head + 1) % self.cap;
+            self.count -= 1;
+        }
+        vyx_aligned_free_abi(self.buffer);
+        mutex_destroy(self.lock_h);
+        self.buffer = null;
+        self.lock_h = null;
+        self.cap = 0;
+        self.closed = true;
+    }
+    public fn drop() { self.destroy(); }
 }
 
-public fn channel_new() -> _Channel {
-    return channel_with_capacity(256);
+// Legacy i64 surface. Empty receive returns zero for compatibility.
+// New callers use try_recv() to distinguish empty and closed.
+public struct _Channel {
+    public inner: Channel<i64>;
 }
-
+impl Drop for _Channel {
+    fn drop() { self.inner.destroy(); }
+}
+public fn channel_new() -> _Channel { return channel_with_capacity(256); }
 public fn channel_with_capacity(cap: i64) -> _Channel {
-    var c = cap;
-    if (c < 4) { c = 4; }
-    unsafe {
-        let buf = malloc(c * 8);
-        memset(buf, 0, c * 8);
-        return _Channel { buffer: buf, cap: c, head: 0, tail: 0, count: 0 };
-    }
+    return _Channel { inner: Channel::<i64>.withCapacity(cap) };
 }
-
 public fn channel_send(ch: rawptr, val: i64) -> bool {
-    unsafe {
-        var count: i64 = 0;
-        var cap: i64 = 0;
-        var tail: i64 = 0;
-        var buf: rawptr = null;
-        memcpy(to_rawptr(&buf), ch, 8);
-        memcpy(to_rawptr(&cap), ch + 8, 8);
-        memcpy(to_rawptr(&tail), ch + 24, 8);
-        memcpy(to_rawptr(&count), ch + 32, 8);
-        if (count >= cap) { return false; }
-        memcpy(buf + tail * 8, to_rawptr(&val), 8);
-        tail = (tail + 1) % cap;
-        count = count + 1;
-        memcpy(ch + 24, to_rawptr(&tail), 8);
-        memcpy(ch + 32, to_rawptr(&count), 8);
-        return true;
-    }
+    if (ch == null) { return false; }
+    unsafe { return (*(ch as *_Channel)).inner.send(val); }
 }
-
 public fn channel_recv(ch: rawptr) -> i64 {
+    if (ch == null) { return 0; }
     unsafe {
-        var count: i64 = 0;
-        var cap: i64 = 0;
-        var head: i64 = 0;
-        var buf: rawptr = null;
-        memcpy(to_rawptr(&buf), ch, 8);
-        memcpy(to_rawptr(&cap), ch + 8, 8);
-        memcpy(to_rawptr(&head), ch + 16, 8);
-        memcpy(to_rawptr(&count), ch + 32, 8);
-        if (count == 0) { return 0; }
-        var val: i64 = 0;
-        memcpy(to_rawptr(&val), buf + head * 8, 8);
-        head = (head + 1) % cap;
-        count = count - 1;
-        memcpy(ch + 16, to_rawptr(&head), 8);
-        memcpy(ch + 32, to_rawptr(&count), 8);
-        return val;
+        match ((*(ch as *_Channel)).inner.recv()) {
+            Some(value) => { return value; }
+            None => { return 0; }
+        }
     }
 }
-
 public fn channel_len(ch: rawptr) -> i64 {
-    unsafe {
-        var count: i64 = 0;
-        memcpy(to_rawptr(&count), ch + 32, 8);
-        return count;
-    }
+    if (ch == null) { return 0; }
+    unsafe { return (*(ch as *_Channel)).inner.len(); }
 }
-
-public fn channel_is_empty(ch: rawptr) -> bool {
-    return channel_len(ch) == 0;
-}
-
+public fn channel_is_empty(ch: rawptr) -> bool { return channel_len(ch) == 0; }
 public fn channel_is_full(ch: rawptr) -> bool {
-    unsafe {
-        var count: i64 = 0;
-        var cap: i64 = 0;
-        memcpy(to_rawptr(&count), ch + 32, 8);
-        memcpy(to_rawptr(&cap), ch + 8, 8);
-        return count >= cap;
-    }
+    if (ch == null) { return false; }
+    unsafe { return (*(ch as *_Channel)).inner.isFull(); }
 }
-
 public fn channel_free(ch: rawptr) {
-    unsafe {
-        var buf: rawptr = null;
-        memcpy(to_rawptr(&buf), ch, 8);
-        if (buf != null) { free(buf); }
-        memset(ch, 0, 40);
-    }
+    if (ch != null) { unsafe { (*(ch as *_Channel)).inner.destroy(); } }
 }

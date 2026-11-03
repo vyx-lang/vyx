@@ -3653,6 +3653,24 @@ extern "C" VYX_API void* vyx_rt_build_si_to_fp(void* h, void* val, void* dst_ty,
     return m->builder->CreateSIToFP(asVal(val), asTy(dst_ty), asStr(name, len));
 }
 
+extern "C" VYX_API void* vyx_rt_build_ui_to_fp(void* h, void* val, void* dst_ty,
+                                            const char* name, uint64_t len) {
+    VYX_RT_PROF(BuildCast);
+    if (!h || !val || !dst_ty) return nullptr;
+    auto* m = asMod(h);
+    if (!m->builder) { m->lastError = "build_ui_to_fp: no builder"; return nullptr; }
+    return m->builder->CreateUIToFP(asVal(val), asTy(dst_ty), asStr(name, len));
+}
+
+extern "C" VYX_API void* vyx_rt_build_fp_to_ui(void* h, void* val, void* dst_ty,
+                                            const char* name, uint64_t len) {
+    VYX_RT_PROF(BuildCast);
+    if (!h || !val || !dst_ty) return nullptr;
+    auto* m = asMod(h);
+    if (!m->builder) { m->lastError = "build_fp_to_ui: no builder"; return nullptr; }
+    return m->builder->CreateFPToUI(asVal(val), asTy(dst_ty), asStr(name, len));
+}
+
 extern "C" VYX_API void* vyx_rt_build_fp_ext(void* h, void* val, void* dst_ty,
                                               const char* name, uint64_t len) {
     VYX_RT_PROF(BuildCast);

@@ -30,8 +30,8 @@ bridge（JSON/miniz）继续使用 static package。当前入口：
 | `std:sync` | `std_sync` | sync/channel/threading/thread_pool/concurrent |
 | `std:format` | `std_format` | fmt/color |
 | `std:testing` | `std_testing` | testing/mock |
-| `std:toml` | `std_toml` | TOML |
-| `std:json` | `std_json` | JSON + cJSON bridge |
+| `std:serde` | `serde_toml` | TOML |
+| `std:serde` | `serde_json` | JSON + cJSON bridge |
 | `std:miniz` | `std_miniz` | 压缩 + miniz bridge |
 | `std:std` | `std` | 已 package 化的通用标准库聚合包（含 JSON/miniz） |
 | `std:cacao` | `std_cacao` | Cacao 图形/GPU C ABI 绑定（按需，自行链接 Cacao） |
@@ -60,6 +60,54 @@ collections = { path = "std:collections", target = "std_collections" }
 OpenSSL、SQLite、stb_image、Win32 等需要独立 native SDK/实现的绑定不进入
 通用聚合包，避免一个普通 `std` 应用被迫链接所有第三方库；它们应由对应的
 显式 native package 提供完整 link closure 后再导入。
+
+## 资源与值语义
+
+[标准库回归门](../probes/gates/stdlib-contracts/README.md) 包含 O0/O2 项目运行、
+语义拒绝检查，以及使用 Python 列表计算预期结果的组合操作测试。Windows、Linux、
+macOS 的原生 Release 任务在打包前执行。验证报告中的平台、编译器和配套库哈希
+才是本次验证的身份；目录清单和构建成功本身不能证明运行正确。
+
+`Vec<T>` 的查找和相等比较要求 `T: Eq`，哈希要求 `T: Hashable`，排序要求
+`T: Ord`。这些操作使用元素值，不比较指针地址或结构体填充字节。排序不稳定，
+使用有界堆排序，并使已有迭代器失效。哈希值不作为持久化格式。
+兼容方法 `Vec.sum()`、`Iterator.sum()` 将每个元素转换为 i64 后累加，浮点数
+逐项截断；需要保留元素类型时使用 `std.algorithm.sum_iter`。
+
+`PriorityQueue<T>` 的入队、出队和堆序切换要求 `T: Ord`。`peek` 要求 `Clone`，
+返回独立值；`pop` 转移元素所有权。`clear` 析构所有存活元素并保留容量。切换
+最小堆/最大堆会以 O(n) 重建非空队列、使迭代器失效，并返回可变借用。
+构造拥有存储的最大堆用 `new_max()`；初始分配和扩容均遵守 `alignof<T>`。
+
+`BTreeMap`、`BTreeSet` 当前使用有序平坦数组：查询 O(log n)，插入、删除 O(n)。
+查询和删除借用查询键，不要求键实现 Clone。返回独立的值、键或克隆整个容器时，
+才要求相应的 Clone 约束。有序键的 Eq 必须与 `compare(other) == 0` 一致。
+
+`Iterator.next` 和返回独立元素值的读取操作要求 `Clone`。`map`、`filter`、
+`take`、`skip` 立即执行并持有独立存储，并非惰性管线。`map`、`filter` 耗尽
+输入游标；`take(n)` 只前进选中的数量；`skip(n)` 耗尽游标并返回剩余范围。
+`fn(T)` 回调接收所有权，`fn(&T)` 回调借用参数。适配器销毁时也清理未读取元素。
+容器迭代器借用源容器；源必须存活到迭代器使用结束，修改计数检查不能延长其寿命。
+
+`Channel<T>` 是有界、非阻塞队列。`try_send` 通过 `ChannelSendError<T>` 返回
+拒收值的所有权，`into_inner()` 可以取回一次。`try_recv` 区分空与关闭；关闭后
+仍可取完已有消息。销毁时清理未读取消息；销毁前必须等待所有使用者退出。
+
+`File.try_open`、`try_read_all_bytes`、`try_read_all_text` 返回 `Result`，空文件
+是成功结果。旧便捷读取方法保留失败时返回空值的行为。Windows 路径按 UTF-8 转为
+宽字符 API 输入。文件作用域清理自动关闭句柄，显式关闭可重复调用。
+
+`std.security.openssl` 提供 `try_sha256`、`try_sha512`、`try_sha1`、`try_md5`、
+`try_hmac_sha256`、`try_random_bytes`、`try_random_int`，通过 `Result` 返回
+`CryptoError`（类别、原生错误码、消息）。摘要和 HMAC 的成功结果是拥有存储的
+十六进制 `String`。`try_random_bytes` 接受 0..256 字节，也返回十六进制文本，
+每字节两个字符；零长度是成功的空结果。原有文本便捷函数在原生调用失败时 panic。
+真实 OpenSSL 已知答案和失败注入测试须显式启用并提供原生库，不代表整个 TLS API
+已经验收。
+
+严格 Base64/hex 解码提供返回 `Result` 的 `try_*` 方法。CSV 支持引号内换行、
+双引号转义、CRLF 和内嵌 NUL，格式错误包含位置。现有项目回归不代表所有原生绑定、
+数据格式、内存分配失败、异步调度和设备后端均已验收。
 
 ## 当前状态
 
@@ -100,16 +148,16 @@ adapter 写出 `contracts/spdlog.dcib`。Vyx 通过契约调用
 logger = { path = "std:logger", target = "std_logger" }
 ```
 
-`bootstrap_compiler/std_packages/json` 把 Vyx API、cJSON 源码和 native bridge
+`bootstrap_compiler/std_packages/serde` 把 Vyx API、cJSON 源码和 native bridge
 放在同一个 `Vyx.toml` 项目中。消费项目可声明：
 
 ```toml
 [dependencies]
-json = { path = "std:json", target = "std_json" }
+json = { path = "std:serde", target = "serde_json" }
 ```
 
 构建器会递归构建 package、导入其 `.vyi`、自动加入静态库并传播运行时资源。
-`std.json` 提供 `Result` 错误、对象/数组/标量、深拷贝子值、类型检查、序列化
+`std.serde.json` 提供 `Result` 错误、对象/数组/标量、深拷贝子值、类型检查、序列化
 和确定性的 `drop()`；缺失键、类型错误、解析错误和分配错误不会被伪装成空值。
 
 `bootstrap_compiler/std_packages/miniz` 提供自包含的 zlib-compatible 压缩、
@@ -124,7 +172,7 @@ miniz = { path = "std:miniz", target = "std_miniz" }
 容量不足、非法参数、分配失败和数据错误通过 `Result` 区分，不返回含混的空字符串。
 
 `bootstrap_compiler/std_packages/stb_image` 内嵌 stb 图像家族，并用一个 stub C
-做实现宏（与 `std:json` 相同的 C/H 混编）：
+做实现宏（与 `std:serde` 相同的 C/H 混编）：
 
 - `vendor/stb_image.h`
 - `vendor/stb_image_write.h`
@@ -156,13 +204,16 @@ flat-std 搜索；漏写依赖会在 import 阶段直接报错，而不是静默
 
 ---
 
-## 内置函数 (Builtins)
+## 常用入口与编译器内建
+
+`print`、`assert`、`panic` 和 `format` 由标准库源码提供。下表同时列出
+类型查询等编译器内建；不能把库函数的名字当作独立于库实现的编译器能力。
 
 ### 输出 & 调试
 | 函数 | 签名 | 说明 |
 |------|------|------|
 | `print` | `print(val)` | 打印任意类型（i64/f64/string/bool） |
-| `assert` | `assert(cond: bool)` | 条件为 false 时终止并报告位置 |
+| `assert` | `assert(cond: bool, message: str = "assert failed")` | 条件为 false 时打印消息并终止 |
 | `panic` | `panic(msg: string)` | 立即终止程序并打印消息 |
 | `format` | `format(fmt, args...)` | 字符串格式化 |
 
@@ -628,7 +679,7 @@ trait Hashable {
 | `std.fs` | 文件系统 (exists/mkdir/readdir/stat) |
 | `std.os` | 操作系统 (env/exec/exit/sleep) |
 | `std.error` | 错误处理 (Error trait/panic) |
-| `std.serde` | Vyx 值序列化基础接口；完整 JSON 能力使用 `std.json` package |
+| `std.serde` | Vyx 值序列化基础接口；完整 JSON 能力使用 `std.serde.json` package |
 | `std.ffi` | C ABI 外部函数接口（`c_int`/`CStr`/`CString`；不是 C++） |
 | `std.allocator` | 内存分配器 |
 | `std.win32` | Windows API 绑定 |

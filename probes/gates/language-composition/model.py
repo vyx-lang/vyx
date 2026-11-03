@@ -26,6 +26,8 @@ RULES = tuple(Rule(name, features) for name, features in [
     ("tuple", ("tuple", "projection")),
     ("array", ("array", "index")),
     ("loop", ("while", "mutation")),
+    ("short_circuit_scan", ("boolean_calls", "and", "or", "scan_loop", "single_evaluation")),
+    ("large_function", ("256_locals", "768_statements", "branches", "observable_calls")),
     ("generic", ("generic_function", "inference")),
     ("named_call", ("named_arguments", "generic_inference", "single_evaluation")),
     ("args_parameter", ("ordinary_parameter_name", "generic_inference", "named_arguments")),
@@ -33,7 +35,13 @@ RULES = tuple(Rule(name, features) for name, features in [
     ("c_varargs", ("C_ellipsis", "named_arguments", "integer_promotion", "float_promotion", "libc_roundtrip")),
     ("class", ("aggregate", "receiver")),
     ("generic_class", ("generic_class", "static_factory", "receiver")),
+    ("operator_overload", ("generic_class", "operator", "overload_identity", "distinct_return_types", "interleaved_calls")),
+    ("operator_generic", ("generic_class", "method_template", "instance_identity", "interleaved_calls")),
+    ("index_overload", ("generic_class", "index", "overload_identity", "interleaved_calls")),
+    ("pointer_index_owner", ("typed_pointer", "index", "class_with_operator", "borrowed_return", "concrete_trait_binding")),
+    ("unary_operator", ("generic_class", "unary_operator", "lazy_materialization")),
     ("trait", ("interface", "impl", "generic_constraint", "shared_borrow")),
+    ("dynamic_overload", ("dyn_interface", "generic_impl", "overload_identity", "distinct_return_types", "aggregate_return", "shared_borrow")),
     ("enum", ("payload_enum", "match", "binding")),
     ("option", ("Option", "static_generic", "unwrap")),
     ("result", ("Result", "static_generic", "unwrap")),
@@ -69,14 +77,16 @@ RULES = tuple(Rule(name, features) for name, features in [
     ("owned_linear", ("Stack", "Queue", "String", "Clone", "move", "clear", "drop")),
     ("owned_array", ("array", "Clone", "shared_borrow", "drop", "single_evaluation")),
     ("inherited_iterator", ("foreach", "nominal_inheritance", "next_only", "Option_exhaustion")),
+    ("overloaded_iterator", ("foreach", "generic_class", "next_overload", "optional_protocol", "single_evaluation")),
+    ("overloaded_array_clone", ("foreach", "array", "clone_overload", "owned_payload", "drop")),
 ])
 RULE_BY_NAME = {r.name: r for r in RULES}
 TYPE_BASES = ("i64", "String", "Tracked")
 TYPE_CONSTRUCTORS = ("Vec", "Option", "Result")
 # This is an explicit scope boundary, not permission to ignore a failing rule.
 UNMODELED = ["DCI producer ABIs", "async scheduling", "Effect schemas",
-             "Reflection", "Migrate", "dynamic dispatch", "general unsafe pointers",
-             "exceptions", "floating point", "separate library/VYI linking"]
+             "Reflection", "Migrate", "general dynamic dispatch and object safety", "general unsafe pointers",
+             "exceptions", "general floating point arithmetic"]
 NEGATIVES = {
     "moved_string": r"error: E3100:.*(?:moved|move|source)",
     "unknown_trait": r"error: E1100: unknown trait constraint.*MissingTrait",
@@ -135,12 +145,28 @@ def oracle(case):
         elif rule == "tuple": value = value * 2 + 3
         elif rule == "array": value = value * 2 + 4
         elif rule == "loop": value += 6
+        elif rule == "short_circuit_scan":
+            original = value
+            value += 1 + (3 if original >= 0 and original % 2 == 0 else 0)
+            value += 5 if original < 0 or original % 2 != 0 else 0
+            calls += 7 if original >= 0 else 5
+        elif rule == "large_function":
+            original = value
+            for index in range(256):
+                term = original + index % 7 - 3
+                value += term if term % 2 == 0 else -term
+            calls += 256
         elif rule == "generic": value += 1
         elif rule == "named_call": value += 1; calls += 1
         elif rule == "args_parameter": value += 1; calls += 1
         elif rule == "pipe_default": value += 4; calls += 1
         elif rule == "c_varargs": calls += 1
         elif rule in ("class", "generic_class", "trait", "enum"): value += 2
+        elif rule == "operator_overload": value = 3 * value + 143; calls += 3
+        elif rule == "operator_generic": value = 3 * value + 16; calls += 3
+        elif rule == "index_overload": value = 3 * value + 47; calls += 3
+        elif rule == "pointer_index_owner": pass
+        elif rule == "unary_operator": value = -value - 5; calls += 1
         elif rule in ("option", "result", "shared_ref"): pass
         elif rule == "mut_ref": value += 4
         elif rule == "closure": value += 7
@@ -172,6 +198,9 @@ def oracle(case):
         elif rule == "owned_linear": value = 3 * value + 2; calls += 3; drops += 6
         elif rule == "owned_array": value = 2 * value + 21; calls += 2; drops += 4
         elif rule == "inherited_iterator": value = 2 * value + 3; calls += 3
+        elif rule == "overloaded_iterator": value = 2 * value + 3; calls += 3
+        elif rule == "overloaded_array_clone": value = 2 * value + 1; calls += 2; drops += 4
+        elif rule == "dynamic_overload": value = 6 * value + 86; calls += 6
         else: raise ValueError(f"unknown production {rule}")
     return [value, calls, drops, defers, 0]
 
@@ -179,6 +208,7 @@ def oracle(case):
 COMMON = '''use std.string;
 use std.collections;
 use std.core;
+use std.hash;
 public var calls: i64 = 0;
 public var drops: i64 = 0;
 public var defers: i64 = 0;
@@ -189,6 +219,168 @@ public fn report(id: str, value: i64) {
 }
 '''
 SUPPORT = {
+    "dynamic_overload": '''public class DynAnswer { public value: i64; public extra: i64; public last: i64; }
+public interface DynMetric {
+    fn score(&self, value: i32) -> i64;
+    fn score(&self, value: f64) -> DynAnswer;
+}
+public class DynMeter<T> { public base: i64; public tag: T; }
+impl<T> DynMetric for DynMeter<T> {
+    fn score(&self, value: i32) -> i64 { calls += 1; return self.base + value as i64 + self.tag as i64; }
+    fn score(&self, value: f64) -> DynAnswer {
+        calls += 1;
+        return DynAnswer { value: self.base + (value * 10.0) as i64 + self.tag as i64, extra: 3, last: 4 };
+    }
+}
+public fn dyn_read(value: &dyn DynMetric) -> i64 {
+    let first = value.score(3 as i32);
+    let second = value.score(2.0);
+    let third = value.score(4 as i32);
+    return first + second.value + second.extra + second.last + third;
+}
+public fn observe_dynamic_overload(value: i64) -> i64 {
+    let first = DynMeter::<i32> { base: value, tag: 2 };
+    let second = DynMeter::<u8> { base: value + 1, tag: 3 };
+    return dyn_read(&first) + dyn_read(&second);
+}
+''',
+    "overloaded_iterator": '''public class OverloadedPull<Tag, Item> {
+    public base: Item;
+    public pos: i32;
+    public fn next(unused: i32) -> Option<i32> { rule_errors += 1; return None; }
+    public fn has_next(unused: i32) -> bool { rule_errors += 1; return true; }
+    public fn next() -> Option<Item> {
+        calls += 1;
+        if (self.pos >= 2) { return None; }
+        self.pos += 1;
+        return Some((self.base as i64 + self.pos as i64) as Item);
+    }
+}
+public fn observe_overloaded_iterator(value: i64) -> i64 {
+    var total: i64 = 0;
+    for item in (OverloadedPull::<i32, i64> { base: value, pos: 0 }) { total += item; }
+    return total;
+}
+''',
+    "overloaded_array_clone": '''public class OverloadedArrayValue {
+    public value: i64;
+    public text: String;
+    public fn clone(unused: i32) -> i32 { rule_errors += 1; return 99; }
+    public fn clone(&self) -> OverloadedArrayValue {
+        calls += 1;
+        return OverloadedArrayValue { value: self.value, text: self.text.clone() };
+    }
+    public fn drop(&mut self) { drops += 1; self.text.drop(); }
+}
+public fn observe_overloaded_array(value: i64) -> i64 {
+    var total: i64 = 0;
+    {
+        let values = [OverloadedArrayValue { value: value, text: String.from("owned array protocol payload") },
+                      OverloadedArrayValue { value: value + 1, text: String.from("owned array protocol payload") }];
+        for item in &values { total += item.value; }
+        if (values[0].text.as_str() != "owned array protocol payload") { rule_errors += 1; }
+    }
+    return total;
+}
+''',
+    "short_circuit_scan": '''public fn counted_condition(value: bool) -> bool {
+    calls += 1;
+    return value;
+}
+public fn observe_short_circuit(value: i64) -> i64 {
+    var total = value;
+    if (counted_condition(value >= 0) && counted_condition(value % 2 == 0)) { total += 3; }
+    if (counted_condition(value < 0) || counted_condition(value % 2 != 0)) { total += 5; }
+    var p: i64 = 0;
+    while (p < 3 && counted_condition(p < 2)) { total += p; p += 1; }
+    return total;
+}
+''',
+    "large_function": '''public fn large_function_term(value: i64, offset: i64) -> i64 {
+    calls += 1;
+    return value + offset - 3;
+}
+public fn observe_large_function(value: i64) -> i64 {
+    var total: i64 = value;
+''' + "".join(
+        f"    let term_{i}: i64 = large_function_term(value, {i % 7} as i64);\n"
+        f"    if ((term_{i} & 1) == 0) {{ total += term_{i}; }}\n"
+        f"    else {{ total -= term_{i}; }}\n" for i in range(256)
+    ) + "    return total;\n}\n",
+    "operator_overload": '''public class OperatorResult {
+    public value: i64;
+}
+public class OverloadedOperator<T> {
+    public value: T;
+    @[lazy]
+    public fn operator+(&self, rhs: i64) -> i64 { calls += 1; return self.value as i64 + rhs + 31; }
+    @[lazy]
+    public fn operator+(&self, rhs: f64) -> OperatorResult {
+        calls += 1;
+        return OperatorResult { value: self.value as i64 + rhs as i64 + 73 };
+    }
+}
+public fn observe_operator_overloads(value: i64) -> i64 {
+    let receiver = OverloadedOperator::<i64> { value: value };
+    let first = receiver + (3 as i64);
+    let second = receiver + (2.0 as f64);
+    let third = receiver + (3 as i64);
+    return first + second.value + third;
+}
+''',
+    "operator_generic": '''public class GenericOperator<T> {
+    public value: T;
+    @[lazy]
+    public fn operator+<U>(&self, rhs: U) -> i64 { calls += 1; return self.value as i64 + sizeof::<U>(); }
+}
+public fn observe_operator_instances(value: i64) -> i64 {
+    let receiver = GenericOperator::<i64> { value: value };
+    let other_receiver = GenericOperator::<i32> { value: value as i32 };
+    let first = receiver + (1 as i32);
+    let second = other_receiver + (1 as i64);
+    let third = receiver + (1 as i32);
+    return first + second + third;
+}
+''',
+    "pointer_index_owner": '''public class PointerIndexedRecord {
+    public value: i64;
+    public fn operator[](&self, index: i64) -> i64 { calls += 1; return 999 + index; }
+}
+public fn observe_pointer_index(value: i64) -> i64 {
+    let record = PointerIndexedRecord { value: value };
+    let pointer = to_rawptr(&record) as *PointerIndexedRecord;
+    let borrowed = &pointer[0];
+    let owner = Box::<PointerIndexedRecord>.new(PointerIndexedRecord { value: value });
+    if (owner.deref().value != value) { rule_errors += 1; }
+    if (hash::<i64>(value) != hash_i64(value)) { rule_errors += 1; }
+    return borrowed.value;
+}
+''',
+    "unary_operator": '''public class UnaryOperator<T> {
+    public value: T;
+    @[lazy]
+    public fn operator_neg(&self) -> i64 { calls += 1; return -(self.value as i64) - 5; }
+}
+public fn observe_unary_operator(value: i64) -> i64 {
+    let receiver = UnaryOperator::<i64> { value: value };
+    return -receiver;
+}
+''',
+    "index_overload": '''public class OverloadedIndex<T> {
+    public value: T;
+    @[lazy]
+    public fn operator[](&self, index: i32) -> i64 { calls += 1; return self.value as i64 + index as i64 + 11; }
+    @[lazy]
+    public fn operator[](&self, index: i64) -> i64 { calls += 1; return self.value as i64 + index + 22; }
+}
+public fn observe_index_overloads(value: i64) -> i64 {
+    let receiver = OverloadedIndex::<i64> { value: value };
+    let first = receiver[1 as i32];
+    let second = receiver[1 as i64];
+    let third = receiver[1 as i32];
+    return first + second + third;
+}
+''',
     "owned_linear": '''use std.clone;
 public class LinearOwned {
     public value: i64;
@@ -589,6 +781,8 @@ class Emitter:
             elif rule == "if_expr":
                 x = self.bind(expr)
                 expr = f"(if ({x} >= 0) {{ {x} + 5 }} else {{ 3 - {x} }})"
+            elif rule == "short_circuit_scan": expr = f"observe_short_circuit({expr})"
+            elif rule == "large_function": expr = f"observe_large_function({expr})"
             elif rule == "match_value":
                 x = self.bind(expr)
                 expr = f"(match {x} {{ case 0 => 11 as i64, default => {x} + 2, }})"
@@ -615,6 +809,11 @@ class Emitter:
                 self.lines.append(f"let {obj} = Cell {{ value: {expr} }};")
                 expr = f"{obj}.get()"
             elif rule == "generic_class": expr = f"(GenericCell::<i64>.make({expr}).get() + 2)"
+            elif rule == "operator_overload": expr = f"observe_operator_overloads({expr})"
+            elif rule == "operator_generic": expr = f"observe_operator_instances({expr})"
+            elif rule == "index_overload": expr = f"observe_index_overloads({expr})"
+            elif rule == "pointer_index_owner": expr = f"observe_pointer_index({expr})"
+            elif rule == "unary_operator": expr = f"observe_unary_operator({expr})"
             elif rule == "trait":
                 obj = self.name("metric")
                 self.lines.append(f"let {obj} = Measured {{ value: {expr} }};")
@@ -719,6 +918,9 @@ class Emitter:
             elif rule == "next_only_iterator": expr = f"sum_pull({expr})"
             elif rule == "owned_array": expr = f"sum_owned_array({expr})"
             elif rule == "inherited_iterator": expr = f"sum_inherited({expr})"
+            elif rule == "overloaded_iterator": expr = f"observe_overloaded_iterator({expr})"
+            elif rule == "overloaded_array_clone": expr = f"observe_overloaded_array({expr})"
+            elif rule == "dynamic_overload": expr = f"observe_dynamic_overload({expr})"
             elif rule == "owned_dict": expr = f"dict_owned_observation({expr})"
             elif rule == "owned_linear": expr = f"linear_owned_observation({expr})"
             elif rule == "borrowed_owned_vec":

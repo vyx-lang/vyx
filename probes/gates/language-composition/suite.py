@@ -86,7 +86,7 @@ def plan(args):
             "domain": {"rules": names, "values": values, "forms": forms,
                        "depth": args.depth, "negative_depth": args.negative_depth,
                        "type_depth": args.type_depth, "type_context_depth": args.type_context_depth},
-            "default_execution_matrix_cells": 18,
+            "default_execution_matrix_cells": 24,
             "unmodeled": catalog()["unmodeled"]}
 
 
@@ -105,16 +105,19 @@ def write_program(directory, cases, layout):
         sources = {"main.vyx": support(cases) + case_functions(cases) + main(cases)}
     elif layout == "project":
         sources = {"support.vyx": support(cases), "cases.vyx": case_functions(cases), "main.vyx": main(cases)}
-    elif layout == "modules":
+    elif layout in ("modules", "library"):
         sources = {"support.vyx": "module generated.support;\n" + support(cases),
                    "cases.vyx": "module generated.cases;\nuse generated.support;\n" + case_functions(cases),
                    "main.vyx": "module generated.main;\nuse generated.support;\nuse generated.cases;\n" + main(cases)}
     else:
         raise ValueError(f"unknown layout {layout}")
+    if layout == "library":
+        sources["library/support.vyx"] = sources.pop("support.vyx")
     for filename, content in sources.items():
+        (directory / filename).parent.mkdir(parents=True, exist_ok=True)
         (directory / filename).write_text(content, encoding="utf-8")
     if layout != "file":
-        (directory / "Vyx.toml").write_text('''[package]
+        manifest = '''[package]
 name = "grammar_suite"
 version = "0.1.0"
 entry = "main.vyx"
@@ -126,7 +129,25 @@ type = "executable"
 entry = "main.vyx"
 auto_sources = false
 sources = ["support.vyx", "cases.vyx", "main.vyx"]
+'''
+        if layout == "library":
+            manifest = manifest.replace('[target.probe]',
+                'support = { path = "library", target = "support" }\n[target.probe]')
+            manifest = manifest.replace('sources = ["support.vyx", "cases.vyx", "main.vyx"]',
+                'sources = ["cases.vyx", "main.vyx"]')
+            (directory / "library/Vyx.toml").write_text('''[package]
+name = "generated_support"
+version = "0.1.0"
+entry = "support.vyx"
+[dependencies]
+core = { path = "std:core", target = "std_core" }
+collections = { path = "std:collections", target = "std_collections" }
+[target.support]
+type = "staticlib"
+entry = "support.vyx"
+auto_sources = false
 ''', encoding="utf-8")
+        (directory / "Vyx.toml").write_text(manifest, encoding="utf-8")
     write_json(directory / "recipes.json", cases)
     (directory / "expected.txt").write_text(expected(cases) if not cases[0]["negative"] else "", encoding="utf-8")
     return {name: digest(directory / name) for name in sources}
@@ -172,6 +193,8 @@ def generate(args):
                 "plan": details, "cases": cases, "batches": batches,
                 "coverage": coverage(cases), "generated": len(cases), "executed": 0}
     write_json(directory / "suite.json", manifest)
+    shutil.copy2(HERE / "model.py", directory / "model.py.snapshot")
+    shutil.copy2(Path(__file__), directory / "suite.py.snapshot")
     print(json.dumps({"suite": str(directory / "suite.json"), **details,
                       "generated": len(cases), "executed": 0}, ensure_ascii=False, indent=2))
 
@@ -384,7 +407,7 @@ def run(args):
     if not cases: raise ValueError("selection is empty")
     selected_ids = {c["id"] for c in cases}
     layouts, opts, cgus = csv(args.layouts), csv(args.optimizations), csv(args.cgus)
-    if not layouts or set(layouts) - {"file", "project", "modules"}: raise ValueError("invalid layouts")
+    if not layouts or set(layouts) - {"file", "project", "modules", "library"}: raise ValueError("invalid layouts")
     if not opts or set(opts) - {"0", "2"}: raise ValueError("AOT optimization domain is 0,2")
     if not cgus or set(cgus) - {"default", "1", "4"}: raise ValueError("CGU domain is default,1,4")
     if any(len(set(v)) != len(v) for v in (layouts, opts, cgus)): raise ValueError("matrix axes must not contain duplicates")
@@ -534,7 +557,7 @@ def parser():
             sub.add_argument("--ids", help="explicit case IDs; omitted cases counted")
             sub.add_argument("--kind", choices=("all", "positive", "negative"), default="all")
             sub.add_argument("--family", choices=("all", "numeric", "types"), default="all")
-            sub.add_argument("--layouts", default="file,project,modules")
+            sub.add_argument("--layouts", default="file,project,modules,library")
             sub.add_argument("--optimizations", default="0,2")
             sub.add_argument("--cgus", default="default,1,4")
             sub.add_argument("--batch-size", type=int, default=128)

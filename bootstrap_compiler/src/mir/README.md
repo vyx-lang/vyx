@@ -91,6 +91,60 @@ tables, and the builder shares lookup caches and queues; they are not safe for
 concurrent mutation. `analysis/mir_analysis.vyx` and `passes/mir_pass.vyx` still
 contain concentrated implementations to decompose separately.
 
+## Resolved call boundary
+
+A source direct call enters MIR with a selected HIR FunctionId and a closed
+signature. Mapping that identity to a MIR function must preserve its HIR ID.
+Missing IDs are errors; expression names cannot recover them. A concrete
+receiver cannot retain an interface requirement as its executable target;
+dynamic receivers retain the selected interface slot for vtable dispatch.
+The call lowering path must not search the receiver's method family again.
+
+Source operators and class indexing follow the same identity rule. Overload
+scoring and generic method materialization belong to HIR. Typed `*T` indexing
+selects T storage, regardless of any operator declared on T. Fixed arrays and
+primitive text keep their intrinsic indexing rules. Newly materialized HIR
+bodies check function bindings over their own append range before MIR lowering;
+this does not retain or rescan whole-unit bodies.
+
+The build driver distinguishes the complete unity input list from the authored
+source list (`--project-owned-sources`). Source dependencies provide bodies,
+but do not become the consumer's export roots. Package discovery stops at
+nested `Vyx.toml` boundaries; compiled dependencies supply their published VYI
+through their resolved artifact directory instead of recursive source scans.
+The source-dependency marker authorizes lazy body materialization without
+granting export ownership. MIR builder diagnostics restore the source file of
+the materialized function before using its expression's line and column.
+
+Iteration stores selected `iter`, `next`, optional `has_next` and array leaf
+`clone` FunctionIds on its HIR statement. HIR closes their receiver-only
+signatures before MIR. MIR maps those identities directly, without searching
+method families again. The bindings are checked over the materialized statement
+range and survive body streaming; they do not retain function bodies.
+Protocol instantiation also receives the collection's HIR expression identity
+for constraint diagnostics. Resolve its location when emitting the diagnostic;
+do not retain a pointer into a growing HIR table or reuse Sema's last location.
+Dynamic conversions bind each interface prototype to its concrete HIR method
+using the complete parameter/return signature and declared inheritance. MIR
+retains `(payload TypeId, prototype FunctionId, implementation FunctionId)`
+bindings across body discard and CGU partitioning. LLVM consumes these bindings;
+it does not select implementations from a method-name index or saved local
+chains. The MIR unit owns the binding records; streaming releases them after
+module finalization. Async support still has separate lookup entry points to
+audit and does not authorize a source-call fallback.
+CGU membership comes from the executable reachability walk. A retained function
+shell can describe an external library symbol or an interface prototype; its
+presence cannot promote it into a definition or another export root.
+Verified imported template artifacts can materialize private helper bodies.
+When those helpers cross CGUs, they retain ODR linkage so a separately linked
+library's canonical export does not collide with a new strong definition.
+Ordinary public free functions loaded from a compiled interface remain owned
+by the producer library even when the AST artifact transports their bodies.
+Source-package bodies and closed generic instances retain their distinct
+materialization paths; body availability does not grant export ownership.
+For native linkage diagnostics, `VYX_LLVM_LINKAGE_TRACE=1` prints the function
+flags, CGU identity and chosen internal/ODR linkage at definition emission.
+
 ## Validation
 
 Build the SDK compiler from this tree, then run hello `--dump-mir2`,

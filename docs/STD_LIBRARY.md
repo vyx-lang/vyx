@@ -32,8 +32,8 @@ static packages.
 | `std:sync` | `std_sync` | sync, channel, threading, thread_pool, concurrent |
 | `std:format` | `std_format` | fmt, color |
 | `std:testing` | `std_testing` | testing and mock |
-| `std:toml` | `std_toml` | TOML |
-| `std:json` | `std_json` | JSON plus cJSON native bridge |
+| `std:serde` | `serde_toml` | TOML |
+| `std:serde` | `serde_json` | JSON plus cJSON native bridge |
 | `std:miniz` | `std_miniz` | compression plus miniz bridge |
 | `std:std` | `std` | aggregate package, including JSON/miniz |
 | `std:cacao` | `std_cacao` | Cacao graphics/GPU C ABI bindings (opt-in; link Cacao) |
@@ -64,6 +64,68 @@ Bindings requiring a separate native SDK or implementation—LLVM, Cacao, curl,
 OpenSSL, SQLite, stb_image, Win32, spdlog, and similar—do not belong in that
 generic aggregate. Consume an explicit native package with a complete link
 closure.
+
+## Resource and value contracts
+
+The [standard-library gate](../probes/gates/stdlib-contracts/README.md) runs
+project contracts at O0/O2, semantic rejection checks and generated operation
+traces against Python list results. Native Windows, Linux and macOS release
+jobs run it before packaging. Read the recorded platform and compiler hashes;
+an inventory entry or a build alone does not establish runtime coverage.
+
+`Vec<T>` membership and equality require `T: Eq`; hashing requires
+`T: Hashable`, and sorting requires `T: Ord`. They use element values, not
+pointer bytes or padding. Sorting is unstable, uses bounded heapsort and
+invalidates existing iterators. Hash values are not a persistence format.
+The compatibility `Vec.sum()` and `Iterator.sum()` return i64 after converting
+each element; floating values truncate per element. Use
+`std.algorithm.sum_iter` for a reduction in the element type.
+
+`PriorityQueue<T>` uses `T: Ord` for push/pop and min/max order changes.
+`peek` requires `Clone` and returns an independent value; `pop` transfers
+ownership. `clear` destroys all live elements and retains capacity. Heap order
+changes rebuild nonempty queues in O(n), invalidate iterators, and return a
+mutable borrow. Use `new_max()` to construct an owned max-heap. Storage honors
+`alignof<T>` during construction and growth.
+
+`BTreeMap` and `BTreeSet` currently use sorted flat arrays: lookup is O(log n),
+insertion/removal O(n). Search and removal borrow the query and do not require
+keys to be Clone. Reading an independent value/key or cloning the collection
+requires the corresponding Clone bounds. Ordered keys must make Eq agree with
+`compare(other) == 0`.
+
+`Iterator.next` and reads that return an owned element require `Clone`.
+`map`, `filter`, `take` and `skip` are eager adapters with independent storage;
+they are not lazy pipelines. `map` and `filter` exhaust the input cursor;
+`take(n)` advances by the selected count, and `skip(n)` exhausts it while
+returning the remaining range. Callbacks of type `fn(T)` receive owned
+values; `fn(&T)` borrows. An adapter destroys all its retained values,
+including unread ones. A container iterator borrows its source, which must
+outlive it; mutation generation checks do not extend the source lifetime.
+
+`Channel<T>` is bounded and nonblocking. `try_send` returns rejected ownership
+in `ChannelSendError<T>`; `into_inner()` recovers it once. `try_recv` separates
+empty from closed. Close permits draining, and destruction releases unread
+messages. Join all users before destroying a channel.
+
+`File.try_open`, `try_read_all_bytes` and `try_read_all_text` return `Result`,
+including successful empty reads. Legacy convenience reads retain empty-on-error
+behavior. Windows paths use UTF-8 conversion to wide filesystem APIs. File
+cleanup is automatic, and explicit close is idempotent.
+
+`std.security.openssl` provides `try_sha256`, `try_sha512`, `try_sha1`,
+`try_md5`, `try_hmac_sha256`, `try_random_bytes` and `try_random_int`.
+They return `Result` with `CryptoError` (category, native error code, message).
+Digest/HMAC success owns a hexadecimal `String`. `try_random_bytes` accepts
+0..256 bytes and also returns hex text, two characters per byte; zero is a
+successful empty result. Existing text convenience functions panic on native
+failure. Native OpenSSL known-answer and injected-failure tests are opt-in;
+they require the selected native libraries and do not certify the full TLS API.
+
+Strict Base64/hex decoding has Result-returning `try_*` APIs. CSV supports
+quoted multiline fields, doubled quotes, CRLF and embedded NUL, with a located
+error for malformed quoting. Package-level tests do not certify every native
+binding, format, allocation failure, async schedule or device backend.
 
 ## Current implementation boundary
 
@@ -117,16 +179,16 @@ and read levels through `log_level_*()` (package `.vyi` does not re-export
 logger = { path = "std:logger", target = "std_logger" }
 ```
 
-`bootstrap_compiler/std_packages/json` keeps the Vyx API, cJSON source, and
+`bootstrap_compiler/std_packages/serde` keeps the Vyx API, cJSON source, and
 native bridge in one `Vyx.toml` project:
 
 ```toml
 [dependencies]
-json = { path = "std:json", target = "std_json" }
+json = { path = "std:serde", target = "serde_json" }
 ```
 
 The builder recursively builds the package, imports its `.vyi`, adds the static
-library, and propagates runtime resources. `std.json` exposes `Result` errors,
+library, and propagates runtime resources. `std.serde.json` exposes `Result` errors,
 object/array/scalar values, deep copy of child values, type checks,
 serialization, and deterministic `drop()`. Missing keys, type errors, parse
 errors, and allocation errors are distinct failures, not empty-value aliases.
@@ -144,7 +206,7 @@ requires a maximum output length; insufficient capacity, bad arguments,
 allocation failure, and malformed data are reported through `Result`.
 
 `bootstrap_compiler/std_packages/stb_image` vendors the stb image family and
-compiles it through one stub, the same mixed C/H pattern as `std:json`:
+compiles it through one stub, the same mixed C/H pattern as `std:serde`:
 
 - `vendor/stb_image.h`
 - `vendor/stb_image_write.h`
@@ -177,14 +239,18 @@ The flat `std.cjson` binding was removed. An explicit source package disables
 that target's implicit flat-std lookup: a missing dependency is an import error,
 not a silent fallback to a compatibility mirror.
 
-## Built-ins
+## Common entry points and compiler intrinsics
+
+`print`, `assert`, `panic` and `format` have standard-library source
+implementations. The tables also include compiler intrinsics such as type
+queries; the library names are not independent compiler implementations.
 
 ### Output and diagnostics
 
 | Function | Signature | Meaning |
 |---|---|---|
 | `print` | `print(val)` | print i64/f64/string/bool and compatible values |
-| `assert` | `assert(cond: bool)` | stop and report a location when false |
+| `assert` | `assert(cond: bool, message: str = "assert failed")` | print the message and terminate when false |
 | `panic` | `panic(msg: string)` | immediately terminate with a message |
 | `format` | `format(fmt, args...)` | format a string |
 

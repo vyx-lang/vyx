@@ -28,6 +28,7 @@ def main():
         'owned_stack_lifetime': -1, 'owned_queue_lifetime': -1,
         'owned_vec_from_array': -1, 'stack_queue_str_lifetime': -1,
         'owned_array_clone': -1, 'owned_array_lifetime': -1, 'format_cleanup': 5,
+        'dyn_owned_arguments': -1,
         'conditional_raw_param_lifetime': -1, 'raw_copy_param_lifetime': -1,
         'conditional_owned_param_lifetime': -1,
         'named_owned_arguments': -1, 'ordinary_args_ownership': -1}
