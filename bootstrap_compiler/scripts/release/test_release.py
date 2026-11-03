@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import unittest
 import urllib.error
+from unittest.mock import patch
+import build_native
 
 from common import REPO, checksum_sidecar, sha256
 from build_termux import debian_version
@@ -18,6 +20,72 @@ from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validat
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_dynamic_library_requires_every_cgu_and_current_compiler(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            compiler = root / "vyxc"
+            compiler.write_bytes(b"current compiler")
+            report = root / "dynamic-library/run/results.json"
+            report.parent.mkdir(parents=True)
+            valid = {"compiler": {"sha256": sha256(compiler)}, "generated": 78, "selected": 78,
+                     "status": "pass", "complete": True, "passed_case_cell_count": 312,
+                     "matrix": [["library", opt, cgu] for opt in ("0", "2") for cgu in ("1", "4")]}
+            with patch.object(build_native, "run"):
+                report.write_text(json.dumps(valid), encoding="utf8")
+                self.assertEqual(build_native.check_dynamic_library(compiler, root, {})["passed_case_cells"], 312)
+                for changes in ({"selected": 77}, {"passed_case_cell_count": 311}, {"status": "fail"},
+                                {"matrix": [valid["matrix"][0]] * 4}, {"complete": False},
+                                {"compiler": {"sha256": "old compiler"}}):
+                    report.write_text(json.dumps(valid | changes), encoding="utf8")
+                    with self.assertRaisesRegex(RuntimeError, "every selected case/configuration"):
+                        build_native.check_dynamic_library(compiler, root, {})
+
+    def test_protocol_gate_rejects_missing_checks_and_wrong_compiler(self):
+        for check, cases, directory in (
+                (build_native.check_iteration_protocol, build_native.ITERATION_PROTOCOL_CASES, "protocol-edges"),
+                (build_native.check_dynamic_dispatch, build_native.DYNAMIC_DISPATCH_CASES, "dynamic-edges")):
+            with self.subTest(gate=directory), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                compiler = root / "vyxc"
+                compiler.write_bytes(b"current compiler")
+                report = root / directory / "results.json"
+                report.parent.mkdir()
+                count = len(cases) * 2
+                valid = {"compiler": {"sha256": sha256(compiler)}, "passed": count, "failed": 0,
+                         "results": [{"name": name, "opt": opt, "cgu": "default", "pass": True}
+                                     for name in cases for opt in ("0", "2")]}
+                with patch.object(build_native, "run"):
+                    report.write_text(json.dumps(valid), encoding="utf-8")
+                    self.assertEqual(check(compiler, root, {})["checks"], count)
+                    for changes in ({"passed": 0, "results": []}, {"passed": count - 1}, {"failed": 1},
+                                    {"results": [{"pass": False}] * count},
+                                    {"results": [valid["results"][0]] * count},
+                                    {"results": [row | {"cgu": "4"} for row in valid["results"]]},
+                                    {"compiler": {"sha256": "old compiler"}}):
+                        report.write_text(json.dumps(valid | changes), encoding="utf-8")
+                        with self.assertRaisesRegex(RuntimeError, "every required case/configuration"):
+                            check(compiler, root, {})
+
+    def test_semantic_gate_rejects_empty_partial_and_wrong_compiler_reports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            compiler = root / "vyxc"
+            compiler.write_bytes(b"current compiler")
+            report = root / "semantic-composition/run/results.json"
+            report.parent.mkdir(parents=True)
+            valid = {"generated": 666, "selected": 666, "matrix": [[i] for i in range(8)],
+                     "compiler": {"sha256": sha256(compiler)}, "status": "pass", "complete": True,
+                     "passed_case_cell_count": 5328}
+            with patch.object(build_native, "run"):
+                report.write_text(json.dumps(valid), encoding="utf-8")
+                self.assertEqual(build_native.check_semantic_composition(compiler, root, {})["passed_case_cells"], 5328)
+                for changes in ({"generated": 0, "selected": 0, "passed_case_cell_count": 0},
+                                {"selected": 665}, {"passed_case_cell_count": 5327}, {"complete": False},
+                                {"compiler": {"sha256": "old compiler"}}):
+                    report.write_text(json.dumps(valid | changes), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "every selected case/configuration"):
+                        build_native.check_semantic_composition(compiler, root, {})
+
     def test_windows_checkout_preserves_debugger_patch_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

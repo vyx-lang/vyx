@@ -34,6 +34,98 @@ def run(command, *, cwd=REPO, env=None):
     print(f"[release] completed in {time.monotonic() - started:.1f}s", flush=True)
 
 
+def check_standard_library(compiler, work, environment):
+    output = work / "stdlib-contracts"
+    run([sys.executable, "-m", "unittest", "discover", "-s",
+         REPO / "probes/gates/stdlib-contracts", "-p", "test_runner.py"], env=environment)
+    run([sys.executable, REPO / "probes/gates/stdlib-contracts/run.py",
+         "--compiler", compiler, "--output", output, "--negative", "--model"], env=environment)
+    report = output / "verification.json"
+    result = json.loads(report.read_text(encoding="utf-8"))
+    return {"checks": len(result["results"]), "passed": sum(row["passed"] for row in result["results"]),
+            "compiler_sha256": result["compiler_sha256"], "report_sha256": sha256(report)}
+
+
+def check_semantic_composition(compiler, work, environment):
+    gate = REPO / "probes/gates/language-composition/suite.py"
+    output = work / "semantic-composition"
+    corpus = output / "corpus"
+    results = output / "run"
+    run([sys.executable, gate, "generate", "--rules",
+         "operator_overload,operator_generic,index_overload,pointer_index_owner,unary_operator,short_circuit_scan,large_function,overloaded_iterator,overloaded_array_clone,dynamic_overload",
+         "--depth", "2", "--no-types", "--no-negative", "--out", corpus], env=environment)
+    run([sys.executable, gate, "run", "--suite", corpus / "suite.json", "--compiler", compiler,
+         "--layouts", "file,project,modules,library", "--optimizations", "0,2", "--cgus", "default",
+         "--kind", "positive", "--out", results], env=environment)
+    report = results / "results.json"
+    result = json.loads(report.read_text(encoding="utf-8"))
+    expected = 666 * 8
+    if (result["generated"] != 666 or result["selected"] != 666 or len(result["matrix"]) != 8
+            or result["compiler"]["sha256"] != sha256(compiler)
+            or result["status"] != "pass" or not result["complete"]
+            or result["passed_case_cell_count"] != expected):
+        raise RuntimeError("semantic composition gate did not execute and pass every selected case/configuration")
+    return {"generated": result["generated"], "passed_case_cells": result["passed_case_cell_count"],
+            "configurations": len(result["matrix"]), "report_sha256": sha256(report)}
+
+
+ITERATION_PROTOCOL_CASES = (
+    "for_collection_delimiters", "bad_iteration_has_next_return", "bad_iteration_next_args",
+    "str_array_iteration", "owned_array_clone", "nested_array_clone", "bad_iterator_clone", "bad_array_clone",
+)
+
+
+def check_iteration_protocol(compiler, work, environment):
+    return check_protocol_edges(compiler, work, environment, ITERATION_PROTOCOL_CASES, "protocol-edges")
+
+
+DYNAMIC_DISPATCH_CASES = (
+    "dyn_overload", "dyn_overload_return", "dyn_generic_overload", "dyn_owned_arguments",
+    "dyn_inherited", "dyn_inherited_overload", "dyn_structural", "bad_dyn_missing_member",
+)
+
+
+def check_dynamic_dispatch(compiler, work, environment):
+    return check_protocol_edges(compiler, work, environment, DYNAMIC_DISPATCH_CASES, "dynamic-edges")
+
+
+def check_dynamic_library(compiler, work, environment):
+    gate = REPO / "probes/gates/language-composition/suite.py"
+    output = work / "dynamic-library"
+    corpus = output / "corpus"
+    run([sys.executable, gate, "generate", "--rules", "dynamic_overload,operator_overload,overloaded_iterator",
+         "--depth", "2", "--no-types", "--no-negative", "--out", corpus], env=environment)
+    run([sys.executable, gate, "run", "--suite", corpus / "suite.json", "--compiler", compiler,
+         "--layouts", "library", "--optimizations", "0,2", "--cgus", "1,4",
+         "--out", output / "run"], env=environment)
+    report = output / "run/results.json"
+    result = json.loads(report.read_text(encoding="utf-8"))
+    matrix = {tuple(cell) for cell in result["matrix"]}
+    required = {("library", opt, cgu) for opt in ("0", "2") for cgu in ("1", "4")}
+    if (result["compiler"]["sha256"] != sha256(compiler) or result["generated"] != 78
+            or result["selected"] != 78 or matrix != required or len(result["matrix"]) != 4
+            or result["status"] != "pass" or not result["complete"] or result["passed_case_cell_count"] != 312):
+        raise RuntimeError("dynamic library gate did not pass every selected case/configuration")
+    return {"generated": 78, "passed_case_cells": 312, "report_sha256": sha256(report)}
+
+
+def check_protocol_edges(compiler, work, environment, cases, directory):
+    output = work / directory
+    run([sys.executable, REPO / "probes/gates/language-composition/check_edges.py",
+         "--compiler", compiler, "--out", output, "--optimizations", "0,2", "--cgus", "default",
+         "--cases", ",".join(cases)],
+        env=environment)
+    report = output / "results.json"
+    result = json.loads(report.read_text(encoding="utf-8"))
+    required = {(name, opt, "default") for name in cases for opt in ("0", "2")}
+    actual = {(row.get("name"), row.get("opt"), row.get("cgu")) for row in result["results"]}
+    if (result["compiler"]["sha256"] != sha256(compiler) or result["passed"] != len(required)
+            or result["failed"] != 0 or len(result["results"]) != len(required) or actual != required
+            or not all(row["pass"] for row in result["results"])):
+        raise RuntimeError("protocol gate did not pass every required case/configuration")
+    return {"checks": result["passed"], "report_sha256": sha256(report)}
+
+
 def bootstrap_manifest(manifest, sdk):
     setting = 'parallel_std_sources = "std"'
     if manifest.count(setting) != 1:
@@ -183,6 +275,11 @@ def main():
          "--output-dir", work / "root-lists"], env=environment)
     run([sys.executable, REPO / "probes/gates/test-runner/run.py",
          "--compiler", built_compiler, "--output", work / "test-runner"], env=environment)
+    record["semantic_composition"] = check_semantic_composition(built_compiler, work, environment)
+    record["iteration_protocol"] = check_iteration_protocol(built_compiler, work, environment)
+    record["dynamic_dispatch"] = check_dynamic_dispatch(built_compiler, work, environment)
+    record["dynamic_library"] = check_dynamic_library(built_compiler, work, environment)
+    record["stdlib_contracts"] = check_standard_library(built_compiler, work, environment)
     if not windows:
         run([sys.executable, REPO / "probes/gates/directory-enumeration/run.py",
              "--compiler", built_compiler, "--cc", args.llvm_root / "bin/clang",
