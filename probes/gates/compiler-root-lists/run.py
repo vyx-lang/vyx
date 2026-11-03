@@ -135,13 +135,17 @@ def main():
                                "--emit=obj", "-o", artifact])
             record["passed"] = record["exit"] == 1
             check(record, "error: E3102:" in record["stdout"] + record["stderr"] and not artifact.exists())
-        artifact = output / "returned_string_slices.obj"
-        record = run("returned-string-slices", [compiler, "--src=file", lifetime / "returned_string_slices.vyx",
-                     "--emit=obj", "-o", artifact])
-        record["passed"] = record["exit"] == 1
-        diagnostics = record["stdout"] + record["stderr"]
-        check(record, all(fragment in diagnostics for fragment in
-                         ("error: E3102:", "return owner.substring(", "return owner.trim()")) and not artifact.exists())
+        # Streaming MIR verification stops after its first invalid function.
+        # Compile each method separately so both rejections must be observed.
+        for name, source_line in (("returned_string_substring", "return owner.substring("),
+                                  ("returned_string_trim", "return owner.trim()")):
+            artifact = output / (name + ".obj")
+            record = run(name.replace("_", "-"), [compiler, "--src=file", lifetime / (name + ".vyx"),
+                         "--emit=obj", "-o", artifact])
+            record["passed"] = record["exit"] == 1
+            diagnostics = record["stdout"] + record["stderr"]
+            check(record, "error: E3102:" in diagnostics and source_line in diagnostics
+                  and not artifact.exists())
         imported = output / "interfaces/audit"
         imported.mkdir(parents=True)
         (imported / "borrowing.vyi").write_text(

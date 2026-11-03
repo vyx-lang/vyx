@@ -23,6 +23,8 @@ python probes/gates/full-expression/run.py --compiler bootstrap_compiler/out/vyx
 - 泛型函数转发未绑定的 `T` 时不能选中其他类型的全特化；根命名空间和其他模块的同名泛型与特化必须各自绑定。
 - 直接打印堆分配及内联 `String`，并检查实际生成的清理路径。
 - 局部 `str` 视图保持临时对象到绑定作用域结束；返回临时对象的借用视图必须报错。
+- `String.substring` 和 `String.trim` 返回局部拥有者的视图分别用独立文件验证，
+  每个文件都必须在对应的 return 语句报 E3102，且不能产出可执行文件。
 - 自定义 `clone`、`toUpper`、`substring`、`str_dup`、`readFile` 等同名调用返回借用时，
   不按名字猜测它拥有新存储；借用结束后的分配扰动不能破坏原对象，原对象仅析构一次。
 - 局部独立字符串经内建复制、标准库复制、普通函数返回链和字符串变换产生后，

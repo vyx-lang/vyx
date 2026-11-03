@@ -45,5 +45,8 @@ user `str_drop` functions cannot replace the std.string lifecycle binding. It
 requires E3102 for dangling views, aliases, forwarding calls, a misleading clone
 name, library String slices, reassignment, loop/branch exits and references to local scalars. This keeps
 the repair paired with rejection tests instead of disabling return checking.
+String `substring` and `trim` escapes are compiled as separate inputs. Each must
+report E3102 at its own return statement and produce no object; streaming MIR
+verification need not continue into other functions after finding an error.
 Generated generic interfaces retain their defining-module helpers and overloads;
 incompatible calls must report E2200 without producing an artifact.

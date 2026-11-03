@@ -144,10 +144,13 @@ def main() -> int:
                 expected = b"stored-strings=ok\n" if fixture == "stored_strings" else b"local-string-results=ok\n"
                 invoke(label + "-run", [executable], stdout=expected)
 
-    for name in ("returned_view", "returned_bound_view", "returned_payload", "returned_string_slices"):
+    for name in ("returned_view", "returned_bound_view", "returned_payload",
+                 "returned_string_substring", "returned_string_trim"):
         diagnostic = "returned view borrows an owning temporary"
-        if name == "returned_string_slices":
-            diagnostic = (diagnostic, "return owner.substring(", "return owner.trim()")
+        if name == "returned_string_substring":
+            diagnostic = ("error: E3102:", diagnostic, "return owner.substring(")
+        elif name == "returned_string_trim":
+            diagnostic = ("error: E3102:", diagnostic, "return owner.trim()")
         rejected = output / (name + (".exe" if os.name == "nt" else ""))
         rejected.unlink(missing_ok=True)
         invoke(f"{name}-rejected", [compiler, "--src=file", gate / f"{name}.vyx",
