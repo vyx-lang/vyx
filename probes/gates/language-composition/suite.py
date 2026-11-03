@@ -13,11 +13,12 @@ import random
 import re
 import queue
 import shutil
-import signal
 import subprocess
 import sys
 import threading
 import time
+
+from posix_process import execute as execute_posix, memory_policy as posix_memory_policy
 
 from model import (NEGATIVES, RULE_BY_NAME, RULES, TYPE_BASES, TYPE_CONSTRUCTORS, case_functions, case_id,
                    catalog, expected, main, oracle, recipes, support)
@@ -277,26 +278,9 @@ class Executor:
             for key, value in environment.items():
                 if value is None: env.pop(key, None)
                 else: env[key] = value
-            # RLIMIT_AS covers each child separately on POSIX; it does not claim
-            # to bound total resident/commit memory of a project process group.
-            def limits():
-                if self.memory_mb:
-                    import resource
-                    limit = self.memory_mb * 1024 * 1024
-                    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
             with open(request["stdout"], "wb") as out, open(request["stderr"], "wb") as err:
-                proc = subprocess.Popen([str(exe), *map(str, arguments)], cwd=directory, env=env,
-                                        stdout=out, stderr=err, start_new_session=True, preexec_fn=limits)
-                timed_out = False
-                try: exit_code = proc.wait(timeout=self.timeout)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
-                    exit_code = -901
-            result = {"ExitCode": exit_code, "TimedOut": timed_out, "MemoryExceeded": False,
-                      "DialogCaught": False, "JobLimited": False, "PeakWorkingSetMB": None,
-                      "PeakPrivateCommitMB": None, "MemoryPolicy": "per-process RLIMIT_AS"}
+                result = execute_posix([str(exe), *map(str, arguments)], cwd=directory, env=env,
+                                       stdout=out, stderr=err, timeout=self.timeout, memory_mb=self.memory_mb)
         return {"request": request, "result": result, "seconds": round(time.monotonic() - started, 3)}
 
     def test(self, cases, directory, layout, opt, cgu):
@@ -365,13 +349,14 @@ def executor(args):
 def compiler_identity(instance):
     compiler = instance.compiler
     companion = {}
-    for name in ("vyx_compiler_backend.dll", "vyx_runtime.lib", "libvyx_compiler_backend.so", "libvyx_runtime.a"):
+    for name in ("vyx_compiler_backend.dll", "vyx_runtime.lib", "libvyx_compiler_backend.so",
+                 "libvyx_compiler_backend.dylib", "libvyx_runtime.a"):
         p = compiler.parent / name
         if p.exists(): companion[name] = {"path": str(p), "sha256": digest(p)}
     return {"path": str(compiler), "sha256": digest(compiler), "bytes": compiler.stat().st_size,
             "companions": companion, "platform": sys.platform,
             "memory_limit_mb": instance.memory_mb,
-            "memory_policy": "Windows inherited Job private commit" if os.name == "nt" else "per-process RLIMIT_AS"}
+            "memory_policy": "Windows inherited Job private commit" if os.name == "nt" else posix_memory_policy()}
 
 
 def load_suite(path):

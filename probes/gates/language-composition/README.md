@@ -216,7 +216,13 @@ python probes/gates/language-composition/suite.py run --suite .cache/grammar-cor
 项目路径调用 `--src=project ... --target probe -j20`。构建采用 2 个 Vyx slot，
 CGU 发射线程为 1，Windows 编译/运行进程树默认限额 2048 MiB private commit、120 秒。
 限额或超时失败单独记为 `resource`，不能记为语义诊断通过。
-POSIX 使用每进程 `RLIMIT_AS` 和进程组超时终止；它不等于 Windows 的整树 commit 限额。
+Linux 使用每进程 `RLIMIT_AS`。macOS 不在 `preexec_fn` 设置该限额，
+而是通过系统 `/bin/ps` 约每 50 ms 采样该次调用进程组的 RSS 总和，超过预算则终止整组，
+记录 `MemoryExceeded` 和采样峰值。监测失败直接报错并清理该进程组，不无声取消限额。
+两者都在超时、监测异常和根进程退出时清理仍存活的组内子进程。
+RSS 采样可能遗漏采样间隔内的瞬时峰值；它与虚拟地址空间、Windows 的整树 commit 限额
+不是同一种测量。报告区分各平台实际策略，macOS 的采样值保存在 `SampledPeakGroupRssMB`。
+Release 在构建 SDK 之前运行 `test_process_executor.py`，验证启动、内存超限、超时和子进程清理。
 
 迭代时可显式选择一部分矩阵；结果会记录未选输入及未执行单元：
 
