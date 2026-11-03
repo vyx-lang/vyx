@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tomllib
 
-from build_native import bootstrap_manifest, check_dynamic_dispatch, check_dynamic_library, check_iteration_protocol, check_semantic_composition, check_standard_library, run
+from build_native import bootstrap_manifest, check_dynamic_dispatch, check_dynamic_library, check_iteration_protocol, check_semantic_composition, check_standard_library, check_value_bindings, run
 from common import REPO, bootstrap_asset, checksum_sidecar, sha256, unpack_sdk
 from macos_common import TRIPLES, collect_objects, executable_content, source_commit, source_snapshot, verify_bundle
 
@@ -308,6 +308,7 @@ def native(args):
     record["semantic_composition"] = check_semantic_composition(built, work, environment)
     record["iteration_protocol"] = check_iteration_protocol(built, work, environment)
     record["dynamic_dispatch"] = check_dynamic_dispatch(built, work, environment)
+    record["value_bindings"] = check_value_bindings(built, work, environment)
     record["dynamic_library"] = check_dynamic_library(built, work, environment)
     record["stdlib_contracts"] = check_standard_library(built, work, environment)
     run([sys.executable, REPO / "probes/gates/directory-enumeration/run.py",

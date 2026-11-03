@@ -52,15 +52,15 @@ def check_semantic_composition(compiler, work, environment):
     corpus = output / "corpus"
     results = output / "run"
     run([sys.executable, gate, "generate", "--rules",
-         "operator_overload,operator_generic,index_overload,pointer_index_owner,unary_operator,short_circuit_scan,large_function,overloaded_iterator,overloaded_array_clone,dynamic_overload",
+         "operator_overload,operator_generic,index_overload,pointer_index_owner,unary_operator,short_circuit_scan,large_function,overloaded_iterator,overloaded_array_clone,dynamic_overload,generic_function_value",
          "--depth", "2", "--no-types", "--no-negative", "--out", corpus], env=environment)
     run([sys.executable, gate, "run", "--suite", corpus / "suite.json", "--compiler", compiler,
          "--layouts", "file,project,modules,library", "--optimizations", "0,2", "--cgus", "default",
          "--kind", "positive", "--out", results], env=environment)
     report = results / "results.json"
     result = json.loads(report.read_text(encoding="utf-8"))
-    expected = 666 * 8
-    if (result["generated"] != 666 or result["selected"] != 666 or len(result["matrix"]) != 8
+    expected = 798 * 8
+    if (result["generated"] != 798 or result["selected"] != 798 or len(result["matrix"]) != 8
             or result["compiler"]["sha256"] != sha256(compiler)
             or result["status"] != "pass" or not result["complete"]
             or result["passed_case_cell_count"] != expected):
@@ -87,6 +87,19 @@ DYNAMIC_DISPATCH_CASES = (
 
 def check_dynamic_dispatch(compiler, work, environment):
     return check_protocol_edges(compiler, work, environment, DYNAMIC_DISPATCH_CASES, "dynamic-edges")
+
+
+VALUE_BINDING_CASES = (
+    "generic_function_values", "generic_function_owned", "generic_function_overloads", "generic_function_containers",
+    "bad_generic_function_arity", "bad_generic_function_open", "bad_generic_function_argument",
+    "bad_function_value_ambiguous", "bad_generic_function_bound", "bad_generic_function_type",
+    "await_borrow", "await_owned_lifetime", "bad_await_scalar", "bad_await_void",
+    "bad_await_poll", "bad_await_payload", "for_direct_ranges", "await_taken_result",
+)
+
+
+def check_value_bindings(compiler, work, environment):
+    return check_protocol_edges(compiler, work, environment, VALUE_BINDING_CASES, "value-bindings")
 
 
 def check_dynamic_library(compiler, work, environment):
@@ -127,7 +140,7 @@ def check_protocol_edges(compiler, work, environment, cases, directory):
 
 
 def bootstrap_manifest(manifest, sdk):
-    setting = 'parallel_std_sources = "std"'
+    setting = 'parallel_std_sources = "std_packages"'
     if manifest.count(setting) != 1:
         raise RuntimeError("Bootstrap standard-library source selection drifted")
     return manifest.replace(setting, "parallel_std_sources = " + json.dumps((sdk / "std").as_posix()))
@@ -278,6 +291,7 @@ def main():
     record["semantic_composition"] = check_semantic_composition(built_compiler, work, environment)
     record["iteration_protocol"] = check_iteration_protocol(built_compiler, work, environment)
     record["dynamic_dispatch"] = check_dynamic_dispatch(built_compiler, work, environment)
+    record["value_bindings"] = check_value_bindings(built_compiler, work, environment)
     record["dynamic_library"] = check_dynamic_library(built_compiler, work, environment)
     record["stdlib_contracts"] = check_standard_library(built_compiler, work, environment)
     if not windows:

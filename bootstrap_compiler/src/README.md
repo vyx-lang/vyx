@@ -41,6 +41,9 @@ and [LLVM map](codegen/llvm/README.md) for method-level entry points.
 The [architecture guide](../../docs/COMPILER.md) explains the data flow.
 
 `core/sema/call_arguments.vyx` owns source argument binding and name diagnostics.
+`core/sema/function_values.vyx` selects declarations for free function values
+within the resolved module, checks explicit type-argument arity and rejects
+ambiguous overload sets. HIR closes their instance signatures before lowering.
 HIR carries the source order and argument labels through inference and coercion;
 MIR evaluates named arguments in that order before arranging the ABI argument list.
 

@@ -28,6 +28,7 @@ class GeneratorTests(unittest.TestCase):
             "overloaded_array_clone": (-13, 2, 4, 0),
             "dynamic_overload": (44, 6, 0, 0),
             "await_ready": (-11, 2, 0, 0),
+            "generic_function_value": (-13, 3, 0, 0),
         }
         for name, observation in cases.items():
             self.assertEqual(oracle(make_case((name,), -7, "inline")), list(observation) + [0])

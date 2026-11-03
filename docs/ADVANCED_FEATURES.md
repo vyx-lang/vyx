@@ -760,6 +760,26 @@ The constraint is that **the operator must hold for every argument**: `+` requir
 
 Nested generics instantiate via turbofish or receiver arguments.
 
+### Generic functions as values
+
+Specify type arguments when storing or passing a generic function:
+
+```vyx program
+fn identity<T>(value: T) -> T { return value; }
+fn factory<T>() -> fn(T) -> T { return identity::<T>; }
+
+fn main() -> i32 {
+    let direct = identity::<i64>;
+    let returned = factory::<i64>();
+    print(direct(40) + returned(2));
+    return 0;
+}
+```
+
+`identity::<i64>` has type `fn(i64) -> i64`. Calls through the value use
+positional arguments and the instantiated function's ownership rules. A generic
+function value needs explicit type arguments; an ambiguous overload set is an error.
+
 ### Recap
 
 Take generic enums apart with match; fold parameter packs with `...`.

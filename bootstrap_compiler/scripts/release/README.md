@@ -22,6 +22,8 @@ The build uses an isolated committed source snapshot, and its bootstrap-only
 manifest points `parallel_std_sources` at the Stage 0 SDK's `std`. Environment
 variables alone do not override that explicit source list. The manifest is
 restored before the current compiler builds tools or the SDK is packaged.
+The restored manifest selects `std_packages`; the checkout's compatibility
+`std/` directory is not an input to current-source builds.
 The native C++ bridge is built first. Stage 0 then loads that bridge from a
 separate directory while keeping its own executable and application runtime.
 This prevents old Stage 0 bridges from embedding the build runner's optional
@@ -48,6 +50,14 @@ it also exercises rejection of escaped local storage through named/top-level
 export roots. This detects source/ownership failures in the new compiler before
 the Linux archive is passed to the Android job. It does not rebuild a compiler
 generation. Per-module commands and results are retained in `self-source/`.
+
+Native builds also run the language-composition gate with 798 inputs across
+file, project, named-module and static-library layouts at O0/O2. Function-value
+inputs include an `Option<fn(...)>` payload, an explicitly instantiated generic
+callback and a factory returning that callback. The `value-bindings/` gate adds
+overload, nested signature, owned argument, await and diagnostic fixtures. Its
+report must contain every required case/configuration and the current compiler
+hash before packaging continues.
 
 The [root-selection gate](../../../../probes/gates/compiler-root-lists/README.md)
 then checks the actual driver helper against the bootstrap interfaces, primitive

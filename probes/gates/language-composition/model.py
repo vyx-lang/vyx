@@ -43,6 +43,7 @@ RULES = tuple(Rule(name, features) for name, features in [
     ("trait", ("interface", "impl", "generic_constraint", "shared_borrow")),
     ("dynamic_overload", ("dyn_interface", "generic_impl", "overload_identity", "distinct_return_types", "aggregate_return", "shared_borrow")),
     ("await_ready", ("Task", "Promise", "await", "shared_borrow", "generic_payload", "single_transfer")),
+    ("generic_function_value", ("explicit_type_arguments", "function_value", "generic_factory", "indirect_call", "higher_order", "Option_function_payload")),
     ("enum", ("payload_enum", "match", "binding")),
     ("option", ("Option", "static_generic", "unwrap")),
     ("result", ("Result", "static_generic", "unwrap")),
@@ -203,6 +204,7 @@ def oracle(case):
         elif rule == "overloaded_array_clone": value = 2 * value + 1; calls += 2; drops += 4
         elif rule == "dynamic_overload": value = 6 * value + 86; calls += 6
         elif rule == "await_ready": value = 2 * value + 3; calls += 2
+        elif rule == "generic_function_value": value = 3 * value + 8; calls += 3
         else: raise ValueError(f"unknown production {rule}")
     return [value, calls, drops, defers, 0]
 
@@ -221,6 +223,18 @@ public fn report(id: str, value: i64) {
 }
 '''
 SUPPORT = {
+    "generic_function_value": '''public fn function_value_identity<T>(value: T) -> T { calls += 1; return value; }
+public fn function_value_factory<T>() -> fn(T) -> T { return function_value_identity::<T>; }
+public fn function_value_apply<T>(f: fn(T) -> T, value: T) -> T { return f(value); }
+public fn observe_function_value(value: i64) -> i64 {
+    let first = Option::<fn(i64) -> i64>.some(function_value_identity::<i64>).unwrap();
+    let a = first(value);
+    let second = function_value_factory::<i64>();
+    let b = second(value + 3);
+    let c = function_value_apply::<i64>(function_value_identity::<i64>, value + 5);
+    return a + b + c;
+}
+''',
     "await_ready": '''use std.vio;
 public fn take_ready_promise<T>(pending: &Promise<T>) -> T {
     calls += 1;
@@ -938,6 +952,7 @@ class Emitter:
             elif rule == "overloaded_array_clone": expr = f"observe_overloaded_array({expr})"
             elif rule == "dynamic_overload": expr = f"observe_dynamic_overload({expr})"
             elif rule == "await_ready": expr = f"observe_ready_await({expr})"
+            elif rule == "generic_function_value": expr = f"observe_function_value({expr})"
             elif rule == "owned_dict": expr = f"dict_owned_observation({expr})"
             elif rule == "owned_linear": expr = f"linear_owned_observation({expr})"
             elif rule == "borrowed_owned_vec":

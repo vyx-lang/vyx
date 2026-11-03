@@ -17,12 +17,15 @@ Option/Result、借用、闭包、Vec、String 或 StringBuilder，再产生 i64
 三种类型构造器；默认穷举两层嵌套。例如 `Vec<Option<String>>` 和
 `Option<Vec<String>>` 都会构造真实值、取出拥有的 payload、检查内容和最终清理。
 `--type-context-depth 1` 把每棵类型树的观测值再交给全部一层表达式规则。
-当前默认域有 60 条表达式规则，共 22,200 个合法组合、4,026 个非法组合，合计
-26,226 个输入。随机样本另外计数，不包含在这个穷举数中。
+当前默认域有 61 条表达式规则，共 22,932 个合法组合、4,092 个非法组合，合计
+27,024 个输入。随机样本另外计数，不包含在这个穷举数中。
 
 合法程序的预期结果由 Python 解释规则树计算，**不从 Vyx 编译结果提取**。
 `await_ready` 将泛型载荷、借用、共享句柄与 Task / Promise 的单次结果转移放入组合域；
 它使用已完成任务。异步调度时序另由 `compiler-usability` 的原生执行门检查，尚未进入规则机。
+`generic_function_value` 将显式泛型函数值、`Option<fn(...)>` 载荷、工厂返回的函数值和高阶调用放入组合域，
+分别核对返回值与调用次数。定向夹具另查拥有值经回调的转移/析构、聚合 ABI、
+泛型参数数量和约束诊断；`generic_function_values` 项目覆盖模块别名与标准库 Iterator.map。
 还检查调用次数、drop 次数、defer 次数及资源内容断言。负例在规则树叶子嵌入
 非法操作，检查预期诊断，单纯非零退出不能算通过。
 
@@ -255,7 +258,8 @@ python probes/gates/language-composition/suite.py reduce --suite .cache/grammar-
 固定整数宣称那项能力已覆盖。
 
 原生 Release 任务执行上述五条调用身份规则，以及 `short_circuit_scan`、`large_function`、
-`overloaded_iterator`、`overloaded_array_clone`、`dynamic_overload` 的两层组合，共 666 个输入，
+`overloaded_iterator`、`overloaded_array_clone`、`dynamic_overload`、`generic_function_value`
+的两层组合，共 798 个输入；函数值规则包含 `Option<fn(...)>` 往返、泛型工厂和间接调用，
 通过四种布局与 O0/O2 共八个配置。SDK 构建记录保留
 实际通过的 case/configuration 数和完整报告哈希。
 发布任务还执行 `for_collection_delimiters`、`bad_iteration_has_next_return`、
@@ -266,4 +270,4 @@ python probes/gates/language-composition/suite.py reduce --suite .cache/grammar-
 和与静态重载交错的调用；同样执行 O0/O2，并保存完整用例与配置集合。另以
 `dynamic_overload,operator_overload,overloaded_iterator` 生成 78 个输入，在独立静态库布局
 执行 O0/O2 × CGU 1/4，防止消费端将库的普通导出声明重新生成定义。
-这只是发布必跑子集；不能将其写成完整 25,440 个输入全部验收。
+这只是发布必跑子集；不能将其写成完整 27,024 个输入全部验收。

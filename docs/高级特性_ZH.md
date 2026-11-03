@@ -756,6 +756,25 @@ fn main() -> i32 {
 
 嵌套泛型按 turbofish / 接收者实参实例化。
 
+### 泛型函数作为值
+
+保存或传递泛型函数时，显式给出类型实参：
+
+```vyx program
+fn identity<T>(value: T) -> T { return value; }
+fn factory<T>() -> fn(T) -> T { return identity::<T>; }
+
+fn main() -> i32 {
+    let direct = identity::<i64>;
+    let returned = factory::<i64>();
+    print(direct(40) + returned(2));
+    return 0;
+}
+```
+
+`identity::<i64>` 的类型是 `fn(i64) -> i64`。通过函数值调用时使用位置实参，
+所有权规则由实例化后的参数类型决定。泛型函数值需要显式类型实参；重载集合无法唯一确定时会报错。
+
 ### 小结
 
 泛型枚举用 match 拆；参数包用 `...` 折叠。

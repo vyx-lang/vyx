@@ -43,7 +43,8 @@ class ReleaseTests(unittest.TestCase):
     def test_protocol_gate_rejects_missing_checks_and_wrong_compiler(self):
         for check, cases, directory in (
                 (build_native.check_iteration_protocol, build_native.ITERATION_PROTOCOL_CASES, "protocol-edges"),
-                (build_native.check_dynamic_dispatch, build_native.DYNAMIC_DISPATCH_CASES, "dynamic-edges")):
+                (build_native.check_dynamic_dispatch, build_native.DYNAMIC_DISPATCH_CASES, "dynamic-edges"),
+                (build_native.check_value_bindings, build_native.VALUE_BINDING_CASES, "value-bindings")):
             with self.subTest(gate=directory), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 compiler = root / "vyxc"
@@ -73,14 +74,14 @@ class ReleaseTests(unittest.TestCase):
             compiler.write_bytes(b"current compiler")
             report = root / "semantic-composition/run/results.json"
             report.parent.mkdir(parents=True)
-            valid = {"generated": 666, "selected": 666, "matrix": [[i] for i in range(8)],
+            valid = {"generated": 798, "selected": 798, "matrix": [[i] for i in range(8)],
                      "compiler": {"sha256": sha256(compiler)}, "status": "pass", "complete": True,
-                     "passed_case_cell_count": 5328}
+                     "passed_case_cell_count": 6384}
             with patch.object(build_native, "run"):
                 report.write_text(json.dumps(valid), encoding="utf-8")
-                self.assertEqual(build_native.check_semantic_composition(compiler, root, {})["passed_case_cells"], 5328)
+                self.assertEqual(build_native.check_semantic_composition(compiler, root, {})["passed_case_cells"], 6384)
                 for changes in ({"generated": 0, "selected": 0, "passed_case_cell_count": 0},
-                                {"selected": 665}, {"passed_case_cell_count": 5327}, {"complete": False},
+                                {"selected": 797}, {"passed_case_cell_count": 6383}, {"complete": False},
                                 {"compiler": {"sha256": "old compiler"}}):
                     report.write_text(json.dumps(valid | changes), encoding="utf-8")
                     with self.assertRaisesRegex(RuntimeError, "every selected case/configuration"):
@@ -127,10 +128,10 @@ class ReleaseTests(unittest.TestCase):
                 verify_debug_adapter(adapter, "windows-x86_64", patch)
 
     def test_bootstrap_explicit_std_sources_use_stage0(self):
-        manifest = 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std"\n'
+        manifest = 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std_packages"\n'
         changed = bootstrap_manifest(manifest, Path("C:/SDK/Stage 0"))
         self.assertIn('parallel_std_sources = "C:/SDK/Stage 0/std"', changed)
-        self.assertEqual(manifest, 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std"\n')
+        self.assertEqual(manifest, 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std_packages"\n')
         with self.assertRaisesRegex(RuntimeError, "selection drifted"):
             bootstrap_manifest("unexpected manifest", Path("sdk"))
 
