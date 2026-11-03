@@ -88,6 +88,7 @@ extern "C" void vyx_rt_service_string_alias(void* base, void* text);
 #  include <unistd.h>
 #  include <ucontext.h>
 #  include <pthread.h>
+#  include "bootstrap_process_posix.hpp"
 #  define VYX_RT_ABI __attribute__((visibility("default")))
 #  if defined(__APPLE__)
 #    include <mach/mach.h>
@@ -3893,8 +3894,14 @@ static bool vyx_bootstrap_open_output_fd(const char* path, int& fd) {
     if (!path || !path[0]) {
         return true;
     }
-    fd = ::open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
-    return fd >= 0;
+    fd = ::open(path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0) { return false; }
+    if (!vyx_bootstrap_posix::private_fd(fd)) {
+        const int number = errno;
+        ::close(fd); fd = -1; errno = number;
+        return false;
+    }
+    return true;
 }
 #endif
 
@@ -4088,65 +4095,33 @@ static int64_t vyx_bootstrap_process_spawn_impl(std::vector<std::string> argv,
     int out_fd = -1;
     int err_fd = -1;
     if (!vyx_bootstrap_open_output_fd(stdout_path, out_fd)) {
+        const int number = errno;
+        std::fprintf(stderr, "error: cannot open bootstrap child stdout '%s' (errno=%d: %s)\n",
+                     stdout_path, number, std::strerror(number));
         return 0;
     }
     if (stderr_path && stderr_path[0] && (!stdout_path || std::strcmp(stdout_path, stderr_path) != 0)) {
         if (!vyx_bootstrap_open_output_fd(stderr_path, err_fd)) {
+            const int number = errno;
             if (out_fd >= 0) { ::close(out_fd); }
+            std::fprintf(stderr, "error: cannot open bootstrap child stderr '%s' (errno=%d: %s)\n",
+                         stderr_path, number, std::strerror(number));
             return 0;
         }
     } else {
         err_fd = out_fd;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        if (out_fd >= 0) { ::close(out_fd); }
-        if (err_fd >= 0 && err_fd != out_fd) { ::close(err_fd); }
-        return 0;
-    }
-    if (pid == 0) {
-        if (::setpgid(0, 0) != 0) {
-            _exit(126);
-        }
-        if (env_name && env_name[0]) {
-            ::setenv(env_name, env_value ? env_value : "", 1);
-        }
-        if (!expanded_cwd.empty()) {
-            ::chdir(expanded_cwd.c_str());
-        }
-        if (out_fd >= 0) {
-            ::dup2(out_fd, STDOUT_FILENO);
-        }
-        if (err_fd >= 0) {
-            ::dup2(err_fd, STDERR_FILENO);
-        }
-        if (out_fd >= 0) { ::close(out_fd); }
-        if (err_fd >= 0 && err_fd != out_fd) { ::close(err_fd); }
-
-        std::vector<char*> cargv;
-        cargv.reserve(argv.size() + 1u);
-        for (auto& s : argv) {
-            cargv.push_back(const_cast<char*>(s.c_str()));
-        }
-        cargv.push_back(nullptr);
-        ::execvp(cargv[0], cargv.data());
-        _exit(127);
-    }
+    vyx_bootstrap_posix::SpawnError startup_error;
+    const pid_t pid = vyx_bootstrap_posix::spawn(argv, expanded_cwd, out_fd, err_fd,
+                                               env_name, env_value, startup_error);
     if (out_fd >= 0) { ::close(out_fd); }
     if (err_fd >= 0 && err_fd != out_fd) { ::close(err_fd); }
-    int setpgid_rc = 0;
-    do {
-        setpgid_rc = ::setpgid(pid, pid);
-    } while (setpgid_rc != 0 && errno == EINTR);
-    if (setpgid_rc != 0 && errno != EACCES && errno != ESRCH) {
-        const int setpgid_error = errno;
-        (void)::kill(pid, SIGKILL);
-        int status = 0;
-        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (pid < 0) {
         std::fprintf(stderr,
-                     "error: cannot create bootstrap child process group (errno=%d)\n",
-                     setpgid_error);
+                     "error: cannot start bootstrap child '%s': %s failed (errno=%d: %s)\n",
+                     argv[0].c_str(), startup_error.operation, startup_error.number,
+                     std::strerror(startup_error.number));
         return 0;
     }
     proc->pid = pid;

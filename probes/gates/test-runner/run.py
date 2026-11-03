@@ -37,16 +37,18 @@ def main() -> None:
                 path.write_text(text, encoding='utf-8')
             return directory
 
-        def check(name, cwd, arguments, expected=0, contains=(), absent=(), kind='test', codegen_units=None):
+        def check(name, cwd, arguments, expected=0, contains=(), absent=(), kind='test', codegen_units=None, any_diagnostic=()):
             command = [str(compiler), kind, *map(str, arguments)]
             case_env=dict(env)
             if codegen_units is not None:case_env['VYX_CODEGEN_UNITS']=str(codegen_units)
             result = subprocess.run(command, cwd=cwd, env=case_env, capture_output=True, timeout=120)
             text = (result.stdout + result.stderr).decode('utf-8', errors='replace')
             valid_exit = result.returncode in expected if isinstance(expected,tuple) else result.returncode == expected
-            passed = valid_exit and all(t in text for t in contains) and all(t not in text for t in absent)
+            passed = (valid_exit and all(t in text for t in contains) and all(t not in text for t in absent)
+                      and (not any_diagnostic or any(t in text for t in any_diagnostic)))
             record = dict(name=name, command=command, exit=result.returncode, expected=expected,
-                          passed=passed, codegen_units=codegen_units, stdout=result.stdout.decode(errors='replace'), stderr=result.stderr.decode(errors='replace'))
+                          passed=passed, codegen_units=codegen_units, any_diagnostic=any_diagnostic,
+                          stdout=result.stdout.decode(errors='replace'), stderr=result.stderr.decode(errors='replace'))
             with report_lock:
                 records.append(record)
                 (output/'verification.partial.json').write_text(json.dumps(records,indent=2),encoding='utf-8')
@@ -347,7 +349,12 @@ fn main()->i32{return 9;}
         assert noise_report['results'][0]['status']=='output_limit' and noise_report['summary']['failed']==1
         assert ET.parse(noisy/'noise.xml').getroot().get('failures')=='1'
         nul=project('nul-source',{'tests/a.vyx':'@[test] fn valid(){}\x00garbage'})
-        check('source-read-cannot-truncate-at-nul',nul,['--allow-empty'],1,contains=('embedded NUL','discovery errors'))
+        # A reader can reject NUL explicitly, or preserve all bytes and let the
+        # lexer reject the actual NUL. Both must fail discovery, even when an
+        # empty suite is allowed; accepting the truncated valid prefix is wrong.
+        check('source-read-cannot-truncate-at-nul',nul,['--allow-empty'],1,
+              contains=('discovery errors',), absent=('test result: ok', '::valid ... ok'),
+              any_diagnostic=('embedded NUL', 'E0104: unexpected character `\x00`'))
         check('test-rejects-benchmark-only-options',good,['--samples','5'],2,contains=('benchmark option',))
         typed=project('typed-barriers',{'tests/a.vyx':'''use std.benchmark;
 use std.string;

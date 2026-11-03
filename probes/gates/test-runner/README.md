@@ -43,6 +43,8 @@ Filesystem identities resolve directory/file symlinks and existing hardlinks.
 Full `--exact` identities accept an alias of the same source; report and JUnit
 destinations cannot alias inputs or each other, including new destinations below
 symlinked parents. This covers macOS `/var` and `/private/var` spellings.
+POSIX child startup is also checked by the [native process gate](../process-startup/README.md),
+including process-group creation, startup diagnostics and concurrent launches.
 
 For a repeatable discovery/report scaling measurement:
 
