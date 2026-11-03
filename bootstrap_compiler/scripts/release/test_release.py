@@ -20,6 +20,36 @@ from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validat
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_windows_tbb_handoff_restores_the_producer_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary) / "source/bootstrap_compiler"
+            producer = build.parent / "runtime/vendor/oneTBB/cmake-build/tbb_out_release"
+            producer.mkdir(parents=True)
+            (build / "out").mkdir(parents=True)
+            for name in ("tbb12.dll", "tbb12.lib"):
+                (producer / name).write_bytes(b"current producer " + name.encode())
+                (build / "out" / name).write_bytes(b"old SDK")
+            result = build_native.stage_windows_tbb(build)
+            self.assertEqual(result["producer"], str(producer))
+            for name in ("tbb12.dll", "tbb12.lib"):
+                self.assertEqual((build / "out" / name).read_bytes(), (producer / name).read_bytes())
+                self.assertTrue(result["files"][name]["replaced_stage0_copy"])
+            with patch.object(build_native.shutil, "copy2", side_effect=AssertionError("identical DLL must not be overwritten")):
+                repeated = build_native.stage_windows_tbb(build)
+            self.assertFalse(any(row["replaced_stage0_copy"] for row in repeated["files"].values()))
+
+    def test_windows_tbb_handoff_rejects_partial_and_empty_outputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary) / "source/bootstrap_compiler"
+            producer = build.parent / "runtime/vendor/oneTBB/cmake-build/tbb_out_release"
+            producer.mkdir(parents=True)
+            (producer / "tbb12.dll").write_bytes(b"current DLL")
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                build_native.stage_windows_tbb(build)
+            (producer / "tbb12.lib").write_bytes(b"")
+            with self.assertRaisesRegex(RuntimeError, "empty"):
+                build_native.stage_windows_tbb(build)
+
     def test_dynamic_library_requires_every_cgu_and_current_compiler(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

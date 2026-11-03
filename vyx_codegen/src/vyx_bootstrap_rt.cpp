@@ -7148,6 +7148,30 @@ extern "C" VYX_RT_ABI int32_t vyx_bootstrap_repl_run(const char* self_exe,
     }
 }
 
+// Return 1 for equal bytes, 0 for different bytes, -1 for an I/O failure.
+// Loaded Windows DLLs cannot be opened for writing even when unchanged.
+static int vyx_bootstrap_same_file_contents(const std::filesystem::path& source,
+                                           const std::filesystem::path& destination) {
+    std::error_code ec;
+    const auto source_size = std::filesystem::file_size(source, ec);
+    if (ec) return -1;
+    const auto destination_size = std::filesystem::file_size(destination, ec);
+    if (ec) return -1;
+    if (source_size != destination_size) return 0;
+    std::ifstream left(source, std::ios::binary), right(destination, std::ios::binary);
+    if (!left || !right) return -1;
+    char a[65536], b[65536];
+    for (;;) {
+        left.read(a, sizeof(a));
+        right.read(b, sizeof(b));
+        if (left.bad() || right.bad()) return -1;
+        const auto na = left.gcount(), nb = right.gcount();
+        if (na != nb) return 0;
+        if (na == 0) return left.eof() && right.eof() ? 1 : -1;
+        if (std::memcmp(a, b, static_cast<size_t>(na)) != 0) return 0;
+    }
+}
+
 extern "C" VYX_RT_ABI int32_t vyx_bootstrap_copy_file(const char* src,
                                                       const char* dst) {
     if (!src || !src[0] || !dst || !dst[0]) {
@@ -7158,6 +7182,11 @@ extern "C" VYX_RT_ABI int32_t vyx_bootstrap_copy_file(const char* src,
     std::error_code ec;
     if (std::filesystem::equivalent(src_path, dst_path, ec) && !ec) {
         return 0;
+    }
+    ec.clear();
+    if (std::filesystem::is_regular_file(dst_path, ec) && !ec) {
+        const int same = vyx_bootstrap_same_file_contents(src_path, dst_path);
+        if (same != 0) return same > 0 ? 0 : -1;
     }
     ec.clear();
     const auto parent = dst_path.parent_path();

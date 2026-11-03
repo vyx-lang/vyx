@@ -146,6 +146,36 @@ def bootstrap_manifest(manifest, sdk):
     return manifest.replace(setting, "parallel_std_sources = " + json.dumps((sdk / "std").as_posix()))
 
 
+def stage_windows_tbb(build):
+    """Finish Stage 0's handoff before starting any executable from out/.
+
+    Older bootstrap compilers overwrite the source-built TBB DLL with their SDK
+    copy after linking boot. The current runtime's CMake output owns this pair.
+    """
+    outputs = build.parent / "runtime/vendor/oneTBB/cmake-build"
+    names = ("tbb12.dll", "tbb12.lib")
+    producer = next((outputs / leaf for leaf in ("tbb_out_release", "clang_22.1_cxx_64_md_release")
+                     if all((outputs / leaf / name).is_file() for name in names)), None)
+    if producer is None:
+        raise RuntimeError(f"Current oneTBB producer output is incomplete: {outputs}")
+    for name in names:
+        if (producer / name).stat().st_size == 0:
+            raise RuntimeError(f"Current oneTBB producer output is empty: {producer / name}")
+    record = {"producer": str(producer), "files": {}}
+    for name in names:
+        source, destination = producer / name, build / "out" / name
+        expected = sha256(source)
+        changed = not destination.is_file() or sha256(destination) != expected
+        if changed:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        if sha256(destination) != expected:
+            raise RuntimeError(f"Current oneTBB handoff hash mismatch: {destination}")
+        record["files"][name] = {"source": str(source), "destination": str(destination),
+                                "sha256": expected, "replaced_stage0_copy": changed}
+    return record
+
+
 def verify_debug_adapter(adapter, platform_name, patch):
     manifest = json.loads((adapter / "MANIFEST.json").read_text(encoding="utf-8"))
     if manifest.get("platform") != platform_name:
@@ -263,6 +293,8 @@ def main():
         run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
     finally:
         manifest_path.write_text(original_manifest, encoding="utf-8")
+    if windows:
+        record["current_tbb_handoff"] = stage_windows_tbb(build)
     built_compiler = out / ("boot.exe" if windows else "boot")
     shutil.copy2(built_compiler, out / ("vyxc.exe" if windows else "vyxc"))
     environment["VYX_STD_PACKAGES"] = str(build / "std_packages")
@@ -278,6 +310,10 @@ def main():
                 (out / soname[1]).symlink_to(tbb.name)
         environment["LD_LIBRARY_PATH"] = str(out) + (":" + environment["LD_LIBRARY_PATH"]
                                                     if environment.get("LD_LIBRARY_PATH") else "")
+    if windows:
+        run([sys.executable, REPO / "probes/gates/runtime-companions/run.py",
+             "--compiler", built_compiler, "--runtime", out,
+             "--output", work / "runtime-companions"], env=environment)
     run([sys.executable, REPO / "probes/gates/compiler-self-source/run.py",
          "--compiler", built_compiler, "--build-root", build,
          "--output", work / "self-source"], env=environment)
@@ -286,6 +322,17 @@ def main():
     run([sys.executable, REPO / "probes/gates/compiler-root-lists/run.py",
          "--compiler", built_compiler, "--build-root", build,
          "--output-dir", work / "root-lists"], env=environment)
+    # Build and exercise tools before the long semantic/package suites. They
+    # rebuild the runtime with S1, so those suites test the final shipped pair.
+    for target in tools:
+        run([built_compiler, "build", "--target", target, f"-j{args.jobs}"], cwd=build, env=environment)
+        if target == "vyxc-lsp":
+            run([sys.executable, REPO / "tests/bootstrap/lsp_smoke/run.py",
+                 out / (target + (".exe" if windows else "")), "--runs", "1",
+                 "--diagnostics-dir", work / "lsp-smoke"], env=environment)
+            run([sys.executable, REPO / "probes/gates/formatter/run.py",
+                 "--compiler", built_compiler, "--lsp", out / (target + (".exe" if windows else "")),
+                 "--output", work / "formatter"], env=environment)
     run([sys.executable, REPO / "probes/gates/test-runner/run.py",
          "--compiler", built_compiler, "--output", work / "test-runner"], env=environment)
     record["semantic_composition"] = check_semantic_composition(built_compiler, work, environment)
@@ -298,15 +345,6 @@ def main():
         run([sys.executable, REPO / "probes/gates/directory-enumeration/run.py",
              "--compiler", built_compiler, "--cc", args.llvm_root / "bin/clang",
              "--output", work / "directory-enumeration"], env=environment)
-    for target in tools:
-        run([built_compiler, "build", "--target", target, f"-j{args.jobs}"], cwd=build, env=environment)
-        if target == "vyxc-lsp":
-            run([sys.executable, REPO / "tests/bootstrap/lsp_smoke/run.py",
-                 out / (target + (".exe" if windows else "")), "--runs", "1",
-                 "--diagnostics-dir", work / "lsp-smoke"], env=environment)
-            run([sys.executable, REPO / "probes/gates/formatter/run.py",
-                 "--compiler", built_compiler, "--lsp", out / (target + (".exe" if windows else "")),
-                 "--output", work / "formatter"], env=environment)
     arguments = ["pwsh", "-NoProfile", "-File", REPO / "bootstrap_compiler/scripts/package_sdk.ps1",
         "-CompilerPath", built_compiler, "-Destination", output / leaf,
         "-BootstrapRoot", build, "-OutDir", out,

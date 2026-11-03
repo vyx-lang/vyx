@@ -31,6 +31,17 @@ CPU instructions in a portable SDK. A baseline-ISA emission gate runs before
 the compiler build, and a packaged SDK must build and run a StringBuilder
 project before its archive is accepted. The bootstrap bridge hash is recorded
 in `SDK-BUILD.*.json`.
+On Windows, the handoff also stages the DLL/import-library pair from this
+build's oneTBB CMake output before starting S1. Older Stage 0 compilers can
+overwrite the freshly built DLL with their SDK copy after linking. Both file
+hashes and their producer paths are recorded. The current builder deploys SDK
+companions only when it implicitly links the SDK runtime; explicit runtime
+targets retain ownership of their native dependencies. The
+[companion gate](../../../../probes/gates/runtime-companions/README.md) verifies
+both paths through native project builds and execution before other release gates.
+Native builds compile LSP/DAP and run the LSP/formatter smoke checks before the
+long semantic and package suites. Those suites therefore use the final runtime
+rebuilt by S1, and tool build failures are reported before those suites begin.
 The new SDK packages the checkout's `std_packages`, and the newly
 built compiler builds LSP and, on x64, DAP. CodeLLDB comes from the verified
 Stage 0 bundle. AArch64 Linux has no DAP bundle. Termux is cross-built using
