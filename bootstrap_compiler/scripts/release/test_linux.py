@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +15,22 @@ import prepare_linux_llvm as linux
 
 
 class LinuxPreparationTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell native argument forwarding")
+    def test_workflow_forwards_both_llvm_selections_as_whole_arguments(self):
+        workflow = Path(__file__).resolve().parents[3] / ".github/workflows/sdk-release.yml"
+        expression = next(line.strip() for line in workflow.read_text(encoding="utf-8").splitlines()
+                          if "$llvmInput = if" in line)
+        python = "'" + sys.executable.replace("'", "''") + "'"
+        for windows, expected in ((True, ["--llvm-root", "C:/LLVM with spaces"]),
+                                  (False, ["--use-sdk-llvm"])):
+            with self.subTest(windows=windows):
+                selection = expression.replace("$IsWindows", "$true" if windows else "$false")
+                command = ("$env:LLVM_ROOT = 'C:/LLVM with spaces'; " + selection + "; & " + python
+                           + " -c 'import json,sys; print(json.dumps(sys.argv[1:]))' @llvmInput")
+                result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive",
+                                         "-Command", command], capture_output=True, text=True, check=True, timeout=30)
+                self.assertEqual(json.loads(result.stdout), expected)
+
     def fixture(self, root):
         sdk = root / "sdk"
         files = ["SDK-MANIFEST.json", "toolchain/include/llvm/IR/Module.h",
