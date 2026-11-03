@@ -17,10 +17,12 @@ Option/Result、借用、闭包、Vec、String 或 StringBuilder，再产生 i64
 三种类型构造器；默认穷举两层嵌套。例如 `Vec<Option<String>>` 和
 `Option<Vec<String>>` 都会构造真实值、取出拥有的 payload、检查内容和最终清理。
 `--type-context-depth 1` 把每棵类型树的观测值再交给全部一层表达式规则。
-当前默认域有 59 条表达式规则，共 21,480 个合法组合、3,960 个非法组合，合计
-25,440 个输入。随机样本另外计数，不包含在这个穷举数中。
+当前默认域有 60 条表达式规则，共 22,200 个合法组合、4,026 个非法组合，合计
+26,226 个输入。随机样本另外计数，不包含在这个穷举数中。
 
 合法程序的预期结果由 Python 解释规则树计算，**不从 Vyx 编译结果提取**。
+`await_ready` 将泛型载荷、借用、共享句柄与 Task / Promise 的单次结果转移放入组合域；
+它使用已完成任务。异步调度时序另由 `compiler-usability` 的原生执行门检查，尚未进入规则机。
 还检查调用次数、drop 次数、defer 次数及资源内容断言。负例在规则树叶子嵌入
 非法操作，检查预期诊断，单纯非零退出不能算通过。
 
@@ -87,6 +89,10 @@ python probes/gates/language-composition/suite.py generate --rules operator_over
 与其他产生式组合；它只覆盖这一有界缓冲区路径，不代表通用裸指针操作已建模。
 `raw_copy_param_lifetime` 检查 C memcpy/memmove 的零长度、部分和完整字节拷贝：
 字节拷贝不转移源对象的所有权，拥有参数仍须析构，不能根据 C 函数名取消清理。
+`await_borrow` 检查借用 Task / Promise 及泛型函数中的结果提取；非法 await、
+错误 poll 返回类型和错误 payload 类型必须产生语义诊断，不能附带内部验证器错误。
+`await_owned_lifetime` 检查单次转移、句柄共享、未取值销毁、重复 resolve、失败状态
+和 str 载荷清理，并进入分配计数门。分配门同时拦截普通与带对齐的分配/释放。
 `str_move_iteration` 检查拥有的迭代文本移入另一 Vec 后仍有效；`str_typed_storage`
 检查带分配器标记的 str 在分支、defer、match、for 中的转移/不转移，以及字节拷贝
 保留调用方清理。两者均进入真实分配计数门，不用正常退出码代替内容和释放检查。

@@ -302,6 +302,13 @@ At the compiler layer, `@[async]` calls lower to `vio_sched_spawn` and
 Android, missing ucontext means stackless invoke rather than fiber switch
 (see the implementation boundary above).
 
+`resolve(value)` takes ownership of the result. A value passed to an already
+completed state is destroyed normally. `await pending` and `await_value()`
+transfer the result once. Cloned handles share that single result; taking it
+again panics. `poll()` and `is_done()` remain true after the transfer. The last
+handle destroys an unread result. Owning payloads do not require `Clone`;
+applications needing independent copies can explicitly clone the extracted value.
+
 ### `std.sync` / `std.threading` / `std.thread_pool`
 
 `Mutex<T>`, `RwLock<T>`, `Condvar`, `Barrier`, `Once`, and `atomic_*` are Vyx

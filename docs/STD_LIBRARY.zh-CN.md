@@ -280,6 +280,12 @@ flat-std 搜索；漏写依赖会在 import 阶段直接报错，而不是静默
 
 当前编译器层把 `@[async]` 调用 lower 到 `vio_sched_spawn`，把 `await` lower 到 `await_value()`。`poll()` 是用户 Future 表面。Android 没有 ucontext 时走无栈 invoke，不是 fiber 切换。
 
+`resolve(value)` 接收结果的所有权；重复完成时，传入但未被接收的值仍会正常析构。
+`await pending` 或 `pending.await_value()` 将结果转移给调用者，结果只能取一次。
+`clone()` 只共享完成状态，不复制结果；通过任意句柄取过结果后，再次取值会 panic。
+`poll()` / `is_done()` 在取值后仍保持完成状态。最后一个句柄销毁时，尚未取出的结果也会析构。
+拥有值无需实现 `Clone`；如果应用需要多份独立结果，应在取值后显式克隆结果。
+
 ### `std.sync` / `std.threading` / `std.thread_pool`
 
 `Mutex<T>`、`RwLock<T>`、`Condvar`、`Barrier`、`Once`、`atomic_*` 是 Vyx 类型。句柄来自 `runtime/src/vyx_sync.c` 的 OS 对象（Windows SRWLOCK / CONDITION_VARIABLE / CreateThread，POSIX pthread），不是对 C++ `std::mutex` / `std::thread` 的封装。

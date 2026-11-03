@@ -28,7 +28,7 @@ def main():
         'owned_stack_lifetime': -1, 'owned_queue_lifetime': -1,
         'owned_vec_from_array': -1, 'stack_queue_str_lifetime': -1,
         'owned_array_clone': -1, 'owned_array_lifetime': -1, 'format_cleanup': 5,
-        'dyn_owned_arguments': -1,
+        'dyn_owned_arguments': -1, 'await_owned_lifetime': -1,
         'conditional_raw_param_lifetime': -1, 'raw_copy_param_lifetime': -1,
         'conditional_owned_param_lifetime': -1,
         'named_owned_arguments': -1, 'ordinary_args_ownership': -1}
@@ -60,7 +60,8 @@ def main():
                 for symbol, hook in hooks.items():
                     text = re.sub(r'@(vyx_runtime_'+symbol+'|'+symbol+r')(?=[(\s])', '@'+hook, text)
                 for symbol, hook in (('vyx_string_clone_len_abi', 'probe_clone'), ('vyx_string_alloc_abi', 'probe_string_alloc'),
-                    ('vyx_free_runtime_string', 'probe_runtime_free'), ('vyx_free_pooled_string', 'probe_pooled_free')):
+                    ('vyx_free_runtime_string', 'probe_runtime_free'), ('vyx_free_pooled_string', 'probe_pooled_free'),
+                    ('vyx_aligned_alloc_abi', 'probe_aligned_alloc'), ('vyx_aligned_free_abi', 'probe_aligned_free')):
                     text = re.sub('@'+symbol+r'(?=[(\s])', '@'+hook, text)
                 text, count = re.subn(r'@main(?=\()', '@probe_entry', text)
                 if count != 1:

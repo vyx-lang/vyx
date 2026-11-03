@@ -50,11 +50,20 @@ def main():
                     if negative:
                         result["diagnostic"] = diagnostic
                         result["pass"] = not resource_failure and status["ExitCode"] == 1 and re.search(expected["diagnostic"], diagnostic) is not None
+                        forbidden = expected.get("forbidden_diagnostic")
+                        if forbidden and re.search(forbidden, diagnostic):
+                            result["pass"] = False
                     elif not resource_failure and status["ExitCode"] == 0:
                         run = engine.execute(exe, [], directory, "run", cgu)
                         result["run"] = run
                         result["actual"] = log_text(directory / "run.stdout.log").replace("\r\n", "\n")
-                        result["pass"] = run["result"]["ExitCode"] == 0 and result["actual"] == expected["output"] and not log_text(directory / "run.stderr.log")
+                        if "runtime_diagnostic" in expected:
+                            runtime_text = result["actual"] + log_text(directory / "run.stderr.log")
+                            result["pass"] = (run["result"]["ExitCode"] == 1
+                                and not any(run["result"].get(k) for k in ("TimedOut", "MemoryExceeded", "DialogCaught"))
+                                and re.search(expected["runtime_diagnostic"], runtime_text) is not None)
+                        else:
+                            result["pass"] = run["result"]["ExitCode"] == 0 and result["actual"] == expected["output"] and not log_text(directory / "run.stderr.log")
                     else:
                         result["diagnostic"] = diagnostic
                         result["pass"] = False

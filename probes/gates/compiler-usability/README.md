@@ -27,6 +27,7 @@ The actual unit count depends on the partition size.
 | `async_params.vyx` | Mutable integer, string and aggregate parameters across yield/sleep; native byval body calls and borrowed method receivers |
 | `async_values.vyx` | Mutable object, Vec and string locals across awaits; `defer` executes once per completed task |
 | `async_payload.vyx` | Nested async string and aggregate returns; native sret/byval in the task worker |
+| `async_owned.vyx` | Interleaved async returns with owned String fields and explicit destructors; no early destruction and one cleanup per result |
 | `interpolation_invalid.vyx` | Trailing expression tokens must fail with `E0001` at line 2, column 20 |
 | `interpolation_unterminated.vyx` | Unclosed interpolation must fail with `E0102` at line 2, column 11 |
 

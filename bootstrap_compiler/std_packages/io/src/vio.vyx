@@ -1,6 +1,7 @@
 module std.vio;
 
 use std.ffi;
+use std.string;
 
 /// std/vio.vyx - Vyx Async I/O Runtime (Cross-Platform)
 ///
@@ -34,6 +35,8 @@ extern "C" {
     fn memset(dest: rawptr, c: i32, n: i64) -> rawptr;
     fn memcpy(dest: rawptr, src: rawptr, n: i64) -> rawptr;
     fn strlen(s: rawptr) -> i64;
+    fn vyx_aligned_alloc_abi(size: i64, alignment: i64) -> rawptr;
+    fn vyx_aligned_free_abi(ptr: rawptr);
     fn vyx_fiber_invoke(work: i64, arg: rawptr) -> i32;
     fn vyx_fiber_set_current(slot: rawptr);
     fn vyx_fiber_get_current() -> rawptr;
@@ -533,7 +536,7 @@ public fn vio_timer_arm(state: rawptr, ms: i32) {
     vio_promise_state_retain(state);
     let slot = malloc(VIO_TIMER_SLOT);
     if (slot == null) {
-        vio_promise_state_release(state);
+        vio_promise_state_release::<i32>(state);
         return;
     }
     memset(slot, 0, VIO_TIMER_SLOT);
@@ -573,7 +576,7 @@ public fn vio_timer_fire() {
         vio_timer_head = ptr_read_i64(ptr_offset(slot, VIO_TIMER_NEXT)) as rawptr;
         if (state != null) {
             vio_promise_state_resolve::<i32>(state, 0);
-            vio_promise_state_release(state);
+            vio_promise_state_release::<i32>(state);
         }
         free(slot);
     }
@@ -968,7 +971,16 @@ public fn vio_promise_state_retain(state: rawptr) {
     vio_lock_unlock(lock);
 }
 
-public fn vio_promise_state_release(state: rawptr) {
+// A typed slot has exactly one owner: its state until take(), then the caller.
+fn vio_promise_take_slot<T>(payload: rawptr) -> T {
+    var value: T;
+    memcpy(to_rawptr(&value), payload, sizeof::<T>());
+    return value;
+}
+fn vio_promise_drop_slot<T>(payload: rawptr) { let value = vio_promise_take_slot::<T>(payload); }
+fn vio_promise_drop_slot<str>(payload: rawptr) { unsafe { str_drop(*(payload as *str)); } }
+
+public fn vio_promise_state_release<T>(state: rawptr) {
     if (state == null) { return; }
     let lock = vio_promise_state_lock_handle(state);
     let cond = vio_promise_state_cond_handle(state);
@@ -994,7 +1006,9 @@ public fn vio_promise_state_release(state: rawptr) {
     vio_cond_destroy(cond);
     vio_lock_destroy(lock);
     if (payload != null) {
-        free(payload);
+        // Destructors run outside the state lock. All handles share T.
+        vio_promise_drop_slot::<T>(payload);
+        vyx_aligned_free_abi(payload);
     }
     free(state);
 }
@@ -1010,30 +1024,67 @@ public fn vio_promise_state_resolve<T>(state: rawptr, val: T) {
         return;
     }
     let size = sizeof::<T>();
-    if (vio_promise_state_payload_size(state) == 0) {
-        if (size > 0) {
-            let buf = malloc(size);
-            if (buf == null) {
-                vio_lock_unlock(lock);
-                panic("Promise payload allocation failed");
-            }
-            memset(buf, 0, size);
-            vio_promise_state_set_payload_ptr(state, buf);
-            vio_promise_state_set_payload_size(state, size);
-        }
-    } else if (vio_promise_state_payload_size(state) != size) {
+    var allocation_size = size;
+    if (allocation_size == 0) { allocation_size = 1; }
+    let payload = vyx_aligned_alloc_abi(allocation_size, alignof::<T>());
+    if (payload == null) {
         vio_lock_unlock(lock);
-        panic("Promise payload size mismatch");
+        panic("Promise payload allocation failed");
     }
-    let payload = vio_promise_state_payload_ptr(state);
-    if (size > 0 && payload != null) {
-        memcpy(payload, to_rawptr(&val), size);
-    }
+    // Ordinary typed assignment consumes val. A byte copy would leave val's
+    // scope cleanup active and publish an already destroyed owning object.
+    unsafe { *(payload as *T) = val; }
+    vio_promise_state_set_payload_ptr(state, payload);
+    vio_promise_state_set_payload_size(state, size);
     vio_promise_state_set_done(state, 1);
     vio_promise_state_set_failed(state, 0);
     vio_promise_state_set_error(state, 0);
     vio_cond_broadcast(cond);
     vio_lock_unlock(lock);
+}
+
+// Completion remains observable after the result is taken. The payload itself
+// is single-consumer even when Task/Promise handles have been cloned.
+fn vio_promise_state_take<T>(state: rawptr) -> T {
+    if (state == null) { panic("await on null Promise/Task"); }
+    vio_promise_state_retain(state);
+    let lock = vio_promise_state_lock_handle(state);
+    let cond = vio_promise_state_cond_handle(state);
+    if (lock == null || cond == null) {
+        vio_promise_state_release::<T>(state);
+        panic("await on invalid Promise/Task state");
+    }
+    vio_future_await_done(state);
+    vio_lock_lock(lock);
+    if (vio_promise_state_failed(state) != 0) {
+        vio_lock_unlock(lock);
+        vio_promise_state_release::<T>(state);
+        panic("await on failed Promise/Task");
+    }
+    let payload = vio_promise_state_payload_ptr(state);
+    if (payload == null) {
+        vio_lock_unlock(lock);
+        vio_promise_state_release::<T>(state);
+        panic("Promise/Task result already taken");
+    }
+    // Detach under the mutex so competing readers cannot take the same T.
+    vio_promise_state_set_payload_ptr(state, null);
+    vio_promise_state_set_payload_size(state, 0);
+    vio_lock_unlock(lock);
+    let value = vio_promise_take_slot::<T>(payload);
+    vyx_aligned_free_abi(payload);
+    vio_promise_state_release::<T>(state);
+    return value;
+}
+
+fn vio_promise_result<T>(state: rawptr) -> T { return vio_promise_state_take::<T>(state); }
+fn vio_promise_result<str>(state: rawptr) -> str {
+    // Primitive text can carry a view tag. Publish independent storage so
+    // ordinary return-ownership analysis can establish the caller's cleanup.
+    let value = vio_promise_state_take::<str>(state);
+    let owned = str_dup(value);
+    str_drop(value);
+    return owned;
 }
 
 public fn vio_promise_state_reject(state: rawptr, code: i64) {
@@ -1107,37 +1158,15 @@ class Promise<R> {
         return vio_promise_state_done(self.state) != 0;
     }
 
+    /// Transfers the completed result once; clone() shares this one result.
     public fn await_value() -> R {
-        if (self.state == null) { panic("await on null Promise/Task"); }
-        if (self.is_failed()) { panic("await on failed Promise/Task"); }
-        vio_promise_state_retain(self.state);
-        var out: R;
-        let lock = vio_promise_state_lock_handle(self.state);
-        let cond = vio_promise_state_cond_handle(self.state);
-        if (lock == null || cond == null) {
-            vio_promise_state_release(self.state);
-            panic("await on invalid Promise/Task state");
-        }
-        vio_future_await_done(self.state);
-        if (vio_promise_state_failed(self.state) != 0) {
-            vio_promise_state_release(self.state);
-            panic("await on failed Promise/Task");
-        }
-        vio_lock_lock(lock);
-        let size = vio_promise_state_payload_size(self.state);
-        let payload = vio_promise_state_payload_ptr(self.state);
-        if (size > 0 && payload != null) {
-            memcpy(to_rawptr(&out), payload, size);
-        }
-        vio_lock_unlock(lock);
-        vio_promise_state_release(self.state);
-        return out;
+        return vio_promise_result::<R>(self.state);
     }
 
     public fn drop() {
         if (to_rawptr(self) == null) { return; }
         if (self.state == null) { return; }
-        vio_promise_state_release(self.state);
+        vio_promise_state_release::<R>(self.state);
         self.state = null;
     }
 }
@@ -1208,37 +1237,15 @@ class Task<R> {
         return vio_promise_state_done(self.state) != 0;
     }
 
+    /// Transfers the completed result once; clone() shares this one result.
     public fn await_value() -> R {
-        if (self.state == null) { panic("await on null Promise/Task"); }
-        if (self.is_failed()) { panic("await on failed Promise/Task"); }
-        vio_promise_state_retain(self.state);
-        var out: R;
-        let lock = vio_promise_state_lock_handle(self.state);
-        let cond = vio_promise_state_cond_handle(self.state);
-        if (lock == null || cond == null) {
-            vio_promise_state_release(self.state);
-            panic("await on invalid Promise/Task state");
-        }
-        vio_future_await_done(self.state);
-        if (vio_promise_state_failed(self.state) != 0) {
-            vio_promise_state_release(self.state);
-            panic("await on failed Promise/Task");
-        }
-        vio_lock_lock(lock);
-        let size = vio_promise_state_payload_size(self.state);
-        let payload = vio_promise_state_payload_ptr(self.state);
-        if (size > 0 && payload != null) {
-            memcpy(to_rawptr(&out), payload, size);
-        }
-        vio_lock_unlock(lock);
-        vio_promise_state_release(self.state);
-        return out;
+        return vio_promise_result::<R>(self.state);
     }
 
     public fn drop() {
         if (to_rawptr(self) == null) { return; }
         if (self.state == null) { return; }
-        vio_promise_state_release(self.state);
+        vio_promise_state_release::<R>(self.state);
         self.state = null;
     }
 }

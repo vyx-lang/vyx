@@ -26,7 +26,8 @@ $cases = @(
     @{ Name = 'async_stream'; Expected = "42`n" },
     @{ Name = 'async_params'; Expected = "42`n" },
     @{ Name = 'async_values'; Expected = "42`n" },
-    @{ Name = 'async_payload'; Expected = "42`n" }
+    @{ Name = 'async_payload'; Expected = "42`n" },
+    @{ Name = 'async_owned'; Expected = "42`n" }
 )
 if ($CaseFilter) {
     $cases = @($cases | Where-Object { $_.Name -like "*$CaseFilter*" })

@@ -42,6 +42,7 @@ RULES = tuple(Rule(name, features) for name, features in [
     ("unary_operator", ("generic_class", "unary_operator", "lazy_materialization")),
     ("trait", ("interface", "impl", "generic_constraint", "shared_borrow")),
     ("dynamic_overload", ("dyn_interface", "generic_impl", "overload_identity", "distinct_return_types", "aggregate_return", "shared_borrow")),
+    ("await_ready", ("Task", "Promise", "await", "shared_borrow", "generic_payload", "single_transfer")),
     ("enum", ("payload_enum", "match", "binding")),
     ("option", ("Option", "static_generic", "unwrap")),
     ("result", ("Result", "static_generic", "unwrap")),
@@ -201,6 +202,7 @@ def oracle(case):
         elif rule == "overloaded_iterator": value = 2 * value + 3; calls += 3
         elif rule == "overloaded_array_clone": value = 2 * value + 1; calls += 2; drops += 4
         elif rule == "dynamic_overload": value = 6 * value + 86; calls += 6
+        elif rule == "await_ready": value = 2 * value + 3; calls += 2
         else: raise ValueError(f"unknown production {rule}")
     return [value, calls, drops, defers, 0]
 
@@ -219,6 +221,20 @@ public fn report(id: str, value: i64) {
 }
 '''
 SUPPORT = {
+    "await_ready": '''use std.vio;
+public fn take_ready_promise<T>(pending: &Promise<T>) -> T {
+    calls += 1;
+    return await pending;
+}
+public fn observe_ready_await(value: i64) -> i64 {
+    calls += 1;
+    let pending = Task::<i64>.ready(value);
+    let alias = pending.clone();
+    let first = await (&alias);
+    let promise = Promise::<i64>.ready(value + 3);
+    return first + take_ready_promise::<i64>(&promise);
+}
+''',
     "dynamic_overload": '''public class DynAnswer { public value: i64; public extra: i64; public last: i64; }
 public interface DynMetric {
     fn score(&self, value: i32) -> i64;
@@ -921,6 +937,7 @@ class Emitter:
             elif rule == "overloaded_iterator": expr = f"observe_overloaded_iterator({expr})"
             elif rule == "overloaded_array_clone": expr = f"observe_overloaded_array({expr})"
             elif rule == "dynamic_overload": expr = f"observe_dynamic_overload({expr})"
+            elif rule == "await_ready": expr = f"observe_ready_await({expr})"
             elif rule == "owned_dict": expr = f"dict_owned_observation({expr})"
             elif rule == "owned_linear": expr = f"linear_owned_observation({expr})"
             elif rule == "borrowed_owned_vec":

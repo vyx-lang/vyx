@@ -8,6 +8,17 @@ extern "C" void* vyx_string_clone_len_abi(const void*, long long);
 extern "C" void* vyx_string_alloc_abi(long long);
 extern "C" void vyx_free_runtime_string(void*);
 extern "C" void vyx_free_pooled_string(void*);
+extern "C" void* vyx_aligned_alloc_abi(long long, long long);
+extern "C" void vyx_aligned_free_abi(void*);
+extern "C" void* probe_aligned_alloc(long long size, long long alignment) {
+    void* pointer = vyx_aligned_alloc_abi(size, alignment);
+    if (pointer) { live.insert(pointer); ++allocated; }
+    return pointer;
+}
+extern "C" void probe_aligned_free(void* pointer) {
+    if (live.erase(pointer)) { ++released; }
+    vyx_aligned_free_abi(pointer);
+}
 extern "C" void* probe_clone(const void* source, long long length) {
     void* pointer = vyx_string_clone_len_abi(source, length);
     if (pointer) { live.insert(pointer); ++allocated; ++cloned; }
