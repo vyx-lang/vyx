@@ -1,0 +1,275 @@
+module std.regex;
+
+use std.core;
+use std.string;
+use std.collections;
+
+extern "C" {
+    fn vyx_regex_compile(pattern: rawptr, length: i64, flags: i32, failure: *i32, offset: *i64) -> rawptr;
+    fn vyx_regex_free(code: rawptr);
+    fn vyx_regex_groups(code: rawptr) -> i32;
+    fn vyx_regex_group_number(code: rawptr, name: rawptr) -> i32;
+    fn vyx_regex_error(code: i32, buffer: rawptr, size: i64) -> i32;
+    fn vyx_regex_find(code: rawptr, text: rawptr, size: i64, start: i64, full: i32, steps: i64, depth: i64, heap_kib: i64, spans: rawptr, capacity: i64) -> i32;
+}
+
+public class RegexError {
+    public code: i32;
+    public offset: i64;
+    public message: String;
+    public fn drop() { self.message.destroy(); }
+}
+fn regex_failure(code: i32, offset: i64) -> RegexError {
+    var buffer = Vec::<u8>.with_capacity(256);
+    var i: i32 = 0;
+    while (i < 256) { buffer.push(0 as u8); i += 1; }
+    let length = vyx_regex_error(code, buffer.data, 256);
+    let message = if (length >= 0) { String.fromBytes(buffer.data, length as i64) } else { String.from("unknown regex engine error") };
+    return RegexError { code: code, offset: offset, message: message };
+}
+
+public class RegexOptions {
+    public case_insensitive: bool;
+    public multiline: bool;
+    public dot_all: bool;
+    public unicode: bool;
+    public static fn defaults() -> RegexOptions { return RegexOptions { case_insensitive: false, multiline: false, dot_all: false, unicode: true }; }
+}
+public class RegexLimits {
+    public steps: i64;
+    public depth: i64;
+    public heap_kib: i64;
+    public static fn defaults() -> RegexLimits { return RegexLimits { steps: 1000000, depth: 1000, heap_kib: 8192 }; }
+}
+
+/// Immutable subject snapshot. Capture offsets are UTF-8 byte offsets;
+/// None is an unmatched group, Some("") is a matched empty group.
+public class RegexMatch {
+    subject: String;
+    spans: Vec<i64>;
+    public fn start(&self) -> i64 { return self.spans.get(0); }
+    public fn end(&self) -> i64 { return self.spans.get(1); }
+    public fn group_count(&self) -> i64 { return self.spans.len / 2; }
+    public fn group(&self, index: i64) -> Result<Option<String>, RegexError> {
+        if (index < 0 || index >= self.group_count()) { return Err(regex_failure(-1000, index)); }
+        let a = self.spans.get(index * 2);
+        let b = self.spans.get(index * 2 + 1);
+        if (a < 0) { return Ok(None); }
+        return Ok(Some(String.fromBytes(self.subject.c_str() + a, b - a)));
+    }
+    public fn drop() { self.subject.destroy(); self.spans.destroy(); }
+}
+
+/// PCRE2 10.49 interpreter. JIT is disabled; each match has explicit
+/// step, depth and heap limits. Compiled patterns are owned, move-only.
+public class Regex {
+    handle: rawptr;
+    public static fn compile(pattern: string) -> Result<Regex, RegexError> { return Regex.compile_with(pattern, RegexOptions.defaults()); }
+    public static fn compile_with(pattern: string, options: RegexOptions) -> Result<Regex, RegexError> {
+        var flags: i32 = 0;
+        if (options.case_insensitive) { flags |= 1; }
+        if (options.multiline) { flags |= 2; }
+        if (options.dot_all) { flags |= 4; }
+        if (options.unicode) { flags |= 8; }
+        var failure: i32 = 0;
+        var offset: i64 = -1;
+        let handle = vyx_regex_compile(pattern.ptr, pattern.len, flags, &failure, &offset);
+        if (handle == null) { return Err(regex_failure(failure, offset)); }
+        return Ok(Regex { handle: handle });
+    }
+    public fn group_number(&self, name: string) -> Result<i32, RegexError> {
+        if (self.handle == null || name.len == 0 || name.indexOf("\0") >= 0) { return Err(regex_failure(-1000, -1)); }
+        let index = vyx_regex_group_number(self.handle, name.c_str());
+        if (index < 0) { return Err(regex_failure(index, -1)); }
+        return Ok(index);
+    }
+    public fn find(&self, text: string) -> Result<Option<RegexMatch>, RegexError> { return self.find_from(text, 0, false, RegexLimits.defaults()); }
+    public fn full_match(&self, text: string) -> Result<Option<RegexMatch>, RegexError> { return self.find_from(text, 0, true, RegexLimits.defaults()); }
+    public fn find_from(&self, text: string, start: i64, full: bool, limits: RegexLimits) -> Result<Option<RegexMatch>, RegexError> {
+        if (self.handle == null) { return Err(regex_failure(-1000, -1)); }
+        let groups = vyx_regex_groups(self.handle) as i64;
+        var spans = Vec::<i64>.with_capacity(groups * 2);
+        var i: i64 = 0;
+        while (i < groups * 2) { spans.push(-1); i += 1; }
+        let result = vyx_regex_find(self.handle, text.ptr, text.len, start, if (full) { 1 } else { 0 }, limits.steps, limits.depth, limits.heap_kib, spans.data, spans.len);
+        if (result < 0) { return Err(regex_failure(result, start)); }
+        if (result == 0) { return Ok(None); }
+        return Ok(Some(RegexMatch { subject: String.from(text), spans: spans }));
+    }
+    public fn destroy() { self.drop(); }
+    public fn drop() { if (self.handle != null) { vyx_regex_free(self.handle); self.handle = null; } }
+}
+
+/// Vyx Standard Library: Regex Module
+/// Character classification, glob matching, and simple pattern matching.
+
+extern "C" {
+    fn memcpy(dst: rawptr, src: rawptr, n: i64) -> rawptr;
+}
+
+// ── Character classification ──
+
+public fn match_char(ch: i32, pattern_ch: i32) -> i32 {
+    if (pattern_ch == 46) { return 1; }
+    if (ch == pattern_ch) { return 1; }
+    return 0;
+}
+
+public fn is_word_char(ch: i32) -> i32 {
+    if (ch >= 65 && ch <= 90) { return 1; }
+    if (ch >= 97 && ch <= 122) { return 1; }
+    if (ch >= 48 && ch <= 57) { return 1; }
+    if (ch == 95) { return 1; }
+    return 0;
+}
+
+public fn is_digit_char(ch: i32) -> i32 {
+    if (ch >= 48 && ch <= 57) { return 1; }
+    return 0;
+}
+
+public fn is_hex_char(ch: i32) -> i32 {
+    if (ch >= 48 && ch <= 57) { return 1; }
+    if (ch >= 65 && ch <= 70) { return 1; }
+    if (ch >= 97 && ch <= 102) { return 1; }
+    return 0;
+}
+
+public fn is_whitespace(ch: i32) -> i32 {
+    if (ch == 32 || ch == 9 || ch == 10 || ch == 13) { return 1; }
+    return 0;
+}
+
+public fn is_upper(ch: i32) -> i32 {
+    if (ch >= 65 && ch <= 90) { return 1; }
+    return 0;
+}
+
+public fn is_lower(ch: i32) -> i32 {
+    if (ch >= 97 && ch <= 122) { return 1; }
+    return 0;
+}
+
+public fn is_alpha(ch: i32) -> i32 {
+    if (is_upper(ch) == 1 || is_lower(ch) == 1) { return 1; }
+    return 0;
+}
+
+public fn is_alnum(ch: i32) -> i32 {
+    if (is_alpha(ch) == 1 || is_digit_char(ch) == 1) { return 1; }
+    return 0;
+}
+
+public fn to_upper(ch: i32) -> i32 {
+    if (is_lower(ch) == 1) { return ch - 32; }
+    return ch;
+}
+
+public fn to_lower(ch: i32) -> i32 {
+    if (is_upper(ch) == 1) { return ch + 32; }
+    return ch;
+}
+
+// ── String scanning helpers ──
+
+public fn scan_while_word(s: string, start: i64) -> i64 {
+    if (start < 0 || start > s.len) { panic("scan_while_word: start outside string"); }
+    var pos = start;
+    while (pos < s.len) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.ptr + pos, 1); }
+        ch = ch & 255;
+        if (is_word_char(ch) == 0) { break; }
+        pos += 1;
+    }
+    return pos;
+}
+
+public fn scan_while_digit(s: string, start: i64) -> i64 {
+    if (start < 0 || start > s.len) { panic("scan_while_digit: start outside string"); }
+    var pos = start;
+    while (pos < s.len) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.ptr + pos, 1); }
+        ch = ch & 255;
+        if (is_digit_char(ch) == 0) { break; }
+        pos += 1;
+    }
+    return pos;
+}
+
+public fn scan_while_ws(s: string, start: i64) -> i64 {
+    if (start < 0 || start > s.len) { panic("scan_while_ws: start outside string"); }
+    var pos = start;
+    while (pos < s.len) {
+        var ch: i32 = 0;
+        unsafe { memcpy(to_rawptr(&ch), s.ptr + pos, 1); }
+        ch = ch & 255;
+        if (is_whitespace(ch) == 0) { break; }
+        pos += 1;
+    }
+    return pos;
+}
+
+public fn char_at(s: string, idx: i64) -> i32 {
+    if (idx < 0 || idx >= s.len) { return -1; }
+    var ch: i32 = 0;
+    unsafe { memcpy(to_rawptr(&ch), s.ptr + idx, 1); }
+    return ch & 255;
+}
+
+// ── Glob matching (*, ?) ──
+
+public fn glob_match(pattern: string, text: string) -> bool {
+    var pi: i64 = 0;
+    var ti: i64 = 0;
+    var star_pi: i64 = -1;
+    var star_ti: i64 = -1;
+
+    while (ti < text.len) {
+        let pc = char_at(pattern, pi);
+        let tc = char_at(text, ti);
+        if (pi < pattern.len && pc == 63) {
+            pi += 1;
+            ti += 1;
+        } elif (pi < pattern.len && tc == pc && pc != 42) {
+            pi += 1;
+            ti += 1;
+        } elif (pi < pattern.len && pc == 42) {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } elif (star_pi >= 0) {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pattern.len && char_at(pattern, pi) == 42) {
+        pi += 1;
+    }
+    return pi == pattern.len;
+}
+
+// ── Simple wildcard search ──
+
+public fn wildcard_find(text: string, pattern: string) -> i64 {
+    var i: i64 = 0;
+    while (i <= text.len - pattern.len) {
+        var matched = true;
+        var j: i64 = 0;
+        while (j < pattern.len) {
+            let pc = char_at(pattern, j);
+            if (pc != 63 && match_char(char_at(text, i + j), pc) == 0) {
+                matched = false;
+                break;
+            }
+            j += 1;
+        }
+        if (matched) { return i; }
+        i += 1;
+    }
+    return -1;
+}

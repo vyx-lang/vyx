@@ -15,10 +15,13 @@ from model import write_project
 from semver_model import write_project as write_semver_project
 from url_model import write_project as write_url_project
 from ini_model import write_project as write_ini_project
+from engines_model import write_project as write_engines_project
 
 ROOT = Path(__file__).resolve().parents[3]
 PACKAGES = ROOT / "bootstrap_compiler/std_packages"
 PROJECTS = {
+    "std_regex_uuid_toml": "std regex uuid toml contracts ok",
+    "std_uuid_faults": "std uuid entropy failures ok",
     "std_text_contracts": "std text contracts ok",
     "std_ownership_contracts": "std ownership contracts ok",
     "std_serde_contracts": "std serde contracts ok",
@@ -243,6 +246,10 @@ def main() -> None:
     semver_directory = output / "semver-model"
     url_directory = output / "url-model"
     ini_directory = output / "ini-model"
+    engines_directory = output / "engines-model"
+    if "std_regex_uuid_toml" in selected:
+        record["engines_model"] = write_engines_project(engines_directory)
+        (output / "engines_model.py.snapshot").write_bytes(Path(__file__).with_name("engines_model.py").read_bytes())
     if "std_ini_contracts" in selected:
         record["ini_model"] = write_ini_project(ini_directory)
         (output / "ini_model.py.snapshot").write_bytes(Path(__file__).with_name("ini_model.py").read_bytes())
@@ -294,6 +301,18 @@ def main() -> None:
             record["results"].append(result)
             (output / "verification.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
             print(f"{project} O{opt}: {'PASS' if passed else 'FAIL'} ({result['seconds']:.1f}s)", flush=True)
+            if not passed:
+                print(log[-7000:].decode("utf-8", "replace"), flush=True)
+        if "engines_model" in record:
+            command = [str(compiler), "--src=project", str(engines_directory), "--run=aot", "-j4", f"-O{opt}"]
+            started = time.monotonic()
+            code, log = execute(command, engines_directory, environment, args.timeout)
+            passed = code == 0 and b"std engines model ok" in log
+            (output / f"engines-model-O{opt}.log").write_bytes(log)
+            record["results"].append({"project": "engines-model", "opt": opt, "command": command,
+                "exit": code, "seconds": time.monotonic() - started, "passed": passed})
+            (output / "verification.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            print(f"engines model O{opt}: {'PASS' if passed else 'FAIL'}", flush=True)
             if not passed:
                 print(log[-7000:].decode("utf-8", "replace"), flush=True)
         if "ini_model" in record:

@@ -39,6 +39,8 @@ Projects cover:
 | `std_semver_contracts` | public cross-module API, strict/located SemVer errors, prerelease precedence, checked core/increments, owning Clone, Vec sorting, Dict key agreement and selection from a real release catalog |
 | `std_url_contracts` | all-byte percent/form codecs, literal plus, IPv4/IPv6 and port validation, empty delimiters, repeated query fields, owning Clone and a cross-module request-preparation consumer |
 | `std_ini_contracts` | indexed case-sensitive configuration, CRLF/BOM/root entries, located syntax/typed errors, i32/i64 limits, missing/empty distinction, owned String results, Clone and real file settings |
+| `std_regex_uuid_toml` | file-backed router configuration across modules; PCRE2 captures/Unicode/bounds, UUID parsing/OS randomness/value keys, TOML types/tables/dates/lifetime; deterministic Python re/uuid/tomllib oracle |
+| `std_uuid_faults` | injected entropy errors, partial provider failure; POSIX short reads, EINTR, EOF, read and close errors; no PRNG fallback |
 | `std_generic_contracts` | a real static library with generic trait-bound methods and a separate consumer |
 | `std_serde_contracts` | quoted multiline CSV, CRLF, blank/trailing fields, embedded NUL, escaped quotes and located malformed-input errors |
 | Existing collections/JSON/miniz/I/O/umbrella projects | package resolution and resource/error contracts already maintained by those projects |
@@ -114,6 +116,26 @@ Python integers provide independent width-bound results. Generated inputs mix
 newlines, comments, empty values, case-sensitive keys, literal percent signs,
 Unicode and conversion errors. Missing values remain distinct from empty
 values and rejected values. Reports retain seed and generator/source hashes.
+
+Selecting `std_regex_uuid_toml` also generates 96 Regex searches checked against
+Python `re` (shared syntax only), 64 UUID conversions checked against `uuid`,
+and eight TOML documents plus 15 invalid inputs checked against `tomllib` and
+the signed-i64 bounds required by TOML. These run at both O0 and O2, separately
+from hand-written feature and file-backed router tests. A 4096-ID uniqueness
+smoke test is not a statistical or cryptographic proof of entropy quality.
+
+Native ownership/failure checks are also available independently:
+
+```sh
+python probes/gates/stdlib-contracts/native_engines.py --cc /usr/bin/clang --output .cache/native-engines
+```
+
+This compiles pinned PCRE2 and tomlc17 bridge paths with ASan/UBSan (and LSan
+where supported), repeatedly releases root/child/clone handles, injects
+bridge allocation failures and checks capture buffer/UTF-8 errors. Release
+Linux/macOS checks run this with the runner's system Clang. Windows tests use
+the actual Vyx APIs and entropy failure executable; this sanitizer command is
+POSIX-only. Corpus sampling does not claim full TOML/PCRE2 upstream conformance.
 
 Native OpenSSL checks are opt-in because the default SDK gate does not install
 OpenSSL. With the native link libraries installed, run:

@@ -32,11 +32,12 @@ static packages.
 | `std:sync` | `std_sync` | sync, channel, threading, thread_pool, concurrent |
 | `std:format` | `std_format` | fmt, color |
 | `std:testing` | `std_testing` | testing and mock |
-| `std:serde` | `serde_toml` | TOML |
+| `std:serde` | `serde_toml` | [typed TOML documents, date/time and arrays of tables](../bootstrap_compiler/std_packages/serde/TOML.md) |
+| `std:regex` | `std_regex` | [PCRE2 patterns, captures and resource limits](../bootstrap_compiler/std_packages/regex/README.md) |
 | `std:serde` | `serde_json` | JSON plus cJSON native bridge |
 | `std:serde` | `serde_ini` | indexed INI configuration and typed Result/Option lookups |
 | `std:miniz` | `std_miniz` | compression plus miniz bridge |
-| `std:std` | `std` | aggregate package, including JSON/miniz |
+| `std:std` | `std` | aggregate package, including JSON/miniz/Regex and UUID |
 | `std:cacao` | `std_cacao` | Cacao graphics/GPU C ABI bindings (opt-in; link Cacao) |
 | `std:dll` | `std_dll` | dynamic library loader |
 | `std:llvm` | `std_llvm` | LLVM C API bindings |

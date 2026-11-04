@@ -1,5 +1,169 @@
 module std.serde.toml;
 
+use std.core;
+use std.string;
+use std.collections;
+use std.clone;
+
+extern "C" {
+    fn vyx_toml_parse(text: rawptr, size: i64, failure: rawptr, capacity: i64, line: *i64) -> rawptr;
+    fn vyx_toml_free(value: rawptr);
+    fn vyx_toml_clone(value: rawptr) -> rawptr;
+    fn vyx_toml_type(value: rawptr) -> i32;
+    fn vyx_toml_line(value: rawptr) -> i64;
+    fn vyx_toml_column(value: rawptr) -> i64;
+    fn vyx_toml_size(value: rawptr) -> i64;
+    fn vyx_toml_get(value: rawptr, key: rawptr, length: i64, status: *i32) -> rawptr;
+    fn vyx_toml_at(value: rawptr, index: i64) -> rawptr;
+    fn vyx_toml_key(value: rawptr, index: i64, length: *i64) -> rawptr;
+    fn vyx_toml_string(value: rawptr, length: *i64) -> rawptr;
+    fn vyx_toml_integer(value: rawptr) -> i64;
+    fn vyx_toml_float(value: rawptr) -> f64;
+    fn vyx_toml_bool(value: rawptr) -> i32;
+    fn vyx_toml_datetime(value: rawptr, fields: rawptr);
+}
+
+public enum TomlKind { Invalid, Text, Integer, Float, Boolean, Date, Time, DateTime, OffsetDateTime, Array, Table }
+public error TomlErrorKind { Parse, Type, Missing, Range, Allocation, Destroyed }
+public class TomlError {
+    public kind: TomlErrorKind;
+    public message: String;
+    public line: i64;
+    public column: i64;
+    public fn drop() { self.message.destroy(); }
+}
+fn toml_failure(kind: TomlErrorKind, message: string, line: i64, column: i64) -> TomlError {
+    return TomlError { kind: kind, message: String.from(message), line: line, column: column };
+}
+fn toml_missing_failure(key: string, line: i64, column: i64) -> TomlError {
+    var message = String.from("missing TOML key: ");
+    message.append(key);
+    return TomlError { kind: TomlErrorKind.Missing, message: message, line: line, column: column };
+}
+public class TomlDateTime {
+    public kind: TomlKind;
+    public year: i32; public month: i32; public day: i32;
+    public hour: i32; public minute: i32; public second: i32;
+    public microsecond: i32;
+    public offset_minutes: i32;
+}
+
+/// Immutable TOML 1.1 value tree (tomlc17 R261003). Children keep their
+/// tree alive; getters copy text, including embedded escaped NUL bytes.
+/// Table keys are exact names, never implicitly split on dots.
+public class Toml {
+    handle: rawptr;
+    public static fn parse(text: string) -> Result<Toml, TomlError> {
+        var failure = Vec::<u8>.with_capacity(256);
+        var i: i64 = 0;
+        while (i < 256) { failure.push(0 as u8); i += 1; }
+        var line: i64 = 0;
+        let handle = vyx_toml_parse(text.ptr, text.len, failure.data, failure.len, &line);
+        if (handle == null) { return Err(toml_failure(TomlErrorKind.Parse, from_cstr(failure.data), line, 0)); }
+        return Ok(Toml { handle: handle });
+    }
+    public fn kind(&self) -> TomlKind {
+        match (vyx_toml_type(self.handle)) {
+            1 => { return TomlKind.Text; } 2 => { return TomlKind.Integer; }
+            3 => { return TomlKind.Float; } 4 => { return TomlKind.Boolean; }
+            5 => { return TomlKind.Date; } 6 => { return TomlKind.Time; }
+            7 => { return TomlKind.DateTime; } 8 => { return TomlKind.OffsetDateTime; }
+            9 => { return TomlKind.Array; } 10 => { return TomlKind.Table; }
+            default => { return TomlKind.Invalid; }
+        }
+    }
+    public fn line(&self) -> i64 { return vyx_toml_line(self.handle); }
+    public fn column(&self) -> i64 { return vyx_toml_column(self.handle); }
+    fn expect(&self, kind: TomlKind) -> Result<i32, TomlError> {
+        if (self.handle == null) { return Err(toml_failure(TomlErrorKind.Destroyed, "TOML value was destroyed", 0, 0)); }
+        if (self.kind() != kind) { return Err(toml_failure(TomlErrorKind.Type, "unexpected TOML value type", self.line(), self.column())); }
+        return Ok(0);
+    }
+    public fn size(&self) -> Result<i64, TomlError> {
+        let size = vyx_toml_size(self.handle);
+        if (size < 0) { return Err(toml_failure(TomlErrorKind.Type, "expected TOML table or array", self.line(), self.column())); }
+        return Ok(size);
+    }
+    public fn get(&self, key: string) -> Result<Option<Toml>, TomlError> {
+        match (self.expect(TomlKind.Table)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        var status: i32 = 0;
+        let child = vyx_toml_get(self.handle, key.ptr, key.len, &status);
+        if (status < 0) { return Err(toml_failure(TomlErrorKind.Allocation, "TOML handle allocation failed", self.line(), self.column())); }
+        if (status == 0) { return Ok(None); }
+        return Ok(Some(Toml { handle: child }));
+    }
+    public fn require(&self, key: string) -> Result<Toml, TomlError> {
+        match (self.get(key)) {
+            Err(e) => { return Err(e); }
+            Ok(value) => {
+                match (value) {
+                    Some(child) => { return Ok(child); }
+                    None => { return Err(toml_missing_failure(key, self.line(), self.column())); }
+                }
+            }
+        }
+    }
+    public fn at(&self, index: i64) -> Result<Toml, TomlError> {
+        match (self.expect(TomlKind.Array)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        if (index < 0 || index >= vyx_toml_size(self.handle)) { return Err(toml_failure(TomlErrorKind.Range, "TOML array index out of range", self.line(), self.column())); }
+        let child = vyx_toml_at(self.handle, index);
+        if (child == null) { return Err(toml_failure(TomlErrorKind.Allocation, "TOML handle allocation failed", self.line(), self.column())); }
+        return Ok(Toml { handle: child });
+    }
+    public fn keys(&self) -> Result<Vec<String>, TomlError> {
+        match (self.expect(TomlKind.Table)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        var keys = Vec::<String>.new();
+        var i: i64 = 0;
+        while (i < vyx_toml_size(self.handle)) {
+            var length: i64 = 0;
+            let ptr = vyx_toml_key(self.handle, i, &length);
+            keys.push(String.fromBytes(ptr, length));
+            i += 1;
+        }
+        return Ok(keys);
+    }
+    public fn as_string(&self) -> Result<String, TomlError> {
+        match (self.expect(TomlKind.Text)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        var length: i64 = 0;
+        let ptr = vyx_toml_string(self.handle, &length);
+        return Ok(String.fromBytes(ptr, length));
+    }
+    public fn as_i64(&self) -> Result<i64, TomlError> {
+        match (self.expect(TomlKind.Integer)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        return Ok(vyx_toml_integer(self.handle));
+    }
+    public fn as_f64(&self) -> Result<f64, TomlError> {
+        match (self.expect(TomlKind.Float)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        return Ok(vyx_toml_float(self.handle));
+    }
+    public fn as_bool(&self) -> Result<bool, TomlError> {
+        match (self.expect(TomlKind.Boolean)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        return Ok(vyx_toml_bool(self.handle) != 0);
+    }
+    public fn as_datetime(&self) -> Result<TomlDateTime, TomlError> {
+        let k = self.kind();
+        if (k != TomlKind.Date && k != TomlKind.Time && k != TomlKind.DateTime && k != TomlKind.OffsetDateTime) { return Err(toml_failure(TomlErrorKind.Type, "expected TOML date/time", self.line(), self.column())); }
+        var fields = Vec::<i32>.with_capacity(8);
+        var i: i32 = 0;
+        while (i < 8) { fields.push(0); i += 1; }
+        vyx_toml_datetime(self.handle, fields.data);
+        return Ok(TomlDateTime { kind: k, year: fields.get(0), month: fields.get(1), day: fields.get(2), hour: fields.get(3), minute: fields.get(4), second: fields.get(5), microsecond: fields.get(6), offset_minutes: fields.get(7) });
+    }
+    public fn try_clone(&self) -> Result<Toml, TomlError> {
+        if (self.handle == null) { return Err(toml_failure(TomlErrorKind.Destroyed, "TOML value was destroyed", 0, 0)); }
+        let copy = vyx_toml_clone(self.handle);
+        if (copy == null) { return Err(toml_failure(TomlErrorKind.Allocation, "TOML handle allocation failed", 0, 0)); }
+        return Ok(Toml { handle: copy });
+    }
+    public fn destroy() { self.drop(); }
+    public fn drop() { if (self.handle != null) { vyx_toml_free(self.handle); self.handle = null; } }
+}
+impl Clone for Toml {
+    public fn clone(&self) -> Toml {
+        match (self.try_clone()) { Ok(value) => { return value; } Err(_) => { panic("Toml.clone: invalid value or allocation failure"); } }
+    }
+}
+
 use std.string;
 
 /// Vyx TOML Configuration Parser

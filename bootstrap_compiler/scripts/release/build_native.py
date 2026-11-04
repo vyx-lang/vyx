@@ -57,6 +57,9 @@ def check_tbb_install(compiler, library, work, environment):
 
 def check_standard_library(compiler, work, environment):
     output = work / "stdlib-contracts"
+    if os.name != "nt":
+        run([sys.executable, REPO / "probes/gates/stdlib-contracts/native_engines.py",
+             "--cc", "/usr/bin/clang", "--output", output / "native-engines"], env=environment)
     run([sys.executable, "-m", "unittest", "discover", "-s",
          REPO / "probes/gates/stdlib-contracts", "-p", "test_runner.py"], env=environment)
     run([sys.executable, REPO / "probes/gates/compiler-platforms/run.py", "--compiler", compiler,

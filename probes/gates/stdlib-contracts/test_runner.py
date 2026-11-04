@@ -14,6 +14,7 @@ from model import write_project
 from semver_model import precedence, write_project as write_semver_project
 from url_model import encode as url_encode_oracle, write_project as write_url_project
 from ini_model import reference as ini_reference, write_project as write_ini_project
+from engines_model import write_project as write_engines_project, literal as engines_literal
 
 
 def alive(pid):
@@ -40,6 +41,19 @@ def alive(pid):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_engine_models_are_reproducible_and_use_independent_oracles(self):
+        self.assertEqual(engines_literal('a\0b'), '"a\\0b"')
+        self.assertEqual(engines_literal('a\\u0000b'), '"a\\\\u0000b"')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = write_engines_project(root / "a", seed=42)
+            self.assertEqual(first, write_engines_project(root / "b", seed=42))
+            self.assertEqual((first["regex_cases"], first["uuid_cases"], first["toml_documents"], first["toml_invalid"]), (96, 64, 8, 15))
+            source = (root / "a/main.vyx").read_text(encoding="utf8")
+            self.assertIn('regex_check(', source)
+            self.assertIn('UUID network byte oracle', source)
+            self.assertIn('TOML signed-64-bit bound', source)
+
     def test_ini_oracle_has_explicit_case_and_interpolation_rules(self):
         result = ini_reference("root=value\r\n[s]\r\nKey=100% %(raw)s\r\nkey=\r\nurl=https://x?q=1;#literal")
         self.assertEqual(result, {("", "root"): "value", ("s", "Key"): "100% %(raw)s", ("s", "key"): "", ("s", "url"): "https://x?q=1;#literal"})

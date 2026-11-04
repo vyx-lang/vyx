@@ -30,11 +30,12 @@ bridge（JSON/miniz）继续使用 static package。当前入口：
 | `std:sync` | `std_sync` | sync/channel/threading/thread_pool/concurrent |
 | `std:format` | `std_format` | fmt/color |
 | `std:testing` | `std_testing` | testing/mock |
-| `std:serde` | `serde_toml` | TOML |
+| `std:serde` | `serde_toml` | [TOML 类型化文档、日期与数组表](../bootstrap_compiler/std_packages/serde/TOML.md) |
+| `std:regex` | `std_regex` | [PCRE2 正则、捕获组与资源上限](../bootstrap_compiler/std_packages/regex/README.md) |
 | `std:serde` | `serde_json` | JSON + cJSON bridge |
 | `std:serde` | `serde_ini` | 带索引的 INI 配置与 Result/Option 类型查询 |
 | `std:miniz` | `std_miniz` | 压缩 + miniz bridge |
-| `std:std` | `std` | 已 package 化的通用标准库聚合包（含 JSON/miniz） |
+| `std:std` | `std` | 通用标准库聚合包（含 JSON/miniz/Regex、UUID） |
 | `std:cacao` | `std_cacao` | Cacao 图形/GPU C ABI 绑定（按需，自行链接 Cacao） |
 | `std:dll` | `std_dll` | 动态库加载 |
 | `std:llvm` | `std_llvm` | LLVM C API 绑定 |

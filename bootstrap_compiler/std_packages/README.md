@@ -8,7 +8,7 @@ by that package manifest.
 
 Pure/generic modules use `type = "source"`: the package exposes explicit module
 sources to the consuming compiler process and emits no archive. Native bridges
-such as `json` and `miniz` use normal static targets.
+such as `json`, `miniz`, `regex` and `serde_toml` use normal static targets.
 
 Each package owns its canonical sources below its own `src/` directory. The
 `std` umbrella target composes the segmented packages through normal manifest
@@ -34,6 +34,13 @@ manifest. `vyxc build` still consumes packages through `std:` dependencies and
 
 `../std/` is a leftover seed snapshot, not a consumer import contract. The root
 repository `std/` is the frozen host mirror and is intentionally untouched.
+
+Regular expressions use a [vendored PCRE2 package](regex/README.md). TOML
+has a [typed, immutable document API](serde/TOML.md). [`std.uuid.Uuid`](std/UUID.md) uses OS
+entropy (`rand_s` on Windows, `/dev/urandom` on POSIX), reports failures through
+`try_new_v4`, and supports canonical parsing, network-order bytes and collection
+value semantics. `uuid4()` remains the panicking string convenience API;
+there is no clock/PRNG fallback or shared mutable UUID generator state.
 
 ## Contracts and errors
 
