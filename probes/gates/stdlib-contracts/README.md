@@ -38,6 +38,7 @@ Projects cover:
 | `std_scalar_contracts` | bit boundaries, negative hex, strict Base64/hex errors, all-byte round trips, independent PCG reference sequence and range extremes |
 | `std_semver_contracts` | public cross-module API, strict/located SemVer errors, prerelease precedence, checked core/increments, owning Clone, Vec sorting, Dict key agreement and selection from a real release catalog |
 | `std_url_contracts` | all-byte percent/form codecs, literal plus, IPv4/IPv6 and port validation, empty delimiters, repeated query fields, owning Clone and a cross-module request-preparation consumer |
+| `std_ini_contracts` | indexed case-sensitive configuration, CRLF/BOM/root entries, located syntax/typed errors, i32/i64 limits, missing/empty distinction, owned String results, Clone and real file settings |
 | `std_generic_contracts` | a real static library with generic trait-bound methods and a separate consumer |
 | `std_serde_contracts` | quoted multiline CSV, CRLF, blank/trailing fields, embedded NUL, escaped quotes and located malformed-input errors |
 | Existing collections/JSON/miniz/I/O/umbrella projects | package resolution and resource/error contracts already maintained by those projects |
@@ -104,6 +105,15 @@ encodings and components come from Python's `urllib.parse` and `ipaddress`.
 The form oracle adjusts urllib's treatment of `*` and `~` to the form alphabet.
 Reports retain the seed and generator/source hashes. This is a strict byte and
 absolute HTTP/WS URL contract, not full WHATWG parsing or DNS validation.
+
+Selecting `std_ini_contracts` also runs a deterministic model using Python's
+`RawConfigParser` for the documented common subset. It checks 24 documents,
+480 raw/typed lookups, strict syntax rejection and a 1024-entry growing index
+under a 4096-byte section name. Section IDs keep index-key storage bounded.
+Python integers provide independent width-bound results. Generated inputs mix
+newlines, comments, empty values, case-sensitive keys, literal percent signs,
+Unicode and conversion errors. Missing values remain distinct from empty
+values and rejected values. Reports retain seed and generator/source hashes.
 
 Native OpenSSL checks are opt-in because the default SDK gate does not install
 OpenSSL. With the native link libraries installed, run:

@@ -34,6 +34,7 @@ static packages.
 | `std:testing` | `std_testing` | testing and mock |
 | `std:serde` | `serde_toml` | TOML |
 | `std:serde` | `serde_json` | JSON plus cJSON native bridge |
+| `std:serde` | `serde_ini` | indexed INI configuration and typed Result/Option lookups |
 | `std:miniz` | `std_miniz` | compression plus miniz bridge |
 | `std:std` | `std` | aggregate package, including JSON/miniz |
 | `std:cacao` | `std_cacao` | Cacao graphics/GPU C ABI bindings (opt-in; link Cacao) |
@@ -157,6 +158,17 @@ Clone owns independent fields. This API does not resolve relative URLs or
 perform IDNA, DNS lookup, WHATWG normalization, IPvFuture or IPv6 zone parsing.
 Raw spaces, controls, non-ASCII characters and malformed escapes are rejected.
 See the [URL consumer and exact boundaries](../tests/projects/std_url_contracts/README.md).
+
+`std.serde.ini` provides `IniDocument.try_parse` and indexed lookup. Names are
+case-sensitive; LF/CRLF/CR, a UTF-8 BOM and root keys are supported. Duplicate
+names and malformed input produce `IniError` with byte offset, line and column.
+`try_get` returns `Result<Option<String>, IniError>` and owns its result; missing
+and present-empty values differ. `try_get_i32/i64/bool` check complete values and
+integer limits. Values are literal: no interpolation, quote unescaping, inline
+value comments or DEFAULT inheritance. The legacy lookup functions retain
+empty/zero/false only for missing keys and panic on malformed/overflow values.
+Use the [configuration consumer and dialect](../tests/projects/std_ini_contracts/README.md)
+for package setup and exact rules.
 
 ## Current implementation boundary
 

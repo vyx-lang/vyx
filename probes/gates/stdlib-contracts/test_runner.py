@@ -13,6 +13,7 @@ import run as gate
 from model import write_project
 from semver_model import precedence, write_project as write_semver_project
 from url_model import encode as url_encode_oracle, write_project as write_url_project
+from ini_model import reference as ini_reference, write_project as write_ini_project
 
 
 def alive(pid):
@@ -39,6 +40,23 @@ def alive(pid):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_ini_oracle_has_explicit_case_and_interpolation_rules(self):
+        result = ini_reference("root=value\r\n[s]\r\nKey=100% %(raw)s\r\nkey=\r\nurl=https://x?q=1;#literal")
+        self.assertEqual(result, {("", "root"): "value", ("s", "Key"): "100% %(raw)s", ("s", "key"): "", ("s", "url"): "https://x?q=1;#literal"})
+        self.assertIn("tests/projects/std_ini_contracts/config.ini", gate.input_hashes(["std_ini_contracts"]))
+
+    def test_ini_model_reproduces_and_counts_lookups(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = write_ini_project(root / "a", seed=42)
+            self.assertEqual(first, write_ini_project(root / "b", seed=42))
+            self.assertEqual(first["documents"], 24)
+            self.assertEqual(first["lookups"], 480)
+            self.assertEqual(first["growing_index_entries"], 1024)
+            source = (root / "a/main.vyx").read_text(encoding="utf8")
+            self.assertEqual(source.count("    check(&document,"), first["lookups"])
+            self.assertNotEqual(first["source_sha256"], write_ini_project(root / "c", seed=43)["source_sha256"])
+
     def test_url_oracle_separates_percent_and_form_alphabets(self):
         self.assertEqual(url_encode_oracle(b" +*~\0"), "%20%2B%2A~%00")
         self.assertEqual(url_encode_oracle(b" +*~\0", True), "+%2B*%7E%00")

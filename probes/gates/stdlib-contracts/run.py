@@ -14,6 +14,7 @@ import tomllib
 from model import write_project
 from semver_model import write_project as write_semver_project
 from url_model import write_project as write_url_project
+from ini_model import write_project as write_ini_project
 
 ROOT = Path(__file__).resolve().parents[3]
 PACKAGES = ROOT / "bootstrap_compiler/std_packages"
@@ -25,6 +26,7 @@ PROJECTS = {
     "std_scalar_contracts": "std scalar contracts ok",
     "std_semver_contracts": "std semver contracts ok",
     "std_url_contracts": "std url contracts ok",
+    "std_ini_contracts": "std ini contracts ok",
     "std_sync_contracts": "std.sync contracts ok",
     "std_owned_collections": "std owning collections contracts ok",
     "std_value_collections": "std value collections ok",
@@ -114,7 +116,7 @@ def input_hashes(projects: list[str]) -> dict[str, str]:
         for path in directory.rglob("*"):
             if not path.is_file() or any(part in (".cache", "out", "target") for part in path.relative_to(directory).parts):
                 continue
-            if path.suffix in (".vyx", ".toml", ".c", ".h", ".cpp", ".txt") or path.name == "registry":
+            if path.suffix in (".vyx", ".toml", ".c", ".h", ".cpp", ".txt", ".ini") or path.name == "registry":
                 result[path.relative_to(ROOT).as_posix()] = sha256(path)
     return result
 
@@ -240,6 +242,10 @@ def main() -> None:
     model_directory = output / "model"
     semver_directory = output / "semver-model"
     url_directory = output / "url-model"
+    ini_directory = output / "ini-model"
+    if "std_ini_contracts" in selected:
+        record["ini_model"] = write_ini_project(ini_directory)
+        (output / "ini_model.py.snapshot").write_bytes(Path(__file__).with_name("ini_model.py").read_bytes())
     if "std_url_contracts" in selected:
         record["url_model"] = write_url_project(url_directory)
         (output / "url_model.py.snapshot").write_bytes(Path(__file__).with_name("url_model.py").read_bytes())
@@ -288,6 +294,18 @@ def main() -> None:
             record["results"].append(result)
             (output / "verification.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
             print(f"{project} O{opt}: {'PASS' if passed else 'FAIL'} ({result['seconds']:.1f}s)", flush=True)
+            if not passed:
+                print(log[-7000:].decode("utf-8", "replace"), flush=True)
+        if "ini_model" in record:
+            command = [str(compiler), "--src=project", str(ini_directory), "--run=aot", "-j4", f"-O{opt}"]
+            started = time.monotonic()
+            code, log = execute(command, ini_directory, environment, args.timeout)
+            passed = code == 0 and b"std ini model ok" in log
+            (output / f"ini-model-O{opt}.log").write_bytes(log)
+            record["results"].append({"project": "ini-model", "opt": opt, "command": command,
+                "exit": code, "seconds": time.monotonic() - started, "passed": passed})
+            (output / "verification.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            print(f"ini model O{opt}: {'PASS' if passed else 'FAIL'}", flush=True)
             if not passed:
                 print(log[-7000:].decode("utf-8", "replace"), flush=True)
         if "url_model" in record:
@@ -346,6 +364,9 @@ def main() -> None:
                 ("form-invalid-escape", "form_decode:", False),
                 ("url-invalid-parse", "Url.parse:", False),
                 ("url-invalid-state", "Url.toString:", False),
+                ("ini-invalid-document", "IniDocument.parse:", False),
+                ("ini-invalid-integer", "ini_find_int:", False),
+                ("ini-invalid-boolean", "ini_find_bool:", False),
             ):
                 directory = output / "negative" / f"{name}-O{opt}"
                 directory.mkdir(parents=True, exist_ok=True)

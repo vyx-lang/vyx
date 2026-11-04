@@ -32,6 +32,7 @@ bridge（JSON/miniz）继续使用 static package。当前入口：
 | `std:testing` | `std_testing` | testing/mock |
 | `std:serde` | `serde_toml` | TOML |
 | `std:serde` | `serde_json` | JSON + cJSON bridge |
+| `std:serde` | `serde_ini` | 带索引的 INI 配置与 Result/Option 类型查询 |
 | `std:miniz` | `std_miniz` | 压缩 + miniz bridge |
 | `std:std` | `std` | 已 package 化的通用标准库聚合包（含 JSON/miniz） |
 | `std:cacao` | `std_cacao` | Cacao 图形/GPU C ABI 绑定（按需，自行链接 Cacao） |
@@ -131,6 +132,14 @@ macOS 的原生 Release 任务在打包前执行。验证报告中的平台、�
 独立拥有字段。此 API 不做相对 URL 解析、IDNA、DNS 查询、浏览器 WHATWG 规范化、
 IPvFuture 或 IPv6 zone 解析。原始空格、控制字节、非 ASCII 字符和错误转义会被拒绝。
 消费示例与边界见 [URL 项目](../tests/projects/std_url_contracts/README.md)。
+
+`std.serde.ini` 提供 `IniDocument.try_parse` 和索引查询，名字区分大小写，支持
+LF/CRLF/CR、UTF-8 BOM 和根节键值。重复名字或格式错误返回含字节位置、行号、列号的
+`IniError`。`try_get` 返回 `Result<Option<String>, IniError>`，结果独立拥有存储，缺失与
+存在但为空是不同状态。`try_get_i32/i64/bool` 验证完整值和整数范围。值保持字面内容，
+不做插值、引号转义、值内注释截断或 DEFAULT 继承。旧查询函数仅对缺失键保留空值、
+零、false 的结果，格式错误及数值溢出会 panic。包配置和完整规则见
+[配置消费项目](../tests/projects/std_ini_contracts/README.md)。
 
 ## 当前状态
 

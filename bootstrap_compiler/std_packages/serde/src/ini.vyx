@@ -1,60 +1,261 @@
 module std.serde.ini;
 
-/// INI — Simple INI Key Lookup for Vyx
-/// Usage: import std::ini;
-///
-/// Example:
-///   let text = "[server]\nhost=localhost\nport=8080";
-///   print(ini_find(text, "server", "host"));   // "localhost"
-///   print(ini_find_int(text, "server", "port")); // 8080
+use std.core;
+use std.string;
+use std.collections;
+use std.clone;
 
-public fn ini_find(text: string, section: string, key: string) -> string {
-    let target = "[" + section + "]";
-    var in_section = false;
-    var line_start = 0;
-    var i = 0;
-    while (i <= text.len) {
-        let is_end = i == text.len;
-        let is_newline = !is_end && text.charAt(i) == 10;
+public error IniErrorKind { InvalidSyntax, InvalidName, DuplicateSection, DuplicateKey, InvalidInteger, Overflow, InvalidBoolean }
+public class IniError {
+    public kind: IniErrorKind;
+    public offset: i64;
+    public line: i64;
+    public column: i64;
+    public message: string;
+}
 
-        if (is_newline || is_end) {
-            if (i > line_start) {
-                let line = text.substring(line_start, i);
-                if (line == target) {
-                    in_section = true;
-                } elif (line.len > 0 && line.charAt(0) == 91) {
-                    in_section = false;
-                } elif (in_section) {
-                    let eq = line.indexOf("=");
-                    if (eq >= 0) {
-                        let k = line.substring(0, eq);
-                        if (k == key) {
-                            return line.substring(eq + 1, line.len);
-                        }
+fn ini_failure(kind: IniErrorKind, offset: i64, line: i64, column: i64, message: string) -> IniError {
+    return IniError { kind: kind, offset: offset, line: line, column: column, message: message };
+}
+fn ini_space(ch: i32) -> bool { return ch == 32 || ch == 9; }
+fn ini_digit(ch: i32) -> bool { return ch >= 48 && ch <= 57; }
+fn ini_bad_name(text: string, section: bool) -> i64 {
+    if (text.len == 0) { return if (section) { -1 } else { 0 }; }
+    if (ini_space(text.charAt(0))) { return 0; }
+    if (ini_space(text.charAt(text.len - 1))) { return text.len - 1; }
+    var i: i64 = 0;
+    while (i < text.len) {
+        let ch = text.charAt(i);
+        if (ch < 32 || ch == 127 || (section && (ch == 91 || ch == 93)) || (!section && (ch == 61 || (i == 0 && (ch == 91 || ch == 35 || ch == 59))))) { return i; }
+        i += 1;
+    }
+    return -1;
+}
+
+class IniEntry {
+    public value: String;
+    public offset: i64;
+    public line: i64;
+    public column: i64;
+}
+impl Clone for IniEntry {
+    public fn clone(&self) -> IniEntry {
+        return IniEntry { value: self.value.clone(), offset: self.offset, line: self.line, column: self.column };
+    }
+}
+
+fn ini_integer(entry: &IniEntry, bits: i32) -> Result<i64, IniError> {
+    let text = entry.value.as_str();
+    var i: i64 = 0;
+    var negative = false;
+    if (text.len > 0 && (text.charAt(0) == 45 || text.charAt(0) == 43)) {
+        negative = text.charAt(0) == 45;
+        i = 1;
+    }
+    if (i == text.len) { return Err(ini_failure(IniErrorKind.InvalidInteger, entry.offset + i, entry.line, entry.column + i, "expected decimal integer digits")); }
+    var limit: u64 = 9223372036854775807 as u64;
+    if (negative) { limit = 9223372036854775808 as u64; }
+    if (bits == 32) { limit = if (negative) { 2147483648 as u64 } else { 2147483647 as u64 }; }
+    var magnitude: u64 = 0;
+    while (i < text.len) {
+        let ch = text.charAt(i);
+        if (!ini_digit(ch)) { return Err(ini_failure(IniErrorKind.InvalidInteger, entry.offset + i, entry.line, entry.column + i, "invalid decimal integer byte")); }
+        let digit = (ch - 48) as u64;
+        if (magnitude > (limit - digit) / (10 as u64)) { return Err(ini_failure(IniErrorKind.Overflow, entry.offset + i, entry.line, entry.column + i, "INI integer is outside the requested type")); }
+        magnitude = magnitude * (10 as u64) + digit;
+        i += 1;
+    }
+    if (negative && magnitude == 9223372036854775808 as u64) { return Ok(-9223372036854775807 - 1); }
+    if (negative) { return Ok(-(magnitude as i64)); }
+    return Ok(magnitude as i64);
+}
+
+/// Strict, case-sensitive INI with '=' assignments and no interpolation.
+/// Comments occupy whole lines; value '#' / ';' / quotes are literal bytes.
+/// Duplicate names and multiline continuations are errors, not overrides.
+public class IniDocument {
+    entries: Vec<IniEntry>;
+    index: Dict<string, i64>;
+    sections: Dict<string, i64>;
+
+    public static fn try_parse(text: string) -> Result<IniDocument, IniError> {
+        var result = IniDocument { entries: Vec::<IniEntry>.new(), index: Dict::<string, i64>.new(), sections: Dict::<string, i64>.new() };
+        var section_prefix: string = "\0";
+        var begin: i64 = 0;
+        var number: i64 = 1;
+        if (text.len >= 3 && text.charAt(0) == 239 && text.charAt(1) == 187 && text.charAt(2) == 191) { begin = 3; }
+        var line_start: i64 = 0;
+        while (begin < text.len) {
+            var end = begin;
+            while (end < text.len && text.charAt(end) != 10 && text.charAt(end) != 13) {
+                let ch = text.charAt(end);
+                if ((ch < 32 && ch != 9) || ch == 127) { return Err(ini_failure(IniErrorKind.InvalidSyntax, end, number, end - line_start + 1, "control byte in INI input")); }
+                end += 1;
+            }
+            var left = begin;
+            var right = end;
+            while (left < right && ini_space(text.charAt(left))) { left += 1; }
+            while (right > left && ini_space(text.charAt(right - 1))) { right -= 1; }
+            if (left < right && text.charAt(left) != 35 && text.charAt(left) != 59) {
+                if (text.charAt(left) == 91) {
+                    var close = left + 1;
+                    while (close < right && text.charAt(close) != 93) { close += 1; }
+                    if (close == right) { return Err(ini_failure(IniErrorKind.InvalidSyntax, left, number, left - line_start + 1, "unterminated INI section")); }
+                    var a = left + 1;
+                    var b = close;
+                    while (a < b && ini_space(text.charAt(a))) { a += 1; }
+                    while (b > a && ini_space(text.charAt(b - 1))) { b -= 1; }
+                    let name = text.substring(a, b);
+                    let bad = ini_bad_name(name, true);
+                    if (a == b || bad >= 0) {
+                        let offset = a + if (bad < 0) { 0 } else { bad };
+                        return Err(ini_failure(IniErrorKind.InvalidName, offset, number, offset - line_start + 1, "invalid INI section name"));
+                    }
+                    var tail = close + 1;
+                    while (tail < right && ini_space(text.charAt(tail))) { tail += 1; }
+                    if (tail < right && text.charAt(tail) != 35 && text.charAt(tail) != 59) { return Err(ini_failure(IniErrorKind.InvalidSyntax, tail, number, tail - line_start + 1, "unexpected bytes after INI section")); }
+                    if (result.sections.contains(name)) { return Err(ini_failure(IniErrorKind.DuplicateSection, left, number, left - line_start + 1, "duplicate INI section")); }
+                    let section_id = result.sections.len + 1;
+                    result.sections.put(name, section_id);
+                    section_prefix = section_id.toString() + "\0";
+                } else {
+                    var equal = left;
+                    while (equal < right && text.charAt(equal) != 61) { equal += 1; }
+                    if (equal == right) { return Err(ini_failure(IniErrorKind.InvalidSyntax, left, number, left - line_start + 1, "expected INI key=value")); }
+                    var key_end = equal;
+                    while (key_end > left && ini_space(text.charAt(key_end - 1))) { key_end -= 1; }
+                    let key = text.substring(left, key_end);
+                    let bad = ini_bad_name(key, false);
+                    if (bad >= 0) { return Err(ini_failure(IniErrorKind.InvalidName, left + bad, number, left - line_start + bad + 1, "invalid INI key")); }
+                    // Intern section names once. Repeating a long section
+                    // name in every index key would multiply storage by the
+                    // number of entries. NUL makes the ID/key split exact.
+                    let lookup = section_prefix + key;
+                    if (result.index.contains(lookup)) { return Err(ini_failure(IniErrorKind.DuplicateKey, left, number, left - line_start + 1, "duplicate INI key")); }
+                    var value_start = equal + 1;
+                    while (value_start < right && ini_space(text.charAt(value_start))) { value_start += 1; }
+                    result.index.put(lookup, result.entries.len);
+                    result.entries.push(IniEntry { value: String.from(text.substring(value_start, right)), offset: value_start, line: number, column: value_start - line_start + 1 });
+                }
+            }
+            begin = end;
+            if (begin < text.len) {
+                let first = text.charAt(begin);
+                begin += 1;
+                if (first == 13 && begin < text.len && text.charAt(begin) == 10) { begin += 1; }
+            }
+            line_start = begin;
+            number += 1;
+        }
+        return Ok(result);
+    }
+
+    public static fn parse(text: string) -> IniDocument {
+        match (IniDocument.try_parse(text)) {
+            Ok(value) => { return value; }
+            Err(failure) => { panic("IniDocument.parse: ", failure.message, " at ", failure.line, ":", failure.column); }
+        }
+    }
+
+    fn find_index(&self, section: string, key: string) -> Result<Option<i64>, IniError> {
+        if (ini_bad_name(section, true) >= 0 || ini_bad_name(key, false) >= 0) { return Err(ini_failure(IniErrorKind.InvalidName, -1, 0, 0, "invalid INI lookup name")); }
+        var prefix: string = "\0";
+        if (section.len > 0) {
+            match (self.sections.try_get(section)) {
+                None => { return Ok(None); }
+                Some(id) => { prefix = id.toString() + "\0"; }
+            }
+        }
+        return Ok(self.index.try_get(prefix + key));
+    }
+    public fn len(&self) -> i64 { return self.entries.len; }
+
+    /// None is missing; a present empty String is still Some.
+    public fn try_get(&self, section: string, key: string) -> Result<Option<String>, IniError> {
+        match (self.find_index(section, key)) {
+            Err(failure) => { return Err(failure); }
+            Ok(found) => {
+                match (found) {
+                    None => { return Ok(None); }
+                    Some(index) => { return Ok(Some(self.entries.get_ref(index).value.clone())); }
+                }
+            }
+        }
+    }
+    public fn get(&self, section: string, key: string) -> Option<String> {
+        match (self.try_get(section, key)) { Ok(value) => { return value; } Err(failure) => { panic("IniDocument.get: ", failure.message); } }
+    }
+    public fn try_get_i64(&self, section: string, key: string) -> Result<Option<i64>, IniError> {
+        match (self.find_index(section, key)) {
+            Err(failure) => { return Err(failure); }
+            Ok(found) => {
+                match (found) {
+                    None => { return Ok(None); }
+                    Some(index) => {
+                        match (ini_integer(self.entries.get_ref(index), 64)) { Ok(value) => { return Ok(Some(value)); } Err(failure) => { return Err(failure); } }
                     }
                 }
             }
-            line_start = i + 1;
         }
-        i = i + 1;
     }
-    return "";
+    public fn try_get_i32(&self, section: string, key: string) -> Result<Option<i32>, IniError> {
+        match (self.find_index(section, key)) {
+            Err(failure) => { return Err(failure); }
+            Ok(found) => {
+                match (found) {
+                    None => { return Ok(None); }
+                    Some(index) => {
+                        match (ini_integer(self.entries.get_ref(index), 32)) { Ok(value) => { return Ok(Some(value as i32)); } Err(failure) => { return Err(failure); } }
+                    }
+                }
+            }
+        }
+    }
+    public fn try_get_bool(&self, section: string, key: string) -> Result<Option<bool>, IniError> {
+        match (self.find_index(section, key)) {
+            Err(failure) => { return Err(failure); }
+            Ok(found) => {
+                match (found) {
+                    None => { return Ok(None); }
+                    Some(index) => {
+                        let entry = self.entries.get_ref(index);
+                        let lower = entry.value.toLower();
+                        if (lower == "true" || lower == "yes" || lower == "on" || lower == "1") { return Ok(Some(true)); }
+                        if (lower == "false" || lower == "no" || lower == "off" || lower == "0") { return Ok(Some(false)); }
+                        return Err(ini_failure(IniErrorKind.InvalidBoolean, entry.offset, entry.line, entry.column, "expected true/false, yes/no, on/off or 1/0"));
+                    }
+                }
+            }
+        }
+    }
 }
 
+impl Clone for IniDocument {
+    public fn clone(&self) -> IniDocument {
+        return IniDocument { entries: self.entries.clone(), index: self.index.clone(), sections: self.sections.clone() };
+    }
+}
+
+/// Compatibility lookups parse the complete document. Only missing keys keep
+/// the old empty/zero/false defaults; malformed syntax/typed values panic.
+public fn ini_find(text: string, section: string, key: string) -> string {
+    let document = IniDocument.parse(text);
+    match (document.get(section, key)) {
+        Some(value) => { return value.as_str().clone(); }
+        None => { return ""; }
+    }
+}
 public fn ini_find_int(text: string, section: string, key: string) -> i32 {
-    let v = ini_find(text, section, key);
-    if (v.len == 0) { return 0; }
-    var result = 0;
-    var i = 0;
-    while (i < v.len) {
-        let ch = v.charAt(i);
-        if (ch >= 48 && ch <= 57) { result = result * 10 + (ch - 48); }
-        i = i + 1;
+    let document = IniDocument.parse(text);
+    match (document.try_get_i32(section, key)) {
+        Ok(value) => { return value.unwrap_or(0); }
+        Err(failure) => { panic("ini_find_int: ", failure.message, " at ", failure.line, ":", failure.column); }
     }
-    return result;
 }
-
 public fn ini_find_bool(text: string, section: string, key: string) -> bool {
-    let v = ini_find(text, section, key);
-    return v == "true" || v == "1" || v == "yes";
+    let document = IniDocument.parse(text);
+    match (document.try_get_bool(section, key)) {
+        Ok(value) => { return value.unwrap_or(false); }
+        Err(failure) => { panic("ini_find_bool: ", failure.message, " at ", failure.line, ":", failure.column); }
+    }
 }
