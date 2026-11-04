@@ -12,6 +12,7 @@ import subprocess
 import time
 import tomllib
 from model import write_project
+from semver_model import write_project as write_semver_project
 
 ROOT = Path(__file__).resolve().parents[3]
 PACKAGES = ROOT / "bootstrap_compiler/std_packages"
@@ -21,6 +22,7 @@ PROJECTS = {
     "std_serde_contracts": "std serde contracts ok",
     "std_generic_contracts": "std generic contracts ok",
     "std_scalar_contracts": "std scalar contracts ok",
+    "std_semver_contracts": "std semver contracts ok",
     "std_sync_contracts": "std.sync contracts ok",
     "std_owned_collections": "std owning collections contracts ok",
     "std_value_collections": "std value collections ok",
@@ -110,7 +112,7 @@ def input_hashes(projects: list[str]) -> dict[str, str]:
         for path in directory.rglob("*"):
             if not path.is_file() or any(part in (".cache", "out", "target") for part in path.relative_to(directory).parts):
                 continue
-            if path.suffix in (".vyx", ".toml", ".c", ".h", ".cpp") or path.name == "registry":
+            if path.suffix in (".vyx", ".toml", ".c", ".h", ".cpp", ".txt") or path.name == "registry":
                 result[path.relative_to(ROOT).as_posix()] = sha256(path)
     return result
 
@@ -234,6 +236,10 @@ def main() -> None:
               "inputs": input_hashes(selected), "runner_sha256": sha256(Path(__file__)),
               "scope": "project contracts; package inventory is not API coverage"}
     model_directory = output / "model"
+    semver_directory = output / "semver-model"
+    if "std_semver_contracts" in selected:
+        record["semver_model"] = write_semver_project(semver_directory)
+        (output / "semver_model.py.snapshot").write_bytes(Path(__file__).with_name("semver_model.py").read_bytes())
     if args.model:
         record["model"] = write_project(model_directory, args.model_seed, args.model_steps,
                                         args.model_block_size, kinds)
@@ -278,6 +284,18 @@ def main() -> None:
             print(f"{project} O{opt}: {'PASS' if passed else 'FAIL'} ({result['seconds']:.1f}s)", flush=True)
             if not passed:
                 print(log[-7000:].decode("utf-8", "replace"), flush=True)
+        if "semver_model" in record:
+            command = [str(compiler), "--src=project", str(semver_directory), "--run=aot", "-j4", f"-O{opt}"]
+            started = time.monotonic()
+            code, log = execute(command, semver_directory, environment, args.timeout)
+            passed = code == 0 and b"std semver model ok" in log
+            (output / f"semver-model-O{opt}.log").write_bytes(log)
+            record["results"].append({"project": "semver-model", "opt": opt, "command": command,
+                "exit": code, "seconds": time.monotonic() - started, "passed": passed})
+            (output / "verification.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            print(f"semver model O{opt}: {'PASS' if passed else 'FAIL'}", flush=True)
+            if not passed:
+                print(log[-7000:].decode("utf-8", "replace"), flush=True)
         if args.model:
             command = [str(compiler), "--src=project", str(model_directory), "--run=aot", "-j4", f"-O{opt}"]
             started = time.monotonic()
@@ -301,6 +319,11 @@ def main() -> None:
                 ("heap-after-destroy", "PriorityQueue: use after destroy", False),
                 ("sort-invalidates", "Iterator invalidated", False),
                 ("swap-bounds", "Vec.swap out of bounds", False),
+                ("semver-invalid-parse", "SemVer.parse:", False),
+                ("semver-overflow", "SemVer.bumpPatch:", False),
+                ("semver-invalid-value", "SemVer.compareTo:", False),
+                ("semver-invalid-int", "semver.parse_int:", False),
+                ("semver-negative-core", "SemVer.create:", False),
             ):
                 directory = output / "negative" / f"{name}-O{opt}"
                 directory.mkdir(parents=True, exist_ok=True)

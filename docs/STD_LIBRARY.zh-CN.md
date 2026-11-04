@@ -109,6 +109,15 @@ macOS 的原生 Release 任务在打包前执行。验证报告中的平台、�
 双引号转义、CRLF 和内嵌 NUL，格式错误包含位置。现有项目回归不代表所有原生绑定、
 数据格式、内存分配失败、异步调度和设备后端均已验收。
 
+`std.semver` 按 [SemVer 2.0](https://semver.org/) 解析和比较版本。
+`SemVer.try_parse` 返回 `Result<SemVer, SemVerError>`，包含错误类别、消息和字节位置。
+三个核心数字范围为 0..2147483647，溢出明确报错；数字预发布标识符不受原生整数位宽限制。
+不接受 `v` 前缀、空白、缺少字段的版本和范围表达式。`parse`、`create` 与原有驼峰命名的
+递增方法在失败时 panic；`try_create`、`try_bump_major/minor/patch` 返回显式错误。
+比较、Eq 和 Hashable 忽略构建元数据，序列化保留元数据。Clone 独立拥有标识符字符串，
+版本值可用于 Vec 排序和 Dict 键。直接修改公开字段后，序列化、比较、哈希、递增仍会验证
+字段有效性。实际消费示例见[版本目录项目](../tests/projects/std_semver_contracts/README.md)。
+
 ## 当前状态
 
 - `std.math` 是源码标准库，直接封装 libm 常见函数。

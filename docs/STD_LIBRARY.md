@@ -127,6 +127,19 @@ quoted multiline fields, doubled quotes, CRLF and embedded NUL, with a located
 error for malformed quoting. Package-level tests do not certify every native
 binding, format, allocation failure, async schedule or device backend.
 
+`std.semver` provides strict [SemVer 2.0](https://semver.org/) parsing and
+precedence. `SemVer.try_parse` returns `Result<SemVer, SemVerError>` with a
+category, message and byte offset. Core numbers are limited to 0..2147483647;
+overflow is an error. Numeric prerelease identifiers have no native-integer
+limit. Prefix `v`, whitespace, partial versions and range expressions are
+rejected. `parse`, `create` and the existing camel-case increment helpers panic
+on invalid input; `try_create` and `try_bump_major/minor/patch` expose errors.
+Comparison, Eq and Hashable ignore build metadata; serialization retains it.
+Clone owns independent identifier strings, and values support Vec sorting and
+Dict keys. Publicly edited fields are validated before serialization,
+comparison, hashing and increments. See the
+[release-catalog consumer](../tests/projects/std_semver_contracts/README.md).
+
 ## Current implementation boundary
 
 - `std.math` is source library code directly wrapping common libm functions.

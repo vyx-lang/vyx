@@ -36,6 +36,7 @@ Projects cover:
 | `std_time_faults` | native clock failure, invalid/overflow values, large QPC frequency, DWORD sleep chunks, POSIX EINTR continuation and permanent sleep failure |
 | `std_sqlite_contracts` | real SQLite: owning bindings/results, embedded NUL and BLOB/NULL distinctions, typed/range/state errors, reset, finalization, deferred connection destruction, native allocation balance and persisted transactions |
 | `std_scalar_contracts` | bit boundaries, negative hex, strict Base64/hex errors, all-byte round trips, independent PCG reference sequence and range extremes |
+| `std_semver_contracts` | public cross-module API, strict/located SemVer errors, prerelease precedence, checked core/increments, owning Clone, Vec sorting, Dict key agreement and selection from a real release catalog |
 | `std_generic_contracts` | a real static library with generic trait-bound methods and a separate consumer |
 | `std_serde_contracts` | quoted multiline CSV, CRLF, blank/trailing fields, embedded NUL, escaped quotes and located malformed-input errors |
 | Existing collections/JSON/miniz/I/O/umbrella projects | package resolution and resource/error contracts already maintained by those projects |
@@ -86,6 +87,14 @@ Protocol interoperability remains in
 their native backend and device. These checks do not certify those packages,
 Android execution, all allocation-failure paths, or every public standard-library
 API. CI must record each actually executed platform.
+
+Selecting `std_semver_contracts` also generates and runs a SemVer model at each
+selected optimization level. Its Python oracle uses a full-match ASCII grammar,
+arbitrary-precision integers and tuple sorting, independent of the Vyx scanner.
+It checks 80 valid round trips, more than 200 invalid versions and 192 comparison
+pairs. The report retains its seed and generator/source hashes. Public convenience
+methods also have negative panic fixtures under `--negative`; malformed input
+and arithmetic overflow must not become a successfully parsed version.
 
 Native OpenSSL checks are opt-in because the default SDK gate does not install
 OpenSSL. With the native link libraries installed, run:

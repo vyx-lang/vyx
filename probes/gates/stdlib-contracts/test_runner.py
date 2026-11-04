@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import run as gate
 from model import write_project
+from semver_model import precedence, write_project as write_semver_project
 
 
 def alive(pid):
@@ -37,6 +38,34 @@ def alive(pid):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_semver_oracle_spec_order_and_unbounded_identifiers(self):
+        ordered = ["1.0.0" + suffix for suffix in ("-alpha", "-alpha.1", "-alpha.beta", "-beta", "-beta.2", "-beta.11", "-rc.1", "")]
+        self.assertEqual(sorted(reversed(ordered), key=precedence), ordered)
+        self.assertEqual(precedence("1.2.3+001"), precedence("1.2.3+abc"))
+        self.assertLess(precedence("1.0.0-" + "9" * 80), precedence("1.0.0-1" + "0" * 80))
+        for invalid in ("v1.2.3", "1.2.3-01", "1.2.3_", "1.2.3+", "2147483648.0.0", "1.2.3\n", "1.2.3-中", "1.2.3-a\0b"):
+            with self.subTest(input=invalid), self.assertRaises(ValueError):
+                precedence(invalid)
+
+    def test_semver_model_reproducibility_and_complete_counts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = write_semver_project(root / "a", seed=42)
+            second = write_semver_project(root / "b", seed=42)
+            self.assertEqual(first, second)
+            source = (root / "a/main.vyx").read_text(encoding="utf8")
+            self.assertEqual(first["comparisons"], 192)
+            self.assertEqual(first["valid"], 80)
+            self.assertGreater(first["invalid"], 200)
+            self.assertEqual(source.count("    check_pair("), first["comparisons"])
+            self.assertEqual(source.count("    check_parse("), first["valid"] + first["invalid"])
+            third = write_semver_project(root / "c", seed=43)
+            self.assertNotEqual(first["source_sha256"], third["source_sha256"])
+
+    def test_semver_catalog_data_is_hashed(self):
+        inputs = gate.input_hashes(["std_semver_contracts"])
+        self.assertIn("tests/projects/std_semver_contracts/catalog.txt", inputs)
+
     def test_native_deployment_uses_only_explicit_libraries(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
