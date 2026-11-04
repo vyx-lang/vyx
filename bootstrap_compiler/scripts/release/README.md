@@ -62,6 +62,13 @@ both paths through native project builds and execution before other release gate
 Native builds compile LSP/DAP and run the LSP/formatter smoke checks before the
 long semantic and package suites. Those suites therefore use the final runtime
 rebuilt by S1, and tool build failures are reported before those suites begin.
+Before those tool builds, Linux and macOS run the
+[loaded-library installation gate](../../../../probes/gates/tbb-install/README.md).
+The oneTBB hook skips identical binaries and publishes changed POSIX libraries
+by atomic rename from a unique file in the destination directory. It never
+truncates a library mapped by the parent compiler. The gate executes the real
+hook with loaded libraries at O0/O2, including nested compiler invocations,
+symlinks and failed installation, and records all 16 checks in the build record.
 The new SDK packages the checkout's `std_packages`, and the newly
 built compiler builds LSP and, on x64, DAP. CodeLLDB comes from the verified
 Stage 0 bundle. AArch64 Linux has no DAP bundle. Termux is cross-built using

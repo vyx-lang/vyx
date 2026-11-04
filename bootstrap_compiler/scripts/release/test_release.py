@@ -20,6 +20,31 @@ from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validat
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_tbb_install_requires_every_configuration_and_current_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            compiler, library = work / "vyxc", work / "libtbb.so"
+            compiler.write_bytes(b"current compiler")
+            library.write_bytes(b"current oneTBB")
+            output = work / "tbb-install"
+            output.mkdir()
+            report = output / "verification.json"
+            records = [{"name": case + "-O" + opt, "passed": True}
+                       for case in build_native.TBB_INSTALL_CASES for opt in ("0", "2")]
+            valid = {"compiler_sha256": sha256(compiler), "library_sha256": sha256(library),
+                     "hook_sha256": sha256(REPO / "runtime/scripts/prepare_tbb.vyx"),
+                     "records": records, "passed": True}
+            with patch.object(build_native, "run"):
+                report.write_text(json.dumps(valid), encoding="utf8")
+                self.assertEqual(build_native.check_tbb_install(compiler, library, work, {})["checks"], 16)
+                for changes in ({"records": records[:-1]}, {"records": [records[0]] * 16},
+                                {"records": records[:-1] + [dict(records[-1], passed=False)]},
+                                {"compiler_sha256": "old compiler"}, {"library_sha256": "other library"},
+                                {"hook_sha256": "other hook"}, {"passed": False}):
+                    report.write_text(json.dumps(valid | changes), encoding="utf8")
+                    with self.assertRaisesRegex(RuntimeError, "every mapped-library case/configuration"):
+                        build_native.check_tbb_install(compiler, library, work, {})
+
     def test_windows_tbb_handoff_restores_the_producer_pair(self):
         with tempfile.TemporaryDirectory() as temporary:
             build = Path(temporary) / "source/bootstrap_compiler"

@@ -35,6 +35,26 @@ def run(command, *, cwd=REPO, env=None):
     print(f"[release] completed in {time.monotonic() - started:.1f}s", flush=True)
 
 
+TBB_INSTALL_CASES = ("identical", "changed", "destination-alias", "source-alias", "missing", "blocked",
+                     "compiler-identical", "compiler-changed")
+
+
+def check_tbb_install(compiler, library, work, environment):
+    output = work / "tbb-install"
+    run([sys.executable, REPO / "probes/gates/tbb-install/run.py", "--compiler", compiler,
+         "--library", library, "--output", output], env=environment)
+    report = output / "verification.json"
+    result = json.loads(report.read_text(encoding="utf-8"))
+    required = {case + "-O" + opt for case in TBB_INSTALL_CASES for opt in ("0", "2")}
+    records = result["records"]
+    if (result["compiler_sha256"] != sha256(compiler) or result["library_sha256"] != sha256(library)
+            or result["hook_sha256"] != sha256(REPO / "runtime/scripts/prepare_tbb.vyx")
+            or result["passed"] is not True or len(records) != len(required)
+            or {row["name"] for row in records} != required or not all(row["passed"] for row in records)):
+        raise RuntimeError("oneTBB install gate did not pass every mapped-library case/configuration")
+    return {"checks": len(records), "report_sha256": sha256(report)}
+
+
 def check_standard_library(compiler, work, environment):
     output = work / "stdlib-contracts"
     run([sys.executable, "-m", "unittest", "discover", "-s",
@@ -430,6 +450,8 @@ def main():
         run([sys.executable, REPO / "probes/gates/runtime-companions/run.py",
              "--compiler", built_compiler, "--runtime", out,
              "--output", work / "runtime-companions"], env=environment)
+    else:
+        record["tbb_install"] = check_tbb_install(built_compiler, out / "libtbb.so", work, environment)
     run([sys.executable, REPO / "probes/gates/compiler-self-source/run.py",
          "--compiler", built_compiler, "--build-root", build,
          "--output", work / "self-source"], env=environment)

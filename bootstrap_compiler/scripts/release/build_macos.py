@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tomllib
 
-from build_native import bootstrap_manifest, bootstrap_standard_library, check_dynamic_dispatch, check_dynamic_library, check_iteration_protocol, check_semantic_composition, check_standard_library, check_value_bindings, run, verify_bootstrap_standard_library
+from build_native import bootstrap_manifest, bootstrap_standard_library, check_dynamic_dispatch, check_dynamic_library, check_iteration_protocol, check_semantic_composition, check_standard_library, check_tbb_install, check_value_bindings, run, verify_bootstrap_standard_library
 from common import REPO, bootstrap_asset, checksum_sidecar, sha256, unpack_sdk
 from macos_common import TRIPLES, collect_objects, executable_content, source_commit, source_snapshot, verify_bundle
 
@@ -299,6 +299,7 @@ def native(args):
             print("S2/S3 differs only in measured UUID/signature ranges; objects and fixed-corpus IR match", flush=True)
         record["selfhost_fixpoint"] = {"status": "pass", "generations": 3}
     built = stages[-1]
+    record["tbb_install"] = check_tbb_install(built, out / "libtbb.12.dylib", work, environment)
     run([sys.executable, REPO / "probes/gates/compiler-self-source/run.py",
          "--compiler", built, "--build-root", build,
          "--output", work / "self-source"], env=environment)
