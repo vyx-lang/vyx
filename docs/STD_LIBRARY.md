@@ -467,6 +467,39 @@ increments the strong count. A payload reference cannot outlive its handle.
 including `Box<dyn Trait>`. It cannot be called through a shared Box reference.
 Shared `Ref` payloads do not expose this operation.
 
+### Time, paths and SQLite
+
+`std.time` reads elapsed time using QPC on Windows and `clock_gettime` on
+Linux, Android and macOS. Clock identifiers follow the target headers; macOS
+uses `CLOCK_MONOTONIC = 6`. A failed clock never falls back to CPU time.
+`try_monotonic_nanos`, `try_current_timestamp` and `try_sleep_ms` return
+`Result<_, TimeError>`; ordinary clock wrappers panic on failure. POSIX sleep
+resumes the remaining interval after EINTR. Windows sleep chunks large durations
+without narrowing to a signed integer or requesting INFINITE. `sleep_ms` retains
+its nonpositive no-op behavior; `try_sleep_ms` rejects negative durations.
+
+`std.path.is_absolute` uses target-platform lexical rules. On Windows,
+`C:relative` and `\rooted` depend on the current drive/directory and are not
+absolute; `is_rooted` distinguishes rooted paths from ordinary relatives.
+Complete drive roots, UNC server/share roots and Win32 device namespaces are
+absolute. POSIX treats only a leading slash as a root; backslashes and drive
+prefixes are ordinary characters. These functions do not validate filenames,
+resolve symlinks or normalize paths.
+
+`std:sqlite` exposes owned `Database` and `Query` handles with Result-based
+opening, execution, preparation, stepping, binding and reading. `SQLiteError`
+contains a native status code and message. The package propagates the `sqlite3`
+link dependency; install the native library separately. Text/BLOB binding copies
+caller storage; getters return independent copies, preserve NUL and distinguish
+NULL from empty values. i32 reads reject overflow; i64 reads preserve the value.
+Getters check row state, index and type. A query accepts one statement; use
+`try_exec` for batches. Closing is idempotent and scope cleanup releases native
+resources. Existing statements can outlive database close through SQLite's
+deferred `close_v2` cleanup. Finalization frees the statement even when its return
+code reports a previous execution error. The formerly unparseable `error()`
+method is named `lastError()`. See the [SQLite package](../bootstrap_compiler/std_packages/sqlite/README.md)
+for API, native installation and string cleanup requirements.
+
 ### Reflection, hash, and other modules
 
 `std.reflect` is `Type` / `Field` / `Method` / `Instance` (not TypeBuilder).

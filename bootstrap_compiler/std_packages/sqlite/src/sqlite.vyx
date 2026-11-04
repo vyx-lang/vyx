@@ -1,131 +1,283 @@
 module std.sqlite;
+use std.core;
+use std.string;
+use std.collections;
 
-/// Vyx SQLite3 Database Driver
-/// High-level API that hides all raw pointers.
-///
-/// Usage:
-///   let db = Database.open("test.db");
-///   db.exec("CREATE TABLE users (id INTEGER, name TEXT)");
-///   db.exec("INSERT INTO users VALUES (1, 'Alice')");
-///
-///   let query = db.query("SELECT id, name FROM users");
-///   while (query.next()) {
-///       let id = query.getInt(0);
-///       let name = query.getText(1);
-///       print("${id}: ${name}");
-///   }
-///   query.close();
-///   db.close();
-///
-/// Requires: SQLite3 library
-
+// SQLite 3.8.7+; the source package propagates its native link dependency.
 extern "C" {
-    fn sqlite3_open(filename: rawptr, ppDb: rawptr) -> i32;
-    fn sqlite3_close(db: rawptr) -> i32;
+    fn sqlite3_open(filename: rawptr, db: rawptr) -> i32;
+    fn sqlite3_close_v2(db: rawptr) -> i32;
     fn sqlite3_exec(db: rawptr, sql: rawptr, callback: rawptr, arg: rawptr, errmsg: rawptr) -> i32;
     fn sqlite3_errmsg(db: rawptr) -> rawptr;
-    fn sqlite3_prepare_v2(db: rawptr, sql: rawptr, nByte: i32, ppStmt: rawptr, pzTail: rawptr) -> i32;
+    fn sqlite3_errstr(code: i32) -> rawptr;
+    fn sqlite3_prepare_v2(db: rawptr, sql: rawptr, size: i32, stmt: rawptr, tail: rawptr) -> i32;
     fn sqlite3_step(stmt: rawptr) -> i32;
     fn sqlite3_finalize(stmt: rawptr) -> i32;
-    fn sqlite3_column_int(stmt: rawptr, col: i32) -> i32;
+    fn sqlite3_column_int64(stmt: rawptr, col: i32) -> i64;
     fn sqlite3_column_text(stmt: rawptr, col: i32) -> rawptr;
+    fn sqlite3_column_blob(stmt: rawptr, col: i32) -> rawptr;
+    fn sqlite3_column_bytes(stmt: rawptr, col: i32) -> i32;
+    fn sqlite3_column_type(stmt: rawptr, col: i32) -> i32;
     fn sqlite3_column_double(stmt: rawptr, col: i32) -> f64;
     fn sqlite3_column_count(stmt: rawptr) -> i32;
-    fn sqlite3_bind_int(stmt: rawptr, idx: i32, value: i32) -> i32;
-    fn sqlite3_bind_text(stmt: rawptr, idx: i32, value: rawptr, n: i32, destructor: rawptr) -> i32;
+    fn sqlite3_bind_int64(stmt: rawptr, idx: i32, value: i64) -> i32;
+    fn sqlite3_bind_text(stmt: rawptr, idx: i32, value: rawptr, size: i32, destroy: cfn(rawptr)) -> i32;
+    fn sqlite3_bind_blob(stmt: rawptr, idx: i32, value: rawptr, size: i32, destroy: cfn(rawptr)) -> i32;
     fn sqlite3_bind_double(stmt: rawptr, idx: i32, value: f64) -> i32;
+    fn sqlite3_bind_null(stmt: rawptr, idx: i32) -> i32;
+    fn sqlite3_clear_bindings(stmt: rawptr) -> i32;
     fn sqlite3_reset(stmt: rawptr) -> i32;
+    fn sqlite3_malloc64(size: u64) -> rawptr;
+    fn sqlite3_free(ptr: rawptr);
+    fn memcpy(dst: rawptr, src: rawptr, size: u64) -> rawptr;
 }
 
-/// Query result cursor
-class Query {
-    private handle: rawptr
+public struct SQLiteError { public code: i32; public message: string; }
+fn sqlite_failure(code: i32) -> SQLiteError {
+    return SQLiteError { code: code, message: from_cstr(sqlite3_errstr(code)) };
+}
+fn sqlite_status(code: i32) -> Result<bool, SQLiteError> {
+    if (code == 0) { return Ok(true); }
+    return Err(sqlite_failure(code));
+}
 
-    /// Move to next row. Returns false when no more rows.
-    public fn next() -> bool {
-        return sqlite3_step(self.handle) == 100;
+// Inspect only the tail returned by SQLite's parser. Preparing a second statement
+// is not a read-only validation: some PRAGMAs take effect during preparation.
+fn sqlite_empty_tail(data: rawptr) -> bool {
+    unsafe {
+        let bytes = data as *u8;
+        var i: i64 = 0;
+        while (bytes[i] != 0 as u8) {
+            let c = bytes[i] as i32;
+            if (c == 32 || c == 9 || c == 10 || c == 12 || c == 13 || c == 59) { i = i + 1; }
+            else if (c == 45 && bytes[i + 1] == 45 as u8) {
+                i = i + 2;
+                while (bytes[i] != 0 as u8 && bytes[i] != 10 as u8) { i = i + 1; }
+            } else if (c == 47 && bytes[i + 1] == 42 as u8) {
+                i = i + 2;
+                while (bytes[i] != 0 as u8 && !(bytes[i] == 42 as u8 && bytes[i + 1] == 47 as u8)) { i = i + 1; }
+                if (bytes[i] != 0 as u8) { i = i + 2; }
+            } else { return false; }
+        }
     }
-
-    /// Get integer value at column index.
-    public fn getInt(col: i32) -> i32 {
-        return sqlite3_column_int(self.handle, col);
+    return true;
+}
+@[borrow_args]
+fn sqlite_c_string(value: string) -> Result<rawptr, SQLiteError> {
+    if (value.len > 2147483646) { return Err(sqlite_failure(18)); }
+    for (i in 0..value.len) {
+        if (value.charAt(i as i32) == 0) {
+            return Err(SQLiteError { code: 21, message: "SQLite path/SQL contains NUL" });
+        }
     }
+    let buffer = sqlite3_malloc64(value.len as u64 + 1);
+    if (buffer == null) { return Err(sqlite_failure(7)); }
+    memcpy(buffer, value.c_str(), value.len as u64);
+    unsafe { (buffer as *u8)[value.len] = 0 as u8; }
+    return Ok(buffer);
+}
 
-    /// Get text value at column index.
-    public fn getText(col: i32) -> string {
-        let ptr = sqlite3_column_text(self.handle, col);
-        if (ptr == null) { return ""; }
-        return from_cstr(ptr);
+/// An owned prepared statement. close/drop finalize exactly once.
+/// The native connection remains alive until its last statement is finalized.
+public class Query {
+    @[vis(mod)] handle: rawptr;
+    @[vis(mod)] state: i32;
+
+    public fn is_open() -> bool { return self.handle != null; }
+    public fn try_next() -> Result<bool, SQLiteError> {
+        if (self.handle == null) { return Err(sqlite_failure(21)); }
+        if (self.state == 101) { return Ok(false); }
+        if (self.state != 0 && self.state != 100) { return Err(sqlite_failure(self.state)); }
+        self.state = sqlite3_step(self.handle);
+        if (self.state == 100) { return Ok(true); }
+        if (self.state == 101) { return Ok(false); }
+        return Err(sqlite_failure(self.state));
     }
-
-    /// Get float value at column index.
-    public fn getDouble(col: i32) -> f64 {
-        return sqlite3_column_double(self.handle, col);
+    public fn next() -> bool { return self.try_next().unwrap(); }
+    fn check_column(col: i32) -> Result<bool, SQLiteError> {
+        if (self.handle == null || self.state != 100) { return Err(sqlite_failure(21)); }
+        if (col < 0 || col >= sqlite3_column_count(self.handle)) { return Err(sqlite_failure(25)); }
+        return Ok(true);
     }
-
-    /// Get number of columns.
     public fn columnCount() -> i32 {
+        if (self.handle == null) { panic("SQLite: closed query"); }
         return sqlite3_column_count(self.handle);
     }
-
-    /// Bind integer parameter (1-indexed).
-    public fn bindInt(idx: i32, value: i32) {
-        sqlite3_bind_int(self.handle, idx, value);
+    public fn try_is_null(col: i32) -> Result<bool, SQLiteError> {
+        match (self.check_column(col)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        return Ok(sqlite3_column_type(self.handle, col) == 5);
     }
-
-    /// Bind text parameter (1-indexed).
-    public fn bindText(idx: i32, value: string) {
-        sqlite3_bind_text(self.handle, idx, value.c_str() as rawptr, -1, null);
+    public fn isNull(col: i32) -> bool { return self.try_is_null(col).unwrap(); }
+    public fn try_get_int64(col: i32) -> Result<i64, SQLiteError> {
+        match (self.check_column(col)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        if (sqlite3_column_type(self.handle, col) != 1) { return Err(sqlite_failure(20)); }
+        return Ok(sqlite3_column_int64(self.handle, col));
     }
-
-    /// Bind float parameter (1-indexed).
-    public fn bindDouble(idx: i32, value: f64) {
-        sqlite3_bind_double(self.handle, idx, value);
+    public fn getInt64(col: i32) -> i64 { return self.try_get_int64(col).unwrap(); }
+    public fn try_get_int(col: i32) -> Result<i32, SQLiteError> {
+        match (self.try_get_int64(col)) {
+            Err(e) => { return Err(e); }
+            Ok(value) => {
+                if (value < -2147483648 || value > 2147483647) { return Err(sqlite_failure(25)); }
+                return Ok(value as i32);
+            }
+        }
     }
-
-    /// Reset for re-execution.
-    public fn reset() {
-        sqlite3_reset(self.handle);
+    public fn getInt(col: i32) -> i32 { return self.try_get_int(col).unwrap(); }
+    public fn try_get_double(col: i32) -> Result<f64, SQLiteError> {
+        match (self.check_column(col)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        let kind = sqlite3_column_type(self.handle, col);
+        if (kind != 1 && kind != 2) { return Err(sqlite_failure(20)); }
+        return Ok(sqlite3_column_double(self.handle, col));
     }
-
-    /// Free the query.
-    public fn close() {
-        sqlite3_finalize(self.handle);
+    public fn getDouble(col: i32) -> f64 { return self.try_get_double(col).unwrap(); }
+    public fn try_get_text(col: i32) -> Result<string, SQLiteError> {
+        match (self.check_column(col)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        if (sqlite3_column_type(self.handle, col) != 3) { return Err(sqlite_failure(20)); }
+        let data = sqlite3_column_text(self.handle, col);
+        if (data == null) { return Err(sqlite_failure(7)); }
+        let length = sqlite3_column_bytes(self.handle, col);
+        return Ok(from_cstr_len(data, length));
     }
+    public fn getText(col: i32) -> string { return self.try_get_text(col).unwrap(); }
+    public fn try_get_blob(col: i32) -> Result<Vec<u8>, SQLiteError> {
+        match (self.check_column(col)) { Err(e) => { return Err(e); } Ok(_) => {} }
+        if (sqlite3_column_type(self.handle, col) != 4) { return Err(sqlite_failure(20)); }
+        let data = sqlite3_column_blob(self.handle, col);
+        let length = sqlite3_column_bytes(self.handle, col);
+        if (length > 0 && data == null) { return Err(sqlite_failure(7)); }
+        var bytes = Vec<u8>.with_capacity(length);
+        if (length > 0) { memcpy(bytes.data, data, length as u64); }
+        bytes.len = length;
+        return Ok(bytes);
+    }
+    public fn getBlob(col: i32) -> Vec<u8> { return self.try_get_blob(col).unwrap(); }
+
+    fn check_bind() -> Result<bool, SQLiteError> {
+        if (self.handle == null || self.state != 0) { return Err(sqlite_failure(21)); }
+        return Ok(true);
+    }
+    public fn try_bind_int(idx: i32, value: i64) -> Result<bool, SQLiteError> {
+        match (self.check_bind()) { Err(e) => { return Err(e); } Ok(_) => {} }
+        return sqlite_status(sqlite3_bind_int64(self.handle, idx, value));
+    }
+    public fn bindInt(idx: i32, value: i32) { self.try_bind_int(idx, value as i64).unwrap(); }
+    public fn bindInt64(idx: i32, value: i64) { self.try_bind_int(idx, value).unwrap(); }
+    public fn try_bind_double(idx: i32, value: f64) -> Result<bool, SQLiteError> {
+        match (self.check_bind()) { Err(e) => { return Err(e); } Ok(_) => {} }
+        return sqlite_status(sqlite3_bind_double(self.handle, idx, value));
+    }
+    public fn bindDouble(idx: i32, value: f64) { self.try_bind_double(idx, value).unwrap(); }
+    public fn try_bind_null(idx: i32) -> Result<bool, SQLiteError> {
+        match (self.check_bind()) { Err(e) => { return Err(e); } Ok(_) => {} }
+        return sqlite_status(sqlite3_bind_null(self.handle, idx));
+    }
+    public fn bindNull(idx: i32) { self.try_bind_null(idx).unwrap(); }
+
+    // SQLite owns this independent allocation even when bind reports an error.
+    // A typed native destructor avoids both SQLITE_STATIC dangling views and ABI casts.
+    @[borrow_args]
+    public fn try_bind_text(idx: i32, value: string) -> Result<bool, SQLiteError> {
+        match (self.check_bind()) { Err(e) => { return Err(e); } Ok(_) => {} }
+        if (value.len > 2147483647) { return Err(sqlite_failure(18)); }
+        let copy = sqlite3_malloc64(value.len as u64 + 1);
+        if (copy == null) { return Err(sqlite_failure(7)); }
+        memcpy(copy, value.c_str(), value.len as u64);
+        unsafe { (copy as *u8)[value.len] = 0 as u8; }
+        return sqlite_status(sqlite3_bind_text(self.handle, idx, copy, value.len as i32, sqlite3_free));
+    }
+    @[borrow_args]
+    public fn bindText(idx: i32, value: string) { self.try_bind_text(idx, value).unwrap(); }
+    public fn try_bind_blob(idx: i32, value: &Vec<u8>) -> Result<bool, SQLiteError> {
+        match (self.check_bind()) { Err(e) => { return Err(e); } Ok(_) => {} }
+        if (value.len > 2147483647) { return Err(sqlite_failure(18)); }
+        let copy = sqlite3_malloc64(value.len as u64 + 1);
+        if (copy == null) { return Err(sqlite_failure(7)); }
+        if (value.len > 0) { memcpy(copy, value.data, value.len as u64); }
+        return sqlite_status(sqlite3_bind_blob(self.handle, idx, copy, value.len as i32, sqlite3_free));
+    }
+    public fn bindBlob(idx: i32, value: &Vec<u8>) { self.try_bind_blob(idx, value).unwrap(); }
+    public fn try_reset() -> Result<bool, SQLiteError> {
+        if (self.handle == null) { return Err(sqlite_failure(21)); }
+        let code = sqlite3_reset(self.handle);
+        self.state = 0; // reset takes effect even when it returns the previous step error.
+        return sqlite_status(code);
+    }
+    public fn reset() { self.try_reset().unwrap(); }
+    public fn try_clear_bindings() -> Result<bool, SQLiteError> {
+        match (self.check_bind()) { Err(e) => { return Err(e); } Ok(_) => {} }
+        return sqlite_status(sqlite3_clear_bindings(self.handle));
+    }
+    /// Returns the last execution status. Finalization frees storage even on error.
+    public fn close() -> i32 {
+        if (self.handle == null) { return 0; }
+        let handle = self.handle;
+        self.handle = null;
+        self.state = 21;
+        return sqlite3_finalize(handle);
+    }
+    public fn drop() { self.close(); }
 }
 
-/// Database connection
-class Database {
-    private handle: rawptr
-
-    /// Open a database file. Returns a Database instance.
-    public static fn open(path: string) -> Database {
+public class Database {
+    @[vis(self)] handle: rawptr;
+    @[borrow_args]
+    public static fn try_open(path: string) -> Result<Database, SQLiteError> {
+        var name: rawptr = null;
+        match (sqlite_c_string(path)) { Err(e) => { return Err(e); } Ok(p) => { name = p; } }
+        defer { sqlite3_free(name); }
         var db: rawptr = null;
-        sqlite3_open(path.c_str() as rawptr, &mut db as rawptr);
-        return Database { handle: db };
+        let code = sqlite3_open(name, to_rawptr(&db));
+        if (code != 0) {
+            let message = if (db == null) { from_cstr(sqlite3_errstr(code)) } else { from_cstr(sqlite3_errmsg(db)) };
+            sqlite3_close_v2(db);
+            return Err(SQLiteError { code: code, message: message });
+        }
+        return Ok(Database { handle: db });
     }
-
-    /// Execute SQL with no return value.
-    public fn exec(sql: string) -> bool {
-        let result = sqlite3_exec(self.handle, sql.c_str() as rawptr, null, null, null);
-        return result == 0;
+    @[borrow_args]
+    public static fn open(path: string) -> Database { return Database.try_open(path).unwrap(); }
+    public fn is_open() -> bool { return self.handle != null; }
+    @[borrow_args]
+    public fn try_exec(sql: string) -> Result<bool, SQLiteError> {
+        if (self.handle == null) { return Err(sqlite_failure(21)); }
+        var text: rawptr = null;
+        match (sqlite_c_string(sql)) { Err(e) => { return Err(e); } Ok(p) => { text = p; } }
+        defer { sqlite3_free(text); }
+        let code = sqlite3_exec(self.handle, text, null, null, null);
+        if (code != 0) { return Err(SQLiteError { code: code, message: from_cstr(sqlite3_errmsg(self.handle)) }); }
+        return Ok(true);
     }
-
-    /// Prepare a SQL query for execution.
-    public fn query(sql: string) -> Query {
+    @[borrow_args]
+    public fn exec(sql: string) -> bool { return self.try_exec(sql).is_ok(); }
+    @[borrow_args]
+    public fn try_query(sql: string) -> Result<Query, SQLiteError> {
+        if (self.handle == null) { return Err(sqlite_failure(21)); }
+        var text: rawptr = null;
+        match (sqlite_c_string(sql)) { Err(e) => { return Err(e); } Ok(p) => { text = p; } }
+        defer { sqlite3_free(text); }
         var stmt: rawptr = null;
-        sqlite3_prepare_v2(self.handle, sql.c_str() as rawptr, -1, &mut stmt as rawptr, null);
-        return Query { handle: stmt };
+        var tail: rawptr = null;
+        let code = sqlite3_prepare_v2(self.handle, text, -1, to_rawptr(&stmt), to_rawptr(&tail));
+        if (code != 0) { return Err(SQLiteError { code: code, message: from_cstr(sqlite3_errmsg(self.handle)) }); }
+        if (stmt == null) { return Err(SQLiteError { code: 21, message: "SQLite query contains no statement" }); }
+        if (!sqlite_empty_tail(tail)) {
+            sqlite3_finalize(stmt);
+            return Err(SQLiteError { code: 21, message: "SQLite query requires one statement; use exec for batches" });
+        }
+        return Ok(Query { handle: stmt, state: 0 });
     }
-
-    /// Get last error message.
-    public fn error() -> string {
-        let ptr = sqlite3_errmsg(self.handle);
-        return from_cstr(ptr);
+    @[borrow_args]
+    public fn query(sql: string) -> Query { return self.try_query(sql).unwrap(); }
+    public fn lastError() -> string {
+        if (self.handle == null) { return "SQLite: closed database"; }
+        return from_cstr(sqlite3_errmsg(self.handle));
     }
-
-    /// Close the database connection.
-    public fn close() {
-        sqlite3_close(self.handle);
+    public fn close() -> i32 {
+        if (self.handle == null) { return 0; }
+        let code = sqlite3_close_v2(self.handle);
+        if (code == 0) { self.handle = null; }
+        return code;
     }
+    public fn drop() { self.close(); }
 }

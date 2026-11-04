@@ -29,6 +29,9 @@ PROJECTS = {
     "std_ordered_contracts": "std ordered contracts ok",
     "std_testing_contracts": "std testing contracts ok",
     "std_fs_contracts": "std.fs contracts ok",
+    "std_system_contracts": "std system contracts ok",
+    "std_time_faults": "std time failure contracts ok",
+    "std_sqlite_contracts": "std sqlite contracts ok",
     "std_collections_package": "std.collections package ok",
     "std_io_package": "std.io package closure ok",
     "std_json_package": "std.json package ok",
@@ -39,10 +42,31 @@ NATIVE_PROJECTS = {
     "std_security_package": "std.security.openssl package ok",
     "std_crypto_faults": "std crypto failure contracts ok",
 }
+NATIVE_DLLS = {
+    "std_sqlite_contracts": ("sqlite3.dll",),
+    "std_security_package": ("libcrypto-3-x64.dll", "libssl-3-x64.dll"),
+    "std_crypto_faults": (),
+}
 
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def deploy_native_libraries(project: str, directories: list[Path], destination: Path) -> list[dict]:
+    """Select explicit native inputs; a missing required DLL must not fall back to PATH."""
+    import shutil
+    selected = []
+    for name in NATIVE_DLLS[project]:
+        source = next((root / name for root in directories if (root / name).is_file()), None)
+        if source is None:
+            raise RuntimeError(f"Missing explicit --native-bin library: {name}")
+        selected.append(source)
+    result = []
+    for source in selected:
+        shutil.copy2(source, destination / source.name)
+        result.append({"source": str(source), "sha256": sha256(source)})
+    return result
 
 
 def inventory() -> list[dict]:
@@ -225,12 +249,12 @@ def main() -> None:
         for project in selected:
             directory = ROOT / "tests/projects" / project
             command = [str(compiler), "--src=project", str(directory), "--target", project,
-                       "--emit=exe" if project in NATIVE_PROJECTS else "--run=aot", "-j4", f"-O{opt}"]
+                       "--emit=exe" if project in NATIVE_DLLS else "--run=aot", "-j4", f"-O{opt}"]
             start = time.monotonic()
             code, log = execute(command, directory, environment, args.timeout)
             commands = [command]
             libraries = []
-            if code == 0 and project in NATIVE_PROJECTS:
+            if code == 0 and project in NATIVE_DLLS:
                 executable = directory / "target" / (project + (".exe" if os.name == "nt" else ""))
                 if os.name == "nt":
                     # Deploy only explicitly selected DLLs to a private directory.
@@ -239,13 +263,7 @@ def main() -> None:
                     import tempfile
                     deployment = Path(tempfile.mkdtemp(prefix=f"{project}-O{opt}-", dir=output))
                     shutil.copy2(executable, deployment / executable.name)
-                    for name in ("libcrypto-3-x64.dll", "libssl-3-x64.dll"):
-                        for native_bin in native_bins:
-                            source = native_bin / name
-                            if source.is_file():
-                                shutil.copy2(source, deployment / name)
-                                libraries.append({"source": str(source), "sha256": sha256(source)})
-                                break
+                    libraries = deploy_native_libraries(project, native_bins, deployment)
                     executable = deployment / executable.name
                 commands.append([str(executable)])
                 code, runtime_log = execute(commands[-1], directory, environment, args.timeout)

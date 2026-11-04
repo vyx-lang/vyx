@@ -132,9 +132,23 @@ macOS 的原生 Release 任务在打包前执行。验证报告中的平台、�
 - Android 上 `vyx_fiber_posix_*` 是 no-op stub（Bionic 无 `getcontext` /
   `swapcontext` / `makecontext`）。`@[async]` 走无栈泵，不依赖 fiber。
   `StartCoroutine` 仍需要。
-- `std.time` 权威实现是 POSIX `current_timestamp`/`clock_ms`/`monotonic_nanos`/`sleep_ms`（i64；按值结构体 API 等 class ABI）；旧的 Windows QPC/`Sleep` 扁平副本不再作为公开 API。
+- `std.time` 使用 Windows QPC 或 POSIX `clock_gettime` 读取单调时间；macOS 使用本机的 `CLOCK_MONOTONIC` 编号 6，Linux/Android 为 1。失败不退回 CPU 计时。`try_monotonic_nanos`、`try_current_timestamp`、`try_sleep_ms` 返回 `Result<_, TimeError>`，普通时钟函数在失败时 panic。POSIX 睡眠被 EINTR 中断后继续剩余时长；Windows 分段处理超过 DWORD 范围的时长。兼容 `sleep_ms` 的非正参数仍为空操作，`try_sleep_ms` 拒绝负数。
+- `std.path.is_absolute` 按目标平台判断，不访问文件系统。Windows 的 `C:relative` 与 `\\rooted` 都不算绝对路径；`is_rooted` 可区分带驱动器或根的路径。绝对路径包括完整驱动器根、UNC 服务器/共享及 Win32 设备命名空间。POSIX 只把开头的 `/` 视为根，反斜杠与 `C:` 是普通路径字符。这不是文件名有效性或路径规范化检查。
 
 ## 外部库 package
+
+`std:sqlite` 的 `std.sqlite` 模块提供拥有原生句柄的 `Database` 和 `Query`。
+`try_open`、`try_exec`、`try_query` 及游标的 `try_*` 返回包含 SQLite 状态码和消息的
+`Result`；便捷方法保留，同时增加显式错误路径。原来的 `error()` 是无法解析的关键字
+方法名，现为 `lastError()`。包会传播 `sqlite3` 链接依赖，第三方原生库仍需独立安装。
+Windows 可配置 `VCPKG_ROOT`，发布应用时部署相应 `sqlite3.dll`。
+
+绑定文本和 BLOB 时复制输入，允许调用后销毁或修改原始缓冲。读取返回独立副本，
+保留嵌入 NUL，区分 NULL 与空值。i64 读取不截断；i32 读取检查范围。
+游标检查行状态、列索引和类型；`try_query` 拒绝空语句及多语句，批处理用 `try_exec`。
+句柄在作用域退出时关闭，显式关闭可重复调用；数据库先关闭时，已有语句保持原生
+连接存活到最后一次 finalize。`Query.close()` 即使返回上次执行错误也已经释放语句。
+完整 API 和消费示例见 [SQLite package](../bootstrap_compiler/std_packages/sqlite/README.md)。
 
 `bootstrap_compiler/std_packages/logger` 是 `std.log` 的家。`[build] prebuild`
 走编译器自带的 `vyx:` 脚本：克隆 spdlog、CMake 编静态库、跑仓库内 DCI
@@ -196,8 +210,9 @@ Cacao / curl / OpenSSL / SQLite / LLVM / Win32 等按需 native 绑定现在也�
 cacao = { path = "std:cacao", target = "std_cacao" }
 ```
 
-真正调用 GPU/网络 API 时，由消费 target 自己写 `libs` / `lib_paths`（与
-`samples/projects/cacao` 链接 Cacao 的方式相同）。
+调用 Cacao GPU API 时，由消费 target 配置 `libs` / `lib_paths`（与
+`samples/projects/cacao` 相同）。SQLite、OpenSSL 等已声明公开链接依赖的包会
+传播库名和相应搜索路径；消费方仍须安装匹配目标的原生库并部署动态运行库。
 
 `std.cjson` 平铺 binding 已移除。显式 source package 会关闭该 target 的隐式
 flat-std 搜索；漏写依赖会在 import 阶段直接报错，而不是静默拾取兼容镜像。

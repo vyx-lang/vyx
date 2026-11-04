@@ -12,7 +12,8 @@
 `retain` handler 会授权 HIR 的代码生成根（`dce.retain`）；`migrate.collect` 会授权
 字段别名物化，`async.lower`/`task.lower` 会授权协程任务标记。这些 lowering 只消费
 编译器生成的 marker，不直接信任原始属性文本。`platform.select` 也会在语义解析前
-授权声明筛选；`derive.expand` 和 `comptime.evaluate` 分别控制 trait synthesis 与
+授权声明筛选，支持函数、类型、模块及按目标选择的全局 `let` / `const`；
+`derive.expand` 和 `comptime.evaluate` 分别控制 trait synthesis 与
 常量折叠。`dci.import` 会把授权 marker 写入完整声明树；源码自动发现的 `.dcib` 只有
 在 import marker 封存后才能进入生命周期绑定器。`dci.export` 已完成归一化并写入声明树
 marker；它会把函数保留为 AOT 导出根，且可通过 `VYX_DCI_EXPORT_OUT` 选择稳定的

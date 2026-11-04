@@ -16,7 +16,8 @@ authorizes a HIR code-generation root (`dce.retain`); `migrate.collect`
 authorizes field alias materialization, and `async.lower`/`task.lower`
 authorize the coroutine task flag. These lowering boundaries consume
 compiler-owned markers rather than trusting raw attribute text. `platform.select`
-also gates declaration filtering before semantic resolution; `derive.expand` and
+also gates declaration filtering before semantic resolution, including target-selected
+global `let` and `const` values as well as functions, types and modules; `derive.expand` and
 `comptime.evaluate` gate trait synthesis and constant folding. `dci.import`
 stamps the accepted declaration tree, and automatic `.dcib` discovery is
 admitted to the lifecycle binder only after the import marker is sealed.

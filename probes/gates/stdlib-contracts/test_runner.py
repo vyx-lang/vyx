@@ -37,6 +37,26 @@ def alive(pid):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_native_deployment_uses_only_explicit_libraries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, destination = root / "input", root / "deploy"
+            source.mkdir(); destination.mkdir()
+            (source / "sqlite3.dll").write_bytes(b"selected sqlite")
+            (source / "unrelated.dll").write_bytes(b"do not deploy")
+            records = gate.deploy_native_libraries("std_sqlite_contracts", [source], destination)
+            self.assertEqual([p.name for p in destination.iterdir()], ["sqlite3.dll"])
+            self.assertEqual(records, [{"source": str(source / "sqlite3.dll"),
+                                      "sha256": gate.sha256(destination / "sqlite3.dll")}])
+
+    def test_missing_native_input_cannot_be_satisfied_by_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sqlite3.dll").write_bytes(b"ambient library")
+            with patch.dict(os.environ, PATH=str(root)):
+                with self.assertRaisesRegex(RuntimeError, "Missing explicit.*sqlite3.dll"):
+                    gate.deploy_native_libraries("std_sqlite_contracts", [], root)
+
     def test_seed_reproduces_the_generated_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

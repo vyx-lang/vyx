@@ -11,7 +11,7 @@ import sys
 from common import sha256
 
 
-PACKAGES = ("cmake", "ninja-build", "git", "patchelf", "zlib1g-dev", "libzstd-dev", "libxml2-dev")
+PACKAGES = ("cmake", "ninja-build", "git", "patchelf", "zlib1g-dev", "libzstd-dev", "libxml2-dev", "libsqlite3-dev")
 TOOLS = ("clang", "clang++", "llvm-ar", "llvm-nm", "llvm-readobj", "llvm-strip", "lld")
 SYSTEM_LIBRARIES = {"libc.so.6", "libm.so.6", "libdl.so.2", "librt.so.1", "libpthread.so.0"}
 

@@ -1,170 +1,148 @@
 module std.time;
+use std.core;
 
-/// Portable time surface (POSIX + Windows). Authority copy:
-/// `bootstrap_compiler/std_packages/std/src/time.vyx`.
-///
-/// Windows uses QueryPerformanceCounter for the monotonic clock and
-/// `Sleep`/`time` for the sleep/timestamp surfaces; POSIX keeps
-/// `clock_gettime`/`gettimeofday`/`nanosleep`. Platform selection uses the
-/// same `@[platform(...)]` pruning idiom as `std.sync`.
-///
-/// Public API is i64/void only. Struct-by-value helpers (Duration as a
-/// return type) wait on the class-by-value ABI rule (WP-P0a).
+public error TimeError { ClockUnavailable, OutOfRange, InvalidDuration, SleepFailed }
 
-extern "C" {
-    fn time(t: rawptr) -> i64;
-}
-
-@[platform("windows")]
-extern "C" { fn clock() -> i32; }
-
-@[platform("posix")]
-extern "C" { fn clock() -> i64; }
-
-/// Raw process CPU ticks. Windows clock_t is 32 bit; supported POSIX SDKs
-/// use a 64 bit clock_t. Keep the native signature separate from the API.
-public fn cpu_clock_ticks() -> i64 { return clock() as i64; }
-
+extern "C" { fn time(t: rawptr) -> i64; }
 @[platform("windows")]
 extern "C" {
+    fn clock() -> i32;
     fn QueryPerformanceCounter(counter: rawptr) -> i32;
     fn QueryPerformanceFrequency(frequency: rawptr) -> i32;
-    fn Sleep(milliseconds: i32);
+    fn Sleep(milliseconds: u32);
 }
-
+@[platform("posix")]
+extern "C" {
+    fn clock() -> i64;
+    fn clock_gettime(clk_id: i32, tp: rawptr) -> i32;
+    fn nanosleep(req: rawptr, rem: rawptr) -> i32;
+}
 @[platform("linux")]
-extern "C" {
-    fn clock_gettime(clk_id: i32, tp: rawptr) -> i32;
-    fn gettimeofday(tv: rawptr, tz: rawptr) -> i32;
-    fn nanosleep(req: rawptr, rem: rawptr) -> i32;
-}
-
+extern "C" { fn __errno_location() -> *i32; }
 @[platform("macos")]
-extern "C" {
-    fn clock_gettime(clk_id: i32, tp: rawptr) -> i32;
-    fn gettimeofday(tv: rawptr, tz: rawptr) -> i32;
-    fn nanosleep(req: rawptr, rem: rawptr) -> i32;
-}
+extern "C" { fn __error() -> *i32; }
+@[platform("android")]
+extern "C" { fn __errno() -> *i32; }
 
-struct Timespec {
-    tv_sec: i64;
-    tv_nsec: i64;
-}
-
-struct Timeval {
-    tv_sec: i64;
-    tv_usec: i64;
-}
-
+struct Timespec { tv_sec: i64; tv_nsec: i64; }
 public let NS_PER_SEC: i64 = 1000000000;
 public let NS_PER_MS: i64 = 1000000;
 public let MS_PER_SEC: i64 = 1000;
 public let CLOCK_REALTIME: i32 = 0;
+@[platform("macos")]
+public let CLOCK_MONOTONIC: i32 = 6;
+@[platform("linux")]
+public let CLOCK_MONOTONIC: i32 = 1;
+@[platform("android")]
 public let CLOCK_MONOTONIC: i32 = 1;
 
+/// Process CPU ticks, not elapsed wall time. Native units are platform dependent.
+public fn cpu_clock_ticks() -> i64 { return clock() as i64; }
+
+// floor(remainder * 1e9 / frequency), without overflowing a 64-bit product.
 @[platform("windows")]
-public fn monotonic_nanos() -> i64 {
+fn time_fraction_nanos(remainder: i64, frequency: i64) -> i64 {
+    var carry: u64 = 0;
+    var result: u64 = 0;
+    var bit: u64 = 536870912;
+    let f = frequency as u64;
+    while (bit > 0) {
+        carry = carry * 2;
+        result = result * 2;
+        if (carry >= f) { carry = carry - f; result = result + 1; }
+        if ((1000000000 as u64 & bit) != 0) {
+            carry = carry + remainder as u64;
+            if (carry >= f) { carry = carry - f; result = result + 1; }
+        }
+        bit = bit / 2;
+    }
+    return result as i64;
+}
+@[platform("windows")]
+public fn try_monotonic_nanos() -> Result<i64, TimeError> {
     var counter: i64 = 0;
     var frequency: i64 = 0;
-    if (QueryPerformanceFrequency(to_rawptr(&frequency)) == 0 || frequency == 0) {
-        // QPC unavailable (pre-XP or wine edge): fall back to clock().
-        return cpu_clock_ticks() * NS_PER_MS;
-    }
-    QueryPerformanceCounter(to_rawptr(&counter));
-    // Avoid overflow: counter is ticks since boot and can exceed i64 when
-    // scaled by NS_PER_SEC (overflows after ~15 min uptime at 10 MHz).
-    // Split into whole seconds + remainder before scaling.
+    if (QueryPerformanceFrequency(to_rawptr(&frequency)) == 0 || frequency <= 0) { return Err(TimeError.ClockUnavailable); }
+    if (QueryPerformanceCounter(to_rawptr(&counter)) == 0) { return Err(TimeError.ClockUnavailable); }
+    if (counter < 0) { return Err(TimeError.OutOfRange); }
     let secs = counter / frequency;
-    let rem = counter % frequency;
-    return secs * NS_PER_SEC + rem * NS_PER_SEC / frequency;
+    let fraction = time_fraction_nanos(counter % frequency, frequency);
+    if (secs > (9223372036854775807 - fraction) / NS_PER_SEC) { return Err(TimeError.OutOfRange); }
+    return Ok(secs * NS_PER_SEC + fraction);
 }
+@[platform("posix")]
+public fn try_monotonic_nanos() -> Result<i64, TimeError> {
+    var ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    if (clock_gettime(CLOCK_MONOTONIC, to_rawptr(&ts)) != 0) { return Err(TimeError.ClockUnavailable); }
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NS_PER_SEC) { return Err(TimeError.OutOfRange); }
+    if (ts.tv_sec > (9223372036854775807 - ts.tv_nsec) / NS_PER_SEC) { return Err(TimeError.OutOfRange); }
+    return Ok(ts.tv_sec * NS_PER_SEC + ts.tv_nsec);
+}
+
+/// Elapsed nanoseconds. Clock failures are never substituted with CPU time.
+public fn monotonic_nanos() -> i64 {
+    match (try_monotonic_nanos()) {
+        Ok(value) => { return value; }
+        Err(_) => { panic("std.time: monotonic clock unavailable or out of range"); }
+    }
+}
+public fn try_current_timestamp() -> Result<i64, TimeError> {
+    let value = time(null);
+    if (value == -1) { return Err(TimeError.ClockUnavailable); }
+    return Ok(value);
+}
+/// UTC seconds since the Unix epoch.
+public fn current_timestamp() -> i64 {
+    match (try_current_timestamp()) {
+        Ok(value) => { return value; }
+        Err(_) => { panic("std.time: system clock unavailable"); }
+    }
+}
+public fn clock_ms() -> i64 { return monotonic_nanos() / NS_PER_MS; }
+public fn elapsed_seconds(start: i64, end_val: i64) -> i64 { return end_val - start; }
 
 @[platform("linux")]
-public fn monotonic_nanos() -> i64 {
-    var ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-    if (clock_gettime(CLOCK_MONOTONIC, to_rawptr(&ts)) != 0) {
-        return cpu_clock_ticks() * 1000;
-    }
-    return ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
-}
-
+fn time_errno() -> i32 { unsafe { return __errno_location()[0]; } }
 @[platform("macos")]
-public fn monotonic_nanos() -> i64 {
-    var ts = Timespec { tv_sec: 0, tv_nsec: 0 };
-    if (clock_gettime(CLOCK_MONOTONIC, to_rawptr(&ts)) != 0) {
-        return cpu_clock_ticks() * 1000;
-    }
-    return ts.tv_sec * NS_PER_SEC + ts.tv_nsec;
-}
+fn time_errno() -> i32 { unsafe { return __error()[0]; } }
+@[platform("android")]
+fn time_errno() -> i32 { unsafe { return __errno()[0]; } }
 
 @[platform("windows")]
-public fn current_timestamp() -> i64 {
-    // Second-resolution UTC timestamp; msvcrt `time` is always available.
-    return time(null);
-}
-
-@[platform("linux")]
-public fn current_timestamp() -> i64 {
-    var tv = Timeval { tv_sec: 0, tv_usec: 0 };
-    if (gettimeofday(to_rawptr(&tv), null) != 0) {
-        return time(null);
+public fn try_sleep_ms(ms: i64) -> Result<bool, TimeError> {
+    if (ms < 0) { return Err(TimeError.InvalidDuration); }
+    var remaining = ms;
+    while (remaining > 4294967294) {
+        Sleep(4294967294 as u32); // DWORD, excluding INFINITE.
+        remaining = remaining - 4294967294;
     }
-    return tv.tv_sec;
+    if (remaining > 0) { Sleep(remaining as u32); }
+    return Ok(true);
 }
-
-@[platform("macos")]
-public fn current_timestamp() -> i64 {
-    var tv = Timeval { tv_sec: 0, tv_usec: 0 };
-    if (gettimeofday(to_rawptr(&tv), null) != 0) {
-        return time(null);
+@[platform("posix")]
+public fn try_sleep_ms(ms: i64) -> Result<bool, TimeError> {
+    if (ms < 0) { return Err(TimeError.InvalidDuration); }
+    if (ms == 0) { return Ok(true); }
+    var req = Timespec { tv_sec: ms / MS_PER_SEC, tv_nsec: (ms % MS_PER_SEC) * NS_PER_MS };
+    var remaining = Timespec { tv_sec: 0, tv_nsec: 0 };
+    while (nanosleep(to_rawptr(&req), to_rawptr(&remaining)) != 0) {
+        if (time_errno() != 4) { return Err(TimeError.SleepFailed); } // EINTR on supported POSIX targets.
+        if (remaining.tv_sec < 0 || remaining.tv_nsec < 0 || remaining.tv_nsec >= NS_PER_SEC) { return Err(TimeError.SleepFailed); }
+        req = remaining;
     }
-    return tv.tv_sec;
+    return Ok(true);
 }
-
-public fn clock_ms() -> i64 {
-    return monotonic_nanos() / NS_PER_MS;
-}
-
-public fn elapsed_seconds(start: i64, end_val: i64) -> i64 {
-    return end_val - start;
-}
-
-@[platform("windows")]
+/// Compatibility wrapper: nonpositive durations are a no-op; OS failures panic.
 public fn sleep_ms(ms: i64) {
     if (ms <= 0) { return; }
-    var chunks = ms / 4294967;
-    var rem = ms % 4294967;
-    // Sleep takes DWORD (u32) milliseconds; chunk large sleeps.
-    while (chunks > 0) {
-        Sleep(4294967);
-        chunks = chunks - 1;
-    }
-    if (rem > 0) {
-        Sleep(rem as i32);
+    match (try_sleep_ms(ms)) {
+        Ok(_) => {}
+        Err(_) => { panic("std.time: sleep failed"); }
     }
 }
-
-@[platform("linux")]
-public fn sleep_ms(ms: i64) {
-    if (ms <= 0) { return; }
-    var req = Timespec {
-        tv_sec: ms / MS_PER_SEC,
-        tv_nsec: (ms % MS_PER_SEC) * NS_PER_MS
-    };
-    nanosleep(to_rawptr(&req), null);
-}
-
-@[platform("macos")]
-public fn sleep_ms(ms: i64) {
-    if (ms <= 0) { return; }
-    var req = Timespec {
-        tv_sec: ms / MS_PER_SEC,
-        tv_nsec: (ms % MS_PER_SEC) * NS_PER_MS
-    };
-    nanosleep(to_rawptr(&req), null);
-}
-
 public fn sleep_busy(ms: i64) {
+    if (ms <= 0) { return; }
+    if (ms > 9223372036854775807 / NS_PER_MS) { panic("std.time: duration out of range"); }
     let start = monotonic_nanos();
     let target = ms * NS_PER_MS;
     while (monotonic_nanos() - start < target) {}

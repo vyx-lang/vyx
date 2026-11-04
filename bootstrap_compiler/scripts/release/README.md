@@ -26,6 +26,11 @@ Ubuntu APT supplies only the non-LLVM build dependencies, with bounded retries
 and failure on an incomplete index update. No LLVM APT repository is added.
 `--llvm-root` remains available for an explicitly selected development toolchain.
 
+The default standard-library gate also runs real SQLite consumers. Linux runners
+install `libsqlite3-dev`; Windows installs `sqlite3:x64-windows` with the runner's
+vcpkg and passes its explicit DLL directory to the gate; macOS uses system SQLite.
+This is a test dependency, not an implicit SQLite dependency for SDK applications.
+
 The native builds use LLVM 22 and a checksum-verified Stage 0 SDK. Stage 0 uses
 its own matching standard library while building the current compiler source:
 the October Linux SDK cannot compile the newer typed container drop helpers.

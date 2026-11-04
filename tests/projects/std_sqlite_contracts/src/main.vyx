@@ -1,0 +1,178 @@
+module tests.std_sqlite_contracts;
+use std.sqlite;
+use std.core;
+use std.collections;
+use std.fs;
+use std.string;
+extern "C" {
+    fn sqlite3_memory_used() -> i64;
+    fn sqlite3_libversion_number() -> i32;
+}
+
+fn bind_temporary(query: &mut Query) {
+    var text = String.from("A\0B");
+    query.bindText(2, text.as_str());
+    text = String.from("changed");
+    var bytes = Vec<u8>.new();
+    bytes.push(0 as u8); bytes.push(255 as u8); bytes.push(42 as u8);
+    query.bindBlob(3, &bytes);
+    bytes.set(2, 9 as u8);
+}
+fn detached_query() -> Query {
+    let db = Database.open(":memory:");
+    return db.query("SELECT 42");
+}
+fn bounded_views() {
+    let db = Database.open(":memory:");
+    db.try_exec("PRAGMA foreign_keys=ON").unwrap();
+    assert(db.try_query("SELECT 1; PRAGMA foreign_keys=OFF").is_err(), "reject second statement before preparing it");
+    let setting = db.query("PRAGMA foreign_keys");
+    assert(setting.next() && setting.getInt(0) == 1, "rejected tail must not change connection settings");
+    let comments = db.query("SELECT 1; /* ignored ; PRAGMA foreign_keys=OFF */ ; -- tail\n /* unfinished comment");
+    assert(comments.next() && comments.getInt(0) == 1, "SQLite comment and empty separator rules");
+    // Neither input's logical end is NUL-terminated. The suffix must not reach C.
+    let sql = "SELECT 37 invalid suffix";
+    let statement = from_cstr_view_len(sql.c_str(), 9);
+    let query = db.query(statement);
+    assert(query.next() && query.getInt(0) == 37, "bounded SQL copy");
+    let bind = db.query("SELECT ?1");
+    let backing = "prefixignored";
+    bind.bindText(1, from_cstr_view_len(backing.c_str(), 6));
+    assert(bind.next(), "bound text view");
+    let text = bind.getText(0);
+    assert(text == "prefix", "bounded text binding");
+    str_drop(text);
+}
+fn payload_sizes() {
+    let db = Database.open(":memory:");
+    db.try_exec("CREATE TABLE payloads (id INTEGER, text TEXT, bytes BLOB); BEGIN").unwrap();
+    let insert = db.query("INSERT INTO payloads VALUES (?1, ?2, ?3)");
+    for (row in 0..32) {
+        var data = Vec<u8>.new();
+        for (i in 0..(row * 257)) { data.push(((i * 37 + row) % 128) as u8); }
+        let text = String.fromBytes(data.data, data.len);
+        insert.bindInt(1, row as i32);
+        insert.bindText(2, text.as_str());
+        insert.bindBlob(3, &data);
+        assert(!insert.next(), "payload insert");
+        insert.reset();
+    }
+    db.try_exec("COMMIT").unwrap();
+    let query = db.query("SELECT id, text, bytes FROM payloads ORDER BY id");
+    var count = 0;
+    while (query.next()) {
+        let row = query.getInt(0);
+        let text = query.getText(1);
+        let bytes = query.getBlob(2);
+        assert(text.len == row * 257 && bytes.len == text.len, "payload length");
+        for (i in 0..bytes.len) {
+            let expected = ((i * 37 + row) % 128) as i32;
+            assert(text.charAt(i as i32) == expected && bytes.get(i as i32) as i32 == expected, "payload byte oracle");
+        }
+        str_drop(text);
+        count = count + 1;
+    }
+    assert(count == 32, "all payload rows");
+}
+fn memory_contracts() {
+    let db = Database.open(":memory:");
+    assert(db.is_open(), "open memory");
+    assert(db.try_exec("CREATE TABLE items (id INTEGER PRIMARY KEY, text TEXT, bytes BLOB, number REAL, empty BLOB, missing TEXT)").is_ok(), "create");
+    let insert = db.query("INSERT INTO items VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
+    assert(insert.try_bind_int(0, 1).is_err(), "parameter range");
+    insert.bindInt64(1, 4294967297);
+    bind_temporary(&mut insert);
+    insert.bindDouble(4, 2.5);
+    let empty = Vec<u8>.new();
+    assert(insert.try_bind_text(99, "invalid").is_err(), "failed text bind releases native copy");
+    assert(insert.try_bind_blob(99, &empty).is_err(), "failed blob bind releases native copy");
+    insert.bindBlob(5, &empty);
+    insert.bindNull(6);
+    assert(!insert.next(), "insert done");
+    assert(!insert.next(), "DONE must not repeat insert");
+    assert(insert.try_bind_int(1, 2).is_err(), "bind needs reset");
+    insert.reset();
+    insert.bindInt(1, 2);
+    assert(!insert.next(), "reuse bindings after reset");
+    insert.reset();
+    assert(insert.try_clear_bindings().is_ok(), "clear bindings");
+    assert(insert.close() == 0 && insert.close() == 0, "idempotent finalize");
+    assert(insert.try_next().is_err(), "closed query");
+
+    let query = db.query("SELECT id, text, bytes, number, empty, missing FROM items ORDER BY id; -- trailing comment");
+    assert(query.columnCount() == 6, "column count before step");
+    assert(query.try_get_text(1).is_err(), "no row before step");
+    assert(query.next(), "first row");
+    assert(query.getInt(0) == 2, "small integer");
+    let text = query.getText(1);
+    let bytes = query.getBlob(2);
+    assert(text.len == 3 && text.charAt(1) == 0 && text.charAt(2) == 66, "length preserving text binding");
+    assert(bytes.len == 3 && bytes.get(2) == 42 as u8, "binding owns caller-independent blob");
+    assert(query.getDouble(3) == 2.5, "double");
+    assert(!query.isNull(4) && query.getBlob(4).len == 0 && query.isNull(5), "empty BLOB differs from NULL");
+    assert(query.try_get_text(5).is_err() && query.try_get_int(1).is_err(), "typed reads reject NULL/type mismatch");
+    assert(query.try_get_int(6).is_err() && query.try_get_int(-1).is_err(), "column range");
+    assert(query.next(), "second row");
+    assert(query.getInt64(0) == 4294967297 && query.try_get_int(0).is_err(), "no integer truncation");
+    assert(!query.next() && !query.next(), "cursor exhaustion");
+    assert(query.close() == 0, "query close");
+    assert(text.len == 3 && text.charAt(2) == 66 && bytes.get(2) == 42 as u8, "owned results survive step and close");
+
+    assert(db.try_query("SELECT 1; SELECT 2").is_err(), "no silently ignored statements");
+    assert(db.try_query(" -- only a comment").is_err(), "empty query");
+    assert(db.try_query("bad sql").is_err(), "prepare error");
+    assert(db.try_exec("INSERT INTO missing VALUES (1)").is_err(), "exec error");
+    assert(db.lastError().len > 0, "native diagnostic");
+    assert(db.try_exec("SELECT 1\0; SELECT 2").is_err(), "SQL NUL rejected");
+    let duplicate = db.query("INSERT INTO items(id) VALUES (2)");
+    match (duplicate.try_next()) { Err(e) => { assert(e.code == 19, "constraint error"); } Ok(_) => { panic("constraint succeeded"); } }
+    assert(duplicate.try_next().is_err(), "failed cursor stays failed");
+    assert(duplicate.try_reset().is_err(), "reset reports previous execution error");
+    assert(duplicate.try_next().is_err(), "reset did reset despite prior error");
+    assert(duplicate.close() == 19 && duplicate.close() == 0, "finalize frees even on execution error");
+    let retained = db.query("SELECT count(*) FROM items");
+    assert(db.close() == 0 && db.close() == 0 && !db.is_open(), "close with live statement");
+    assert(db.try_exec("SELECT 1").is_err(), "closed database rejects calls");
+    assert(retained.next() && retained.getInt(0) == 2, "statement retains native connection");
+    str_drop(text);
+}
+fn main() -> i32 {
+    assert(sqlite3_libversion_number() >= 3008007, "minimum native SQLite version");
+    print("SQLite version: ${sqlite3_libversion_number()}");
+    memory_contracts();
+    bounded_views();
+    payload_sizes();
+    let detached = detached_query();
+    assert(detached.next() && detached.getInt(0) == 42, "query outlives database owner");
+    assert(Database.try_open("bad\0path").is_err(), "path NUL rejected");
+    assert(Database.try_open(".cache/no-such-directory/db.sqlite").is_err(), "open error");
+    let path = ".cache/sqlite-contract.db";
+    if (fileExists(path)) { assert(deleteFile(path) == 0, "remove prior test DB"); }
+    {
+        let db = Database.open(path);
+        assert(db.exec("CREATE TABLE ledger(value INTEGER); BEGIN; INSERT INTO ledger VALUES (10); COMMIT; BEGIN; INSERT INTO ledger VALUES (99); ROLLBACK;"), "transaction batch");
+    }
+    {
+        let db = Database.open(path);
+        let query = db.query("SELECT sum(value) FROM ledger");
+        assert(query.next() && query.getInt(0) == 10, "reopen persisted transaction");
+    }
+    {
+        let first = Database.open(path);
+        let second = Database.open(path);
+        first.try_exec("BEGIN EXCLUSIVE").unwrap();
+        match (second.try_exec("INSERT INTO ledger VALUES (20)")) {
+            Err(e) => { assert(e.code == 5, "busy is reported as an error"); }
+            Ok(_) => { panic("competing write ignored lock"); }
+        }
+        first.try_exec("ROLLBACK").unwrap();
+        second.try_exec("INSERT INTO ledger VALUES (20)").unwrap();
+    }
+    assert(deleteFile(path) == 0, "all automatic closes released file");
+    detached.close();
+    let baseline = sqlite3_memory_used();
+    for (i in 0..16) { memory_contracts(); }
+    assert(sqlite3_memory_used() == baseline, "repeated lifecycle returns native SQLite allocation count to baseline");
+    print("std sqlite contracts ok");
+    return 0;
+}

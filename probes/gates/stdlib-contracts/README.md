@@ -32,6 +32,9 @@ Projects cover:
 | `std_ordered_contracts` | move-only owning map/set keys, borrowed queries, replacement/removal cleanup, sorted storage, independent result/collection clones and binary text keys |
 | `std_testing_contracts` | bool/integer expectations and repeated mock queries that preserve their logs |
 | `std_fs_contracts` | binary/text lengths, embedded NUL, explicit empty/error results, append/copy, invalid paths, literal directory names and close |
+| `std_system_contracts` | target-specific drive/UNC/POSIX path roots, native clock IDs, independent steady-clock elapsed time across sleep and UTC timestamp |
+| `std_time_faults` | native clock failure, invalid/overflow values, large QPC frequency, DWORD sleep chunks, POSIX EINTR continuation and permanent sleep failure |
+| `std_sqlite_contracts` | real SQLite: owning bindings/results, embedded NUL and BLOB/NULL distinctions, typed/range/state errors, reset, finalization, deferred connection destruction, native allocation balance and persisted transactions |
 | `std_scalar_contracts` | bit boundaries, negative hex, strict Base64/hex errors, all-byte round trips, independent PCG reference sequence and range extremes |
 | `std_generic_contracts` | a real static library with generic trait-bound methods and a separate consumer |
 | `std_serde_contracts` | quoted multiline CSV, CRLF, blank/trailing fields, embedded NUL, escaped quotes and located malformed-input errors |
@@ -100,3 +103,23 @@ evidence. On Windows the runner deploys the explicitly selected OpenSSL DLLs
 beside a private executable and records their source paths and SHA-256 hashes.
 Each Windows invocation gets a separate deployment directory. On POSIX configure
 the native loader search path for the chosen OpenSSL installation.
+
+SQLite is a required native input to the default gate. Install `libsqlite3-dev`
+on Linux; macOS uses system SQLite. On Windows install `sqlite3:x64-windows`, set
+`VCPKG_ROOT`, and pass `--native-bin <vcpkg-root>/installed/x64-windows/bin`.
+The runner copies exactly `sqlite3.dll` beside a private executable and records
+its identity; a missing explicit DLL input fails instead of searching PATH.
+The package remains opt-in for applications and does not enter the std umbrella.
+
+For example, with vcpkg at `E:/vcpkg`:
+
+```powershell
+$env:VCPKG_ROOT = 'E:/vcpkg'
+python probes/gates/stdlib-contracts/run.py --compiler /path/to/vyxc.exe --native-bin E:/vcpkg/installed/x64-windows/bin --negative --model
+```
+
+Time failure injection runs separately from the real-clock consumer. POSIX
+injects native clock/sleep functions; Windows replaces only the test process's
+QPC/Sleep import slots and restores their page protection. It does not alter an
+OS DLL, SDK artifact or compiler. This tests failure handling, while the separate
+steady-clock consumer tests elapsed time against the platform implementation.

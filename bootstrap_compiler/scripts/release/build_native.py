@@ -38,8 +38,16 @@ def check_standard_library(compiler, work, environment):
     output = work / "stdlib-contracts"
     run([sys.executable, "-m", "unittest", "discover", "-s",
          REPO / "probes/gates/stdlib-contracts", "-p", "test_runner.py"], env=environment)
+    run([sys.executable, REPO / "probes/gates/compiler-platforms/run.py", "--compiler", compiler,
+         "--output", output / "platform-selection"], env=environment)
+    native = []
+    if os.name == "nt":
+        root = environment.get("VCPKG_ROOT")
+        if not root:
+            raise RuntimeError("Windows SQLite contracts require an explicit VCPKG_ROOT")
+        native = ["--native-bin", Path(root) / "installed/x64-windows/bin"]
     run([sys.executable, REPO / "probes/gates/stdlib-contracts/run.py",
-         "--compiler", compiler, "--output", output, "--negative", "--model"], env=environment)
+         "--compiler", compiler, "--output", output, "--negative", "--model", *native], env=environment)
     report = output / "verification.json"
     result = json.loads(report.read_text(encoding="utf-8"))
     return {"checks": len(result["results"]), "passed": sum(row["passed"] for row in result["results"]),
