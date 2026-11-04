@@ -12,6 +12,7 @@ from unittest.mock import patch
 import run as gate
 from model import write_project
 from semver_model import precedence, write_project as write_semver_project
+from url_model import encode as url_encode_oracle, write_project as write_url_project
 
 
 def alive(pid):
@@ -38,6 +39,23 @@ def alive(pid):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_url_oracle_separates_percent_and_form_alphabets(self):
+        self.assertEqual(url_encode_oracle(b" +*~\0"), "%20%2B%2A~%00")
+        self.assertEqual(url_encode_oracle(b" +*~\0", True), "+%2B*%7E%00")
+        self.assertEqual(url_encode_oracle(bytes([128, 255])), "%80%FF")
+
+    def test_url_model_is_reproducible_and_retains_all_cases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = write_url_project(root / "a", seed=42)
+            self.assertEqual(first, write_url_project(root / "b", seed=42))
+            self.assertEqual({k: first[k] for k in ("bytes", "urls", "invalid", "queries")},
+                             {"bytes": 80, "urls": 96, "invalid": 64, "queries": 32})
+            source = (root / "a/main.vyx").read_text(encoding="utf8")
+            for key, function in (("bytes", "check_codec"), ("urls", "check_url"), ("invalid", "check_invalid"), ("queries", "check_query")):
+                self.assertEqual(source.count("    " + function + "("), first[key])
+            self.assertNotEqual(first["source_sha256"], write_url_project(root / "c", seed=43)["source_sha256"])
+
     def test_semver_oracle_spec_order_and_unbounded_identifiers(self):
         ordered = ["1.0.0" + suffix for suffix in ("-alpha", "-alpha.1", "-alpha.beta", "-beta", "-beta.2", "-beta.11", "-rc.1", "")]
         self.assertEqual(sorted(reversed(ordered), key=precedence), ordered)

@@ -13,6 +13,7 @@ import time
 import tomllib
 from model import write_project
 from semver_model import write_project as write_semver_project
+from url_model import write_project as write_url_project
 
 ROOT = Path(__file__).resolve().parents[3]
 PACKAGES = ROOT / "bootstrap_compiler/std_packages"
@@ -23,6 +24,7 @@ PROJECTS = {
     "std_generic_contracts": "std generic contracts ok",
     "std_scalar_contracts": "std scalar contracts ok",
     "std_semver_contracts": "std semver contracts ok",
+    "std_url_contracts": "std url contracts ok",
     "std_sync_contracts": "std.sync contracts ok",
     "std_owned_collections": "std owning collections contracts ok",
     "std_value_collections": "std value collections ok",
@@ -237,6 +239,10 @@ def main() -> None:
               "scope": "project contracts; package inventory is not API coverage"}
     model_directory = output / "model"
     semver_directory = output / "semver-model"
+    url_directory = output / "url-model"
+    if "std_url_contracts" in selected:
+        record["url_model"] = write_url_project(url_directory)
+        (output / "url_model.py.snapshot").write_bytes(Path(__file__).with_name("url_model.py").read_bytes())
     if "std_semver_contracts" in selected:
         record["semver_model"] = write_semver_project(semver_directory)
         (output / "semver_model.py.snapshot").write_bytes(Path(__file__).with_name("semver_model.py").read_bytes())
@@ -284,6 +290,18 @@ def main() -> None:
             print(f"{project} O{opt}: {'PASS' if passed else 'FAIL'} ({result['seconds']:.1f}s)", flush=True)
             if not passed:
                 print(log[-7000:].decode("utf-8", "replace"), flush=True)
+        if "url_model" in record:
+            command = [str(compiler), "--src=project", str(url_directory), "--run=aot", "-j4", f"-O{opt}"]
+            started = time.monotonic()
+            code, log = execute(command, url_directory, environment, args.timeout)
+            passed = code == 0 and b"std url model ok" in log
+            (output / f"url-model-O{opt}.log").write_bytes(log)
+            record["results"].append({"project": "url-model", "opt": opt, "command": command,
+                "exit": code, "seconds": time.monotonic() - started, "passed": passed})
+            (output / "verification.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            print(f"url model O{opt}: {'PASS' if passed else 'FAIL'}", flush=True)
+            if not passed:
+                print(log[-7000:].decode("utf-8", "replace"), flush=True)
         if "semver_model" in record:
             command = [str(compiler), "--src=project", str(semver_directory), "--run=aot", "-j4", f"-O{opt}"]
             started = time.monotonic()
@@ -324,6 +342,10 @@ def main() -> None:
                 ("semver-invalid-value", "SemVer.compareTo:", False),
                 ("semver-invalid-int", "semver.parse_int:", False),
                 ("semver-negative-core", "SemVer.create:", False),
+                ("url-invalid-escape", "url_decode:", False),
+                ("form-invalid-escape", "form_decode:", False),
+                ("url-invalid-parse", "Url.parse:", False),
+                ("url-invalid-state", "Url.toString:", False),
             ):
                 directory = output / "negative" / f"{name}-O{opt}"
                 directory.mkdir(parents=True, exist_ok=True)

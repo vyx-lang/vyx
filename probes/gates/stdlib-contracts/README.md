@@ -37,6 +37,7 @@ Projects cover:
 | `std_sqlite_contracts` | real SQLite: owning bindings/results, embedded NUL and BLOB/NULL distinctions, typed/range/state errors, reset, finalization, deferred connection destruction, native allocation balance and persisted transactions |
 | `std_scalar_contracts` | bit boundaries, negative hex, strict Base64/hex errors, all-byte round trips, independent PCG reference sequence and range extremes |
 | `std_semver_contracts` | public cross-module API, strict/located SemVer errors, prerelease precedence, checked core/increments, owning Clone, Vec sorting, Dict key agreement and selection from a real release catalog |
+| `std_url_contracts` | all-byte percent/form codecs, literal plus, IPv4/IPv6 and port validation, empty delimiters, repeated query fields, owning Clone and a cross-module request-preparation consumer |
 | `std_generic_contracts` | a real static library with generic trait-bound methods and a separate consumer |
 | `std_serde_contracts` | quoted multiline CSV, CRLF, blank/trailing fields, embedded NUL, escaped quotes and located malformed-input errors |
 | Existing collections/JSON/miniz/I/O/umbrella projects | package resolution and resource/error contracts already maintained by those projects |
@@ -95,6 +96,14 @@ It checks 80 valid round trips, more than 200 invalid versions and 192 compariso
 pairs. The report retains its seed and generator/source hashes. Public convenience
 methods also have negative panic fixtures under `--negative`; malformed input
 and arithmetic overflow must not become a successfully parsed version.
+
+Selecting `std_url_contracts` also runs a deterministic model with 80 byte
+inputs (including all 256 byte values), 96 URL structures, 64 malformed escapes
+and 32 repeated/empty query sets at each selected optimization level. Expected
+encodings and components come from Python's `urllib.parse` and `ipaddress`.
+The form oracle adjusts urllib's treatment of `*` and `~` to the form alphabet.
+Reports retain the seed and generator/source hashes. This is a strict byte and
+absolute HTTP/WS URL contract, not full WHATWG parsing or DNS validation.
 
 Native OpenSSL checks are opt-in because the default SDK gate does not install
 OpenSSL. With the native link libraries installed, run:

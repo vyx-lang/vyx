@@ -118,6 +118,20 @@ macOS 的原生 Release 任务在打包前执行。验证报告中的平台、�
 版本值可用于 Vec 排序和 Dict 键。直接修改公开字段后，序列化、比较、哈希、递增仍会验证
 字段有效性。实际消费示例见[版本目录项目](../tests/projects/std_semver_contracts/README.md)。
 
+`std.url` 区分百分号编码与表单编码。`url_decode` 保留字面 `+`，需要把加号解为
+空格时使用 `form_decode`。`try_url_decode`、`try_form_decode` 对错误转义返回带字节
+位置的错误。这些是字节 API，保留 NUL 和非 UTF-8 数据，编码通过字节构建器完成。
+`QueryPair` 与 `query_encode_pairs` / `try_query_decode` 保留重复键、顺序和空键值；
+表单参数使用 `form_query_encode` / `try_form_query_decode`。字典版 `query_encode`
+借用输入，按键的字节顺序序列化。
+
+`Url.try_parse` 接受绝对 HTTP/HTTPS/WS/WSS URL，支持注册主机名、IPv4、括号 IPv6，
+端口必须是非空的 0..65535 十进制数字。解析保留转义、大小写和空的 `?` / `#` 分隔符，
+`host` 字段不含 IPv6 方括号。`try_to_string` 验证修改后的公开字段与分隔标志，Clone
+独立拥有字段。此 API 不做相对 URL 解析、IDNA、DNS 查询、浏览器 WHATWG 规范化、
+IPvFuture 或 IPv6 zone 解析。原始空格、控制字节、非 ASCII 字符和错误转义会被拒绝。
+消费示例与边界见 [URL 项目](../tests/projects/std_url_contracts/README.md)。
+
 ## 当前状态
 
 - `std.math` 是源码标准库，直接封装 libm 常见函数。

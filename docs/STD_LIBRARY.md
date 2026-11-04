@@ -140,6 +140,24 @@ Dict keys. Publicly edited fields are validated before serialization,
 comparison, hashing and increments. See the
 [release-catalog consumer](../tests/projects/std_semver_contracts/README.md).
 
+`std.url` separates percent codecs from form codecs. `url_decode` preserves a
+literal `+`; use `form_decode` for plus-to-space conversion. `try_url_decode`
+and `try_form_decode` return located errors for malformed escapes. These are
+byte APIs: NUL and non-UTF-8 bytes are preserved. Encoding uses a byte builder.
+`QueryPair` plus `query_encode_pairs` / `try_query_decode` preserve duplicate
+keys, order and empty names/values. Form pairs use `form_query_encode` /
+`try_form_query_decode`. The dictionary `query_encode` borrows its input and
+sorts keys by byte order.
+
+`Url.try_parse` accepts absolute HTTP/HTTPS/WS/WSS URLs with registered, IPv4
+or bracketed IPv6 hosts and checked decimal ports (0..65535, nonempty).
+It preserves escaped components, case and empty `?`/`#` delimiters; `host`
+excludes IPv6 brackets. `try_to_string` checks edited public fields and flags;
+Clone owns independent fields. This API does not resolve relative URLs or
+perform IDNA, DNS lookup, WHATWG normalization, IPvFuture or IPv6 zone parsing.
+Raw spaces, controls, non-ASCII characters and malformed escapes are rejected.
+See the [URL consumer and exact boundaries](../tests/projects/std_url_contracts/README.md).
+
 ## Current implementation boundary
 
 - `std.math` is source library code directly wrapping common libm functions.
