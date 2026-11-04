@@ -32,14 +32,18 @@ vcpkg and passes its explicit DLL directory to the gate; macOS uses system SQLit
 This is a test dependency, not an implicit SQLite dependency for SDK applications.
 
 The native builds use LLVM 22 and a checksum-verified Stage 0 SDK. Stage 0 uses
-its own matching standard library while building the current compiler source:
-the October Linux SDK cannot compile the newer typed container drop helpers.
-The build uses an isolated committed source snapshot, and its bootstrap-only
-manifest points `parallel_std_sources` at the Stage 0 SDK's `std`. Environment
-variables alone do not override that explicit source list. The manifest is
-restored before the current compiler builds tools or the SDK is packaged.
-The restored manifest selects `std_packages`; the checkout's compatibility
-`std/` directory is not an input to current-source builds.
+its own canonical `std_packages` while building the current compiler source.
+The build uses an isolated committed source snapshot; its bootstrap-only
+manifest and `VYX_STD_PACKAGES` both select that same SDK directory. The legacy
+`std/` snapshot is never a bootstrap input: mixing its Vec with the canonical
+Iterator can produce layout and ownership mismatches even within one SDK.
+A missing canonical registry or source is an error, without a legacy fallback.
+The [bootstrap std gate](../../../../probes/gates/bootstrap-stdlib/README.md)
+builds and runs a small parallel project before the full compiler build, checks
+that the two roots agree, and records registry/source hashes. Native Windows,
+Linux and macOS builds and the macOS cross exporter use the same check.
+The manifest is restored before the current compiler builds tools or the SDK is
+packaged. It then selects the current checkout's maintained `std_packages`.
 The native C++ bridge is built first. Stage 0 then loads that bridge from a
 separate directory while keeping its own executable and application runtime.
 This prevents old Stage 0 bridges from embedding the build runner's optional

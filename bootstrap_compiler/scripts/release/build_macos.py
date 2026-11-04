@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tomllib
 
-from build_native import bootstrap_manifest, check_dynamic_dispatch, check_dynamic_library, check_iteration_protocol, check_semantic_composition, check_standard_library, check_value_bindings, run
+from build_native import bootstrap_manifest, bootstrap_standard_library, check_dynamic_dispatch, check_dynamic_library, check_iteration_protocol, check_semantic_composition, check_standard_library, check_value_bindings, run, verify_bootstrap_standard_library
 from common import REPO, bootstrap_asset, checksum_sidecar, sha256, unpack_sdk
 from macos_common import TRIPLES, collect_objects, executable_content, source_commit, source_snapshot, verify_bundle
 
@@ -26,7 +26,7 @@ def build_environment(llvm, std):
     return environment
 
 
-def export_manifest(original, build):
+def export_manifest(original, build, std_root):
     target = original["target"]["boot"]
     sources = [(build / path).resolve().as_posix() for path in target["sources"] if path.endswith(".vyx")]
     # C/C++ and link dependencies are built by Apple Clang on the native host.
@@ -35,7 +35,7 @@ def export_manifest(original, build):
         '\n[build]\noutput_dir = "out"\ncache_dir = ".cache-macos"\nvyxflags = ["-O2", "-fPIC"]\n'
         '[target.boot]\ntype = "executable"\nentry = ' + json.dumps((build / target["entry"]).as_posix()) +
         '\nsources = ' + json.dumps(sources) + '\nauto_sources = false\nparallel_vyx = true\n'
-        'parallel_std_sources = ' + json.dumps((build / "std").as_posix()) +
+        'parallel_std_sources = ' + json.dumps(std_root.as_posix()) +
         '\nparallel_std_excludes = ' + json.dumps(target["parallel_std_excludes"]) + '\n')
 
 
@@ -59,13 +59,13 @@ def export(args):
         environment["LD_LIBRARY_PATH"] = f"{sdk}/bin:{sdk}/lib"
     manifest = build / "Vyx.toml"
     original = manifest.read_text(encoding="utf-8")
-    exported_manifest = export_manifest(tomllib.loads(original), build)
-    exported_manifest = exported_manifest.replace(json.dumps((build / "std").as_posix()),
-                                                  json.dumps((sdk / "std").as_posix()))
+    standard_library = bootstrap_standard_library(sdk)
+    exported_manifest = export_manifest(tomllib.loads(original), build, Path(standard_library["root"]))
     manifest.write_text(exported_manifest, encoding="utf-8")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     try:
+        preflight = verify_bootstrap_standard_library(compiler, sdk, work, environment, manifest)
         artifact = work / "compiler.objects"
         run([compiler, "build", "--target", "boot", "--emit=obj", "--triplet=" + TRIPLES[args.arch],
              "-o", artifact, f"-j{args.jobs}"], cwd=build, env=environment)
@@ -82,6 +82,7 @@ def export(args):
               "export_host": platform.platform(), "compiler_sha256": sha256(compiler),
               "codegen_backend_sha256": sha256(sdk / "bin" / ("vyx_compiler_backend.dll" if os.name == "nt" else "libvyx_compiler_backend.so")),
               "sdk_manifest_sha256": sha256(sdk / "SDK-MANIFEST.json"),
+              "bootstrap_standard_library": preflight,
               "compiler_version": subprocess.check_output([compiler, "--version"], env=environment, text=True).strip()}
     (output / "BOOTSTRAP.json").write_text(json.dumps(record, indent=2) + "\n")
     verify_bundle(output, args.arch, source_commit())
@@ -242,6 +243,9 @@ def native(args):
              "--triplet", TRIPLES[arch]], env=environment)
         record["cross_preflight"] = json.loads((work / "cross-preflight/verification.json").read_text())
     try:
+        if not args.cross_bundle:
+            record["bootstrap_standard_library"] = verify_bootstrap_standard_library(
+                compiler, sdk, work, environment, manifest)
         run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
     finally:
         manifest.write_text(original, encoding="utf-8")

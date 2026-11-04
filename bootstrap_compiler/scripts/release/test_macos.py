@@ -10,13 +10,21 @@ import unittest
 from unittest.mock import patch
 
 from common import REPO, sha256
-from build_macos import compiler_native_objects
+from build_macos import compiler_native_objects, export_manifest
 from macos_common import CPUS, TRIPLES, executable_content, verify_bundle, verify_object
 from package_macos import macho, parse_dependencies, resolve_dependency
 from prepare_macos_llvm import extract_bottle, resolve_input
 
 
 class MacOSInputs(unittest.TestCase):
+    def test_cross_export_receives_one_explicit_standard_library_root(self):
+        source = tomllib.loads((REPO / "bootstrap_compiler/Vyx.toml").read_text(encoding="utf-8"))
+        build = Path("project/bootstrap_compiler")
+        standard_library = Path("SDK Stage 0/std_packages")
+        result = tomllib.loads(export_manifest(source, build, standard_library))
+        self.assertEqual(result["target"]["boot"]["parallel_std_sources"], standard_library.as_posix())
+        self.assertNotIn('parallel_std_sources = "project/bootstrap_compiler/std"', export_manifest(source, build, standard_library))
+
     def test_cross_link_uses_current_manifest_native_compiler_inputs(self):
         build = REPO / "bootstrap_compiler"
         manifest = tomllib.loads((build / "Vyx.toml").read_text(encoding="utf-8"))

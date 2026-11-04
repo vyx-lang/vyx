@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tomllib
 
 from common import REPO, bootstrap_asset, checksum_sidecar, sha256, unpack_sdk
 
@@ -147,11 +148,106 @@ def check_protocol_edges(compiler, work, environment, cases, directory):
     return {"checks": result["passed"], "report_sha256": sha256(report)}
 
 
+def bootstrap_standard_library(sdk):
+    """One canonical Stage 0 source tree for explicit and implicit imports."""
+    root = (sdk / "std_packages").resolve()
+    registry = root / "registry"
+    if not registry.is_file():
+        raise RuntimeError(f"Stage 0 SDK is missing its canonical standard-library registry: {registry}")
+    sources = {}
+    for entry in registry.read_text(encoding="utf-8").splitlines():
+        entry = entry.strip()
+        if not entry or entry.startswith(("#", "//")):
+            continue
+        source = (root / entry).resolve()
+        if not source.is_relative_to(root) or source.suffix != ".vyx" or not source.is_file():
+            raise RuntimeError(f"Invalid Stage 0 standard-library registry source: {entry}")
+        sources[entry] = sha256(source)
+    if not sources:
+        raise RuntimeError(f"Stage 0 standard-library registry has no sources: {registry}")
+    return {"root": str(root), "registry_sha256": sha256(registry), "sources": sources}
+
+
 def bootstrap_manifest(manifest, sdk):
     setting = 'parallel_std_sources = "std_packages"'
     if manifest.count(setting) != 1:
         raise RuntimeError("Bootstrap standard-library source selection drifted")
-    return manifest.replace(setting, "parallel_std_sources = " + json.dumps((sdk / "std").as_posix()))
+    standard_library = bootstrap_standard_library(sdk)
+    return manifest.replace(setting, "parallel_std_sources = " + json.dumps(Path(standard_library["root"]).as_posix()))
+
+
+def bootstrap_planned_sources(output, root):
+    sources = {}
+    for listing in output.rglob("*.sources"):
+        for line in listing.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            path = Path(line.strip())
+            if not path.is_absolute():
+                path = output / path
+            path = path.resolve()
+            if not path.is_file() or not (path.is_relative_to(root) or path.is_relative_to(output)):
+                raise RuntimeError(f"Bootstrap preflight planned a source outside its canonical roots: {path}")
+            sources[str(path)] = sha256(path)
+    if not any(Path(path).is_relative_to(root) for path in sources):
+        raise RuntimeError("Bootstrap preflight produced no canonical standard-library source plan")
+    return sources
+
+
+def verify_bootstrap_standard_library(compiler, sdk, work, environment, manifest):
+    """Exercise Stage 0's actual project/source selection before the large build."""
+    standard_library = bootstrap_standard_library(sdk)
+    root = Path(standard_library["root"])
+    target = tomllib.loads(manifest.read_text(encoding="utf-8"))["target"]["boot"]
+    explicit = Path(target["parallel_std_sources"]).resolve()
+    implicit = Path(environment.get("VYX_STD_PACKAGES", "")).resolve()
+    if explicit != root or implicit != root:
+        raise RuntimeError(f"Bootstrap explicit and implicit standard-library roots must both be {root}; "
+                           f"manifest={explicit}, VYX_STD_PACKAGES={implicit}")
+    runtime = (sdk / json.loads((sdk / "SDK-MANIFEST.json").read_text(encoding="utf-8"))["application_runtime"]).resolve()
+    runtime_root = Path(environment.get("VYX_RUNTIME_ROOT", "")).resolve()
+    if not runtime.is_relative_to(sdk.resolve()) or not runtime.is_file() or runtime_root != runtime.parent:
+        raise RuntimeError(f"Bootstrap preflight must use Stage 0's declared application runtime: {runtime}")
+    backend_name = "vyx_compiler_backend.dll" if os.name == "nt" else (
+        "libvyx_compiler_backend.dylib" if sys.platform == "darwin" else "libvyx_compiler_backend.so")
+    backend = compiler.parent / backend_name
+    companions = {"compiler_backend": {"path": str(backend), "sha256": sha256(backend)},
+                  "application_runtime": {"path": str(runtime), "sha256": sha256(runtime)}}
+    output = work / "bootstrap-stdlib"
+    output.mkdir(exist_ok=False)
+    shutil.copy2(REPO / "probes/gates/bootstrap-stdlib/main.vyx", output / "main.vyx")
+    probe = ('[package]\nname="bootstrap_stdlib"\nversion="0.1.0"\nentry="main.vyx"\n'
+             '[build]\ncache_dir=".cache"\noutput_dir="target"\n'
+             '[target.bootstrap_stdlib]\ntype="executable"\nentry="main.vyx"\nauto_sources=false\n'
+             'parallel_vyx=true\nparallel_std_sources=' + json.dumps(root.as_posix()) +
+             '\nparallel_std_excludes=' + json.dumps(target.get("parallel_std_excludes", [])) + '\n')
+    (output / "Vyx.toml").write_text(probe, encoding="utf-8")
+    command = [str(compiler), "--src=project", str(output), "--target", "bootstrap_stdlib", "--emit=exe", "-j2", "-O0"]
+    print("[release] checking Stage 0 canonical standard-library closure: " + str(root), flush=True)
+    result = subprocess.run(command, cwd=output, env=environment, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=120)
+    (output / "build.log").write_bytes(result.stdout)
+    executable = output / "target" / ("bootstrap_stdlib.exe" if os.name == "nt" else "bootstrap_stdlib")
+    record = {"compiler_sha256": sha256(compiler), "companions": companions, "standard_library": standard_library,
+              "command": command, "compile_exit": result.returncode, "passed": False}
+    if result.returncode == 0 and executable.is_file():
+        record["planned_sources"] = bootstrap_planned_sources(output, root)
+        runtime_result = subprocess.run([str(executable)], cwd=output, env=environment,
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+        (output / "run.log").write_bytes(runtime_result.stdout)
+        record.update(run_exit=runtime_result.returncode, executable_sha256=sha256(executable))
+        record["passed"] = runtime_result.returncode == 0 and b"bootstrap standard library ok" in runtime_result.stdout
+    if bootstrap_standard_library(sdk) != standard_library:
+        record["passed"] = False
+        record["inputs_changed"] = True
+    (output / "verification.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    if not record["passed"]:
+        print(result.stdout[-6000:].decode("utf-8", "replace"), flush=True)
+        if (output / "run.log").is_file():
+            print((output / "run.log").read_bytes()[-6000:].decode("utf-8", "replace"), flush=True)
+        raise RuntimeError(f"Stage 0 standard-library closure preflight failed: {output}")
+    print("[release] Stage 0 standard-library closure PASS", flush=True)
+    return record
 
 
 def stage_windows_tbb(build):
@@ -308,6 +404,8 @@ def main():
              "--cxx", args.llvm_root.resolve() / "bin" / ("clang++.exe" if windows else "clang++"),
              "--output", work / "runtime-string-scan"], env=environment)
         run([compiler, "--version"], env=environment)
+        record["bootstrap_standard_library"] = verify_bootstrap_standard_library(
+            compiler, sdk, work, environment, manifest_path)
         run([compiler, "build", "--target", "boot", f"-j{args.jobs}"], cwd=build, env=environment)
     finally:
         manifest_path.write_text(original_manifest, encoding="utf-8")

@@ -13,7 +13,7 @@ import build_native
 
 from common import REPO, checksum_sidecar, sha256
 from build_termux import debian_version
-from build_native import bootstrap_manifest, verify_debug_adapter
+from build_native import bootstrap_manifest, bootstrap_standard_library, verify_bootstrap_standard_library, verify_debug_adapter
 from prepare_macos_llvm import selected_member
 from prepare_windows_llvm import extract_development, relative_member
 from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validate_assets
@@ -158,12 +158,80 @@ class ReleaseTests(unittest.TestCase):
                 verify_debug_adapter(adapter, "windows-x86_64", patch)
 
     def test_bootstrap_explicit_std_sources_use_stage0(self):
-        manifest = 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std_packages"\n'
-        changed = bootstrap_manifest(manifest, Path("C:/SDK/Stage 0"))
-        self.assertIn('parallel_std_sources = "C:/SDK/Stage 0/std"', changed)
-        self.assertEqual(manifest, 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std_packages"\n')
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = Path(temporary) / "SDK Stage 0"
+            root = sdk / "std_packages"
+            (root / "core/src").mkdir(parents=True)
+            (root / "registry").write_text("# canonical registry\ncore/src/core.vyx\n", encoding="utf-8")
+            (root / "core/src/core.vyx").write_text("module std.core;", encoding="utf-8")
+            (sdk / "std").mkdir()
+            (sdk / "std/core.vyx").write_text("old incompatible source", encoding="utf-8")
+            manifest = 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std_packages"\n'
+            changed = bootstrap_manifest(manifest, sdk)
+            self.assertIn('parallel_std_sources = ' + json.dumps(root.resolve().as_posix()), changed)
+            self.assertEqual(manifest, 'version = "1.0.0-alpha.1"\nparallel_std_sources = "std_packages"\n')
+            selected = bootstrap_standard_library(sdk)
+            self.assertEqual(selected["sources"], {"core/src/core.vyx": sha256(root / "core/src/core.vyx")})
         with self.assertRaisesRegex(RuntimeError, "selection drifted"):
             bootstrap_manifest("unexpected manifest", Path("sdk"))
+
+    def test_bootstrap_never_falls_back_to_legacy_std(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = Path(temporary)
+            (sdk / "std").mkdir()
+            (sdk / "std/vec.vyx").write_text("module std.collections;")
+            with self.assertRaisesRegex(RuntimeError, "missing its canonical"):
+                bootstrap_standard_library(sdk)
+
+    def test_bootstrap_rejects_missing_and_escaping_registry_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = Path(temporary)
+            (sdk / "std_packages").mkdir()
+            registry = sdk / "std_packages/registry"
+            for content in ("missing.vyx\n", "../legacy.vyx\n"):
+                registry.write_text(content)
+                (sdk / "legacy.vyx").write_text("module std.core;")
+                with self.assertRaisesRegex(RuntimeError, "Invalid Stage 0"):
+                    bootstrap_standard_library(sdk)
+            registry.write_text("# empty\n")
+            with self.assertRaisesRegex(RuntimeError, "no sources"):
+                bootstrap_standard_library(sdk)
+
+    def test_bootstrap_preflight_rejects_split_roots_before_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sdk = Path(temporary) / "sdk"
+            (sdk / "std_packages").mkdir(parents=True)
+            (sdk / "std_packages/registry").write_text("core.vyx\n")
+            (sdk / "std_packages/core.vyx").write_text("module std.core;")
+            manifest = Path(temporary) / "Vyx.toml"
+            for explicit, implicit in ((sdk / "std", sdk / "std_packages"),
+                                       (sdk / "std_packages", sdk / "std")):
+                manifest.write_text('[target.boot]\nparallel_std_sources=' + json.dumps(str(explicit)) + '\n')
+                with patch.object(build_native.subprocess, "run", side_effect=AssertionError("must reject before compilation")):
+                    with self.assertRaisesRegex(RuntimeError, "roots must both be"):
+                        verify_bootstrap_standard_library(Path("compiler"), sdk, Path(temporary),
+                                                          {"VYX_STD_PACKAGES": str(implicit)}, manifest)
+
+    def test_bootstrap_source_plan_rejects_legacy_and_checkout_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            root, output = base / "sdk/std_packages", base / "probe"
+            root.mkdir(parents=True); output.mkdir()
+            (root / "vec.vyx").write_text("module std.collections;")
+            (output / "main.vyx").write_text("fn main()->i32{return 0;}")
+            listing = output / "unit.sources"
+            listing.write_text(str(root / "vec.vyx") + "\nmain.vyx\n")
+            self.assertEqual(set(build_native.bootstrap_planned_sources(output, root)),
+                             {str(root / "vec.vyx"), str(output / "main.vyx")})
+            for unexpected in (base / "sdk/std/vec.vyx", base / "checkout/std_packages/vec.vyx"):
+                unexpected.parent.mkdir(parents=True)
+                unexpected.write_text("module std.collections;")
+                listing.write_text(str(unexpected) + "\n")
+                with self.assertRaisesRegex(RuntimeError, "outside its canonical roots"):
+                    build_native.bootstrap_planned_sources(output, root)
+            listing.write_text("main.vyx\n")
+            with self.assertRaisesRegex(RuntimeError, "no canonical"):
+                build_native.bootstrap_planned_sources(output, root)
 
     def test_streamed_llvm_extraction_filters_unused_payload(self):
         with tempfile.TemporaryDirectory() as temporary:
