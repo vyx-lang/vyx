@@ -22,8 +22,11 @@ still reports retained runtime String allocations even though actual PCRE2
 program and TOML node-handle counters return to zero. Native bridge-only
 ASan/UBSan/LSan passing does not prove the compiler cleans every enum payload.
 
-Adding a generic library `drop` method alone is insufficient: experiments
-also produced a double destructor after `unwrap_err` and still missed the
-temporary. A repair needs compiler ownership/transfer/drop modelling, followed
-by this gate and std ownership/generic regressions. Do not add a library raw
-tag/layout workaround or suppress LeakSanitizer reports.
+Adding a generic library `drop` method alone is insufficient: consuming APIs
+also need an owning receiver and correct transfer/drop modelling. The
+[full-expression gate](../full-expression/README.md) now checks explicit enum
+destructors with `own self` extraction, guarded pattern transfer and borrowed
+generic-enum matches. Automatic structural enum cleanup and the standard
+Result/Option consuming APIs still need this gate and std ownership/generic
+regressions. Do not add a library raw tag/layout workaround or suppress
+LeakSanitizer reports.

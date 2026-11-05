@@ -65,9 +65,20 @@ def main() -> int:
         print(f'{report["passed"]}/{report["checks"]} PASS', flush=True)
         return 0 if records and all(r["pass"] for r in records) else 1
 
+    for optimization in (0, 2):
+        executable = output / (f"enum-match-reuse-O{optimization}" + (".exe" if os.name == "nt" else ""))
+        executable.unlink(missing_ok=True)
+        invoke(f"enum-match-reuse-O{optimization}-rejected",
+               [compiler, "--src=file", gate / "enum_match_reuse.vyx", "--emit=exe",
+                f"-O{optimization}", "-o", executable], expected_exit=1,
+               diagnostic=("error: E3100:", "use of moved value 'value'"))
+        records.append({"name": f"enum-match-reuse-O{optimization}-no-artifact", "pass": not executable.exists()})
+
     if args.enum_only:
         for optimization in (0, 2):
-            for name, marker in (("enum_arguments", b"enum-arguments=ok\n"), ("enum_views", b"enum-views=ok\n")):
+            for name, marker in (("enum_arguments", b"enum-arguments=ok\n"),
+                                 ("enum_views", b"enum-views=ok\n"),
+                                 ("enum_match_transfer", b"enum-match-transfer=ok\n")):
                 label = f"{name}-O{optimization}"
                 executable = output / (label + (".exe" if os.name == "nt" else ""))
                 executable.unlink(missing_ok=True)
@@ -100,6 +111,7 @@ def main() -> int:
                     "conditional_owners": b"conditional-owners=ok\n",
                     "enum_arguments": b"enum-arguments=ok\n",
                     "enum_views": b"enum-views=ok\n",
+                    "enum_match_transfer": b"enum-match-transfer=ok\n",
                     "stdlib_owners": b"",
                     "borrowed_payloads": b"borrowed-payloads=ok\n",
                     "clone_reference_values": b"clone-reference-values=ok\n",

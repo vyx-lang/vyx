@@ -16,6 +16,86 @@ use bootstrap.policy;
 
 @[vis(world)]
 impl bootstrap.mir_builder.MirUnitBuilder {
+    public fn lower_match_subject(self, subject: i32) -> i32 {
+        var value = self.lower_expr(subject);
+        let source_type = self.unit.value_type(value);
+        var enum_type = source_type;
+        var depth: i32 = 0;
+        while (depth < self.h.types.count
+            && (hir_type_table_kind(self.h.types, enum_type) == ty_REF()
+                || hir_type_table_kind(self.h.types, enum_type) == ty_MUTREF())) {
+            enum_type = hir_type_table_elem(self.h.types, enum_type);
+            depth += 1;
+        }
+        if (enum_type == source_type) { return value; }
+        self.ensure_layouts_for_type(enum_type);
+        if (mir_unit_variant_count_for_type(&self.unit, enum_type) <= 0) { return value; }
+        // Sema/HIR resolve variant patterns against the referenced enum. Make
+        // that read explicit in MIR before capturing the subject: a backend
+        // must not compare reference addresses or construct a pattern value.
+        // Ownership remains on the original HIR reference, never this read.
+        var type_id = source_type;
+        while (type_id != enum_type && depth > 0) {
+            type_id = hir_type_table_elem(self.h.types, type_id);
+            let place = self.unit.add_place(self.current_function_id, mir_place_deref(), type_id,
+                mir_id_invalid(), mir_id_invalid(), mir_id_invalid(), value, subject, "match.subject");
+            value = self.add_read_value(self.mark_place_unsafe_if_needed(place), subject);
+            depth -= 1;
+        }
+        return value;
+    }
+
+    public fn lower_match_pattern(self, pattern: i32) -> i32 {
+        if (!self.expr_is_variant_constructor_call(pattern)) { return self.lower_expr(pattern); }
+        // Variant syntax in a pattern describes a tag and binding places. It
+        // must not construct an owning temporary or move uninitialized binds
+        // through the ordinary call-argument path.
+        let type_id = self.h.expr_type(pattern);
+        self.ensure_layouts_for_type(type_id);
+        let callee = self.h.expr_lhs(pattern);
+        var variant = self.target_id_from_hir_expr(pattern);
+        if (self.h.expr_target_kind(pattern) != hir_target_variant()) {
+            variant = self.target_id_from_hir_expr(callee);
+        }
+        variant = self.variant_item_for_owner_type(type_id, variant);
+        let value = self.unit.add_value(self.current_function_id, mir_value_call(), type_id,
+            mir_id_invalid(), mir_target_hir_variant(), variant, pattern,
+            hir_unit_expr_flags(self.h, pattern), 0, 0, self.h.expr_name(pattern), "");
+        self.unit.set_value_lhs(value, self.lower_expr_core(callee));
+        var first = mir_id_invalid();
+        var last = mir_id_invalid();
+        var argument = self.h.expr_first_arg(pattern);
+        while (argument != hir_id_invalid()) {
+            last = self.append_value_arg(value, first, last, self.lower_match_pattern(argument));
+            first = self.unit.value_first_arg(value);
+            argument = self.h.expr_next_arg(argument);
+        }
+        return value;
+    }
+
+    public fn match_pattern_takes_payload(self, pattern: i32) -> bool {
+        if (!self.expr_is_variant_constructor_call(pattern)) { return false; }
+        var argument = self.h.expr_first_arg(pattern);
+        while (argument != hir_id_invalid()) {
+            if (self.h.expr_target_kind(argument) == hir_target_local()
+                && self.hir_local_has_drop(self.h.expr_target_id(argument))) { return true; }
+            argument = self.h.expr_next_arg(argument);
+        }
+        return false;
+    }
+
+    public fn transfer_match_payload_owner(self, pattern: i32, subject: i32, captured_owner: i32) {
+        // HIR marks owning bindings (including discarded payloads) separately
+        // from borrowed patterns. Transfer only on the successful guard edge.
+        // Default/tag-only arms leave the intact aggregate responsible for drop.
+        if (!self.match_pattern_takes_payload(pattern)) { return; }
+        if (captured_owner != hir_id_invalid()) {
+            self.drop_stack_set_active(captured_owner, false);
+        } else {
+            self.deactivate_moved_source_expr_except(subject, hir_id_invalid());
+        }
+    }
+
     // The dispatch binds payload places before the guard. Cleanup starts only
     // after that guard succeeds; a failed guard does not consume the payload.
     public fn activate_match_payload_locals(self, pattern: i32) {
@@ -35,7 +115,7 @@ impl bootstrap.mir_builder.MirUnitBuilder {
     }
     public fn lower_match_stmt(self, stmt_id: i32) {
         let subject_expr = self.h.stmt_expr(stmt_id);
-        let raw_subject_value = self.lower_expr(subject_expr);
+        let raw_subject_value = self.lower_match_subject(subject_expr);
         var subject_value = raw_subject_value;
         let subject_drop_outer_mark = self.drop_stack_head;
         var owned_subject_hir_local = hir_id_invalid();
@@ -104,7 +184,7 @@ impl bootstrap.mir_builder.MirUnitBuilder {
             self.drop_stack_head = match_drop_mark;
             self.defer_stack_head = match_defer_mark;
             self.storage_stack_head = match_storage_mark;
-            let pat_value = self.lower_expr(pattern_expr);
+            let pat_value = self.lower_match_pattern(pattern_expr);
             // Pattern lowering can expand short-circuit expressions into CFG.
             // The case belongs to, and must terminate, the resulting join block.
             let case_owner_block = self.current_block_id;
@@ -165,6 +245,7 @@ impl bootstrap.mir_builder.MirUnitBuilder {
             self.drop_stack_head = match_drop_mark;
             self.defer_stack_head = match_defer_mark;
             self.storage_stack_head = match_storage_mark;
+            self.transfer_match_payload_owner(pattern_expr, subject_expr, owned_subject_hir_local);
             self.activate_match_payload_locals(pattern_expr);
             self.lower_stmt(self.h.stmt_child(arm));
             if (!self.current_block_terminated()) {
@@ -256,7 +337,7 @@ impl bootstrap.mir_builder.MirUnitBuilder {
                                                            "match_expr",
                                                            mir_local_flag_if_expr_result());
         let subject_expr = self.h.expr_lhs(expr_id);
-        let raw_subject_value = self.lower_expr(subject_expr);
+        let raw_subject_value = self.lower_match_subject(subject_expr);
         var subject_value = raw_subject_value;
         let subject_drop_outer_mark = self.drop_stack_head;
         var owned_subject_hir_local = hir_id_invalid();
@@ -325,7 +406,7 @@ impl bootstrap.mir_builder.MirUnitBuilder {
             self.drop_stack_head = match_drop_mark;
             self.defer_stack_head = match_defer_mark;
             self.storage_stack_head = match_storage_mark;
-            let pat_value = self.lower_expr(pattern_expr);
+            let pat_value = self.lower_match_pattern(pattern_expr);
             // Pattern lowering can expand short-circuit expressions into CFG.
             // The case belongs to, and must terminate, the resulting join block.
             let case_owner_block = self.current_block_id;
@@ -386,6 +467,7 @@ impl bootstrap.mir_builder.MirUnitBuilder {
             self.drop_stack_head = match_drop_mark;
             self.defer_stack_head = match_defer_mark;
             self.storage_stack_head = match_storage_mark;
+            self.transfer_match_payload_owner(pattern_expr, subject_expr, owned_subject_hir_local);
             self.activate_match_payload_locals(pattern_expr);
             self.lower_stmt_into_place(self.h.stmt_child(arm), result_place, expr_id);
             if (!self.current_block_terminated()) {
