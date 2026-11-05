@@ -15,12 +15,14 @@ import subprocess
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--enum-only", action="store_true", help="run native enum transfer and view-lifetime regressions")
     args = parser.parse_args()
     compiler = args.compiler.resolve(strict=True)
     gate = Path(__file__).resolve().parent
     repo = gate.parents[2]
-    output = gate / ".cache"
-    output.mkdir(exist_ok=True)
+    output = (args.output or gate / ".cache").resolve()
+    output.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env["PATH"] = str(compiler.parent) + os.pathsep + env.get("PATH", "")
     records = []
@@ -56,6 +58,35 @@ def main() -> int:
             print(json.dumps(preview, indent=2), flush=True)
         return passed
 
+    def finish():
+        report = {"compiler": str(compiler), "sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
+                  "records": records, "passed": sum(r["pass"] for r in records), "checks": len(records)}
+        (output / "verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f'{report["passed"]}/{report["checks"]} PASS', flush=True)
+        return 0 if records and all(r["pass"] for r in records) else 1
+
+    if args.enum_only:
+        for optimization in (0, 2):
+            for name, marker in (("enum_arguments", b"enum-arguments=ok\n"), ("enum_views", b"enum-views=ok\n")):
+                label = f"{name}-O{optimization}"
+                executable = output / (label + (".exe" if os.name == "nt" else ""))
+                executable.unlink(missing_ok=True)
+                if invoke(label + "-compile", [compiler, "--src=file", gate / (name + ".vyx"),
+                                              "--emit=exe", f"-O{optimization}", "-o", executable]):
+                    invoke(label + "-run", [executable], stdout=marker)
+            for name in ("enum_view_escape", "enum_bound_view_escape"):
+                label = f"{name}-O{optimization}"
+                executable = output / (label + (".exe" if os.name == "nt" else ""))
+                executable.unlink(missing_ok=True)
+                invoke(label + "-rejected", [compiler, "--src=file", gate / (name + ".vyx"),
+                                            "--emit=exe", f"-O{optimization}", "-o", executable], expected_exit=1,
+                       diagnostic=("error: E3102:", "returned view borrows an owning temporary", "return "))
+                records.append({"name": label + "-no-artifact", "pass": not executable.exists()})
+                invoke(label + "-mir-rejected", [compiler, "--src=file", gate / (name + ".vyx"),
+                                                "--dump-mir2", f"-O{optimization}"], expected_exit=1,
+                       diagnostic="error: E3102:")
+        return finish()
+
     heap_line = b"0123456789012345678901234567890123\n"
     branch_line = b"01234567890123456789012345678901\n"
     interfaces = output / "interfaces"
@@ -67,6 +98,8 @@ def main() -> int:
                     "task_owners": b"mir_storage_lifetime OK\n",
                     "branch_views": branch_line + b"short\n",
                     "conditional_owners": b"conditional-owners=ok\n",
+                    "enum_arguments": b"enum-arguments=ok\n",
+                    "enum_views": b"enum-views=ok\n",
                     "stdlib_owners": b"",
                     "borrowed_payloads": b"borrowed-payloads=ok\n",
                     "clone_reference_values": b"clone-reference-values=ok\n",
@@ -144,7 +177,7 @@ def main() -> int:
                 expected = b"stored-strings=ok\n" if fixture == "stored_strings" else b"local-string-results=ok\n"
                 invoke(label + "-run", [executable], stdout=expected)
 
-    for name in ("returned_view", "returned_bound_view", "returned_payload",
+    for name in ("returned_view", "returned_bound_view", "returned_payload", "enum_view_escape", "enum_bound_view_escape",
                  "returned_string_substring", "returned_string_trim"):
         diagnostic = "returned view borrows an owning temporary"
         if name == "returned_string_substring":
@@ -172,11 +205,7 @@ def main() -> int:
            "--interface-root", interfaces, "--emit=exe", "-o", rejected], expected_exit=1,
            diagnostic="error: E2200:")
     records.append({"name": "generic-call-no-overload-no-artifact", "pass": not rejected.exists()})
-    report = {"compiler": str(compiler), "sha256": hashlib.sha256(compiler.read_bytes()).hexdigest(),
-              "records": records, "passed": sum(r["pass"] for r in records), "checks": len(records)}
-    (output / "verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f'{report["passed"]}/{report["checks"]} PASS', flush=True)
-    return 0 if all(r["pass"] for r in records) else 1
+    return finish()
 
 
 if __name__ == "__main__":

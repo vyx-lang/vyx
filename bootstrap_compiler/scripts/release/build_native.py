@@ -59,6 +59,8 @@ def check_standard_library(compiler, work, environment):
     output = work / "stdlib-contracts"
     run([sys.executable, REPO / "probes/gates/bootstrap-native-stdlib/run.py",
          "--compiler", compiler, "--output", output / "bootstrap-native"], env=environment)
+    run([sys.executable, REPO / "probes/gates/full-expression/run.py", "--compiler", compiler,
+         "--enum-only", "--output", output / "enum-lifetimes"], env=environment)
     if os.name != "nt":
         run([sys.executable, REPO / "probes/gates/stdlib-contracts/native_engines.py",
              "--cc", "/usr/bin/clang", "--output", output / "native-engines"], env=environment)

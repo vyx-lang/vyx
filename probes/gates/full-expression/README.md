@@ -6,6 +6,9 @@
 python probes/gates/full-expression/run.py --compiler bootstrap_compiler/out/vyxc.exe
 ```
 
+发布流程另执行 `--enum-only --output <结果目录>`，覆盖枚举负载转换、资源转移、视图存活、
+调用方借用与静态文本的合法返回，以及临时拥有者借用的返回拒绝；正负用例均使用 O0/O2。
+
 以原生 AOT、`-O0` 和 `-O2` 检查：
 
 - 借用函数和方法中的临时对象在语句完成后析构一次。
@@ -13,6 +16,8 @@ python probes/gates/full-expression/run.py --compiler bootstrap_compiler/out/vyx
 - 参数求值顺序；`&&`、`||` 和 `?:` 的未选择分支不执行。
 - `?:` 仅移动选中的局部对象，未选择对象仍由原作用域析构。
 - 返回、局部绑定、消费参数和条件结果中的所有权转移。
+- 枚举构造的每个负载按各自声明类型转换；拥有资源的负载移入枚举后，原临时对象或局部量不再析构。夹具中的枚举显式实现析构，自动推导负载析构仍由独立的 `enum-payload-cleanup` 记录。
+- 枚举负载保存临时对象的字符串视图时，临时拥有者保留到枚举绑定的作用域结束；返回这种视图枚举必须报 E3102。
 - 不同泛型实例的析构绑定，以及 `std.vio.Task<T>` 临时对象和 await 路径。
 - 同一程序中的普通及嵌套 `Vec` 克隆与 `Ref` 共享句柄；析构实例化扩容 HIR 表后，MIR 继续使用更新后的表。
 - `Box` / `Ref` 的 `deref()` 借用和 `get()` 克隆；返回临时智能指针的借用必须报错。
