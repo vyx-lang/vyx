@@ -30,6 +30,10 @@ explicit multi-CGU emission through mixed-separator cache paths, owning String/V
 barriers, a large test list, output limits and complete JSON/XML serialization.
 Windows test and benchmark harnesses disable interactive CRT abort reporting
 inside each child. Crash isolation remains distinct from deadline expiry.
+Each invocation owns its generated harness sources, object files and executable
+under its report/log directory. Concurrent commands never relink or strip a
+shared runner. The concurrency regression starts four identical selections and
+checks both successful execution and distinct executable filesystem identities.
 Text fixtures and JSON reports use UTF-8 explicitly. On Windows installations
 with a legacy ANSI code page, also run the gate with `PYTHONUTF8=0`.
 The gate rejects fractional baseline counts/durations, mismatched sample counts

@@ -385,8 +385,31 @@ use std.collections;
         native_alias=root/'native-alias.c';os.link(native_source,native_alias)
         check('report-cannot-overwrite-native-hardlink',native_only,['--allow-empty','--report',native_alias],2,contains=('must not overwrite',))
         assert native_source.read_bytes()==original
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(lambda index:check(f'concurrent-invocation-{index}',good,['--filter','alongside_main','--exact'],contains=('1 passed; 0 failed',)),range(2)))
+        # The source/filter/optimization are identical, so a shared hash-keyed
+        # executable races at link/strip time. Keep the test child alive while
+        # the other invocations build, and independently check artifact identity
+        # so the regression cannot pass just because the scheduler serialized it.
+        concurrent=project('concurrent',{'tests/main.vyx':
+            'use std.time;\n@[test] fn overlap(){sleep_ms(500);assert(true);}\n'})
+        barrier=threading.Barrier(4)
+        def concurrent_run(index):
+            barrier.wait(timeout=30)
+            return check(f'concurrent-invocation-{index}',concurrent,
+                         ['--filter','overlap','--exact','--report',f'run-{index}.json'],
+                         contains=('1 passed; 0 failed',))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            invocations=list(pool.map(concurrent_run,range(4)))
+        if all(record['passed'] for record in invocations):
+            executables=[]
+            for index in range(4):
+                result=json.loads((concurrent/f'run-{index}.json').read_text(encoding='utf-8'))['results'][0]
+                run_directory=(concurrent/result['stdout_path']).parent
+                harnesses=list(run_directory.rglob('runner.exe' if os.name=='nt' else 'runner'))
+                assert len(harnesses)==1,(run_directory,harnesses)
+                executables.append(harnesses[0].resolve())
+            assert len(set(executables))==4,executables
+            for index,left in enumerate(executables):
+                assert all(not os.path.samefile(left,right) for right in executables[index+1:])
     report=dict(compiler=str(compiler),compiler_sha256=hashlib.sha256(compiler.read_bytes()).hexdigest(),
                 passed=sum(r['passed'] for r in records),total=len(records),records=records)
     (output/'verification.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
