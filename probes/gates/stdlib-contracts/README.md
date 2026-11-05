@@ -130,9 +130,13 @@ Native ownership/failure checks are also available independently:
 python probes/gates/stdlib-contracts/native_engines.py --cc /usr/bin/clang --output .cache/native-engines
 ```
 
-This compiles pinned PCRE2 and tomlc17 bridge paths with ASan/UBSan (and LSan
-where supported), repeatedly releases root/child/clone handles, injects
-bridge allocation failures and checks capture buffer/UTF-8 errors. Release
+This compiles pinned PCRE2 and tomlc17 ABI projections with ASan/UBSan (and LSan
+where supported), repeatedly parses/frees native result storage and matches
+capture buffers. The Vyx project tests validation, Ref-based child/clone
+lifetimes and real native resource counters separately. The Regex fixture
+also injects match-data/context allocation failures and requires zero live
+scratch buffers after successful matches, no match, engine errors and both
+partial-allocation failures. Release
 Linux/macOS checks run this with the runner's system Clang. Windows tests use
 the actual Vyx APIs and entropy failure executable; this sanitizer command is
 POSIX-only. Corpus sampling does not claim full TOML/PCRE2 upstream conformance.

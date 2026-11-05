@@ -3,6 +3,9 @@
 `std:regex` / target `std_regex` exposes `std.regex`. It is also a dependency
 of the `std:std` aggregate. The static package compiles its pinned PCRE2 10.49
 sources; consumers need no PCRE2 installation, CMake or network access.
+The public API, validation, matching scratch and cleanup are implemented in
+Vyx and call the original PCRE2 functions directly. There is no custom C
+wrapper ABI. Native size_t parameters follow the SDK's supported 64-bit C ABI.
 
 ```toml
 [dependencies]

@@ -1,7 +1,7 @@
 # TOML documents
 
 `std:serde`, target `serde_toml`, exposes `std.serde.toml`. It builds the
-vendored tomlc17 R261003 parser and its native bridge as a static package.
+vendored tomlc17 R261003 parser and a small ABI projection as a static package.
 No separate library installation or network access is required.
 
 ```toml
@@ -30,15 +30,26 @@ operations, unwrapping each Result. No ambiguous automatic path splitting
 occurs. `keys` returns owned names, `at` indexes arrays, `size` accepts only
 containers. Typed getters reject coercion. `as_string` returns owned String.
 
-Children and Clone retain an immutable reference-counted tree; they remain
-valid after the parent or input text is destroyed. Reference counters are
-atomic. This does not permit destroying one Vyx handle concurrently with
-access through that same handle. `destroy()` on a handle is idempotent.
+Allocation, UTF-8 checking, exact-key lookup, type/bounds checks, error
+conversion and ownership are implemented in Vyx. Children and Clone retain a
+`std.ref.Ref<TomlTree>`; they remain valid after the parent or input text is
+destroyed. Reference counters use the standard Ref implementation. This does
+not permit destroying one Vyx handle concurrently with access through that
+same handle. `destroy()` on a handle is idempotent. Cloning creates no native
+node-handle allocation. Creating the Ref control block follows the standard
+Ref allocation policy (panic on allocation failure); allocating the opaque
+parse-result buffer returns Allocation on failure.
+
+`native/toml_abi.c` contains only by-value structure calls and field
+projections for tomlc17's anonymous union, which the current Vyx FFI cannot
+directly represent. It owns no memory and performs no validation or lookup.
+The actual target C compiler provides the opaque result's size/alignment;
+Vyx allocates aligned storage and never guesses union offsets.
 
 `TomlError` carries a kind, message and available source location. Parser
 failures provide the upstream line number (0 when unavailable); their column
 is 0. Type/missing/range failures use the node's line/column. Parser allocation
-failures currently share the Parse kind and a diagnostic message; handle
+failures currently share the Parse kind and a diagnostic message; result-buffer
 allocation failures have Allocation kind.
 
 `TomlDateTime.kind` distinguishes Date, Time, DateTime and OffsetDateTime.
@@ -60,7 +71,7 @@ consumer with strict typed port/UUID/route validation.
 Upstream MIT licence, commit and original hashes are in `vendor/tomlc17/`.
 The local patch replaces null-based member-address arithmetic in `page_create`
 with `offsetof(page_t, data) + size`, preserving layout while passing UBSan.
-The bridge validates UTF-8 without mutating tomlc17's global options.
+Vyx validates UTF-8 without mutating tomlc17's global options.
 
 Compiler boundary: [discarded owning enum payloads](../../../probes/gates/enum-payload-cleanup/README.md)
 are not yet automatically destroyed. Ignoring a Result error (including a

@@ -5,12 +5,31 @@ use std.string;
 use std.collections;
 
 extern "C" {
-    fn vyx_regex_compile(pattern: rawptr, length: i64, flags: i32, failure: *i32, offset: *i64) -> rawptr;
-    fn vyx_regex_free(code: rawptr);
-    fn vyx_regex_groups(code: rawptr) -> i32;
-    fn vyx_regex_group_number(code: rawptr, name: rawptr) -> i32;
-    fn vyx_regex_error(code: i32, buffer: rawptr, size: i64) -> i32;
-    fn vyx_regex_find(code: rawptr, text: rawptr, size: i64, start: i64, full: i32, steps: i64, depth: i64, heap_kib: i64, spans: rawptr, capacity: i64) -> i32;
+    fn pcre2_compile_8(pattern: rawptr, length: u64, flags: u32, failure: *i32, offset: *u64, context: rawptr) -> rawptr;
+    fn pcre2_code_free_8(code: rawptr);
+    fn pcre2_pattern_info_8(code: rawptr, what: u32, output: rawptr) -> i32;
+    fn pcre2_substring_number_from_name_8(code: rawptr, name: rawptr) -> i32;
+    fn pcre2_get_error_message_8(code: i32, buffer: rawptr, size: u64) -> i32;
+    fn pcre2_match_data_create_from_pattern_8(code: rawptr, context: rawptr) -> rawptr;
+    fn pcre2_match_data_free_8(data: rawptr);
+    fn pcre2_match_context_create_8(context: rawptr) -> rawptr;
+    fn pcre2_match_context_free_8(context: rawptr);
+    fn pcre2_set_match_limit_8(context: rawptr, limit: u32) -> i32;
+    fn pcre2_set_depth_limit_8(context: rawptr, limit: u32) -> i32;
+    fn pcre2_set_heap_limit_8(context: rawptr, limit: u32) -> i32;
+    fn pcre2_match_8(code: rawptr, subject: rawptr, length: u64, start: u64, flags: u32, data: rawptr, context: rawptr) -> i32;
+    fn pcre2_get_ovector_count_8(data: rawptr) -> u32;
+    fn pcre2_get_ovector_pointer_8(data: rawptr) -> *u64;
+}
+
+// Own scratch in Vyx so every early return releases partially created state.
+class RegexScratch {
+    public data: rawptr;
+    public context: rawptr;
+    public fn drop() {
+        if (self.data != null) { pcre2_match_data_free_8(self.data); self.data = null; }
+        if (self.context != null) { pcre2_match_context_free_8(self.context); self.context = null; }
+    }
 }
 
 public class RegexError {
@@ -20,10 +39,11 @@ public class RegexError {
     public fn drop() { self.message.destroy(); }
 }
 fn regex_failure(code: i32, offset: i64) -> RegexError {
+    if (code == -1000) { return RegexError { code: code, offset: offset, message: String.from("regex input, pattern, capture count or resource limit exceeds supported range") }; }
     var buffer = Vec::<u8>.with_capacity(256);
     var i: i32 = 0;
     while (i < 256) { buffer.push(0 as u8); i += 1; }
-    let length = vyx_regex_error(code, buffer.data, 256);
+    let length = pcre2_get_error_message_8(code, buffer.data, 256 as u64);
     let message = if (length >= 0) { String.fromBytes(buffer.data, length as i64) } else { String.from("unknown regex engine error") };
     return RegexError { code: code, offset: offset, message: message };
 }
@@ -66,38 +86,64 @@ public class Regex {
     handle: rawptr;
     public static fn compile(pattern: string) -> Result<Regex, RegexError> { return Regex.compile_with(pattern, RegexOptions.defaults()); }
     public static fn compile_with(pattern: string, options: RegexOptions) -> Result<Regex, RegexError> {
-        var flags: i32 = 0;
-        if (options.case_insensitive) { flags |= 1; }
-        if (options.multiline) { flags |= 2; }
-        if (options.dot_all) { flags |= 4; }
-        if (options.unicode) { flags |= 8; }
+        if (pattern.len > 65536) { return Err(regex_failure(-1000, -1)); }
+        // PCRE2 public option constants; the library's own C header defines
+        // their ABI. No generated wrapper or extra exported ABI is involved.
+        var flags: u32 = 1048576 as u32; // PCRE2_NEVER_BACKSLASH_C
+        if (options.case_insensitive) { flags |= 8 as u32; }
+        if (options.multiline) { flags |= 1024 as u32; }
+        if (options.dot_all) { flags |= 32 as u32; }
+        if (options.unicode) { flags |= 655360 as u32; } // UTF | UCP
         var failure: i32 = 0;
-        var offset: i64 = -1;
-        let handle = vyx_regex_compile(pattern.ptr, pattern.len, flags, &failure, &offset);
-        if (handle == null) { return Err(regex_failure(failure, offset)); }
+        var offset: u64 = 0;
+        let handle = pcre2_compile_8(pattern.ptr, pattern.len as u64, flags, &failure, &offset, null);
+        if (handle == null) { return Err(regex_failure(failure, offset as i64)); }
+        var count: u32 = 0;
+        let status = pcre2_pattern_info_8(handle, 4 as u32, to_rawptr(&count));
+        if (status != 0 || count > 256 as u32) {
+            pcre2_code_free_8(handle);
+            return Err(regex_failure(if (status != 0) { status } else { -1000 }, -1));
+        }
         return Ok(Regex { handle: handle });
     }
     public fn group_number(&self, name: string) -> Result<i32, RegexError> {
         if (self.handle == null || name.len == 0 || name.indexOf("\0") >= 0) { return Err(regex_failure(-1000, -1)); }
-        let index = vyx_regex_group_number(self.handle, name.c_str());
+        let index = pcre2_substring_number_from_name_8(self.handle, name.c_str());
         if (index < 0) { return Err(regex_failure(index, -1)); }
         return Ok(index);
     }
     public fn find(&self, text: string) -> Result<Option<RegexMatch>, RegexError> { return self.find_from(text, 0, false, RegexLimits.defaults()); }
     public fn full_match(&self, text: string) -> Result<Option<RegexMatch>, RegexError> { return self.find_from(text, 0, true, RegexLimits.defaults()); }
     public fn find_from(&self, text: string, start: i64, full: bool, limits: RegexLimits) -> Result<Option<RegexMatch>, RegexError> {
-        if (self.handle == null) { return Err(regex_failure(-1000, -1)); }
-        let groups = vyx_regex_groups(self.handle) as i64;
-        var spans = Vec::<i64>.with_capacity(groups * 2);
-        var i: i64 = 0;
-        while (i < groups * 2) { spans.push(-1); i += 1; }
-        let result = vyx_regex_find(self.handle, text.ptr, text.len, start, if (full) { 1 } else { 0 }, limits.steps, limits.depth, limits.heap_kib, spans.data, spans.len);
+        if (self.handle == null || text.len > 16777216 || start < 0 || start > text.len
+            || limits.steps < 1 || limits.steps > 4294967295
+            || limits.depth < 1 || limits.depth > 4294967295
+            || limits.heap_kib < 1 || limits.heap_kib > 65536) { return Err(regex_failure(-1000, start)); }
+        var scratch = RegexScratch { data: null, context: null };
+        scratch.data = pcre2_match_data_create_from_pattern_8(self.handle, null);
+        scratch.context = pcre2_match_context_create_8(null);
+        if (scratch.data == null || scratch.context == null) { return Err(regex_failure(-48, -1)); }
+        pcre2_set_match_limit_8(scratch.context, limits.steps as u32);
+        pcre2_set_depth_limit_8(scratch.context, limits.depth as u32);
+        pcre2_set_heap_limit_8(scratch.context, limits.heap_kib as u32);
+        let flags: u32 = if (full) { 2684354560 as u32 } else { 0 as u32 }; // ANCHORED | ENDANCHORED
+        let result = pcre2_match_8(self.handle, text.ptr, text.len as u64, start as u64, flags, scratch.data, scratch.context);
+        if (result == -1) { return Ok(None); }
         if (result < 0) { return Err(regex_failure(result, start)); }
-        if (result == 0) { return Ok(None); }
+        let groups = pcre2_get_ovector_count_8(scratch.data) as i64;
+        var spans = Vec::<i64>.with_capacity(groups * 2);
+        let vector = pcre2_get_ovector_pointer_8(scratch.data);
+        var i: i64 = 0;
+        while (i < groups * 2) {
+            var position: u64 = 0;
+            unsafe { position = vector[i]; }
+            spans.push(if (position == 18446744073709551615 as u64) { -1 } else { position as i64 });
+            i += 1;
+        }
         return Ok(Some(RegexMatch { subject: String.from(text), spans: spans }));
     }
     public fn destroy() { self.drop(); }
-    public fn drop() { if (self.handle != null) { vyx_regex_free(self.handle); self.handle = null; } }
+    public fn drop() { if (self.handle != null) { pcre2_code_free_8(self.handle); self.handle = null; } }
 }
 
 /// Vyx Standard Library: Regex Module

@@ -4104,6 +4104,56 @@ fn driver_implicit_module_root_allowed(root: string) -> bool {
     return !driver_registry_path_is_ignored(driver_resolve_abs_path(root) + "/");
 }
 
+// A published interface represents a complete logical module. An implicit
+// source registry may still contain that module under a different file stem.
+// Select one transport by exact module identity, independent of row order;
+// loading both creates distinct AST items for the same native definitions.
+// The source module currently being compiled owns its declarations and must
+// instead ignore an older interface left beside its output library.
+fn driver_registry_select_transports(registry: string, explicit_registry: string, input_module: string) -> string {
+    var interfaces = Vec::<string>.new();
+    var start: i32 = 0;
+    var i: i32 = 0;
+    while (i <= registry.len) {
+        if (i == registry.len || registry.charAt(i) == 10) {
+            let line = registry.substring(start, i);
+            let mod = driver_line_module(line);
+            if (mod.len > 0 && mod != input_module && driver_path_is_vyi(driver_line_path(line))) {
+                interfaces.push(mod);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    var out = String.new("");
+    start = 0; i = 0;
+    while (i <= registry.len) {
+        if (i == registry.len || registry.charAt(i) == 10) {
+            let line = registry.substring(start, i);
+            let mod = driver_line_module(line);
+            let is_vyi = driver_path_is_vyi(driver_line_path(line));
+            var has_interface = false;
+            var at: i64 = 0;
+            while (!is_vyi && at < interfaces.len) {
+                if (interfaces.get(at) == mod) { has_interface = true; break; }
+                at += 1;
+            }
+            var use_interface = is_vyi || has_interface;
+            if (mod == input_module) { use_interface = false; }
+            elif (driver_registry_has_exact_vyi_module(explicit_registry, mod)) { use_interface = true; }
+            elif (driver_registry_has_exact_module(explicit_registry, mod)) { use_interface = false; }
+            let selected = is_vyi == use_interface;
+            if (line.len > 0 && selected) {
+                out.append(line); out.append("\n");
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let view = out.as_str();
+    return from_cstr_len(view.c_str(), view.len);
+}
+
 fn driver_module_registry(input_path: string) -> string {
     let input_dir = driver_dirname(input_path);
     let input_parent_dir = driver_dirname(input_dir.clone());
@@ -4121,6 +4171,7 @@ fn driver_module_registry(input_path: string) -> string {
     // Keeping the path in the registry also makes the existing module+stem
     // de-duplication effective across compatibility and packaged std trees.
     out = driver_registry_append_module_source_path(out, input_path.clone());
+    let explicit_registry = out.clone();
     if (!cli_no_implicit_std()) {
         let packages_root = driver_find_std_packages_root();
         if (packages_root.len > 0) {
@@ -4230,6 +4281,7 @@ fn driver_module_registry(input_path: string) -> string {
     // of the same module win (for example std/hash.vyx versus
     // std_packages/core/src/hash.vyx), so the root and its import become two
     // definitions with identical native symbols.
+    out = driver_registry_select_transports(out, explicit_registry, driver_module_name_from_file(input_path.clone()));
     out = driver_registry_append_lock_aliases(out.clone(), input_path);
     driver_debug_import("registry_len=" + policy_i64_to_string(out.len as i64));
     return out;
@@ -5764,7 +5816,11 @@ fn vyi_format_params(params: rawptr) -> string {
         }
         let pty = decl_get_ty(cur);
         let pty_s = vyi_format_type(pty);
-        let param_piece = pname.clone() + ": " + pty_s.clone();
+        var param_prefix = "";
+        let param_markers = decl_get_generic_params(cur);
+        if (driver_string_contains(param_markers, "|variadic")) { param_prefix = "..."; }
+        elif (driver_string_contains(param_markers, "|param:mut")) { param_prefix = "mut "; }
+        let param_piece = param_prefix + pname.clone() + ": " + pty_s.clone();
         out = out.clone() + param_piece.clone();
         first = false;
         cur = decl_get_next(cur);
@@ -6059,17 +6115,22 @@ fn vyi_impl_suffix(gp: string) -> string {
     var out = "";
     var part_start = start;
     var p = start;
+    var depth: i32 = 0;
     while (p <= end) {
-        if (p == end || gp.charAt(p as i32) == 44) {
+        if (p == end || (gp.charAt(p as i32) == 44 && depth == 0)) {
             let raw_part = gp.substring(part_start as i32, p as i32);
             if (raw_part.len > 0) {
-                let part = driver_symbol_last_segment(raw_part);
+                let part = raw_part.trim();
                 if (part.len > 0) {
                     if (out.len > 0) { out = out + ", "; }
                     out = out + part;
                 }
             }
             part_start = p + 1;
+        } elif (gp.charAt(p as i32) == 60) {
+            depth += 1;
+        } elif (gp.charAt(p as i32) == 62) {
+            depth -= 1;
         }
         p = p + 1;
     }
@@ -6079,7 +6140,16 @@ fn vyi_impl_suffix(gp: string) -> string {
 
 /// Emit a function decl as a Vyx-syntax declaration line for .vyi.
 fn vyi_generic_param_clause(gp: string) -> string {
-    if (gp.len == 0 || string_starts_with(gp, "|")) { return ""; }
+    if (gp.len == 0) { return ""; }
+    if (string_starts_with(gp, "|")) {
+        let marker = "|generics:";
+        let at = gp.indexOf(marker);
+        if (at < 0) { return ""; }
+        var names = gp.substring(at + marker.len, gp.len);
+        let next = names.indexOf("|");
+        if (next >= 0) { names = names.substring(0, next); }
+        return if (names.len > 0) { "<" + names + ">" } else { "" };
+    }
     var names = gp;
     let marker = gp.indexOf("|");
     if (marker >= 0) { names = gp.substring(0, marker); }
@@ -6225,7 +6295,15 @@ fn vyi_emit_impl(d: rawptr, project_private: bool) -> string {
     if (suffix.startsWith(" : ")) {
         out = out + suffix.substring(3, suffix.len) + " for ";
     }
-    out = out + decl_get_name(d) + vyi_where_clause(gp) + " {\n";
+    var owner = decl_get_name(d);
+    let args_at = gp.indexOf("|impl_args:");
+    if (args_at >= 0) {
+        var args = gp.substring(args_at + 11, gp.len);
+        let next = args.indexOf("|");
+        if (next >= 0) { args = args.substring(0, next); }
+        if (args.len > 0) { owner = owner + "<" + args + ">"; }
+    }
+    out = out + owner + vyi_where_clause(gp) + " {\n";
     var m = decl_get_members(d);
     while (m != null) {
         if (decl_get_kind(m) == de_METHOD()
@@ -6281,6 +6359,30 @@ fn vyi_inherent_impl_has_private_owner(unit: rawptr, d: rawptr) -> bool {
     return false;
 }
 
+// 0: imported/unresolved here; 1: local public; 2: local private.
+// Shallow emission transports declarations before resolving imports, so an
+// imported trait/owner is checked by the consumer rather than discarded.
+fn vyi_impl_local_type_visibility(unit: rawptr, d: rawptr, spelling: string) -> i32 {
+    let base = policy_generic_call_base(spelling);
+    if (policy_primitive_type_kind(base.clone()) != 0) { return 1; }
+    var qualified = base.clone();
+    let scope = policy_module_base(decl_get_source_module(d));
+    if (!driver_string_contains(qualified, ".") && scope.len > 0) { qualified = intern_dot(scope, qualified); }
+    var cur = unit_get_decls(unit);
+    while (cur != null) {
+        let kind = decl_get_kind(cur);
+        if ((kind == de_CLASS() || kind == de_ENUM() || kind == de_TYPE_ALIAS())
+            && !driver_string_contains(decl_get_generic_params(cur), "|kind:impl")) {
+            var name = decl_get_name(cur);
+            let owner_scope = policy_module_base(decl_get_source_module(cur));
+            if (!driver_string_contains(name, ".") && owner_scope.len > 0) { name = intern_dot(owner_scope, name); }
+            if (name == qualified) { return if (driver_decl_exports_world(cur)) { 1 } else { 2 }; }
+        }
+        cur = decl_get_next(cur);
+    }
+    return 0;
+}
+
 fn vyi_impl_exports_public_contract(unit: rawptr, d: rawptr) -> bool {
     let suffix = vyi_impl_suffix(decl_get_generic_params(d));
     if (!suffix.startsWith(" : ")) {
@@ -6292,25 +6394,9 @@ fn vyi_impl_exports_public_contract(unit: rawptr, d: rawptr) -> bool {
         }
         return false;
     }
-    let trait_name = suffix.substring(3, suffix.len);
-    let target_name = decl_get_name(d);
-    var trait_public = false;
-    var target_public = policy_primitive_type_kind(target_name.clone()) != 0;
-    var cur = unit_get_decls(unit);
-    while (cur != null) {
-        let kind = decl_get_kind(cur);
-        let name = decl_get_name(cur);
-        if (kind == de_CLASS() && name == trait_name
-            && driver_decl_exports_world(cur)) {
-            trait_public = true;
-        }
-        if ((kind == de_CLASS() || kind == de_ENUM())
-            && name == target_name && driver_decl_exports_world(cur)) {
-            target_public = true;
-        }
-        cur = decl_get_next(cur);
-    }
-    return trait_public && target_public;
+    let trait_visibility = vyi_impl_local_type_visibility(unit, d, suffix.substring(3, suffix.len));
+    let owner_visibility = vyi_impl_local_type_visibility(unit, d, decl_get_name(d));
+    return trait_visibility != 2 && owner_visibility != 2;
 }
 
 /// Emit an enum decl with all variants for .vyi.

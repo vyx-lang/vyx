@@ -20,6 +20,21 @@ from publish import RECORD_NAMES, SDK_NAMES, reserve_tag, tag_candidate, validat
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_boot_native_inputs_close_over_imported_serde_packages(self):
+        import tomllib
+        build = REPO / "bootstrap_compiler"
+        boot = tomllib.loads((build / "Vyx.toml").read_text(encoding="utf8"))["target"]["boot"]
+        serde = build / "std_packages/serde"
+        packages = tomllib.loads((serde / "Vyx.toml").read_text(encoding="utf8"))["target"]
+        native = {(build / p).resolve() for p in boot["sources"] if Path(p).suffix in (".c", ".cpp")}
+        includes = {(build / p).resolve() for p in boot["include_paths"]}
+        for name in ("serde_json", "serde_toml"):
+            for source in packages[name]["sources"]:
+                if Path(source).suffix in (".c", ".cpp"):
+                    self.assertIn((serde / source).resolve(), native, name + " native dependency missing from boot")
+            for include in packages[name]["include_paths"]:
+                self.assertIn((serde / include).resolve(), includes, name + " include dependency missing from boot")
+
     def test_tbb_install_requires_every_configuration_and_current_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)

@@ -25,11 +25,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./probes/gates/generic_inter
 | `extended.ps1` | Nested free generics and private alias/constant/helper dependencies; same short function name in two defining modules; `Dict<string, i64>`; two independent consumers instantiate the same generic and link together |
 | `long-chains.ps1` | 620 generated local declarations plus a closure capturing two values survive interface serialization and consumer execution; a nongeneric extern/record surface does not receive a template payload |
 
-The `Dict` case uses the actual `std.collections.vyi` emitted during the compiler
-build and explicitly supplies `bootstrap_compiler/std/dict.vyx` via
-`--interface-unit-sources`. Std interfaces currently omit the template payload.
-This case therefore verifies the supported std source-unit path, not source-free
-distribution of all std generic implementations.
+The historical `Dict` case in `extended.ps1` supplies a compatibility source
+unit; it does not verify the maintained standard-library packages. Current
+`std.*` interfaces carry generic template artifacts under the same rules as
+application modules. The [compiler native stdlib gate](../bootstrap-native-stdlib/README.md)
+checks `std.ref` body transport and executes the TOML consumer with independently
+compiled current standard-library modules.
 
 The duplicate-consumer case links real COFF objects with repository clang/lld.
 It catches duplicate strong definitions while preserving canonical instance
@@ -61,7 +62,7 @@ compiler/toolchain identity separately when publishing evidence.
 Current source limits are 64 MiB of graph bytes, 200,000 nodes, 16 MiB per field,
 and structural depth 512. Statement/declaration `next` chains are processed
 iteratively; a flat list longer than 512 is not structural nesting. Runtime,
-`bootstrap`, `bootstrap.*`, and `std.*` modules omit this artifact. Marker-only
+`bootstrap` and `bootstrap.*` modules omit this artifact. Marker-only
 parser metadata is not sufficient to classify a declaration as generic.
 
 Changes to the public surface or payload change the artifact's hashes. This

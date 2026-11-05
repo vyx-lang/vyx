@@ -4,23 +4,73 @@ use std.core;
 use std.string;
 use std.collections;
 use std.clone;
+use std.ref;
 
 extern "C" {
-    fn vyx_toml_parse(text: rawptr, size: i64, failure: rawptr, capacity: i64, line: *i64) -> rawptr;
-    fn vyx_toml_free(value: rawptr);
-    fn vyx_toml_clone(value: rawptr) -> rawptr;
-    fn vyx_toml_type(value: rawptr) -> i32;
-    fn vyx_toml_line(value: rawptr) -> i64;
-    fn vyx_toml_column(value: rawptr) -> i64;
-    fn vyx_toml_size(value: rawptr) -> i64;
-    fn vyx_toml_get(value: rawptr, key: rawptr, length: i64, status: *i32) -> rawptr;
-    fn vyx_toml_at(value: rawptr, index: i64) -> rawptr;
-    fn vyx_toml_key(value: rawptr, index: i64, length: *i64) -> rawptr;
-    fn vyx_toml_string(value: rawptr, length: *i64) -> rawptr;
-    fn vyx_toml_integer(value: rawptr) -> i64;
-    fn vyx_toml_float(value: rawptr) -> f64;
-    fn vyx_toml_bool(value: rawptr) -> i32;
-    fn vyx_toml_datetime(value: rawptr, fields: rawptr);
+    fn vyx_aligned_alloc_abi(size: i64, alignment: i64) -> rawptr;
+    fn vyx_aligned_free_abi(value: rawptr);
+    fn memcmp(a: rawptr, b: rawptr, size: i64) -> i32;
+    fn vyx_toml_abi_result_size() -> u64;
+    fn vyx_toml_abi_result_align() -> u64;
+    fn vyx_toml_abi_parse(storage: rawptr, text: rawptr, size: i32);
+    fn vyx_toml_abi_free(storage: rawptr);
+    fn vyx_toml_abi_ok(storage: rawptr) -> i32;
+    fn vyx_toml_abi_error(storage: rawptr) -> rawptr;
+    fn vyx_toml_abi_root(storage: rawptr) -> rawptr;
+    fn vyx_toml_abi_type(node: rawptr) -> i32;
+    fn vyx_toml_abi_line(node: rawptr) -> i64;
+    fn vyx_toml_abi_column(node: rawptr) -> i64;
+    fn vyx_toml_abi_array_size(node: rawptr) -> i64;
+    fn vyx_toml_abi_table_size(node: rawptr) -> i64;
+    fn vyx_toml_abi_array_at(node: rawptr, index: i64) -> rawptr;
+    fn vyx_toml_abi_table_at(node: rawptr, index: i64) -> rawptr;
+    fn vyx_toml_abi_key(node: rawptr, index: i64) -> rawptr;
+    fn vyx_toml_abi_key_length(node: rawptr, index: i64) -> i64;
+    fn vyx_toml_abi_string(node: rawptr) -> rawptr;
+    fn vyx_toml_abi_string_length(node: rawptr) -> i64;
+    fn vyx_toml_abi_integer(node: rawptr) -> i64;
+    fn vyx_toml_abi_float(node: rawptr) -> f64;
+    fn vyx_toml_abi_bool(node: rawptr) -> i32;
+    fn vyx_toml_abi_datetime(node: rawptr, fields: rawptr);
+}
+
+class TomlTree {
+    public storage: rawptr;
+    public fn drop() {
+        if (self.storage != null) { vyx_toml_abi_free(self.storage); vyx_aligned_free_abi(self.storage); self.storage = null; }
+    }
+}
+
+fn toml_utf8_valid(text: string) -> bool {
+    var i: i64 = 0;
+    while (i < text.len) {
+        let ch = text.charAt(i); i += 1;
+        if (ch < 128) { if (ch == 0) { return false; } continue; }
+        var need: i32 = 0; var cp: i32 = 0; var minimum: i32 = 0;
+        if (ch >= 194 && ch <= 223) { need = 1; cp = ch & 31; minimum = 128; }
+        elif (ch >= 224 && ch <= 239) { need = 2; cp = ch & 15; minimum = 2048; }
+        elif (ch >= 240 && ch <= 244) { need = 3; cp = ch & 7; minimum = 65536; }
+        else { return false; }
+        if (need as i64 > text.len - i) { return false; }
+        while (need > 0) {
+            let next = text.charAt(i); i += 1; need -= 1;
+            if ((next & 192) != 128) { return false; }
+            cp = (cp << 6) | (next & 63);
+        }
+        if (cp < minimum || cp > 1114111 || (cp >= 55296 && cp <= 57343)) { return false; }
+    }
+    return true;
+}
+fn toml_error_line(message: string) -> i64 {
+    if (!message.startsWith("(line ")) { return 0; }
+    var line: i64 = 0; var i: i64 = 6;
+    while (i < message.len && message.charAt(i) >= 48 && message.charAt(i) <= 57) {
+        let digit = (message.charAt(i) - 48) as i64;
+        if (line > (9223372036854775807 - digit) / 10) { return 0; }
+        line = line * 10 + digit; i += 1;
+    }
+    if (i == 6 || i >= message.len || message.charAt(i) != 41) { return 0; }
+    return line;
 }
 
 public enum TomlKind { Invalid, Text, Integer, Float, Boolean, Date, Time, DateTime, OffsetDateTime, Array, Table }
@@ -53,17 +103,25 @@ public class TomlDateTime {
 /// Table keys are exact names, never implicitly split on dots.
 public class Toml {
     handle: rawptr;
+    owner: Ref<TomlTree>;
     public static fn parse(text: string) -> Result<Toml, TomlError> {
-        var failure = Vec::<u8>.with_capacity(256);
-        var i: i64 = 0;
-        while (i < 256) { failure.push(0 as u8); i += 1; }
-        var line: i64 = 0;
-        let handle = vyx_toml_parse(text.ptr, text.len, failure.data, failure.len, &line);
-        if (handle == null) { return Err(toml_failure(TomlErrorKind.Parse, from_cstr(failure.data), line, 0)); }
-        return Ok(Toml { handle: handle });
+        if (text.len > 16777216) { return Err(toml_failure(TomlErrorKind.Parse, "TOML document exceeds 16 MiB limit", 0, 0)); }
+        if (!toml_utf8_valid(text)) { return Err(toml_failure(TomlErrorKind.Parse, "TOML input must be valid UTF-8 without literal NUL bytes", 0, 0)); }
+        let buffer = vyx_aligned_alloc_abi(vyx_toml_abi_result_size() as i64, vyx_toml_abi_result_align() as i64);
+        if (buffer == null) { return Err(toml_failure(TomlErrorKind.Allocation, "TOML result allocation failed", 0, 0)); }
+        var tree = TomlTree { storage: buffer };
+        vyx_toml_abi_parse(tree.storage, text.ptr, text.len as i32);
+        if (vyx_toml_abi_ok(tree.storage) == 0) {
+            let message = from_cstr(vyx_toml_abi_error(tree.storage));
+            return Err(toml_failure(TomlErrorKind.Parse, message, toml_error_line(message), 0));
+        }
+        let handle = vyx_toml_abi_root(tree.storage);
+        let owner = Ref::<TomlTree>.new(tree);
+        return Ok(Toml { handle: handle, owner: owner });
     }
     public fn kind(&self) -> TomlKind {
-        match (vyx_toml_type(self.handle)) {
+        if (self.handle == null) { return TomlKind.Invalid; }
+        match (vyx_toml_abi_type(self.handle)) {
             1 => { return TomlKind.Text; } 2 => { return TomlKind.Integer; }
             3 => { return TomlKind.Float; } 4 => { return TomlKind.Boolean; }
             5 => { return TomlKind.Date; } 6 => { return TomlKind.Time; }
@@ -72,25 +130,29 @@ public class Toml {
             default => { return TomlKind.Invalid; }
         }
     }
-    public fn line(&self) -> i64 { return vyx_toml_line(self.handle); }
-    public fn column(&self) -> i64 { return vyx_toml_column(self.handle); }
+    public fn line(&self) -> i64 { return if (self.handle == null) { 0 } else { vyx_toml_abi_line(self.handle) }; }
+    public fn column(&self) -> i64 { return if (self.handle == null) { 0 } else { vyx_toml_abi_column(self.handle) }; }
     fn expect(&self, kind: TomlKind) -> Result<i32, TomlError> {
         if (self.handle == null) { return Err(toml_failure(TomlErrorKind.Destroyed, "TOML value was destroyed", 0, 0)); }
         if (self.kind() != kind) { return Err(toml_failure(TomlErrorKind.Type, "unexpected TOML value type", self.line(), self.column())); }
         return Ok(0);
     }
     public fn size(&self) -> Result<i64, TomlError> {
-        let size = vyx_toml_size(self.handle);
-        if (size < 0) { return Err(toml_failure(TomlErrorKind.Type, "expected TOML table or array", self.line(), self.column())); }
-        return Ok(size);
+        if (self.kind() == TomlKind.Array) { return Ok(vyx_toml_abi_array_size(self.handle)); }
+        if (self.kind() == TomlKind.Table) { return Ok(vyx_toml_abi_table_size(self.handle)); }
+        return Err(toml_failure(TomlErrorKind.Type, "expected TOML table or array", self.line(), self.column()));
     }
     public fn get(&self, key: string) -> Result<Option<Toml>, TomlError> {
         match (self.expect(TomlKind.Table)) { Err(e) => { return Err(e); } Ok(_) => {} }
-        var status: i32 = 0;
-        let child = vyx_toml_get(self.handle, key.ptr, key.len, &status);
-        if (status < 0) { return Err(toml_failure(TomlErrorKind.Allocation, "TOML handle allocation failed", self.line(), self.column())); }
-        if (status == 0) { return Ok(None); }
-        return Ok(Some(Toml { handle: child }));
+        var i: i64 = 0;
+        while (i < vyx_toml_abi_table_size(self.handle)) {
+            if (vyx_toml_abi_key_length(self.handle, i) == key.len
+                && memcmp(vyx_toml_abi_key(self.handle, i), key.ptr, key.len) == 0) {
+                return Ok(Some(Toml { handle: vyx_toml_abi_table_at(self.handle, i), owner: self.owner.clone() }));
+            }
+            i += 1;
+        }
+        return Ok(None);
     }
     public fn require(&self, key: string) -> Result<Toml, TomlError> {
         match (self.get(key)) {
@@ -105,18 +167,16 @@ public class Toml {
     }
     public fn at(&self, index: i64) -> Result<Toml, TomlError> {
         match (self.expect(TomlKind.Array)) { Err(e) => { return Err(e); } Ok(_) => {} }
-        if (index < 0 || index >= vyx_toml_size(self.handle)) { return Err(toml_failure(TomlErrorKind.Range, "TOML array index out of range", self.line(), self.column())); }
-        let child = vyx_toml_at(self.handle, index);
-        if (child == null) { return Err(toml_failure(TomlErrorKind.Allocation, "TOML handle allocation failed", self.line(), self.column())); }
-        return Ok(Toml { handle: child });
+        if (index < 0 || index >= vyx_toml_abi_array_size(self.handle)) { return Err(toml_failure(TomlErrorKind.Range, "TOML array index out of range", self.line(), self.column())); }
+        return Ok(Toml { handle: vyx_toml_abi_array_at(self.handle, index), owner: self.owner.clone() });
     }
     public fn keys(&self) -> Result<Vec<String>, TomlError> {
         match (self.expect(TomlKind.Table)) { Err(e) => { return Err(e); } Ok(_) => {} }
         var keys = Vec::<String>.new();
         var i: i64 = 0;
-        while (i < vyx_toml_size(self.handle)) {
-            var length: i64 = 0;
-            let ptr = vyx_toml_key(self.handle, i, &length);
+        while (i < vyx_toml_abi_table_size(self.handle)) {
+            let length = vyx_toml_abi_key_length(self.handle, i);
+            let ptr = vyx_toml_abi_key(self.handle, i);
             keys.push(String.fromBytes(ptr, length));
             i += 1;
         }
@@ -124,21 +184,21 @@ public class Toml {
     }
     public fn as_string(&self) -> Result<String, TomlError> {
         match (self.expect(TomlKind.Text)) { Err(e) => { return Err(e); } Ok(_) => {} }
-        var length: i64 = 0;
-        let ptr = vyx_toml_string(self.handle, &length);
+        let length = vyx_toml_abi_string_length(self.handle);
+        let ptr = vyx_toml_abi_string(self.handle);
         return Ok(String.fromBytes(ptr, length));
     }
     public fn as_i64(&self) -> Result<i64, TomlError> {
         match (self.expect(TomlKind.Integer)) { Err(e) => { return Err(e); } Ok(_) => {} }
-        return Ok(vyx_toml_integer(self.handle));
+        return Ok(vyx_toml_abi_integer(self.handle));
     }
     public fn as_f64(&self) -> Result<f64, TomlError> {
         match (self.expect(TomlKind.Float)) { Err(e) => { return Err(e); } Ok(_) => {} }
-        return Ok(vyx_toml_float(self.handle));
+        return Ok(vyx_toml_abi_float(self.handle));
     }
     public fn as_bool(&self) -> Result<bool, TomlError> {
         match (self.expect(TomlKind.Boolean)) { Err(e) => { return Err(e); } Ok(_) => {} }
-        return Ok(vyx_toml_bool(self.handle) != 0);
+        return Ok(vyx_toml_abi_bool(self.handle) != 0);
     }
     public fn as_datetime(&self) -> Result<TomlDateTime, TomlError> {
         let k = self.kind();
@@ -146,17 +206,15 @@ public class Toml {
         var fields = Vec::<i32>.with_capacity(8);
         var i: i32 = 0;
         while (i < 8) { fields.push(0); i += 1; }
-        vyx_toml_datetime(self.handle, fields.data);
+        vyx_toml_abi_datetime(self.handle, fields.data);
         return Ok(TomlDateTime { kind: k, year: fields.get(0), month: fields.get(1), day: fields.get(2), hour: fields.get(3), minute: fields.get(4), second: fields.get(5), microsecond: fields.get(6), offset_minutes: fields.get(7) });
     }
     public fn try_clone(&self) -> Result<Toml, TomlError> {
         if (self.handle == null) { return Err(toml_failure(TomlErrorKind.Destroyed, "TOML value was destroyed", 0, 0)); }
-        let copy = vyx_toml_clone(self.handle);
-        if (copy == null) { return Err(toml_failure(TomlErrorKind.Allocation, "TOML handle allocation failed", 0, 0)); }
-        return Ok(Toml { handle: copy });
+        return Ok(Toml { handle: self.handle, owner: self.owner.clone() });
     }
     public fn destroy() { self.drop(); }
-    public fn drop() { if (self.handle != null) { vyx_toml_free(self.handle); self.handle = null; } }
+    public fn drop() { self.owner.drop(); self.handle = null; }
 }
 impl Clone for Toml {
     public fn clone(&self) -> Toml {

@@ -35,7 +35,7 @@ def main():
     if __import__('sys').platform == 'darwin': environment['ASAN_OPTIONS'] = 'detect_leaks=0:abort_on_error=1'
     result = subprocess.run([str(out / 'native-engines')], env=environment, capture_output=True)
     (out / 'run.log').write_bytes(result.stdout + result.stderr)
-    inputs = native + [ROOT / 'bootstrap_compiler/std_packages/serde/native/toml_bridge.c',
+    inputs = native + [ROOT / 'bootstrap_compiler/std_packages/serde/native/toml_abi.c',
                       *sorted((package / 'vendor/pcre2').glob('*.h')),
                       ROOT / 'bootstrap_compiler/std_packages/serde/vendor/tomlc17/tomlc17.h']
     (out / 'verification.json').write_text(json.dumps(dict(command=command, exit=result.returncode,

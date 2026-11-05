@@ -1,45 +1,56 @@
-/* Exercise the actual bridge sources. Wrappers count live native resources;
-   PCRE2/tomlc17 still come from the real linked standard packages. */
-#define vyx_regex_compile regex_compile_impl
-#define vyx_regex_free regex_free_impl
-#include "../../../../bootstrap_compiler/std_packages/regex/native/regex_bridge.c"
-#undef vyx_regex_compile
-#undef vyx_regex_free
-#define vyx_toml_parse toml_parse_impl
-#define vyx_toml_get toml_get_impl
-#define vyx_toml_at toml_at_impl
-#define vyx_toml_clone toml_clone_impl
-#define vyx_toml_free toml_free_impl
-#include "../../../../bootstrap_compiler/std_packages/serde/native/toml_bridge.c"
-#undef vyx_toml_parse
-#undef vyx_toml_get
-#undef vyx_toml_at
-#undef vyx_toml_clone
-#undef vyx_toml_free
+/* Test instrumentation around the actual engine, not a production wrapper. */
+#define pcre2_compile_8 counted_compile_impl
+#define pcre2_code_free_8 counted_free_impl
+#include "../../../../bootstrap_compiler/std_packages/regex/vendor/pcre2/pcre2_compile.c"
+#undef pcre2_compile_8
+#undef pcre2_code_free_8
 
-static int64_t regex_live, toml_live;
+#define pcre2_match_data_create_from_pattern_8 counted_data_create_impl
+#define pcre2_match_data_free_8 counted_data_free_impl
+#include "../../../../bootstrap_compiler/std_packages/regex/vendor/pcre2/pcre2_match_data.c"
+#undef pcre2_match_data_create_from_pattern_8
+#undef pcre2_match_data_free_8
+#define pcre2_match_context_create_8 counted_context_create_impl
+#define pcre2_match_context_free_8 counted_context_free_impl
+#include "../../../../bootstrap_compiler/std_packages/regex/vendor/pcre2/pcre2_context.c"
+#undef pcre2_match_context_create_8
+#undef pcre2_match_context_free_8
+
+#define vyx_toml_abi_parse counted_toml_parse_impl
+#define vyx_toml_abi_free counted_toml_free_impl
+#include "../../../../bootstrap_compiler/std_packages/serde/native/toml_abi.c"
+#undef vyx_toml_abi_parse
+#undef vyx_toml_abi_free
+
+static int64_t regex_live, toml_live, data_live, context_live;
+static int fail_scratch;
 int64_t std_engines_live_regex(void) { return regex_live; }
 int64_t std_engines_live_toml(void) { return toml_live; }
-void *vyx_regex_compile(const void *pattern, int64_t length, int32_t flags, int32_t *failure, int64_t *offset) {
-    void *p = regex_compile_impl(pattern, length, flags, failure, offset);
+int64_t std_engines_live_scratch(void) { return data_live + context_live; }
+void std_engines_fail_scratch(int mode) { fail_scratch = mode; }
+
+pcre2_code *pcre2_compile_8(PCRE2_SPTR pattern, PCRE2_SIZE length, uint32_t flags,
+                         int *failure, PCRE2_SIZE *offset, pcre2_compile_context *context) {
+    pcre2_code *p = counted_compile_impl(pattern, length, flags, failure, offset, context);
     if (p) ++regex_live;
     return p;
 }
-void vyx_regex_free(void *p) { if (p) --regex_live; regex_free_impl(p); }
-void *vyx_toml_parse(const void *text, int64_t size, char *failure, int64_t cap, int64_t *line) {
-    void *p = toml_parse_impl(text, size, failure, cap, line);
-    if (p) ++toml_live;
+void pcre2_code_free_8(pcre2_code *p) { if (p) --regex_live; counted_free_impl(p); }
+pcre2_match_data *pcre2_match_data_create_from_pattern_8(const pcre2_code *code, pcre2_general_context *context) {
+    if (fail_scratch == 1) { fail_scratch = 0; return NULL; }
+    pcre2_match_data *p = counted_data_create_impl(code, context);
+    if (p) ++data_live;
     return p;
 }
-void *vyx_toml_get(void *raw, const void *key, int64_t len, int32_t *status) {
-    void *p = toml_get_impl(raw, key, len, status);
-    if (p) ++toml_live;
+void pcre2_match_data_free_8(pcre2_match_data *p) { if (p) --data_live; counted_data_free_impl(p); }
+pcre2_match_context *pcre2_match_context_create_8(pcre2_general_context *context) {
+    if (fail_scratch == 2) { fail_scratch = 0; return NULL; }
+    pcre2_match_context *p = counted_context_create_impl(context);
+    if (p) ++context_live;
     return p;
 }
-void *vyx_toml_at(void *raw, int64_t index) {
-    void *p = toml_at_impl(raw, index); if (p) ++toml_live; return p;
+void pcre2_match_context_free_8(pcre2_match_context *p) { if (p) --context_live; counted_context_free_impl(p); }
+void vyx_toml_abi_parse(void *out, const char *text, int32_t length) {
+    counted_toml_parse_impl(out, text, length); ++toml_live;
 }
-void *vyx_toml_clone(void *raw) {
-    void *p = toml_clone_impl(raw); if (p) ++toml_live; return p;
-}
-void vyx_toml_free(void *raw) { if (raw) --toml_live; toml_free_impl(raw); }
+void vyx_toml_abi_free(void *storage) { --toml_live; counted_toml_free_impl(storage); }
