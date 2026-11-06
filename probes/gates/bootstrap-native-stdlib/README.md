@@ -5,6 +5,9 @@ stdlib C/C++ sources and include paths with its `parallel_vyx` and
 `parallel_std_sources` settings. It does not use the normal application's
 `std:serde` static-package link path. The fixture calls both the legacy manifest
 helpers and the typed TOML/JSON APIs and runs the result at O0/O2.
+It also instantiates `Vec<i32>.iter()`, consumes `Iterator<i32>.next()` and clones
+the vector through the generated module interfaces. The source exclusion list
+must keep `collections/src/iter.vyx`: `Vec.iter` exposes that class's layout.
 
 ```sh
 python probes/gates/bootstrap-native-stdlib/run.py --compiler /path/to/current/vyxc --output .cache/bootstrap-native-stdlib

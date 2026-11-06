@@ -336,6 +336,8 @@ def native(args):
     record["dci_native_export"] = json.loads((REPO / "probes/gates/dci-native-export/.cache/verification.json").read_text())
     from package_macos import package
     archive = package(build, llvm, args.output.resolve(), arch, environment, work)
+    record["packaged_bootstrap_standard_library"] = json.loads(
+        (work / "packaged-bootstrap/bootstrap-stdlib/verification.json").read_text(encoding="utf-8"))
     checksum_sidecar(archive)
     record.update(compiler_sha256=sha256(out / "boot"), backend_sha256=sha256(backend),
                   runtime_sha256=sha256(out / "libvyx_runtime.a"), archive_sha256=sha256(archive),

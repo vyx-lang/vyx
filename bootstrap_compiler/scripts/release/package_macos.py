@@ -220,6 +220,9 @@ def package(build, llvm, output, arch, environment, work):
         run([sys.executable, REPO / "probes/gates/aot-portability/run.py", "--backend",
              relocated / "bin/libvyx_compiler_backend.dylib", "--compiler", relocated / "bin/vyxc",
              "--output", work / "packaged-sdk-smoke"], env=smoke_environment)
+        run([sys.executable, REPO / "probes/gates/bootstrap-stdlib/run.py",
+             "--compiler", relocated / "bin/vyxc", "--sdk", relocated,
+             "--output", work / "packaged-bootstrap"], env=smoke_environment)
         run([relocated / "bin/vyxc-lsp", "--help"], env=smoke_environment)
         cxx = work / "standard-library.cpp"
         cxx.write_text('#include <vector>\nint main() { std::vector<int> v{1,2,3}; return v.at(2) == 3 ? 0 : 1; }\n')

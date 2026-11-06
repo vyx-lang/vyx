@@ -509,6 +509,11 @@ def main():
          "--backend", packaged / "bin" / backend.name,
          "--compiler", packaged / "bin" / ("vyxc.exe" if windows else "vyxc"),
          "--output", work / "packaged-sdk-smoke"], env=smoke_environment)
+    run([sys.executable, REPO / "probes/gates/bootstrap-stdlib/run.py",
+         "--compiler", packaged / "bin" / ("vyxc.exe" if windows else "vyxc"),
+         "--sdk", packaged, "--output", work / "packaged-bootstrap"], env=smoke_environment)
+    record["packaged_bootstrap_standard_library"] = json.loads(
+        (work / "packaged-bootstrap/bootstrap-stdlib/verification.json").read_text(encoding="utf-8"))
     archive = output / name
     checksum_sidecar(archive)
     record.update(compiler_sha256=sha256(built_compiler), archive_sha256=sha256(archive),

@@ -42,6 +42,11 @@ The [bootstrap std gate](../../../../probes/gates/bootstrap-stdlib/README.md)
 builds and runs a small parallel project before the full compiler build, checks
 that the two roots agree, and records registry/source hashes. Native Windows,
 Linux and macOS builds and the macOS cross exporter use the same check.
+The selected sources include `collections/src/iter.vyx` alongside `vec.vyx`;
+the latter's `iter()` method requires the former's `Iterator<T>` layout.
+The same preflight runs again with each packaged native SDK before publication,
+and its result is recorded as `packaged_bootstrap_standard_library`. This checks
+the standard-library inputs that the next release will use as Stage 0.
 The manifest is restored before the current compiler builds tools or the SDK is
 packaged. It then selects the current checkout's maintained `std_packages`.
 The native C++ bridge is built first. Stage 0 then loads that bridge from a
