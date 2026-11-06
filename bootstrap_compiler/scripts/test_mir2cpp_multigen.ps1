@@ -67,7 +67,7 @@ function Test-RegistryIgnoredPath {
 
 $snapshotSourceTrees = @(
     (Join-Path $bootstrapRoot "src"),
-    (Join-Path $bootstrapRoot "std"),
+    (Join-Path $bootstrapRoot "std_packages"),
     (Join-Path $repoRoot "vyx_codegen\src"),
     (Join-Path $repoRoot "vyx_codegen\include"),
     (Join-Path $repoRoot "third_party\cjson")
@@ -288,7 +288,7 @@ function New-MinimalSnapshot {
     New-Item -ItemType Directory -Path $snapshotThirdParty | Out-Null
     Copy-Item -LiteralPath (Join-Path $bootstrapRoot "Vyx.toml") -Destination $snapshotBootstrap
     Copy-Item -LiteralPath (Join-Path $bootstrapRoot "src") -Destination $snapshotBootstrap -Recurse
-    Copy-Item -LiteralPath (Join-Path $bootstrapRoot "std") -Destination $snapshotBootstrap -Recurse
+    Copy-Item -LiteralPath (Join-Path $bootstrapRoot "std_packages") -Destination $snapshotBootstrap -Recurse
     Copy-Item -LiteralPath (Join-Path $repoRoot "vyx_codegen\src") -Destination $snapshotCodegen -Recurse
     Copy-Item -LiteralPath (Join-Path $repoRoot "vyx_codegen\include") -Destination $snapshotCodegen -Recurse
     Copy-Item -LiteralPath (Join-Path $repoRoot "third_party\cjson") -Destination $snapshotThirdParty -Recurse

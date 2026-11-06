@@ -20,7 +20,7 @@
 |---|---|---|
 | 自举编译器 | `bootstrap_compiler/src/{core,hir,mir,codegen}/` | [编译器 README](bootstrap_compiler/README.md)、[验证指南](docs/TESTING_GUIDE_ZH.md) |
 | LLVM 桥接与运行时 | `vyx_codegen/`、`runtime/` | `bootstrap_compiler/Vyx.toml`、验证指南 |
-| 标准库 | `bootstrap_compiler/std_packages/`、`std_packages/`；`bootstrap_compiler/std/` 为兼容入口 | [标准库参考](docs/STD_LIBRARY.zh-CN.md) |
+| 标准库 | `bootstrap_compiler/std_packages/`；SDK 内安装为 `std_packages/` | [标准库参考](docs/STD_LIBRARY.zh-CN.md) |
 | DCI 生产端与契约工具 | `tools/dci/`；消费端在自举编译器 | [DCI 规范](docs/DCI_SPEC_ZH.md)、[事实语义所有权系统](docs/MOSP_ZH.md) |
 | 回归与压力测试 | `tests/`、`probes/gates/` | 各夹具 README / `run.ps1` |
 | Zyn UI 框架 | `Zyn/`、`samples/projects/zyn_*` | [使用说明与边界](Zyn/README.md)、[组合与布局](Zyn/docs/COMPOSITION_ZH.md) |
@@ -34,7 +34,7 @@
 - 修复必须覆盖真实使用路径。不能把单个能力探针通过写成工业级目标已经完成。
 - 编译器语义修改落在 `bootstrap_compiler/`、`vyx_codegen/`、`tools/dci/`；
   探针落在 `probes/gates/<任务>/`，项目夹具落在 `tests/projects/`。
-- repo-root `src/` 是冻结的 C++ host，repo-root `std/` 是冻结的旧标准库。
+- repo-root `src/` 是冻结的 C++ host；展平的旧标准库已移除。
   不复活旧 host，不为其旧 IR 快照添加编译器特例。
 - 不新增 fail-open：不能用名字 replace/join、末段模糊匹配、null/rawptr 万能相容、
   `{i8}` 假布局或 `_silent` 吞诊断掩盖缺口。类型、布局或生命周期未知时要报告错误。
@@ -154,7 +154,7 @@ Zyn 按底层到应用推进。只有真实依赖项目构建并运行后，才�
 - 新公开类型至少进入一个真实 smoke 项目。绘制 API 必须连接到实际 GPU 工作。
 - 裁剪或 transform 命令必须同时作用于 solid 和 textured 路径，否则明确拒绝。
 - 图片用二进制读取；禁止文本读取路径截断 NUL 字节。
-- 图片解码使用私有 `Zyn/vendor/stb/` 和 `stb_impl.c`，不依赖或修改根 `std/stb_image.vyx`。
+- 图片解码使用私有 `Zyn/vendor/stb/` 和 `stb_impl.c`。
   字体链接与加载使用 `Zyn/vendor/FreeType/`、`Zyn/vendor/HarfBuzz/` 的私有副本。
 - 可失败操作返回显式 `Result`，不吞 backend 错误。
 - 每个获得的 SDL3 / Cacao 资源恰好销毁一次，公开 handle 重复销毁保持无害。

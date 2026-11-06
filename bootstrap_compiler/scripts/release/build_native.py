@@ -57,6 +57,8 @@ def check_tbb_install(compiler, library, work, environment):
 
 def check_standard_library(compiler, work, environment):
     output = work / "stdlib-contracts"
+    run([sys.executable, REPO / "probes/gates/stdlib-package-discovery/run.py",
+         "--compiler", compiler, "--output", output / "package-discovery"], env=environment)
     run([sys.executable, REPO / "probes/gates/bootstrap-native-stdlib/run.py",
          "--compiler", compiler, "--output", output / "bootstrap-native"], env=environment)
     run([sys.executable, REPO / "probes/gates/full-expression/run.py", "--compiler", compiler,

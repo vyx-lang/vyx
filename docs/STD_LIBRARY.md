@@ -10,8 +10,8 @@
 `bootstrap_compiler/std_packages/` is the single authority for std sources.
 `--src=file` loads implicit `std.*` through `bootstrap_compiler/std_packages/registry`,
 which forwards to each package's `.vyx` sources. Make standard-library changes
-in `std_packages/`; the flattened `bootstrap_compiler/std/` and root `std/`
-trees are legacy sources, not implementation entry points.
+in this directory. SDKs install it as `std_packages/`. The flat standard-library
+copies have been removed, along with their implicit search paths.
 
 Authority check: `probes/gates/h/std_single_truth.sh` forbids the same
 non-FFI module basename from appearing in two packages, and probes that
@@ -279,9 +279,9 @@ cacao = { path = "std:cacao", target = "std_cacao" }
 Link the corresponding native library on the consumer target (`libs` /
 `lib_paths`), the same way `samples/projects/cacao` links Cacao.
 
-The flat `std.cjson` binding was removed. An explicit source package disables
-that target's implicit flat-std lookup: a missing dependency is an import error,
-not a silent fallback to a compatibility mirror.
+The flat `std.cjson` binding was removed. Project targets resolve standard
+modules through declared package dependencies; a missing dependency is an
+import error.
 
 ## Common entry points and compiler intrinsics
 

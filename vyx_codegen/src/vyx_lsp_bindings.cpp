@@ -256,8 +256,17 @@ const Fact* at(const File& f,int line,int character) {
         if(character>=start && character<end && !fact.binding.empty()) return &fact;
     } return nullptr;
 }
+bool retired_standard_path(const std::string& path) {
+    const auto& root=g_lsp_index->root;
+    if(root.empty() || path.compare(0,root.size(),root)!=0 ||
+       path.size()<=root.size() || path[root.size()]!='/') return false;
+    const auto relative=path.substr(root.size()+1);
+    return relative=="std" || relative.compare(0,4,"std/")==0 ||
+           relative=="bootstrap_compiler/std" || relative.compare(0,23,"bootstrap_compiler/std/")==0;
+}
 bool registry_file(const File& f) {
     const auto path=path_key(f.path);
+    if(retired_standard_path(path)) return false;
     for(auto& root:g_lsp_index->standard_roots)
         if(path.compare(0,root.first.size(),root.first)==0 &&
            (path.size()==root.first.size() || path[root.first.size()]=='/'))
@@ -561,7 +570,8 @@ extern "C" VYX_API void vyx_lsp_bind_query(const char* path,int32_t line,int32_t
         while(iter!=end && !ec) {
             auto entry=*iter; auto name=entry.path().filename().u8string();
             if(entry.is_directory(ec)) {
-                if(iter.depth()>=12 || excluded.count(name) || name.compare(0,5,"seed_")==0 || entry.is_symlink(ec)) iter.disable_recursion_pending();
+                if(iter.depth()>=12 || excluded.count(name) || name.compare(0,5,"seed_")==0 ||
+                   retired_standard_path(path_key(entry.path().generic_u8string())) || entry.is_symlink(ec)) iter.disable_recursion_pending();
             } else if(entry.path().extension()==".vyx") {
                 auto filename=entry.path().generic_u8string(), key=path_key(filename);
                 if(!g_lsp_index->files.count(key)) {

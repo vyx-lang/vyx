@@ -11,7 +11,7 @@ param(
     [string]$OutDir = "",
     [string[]]$Workloads = @(),
     [switch]$SkipCppLto,
-    [switch]$SkipHost,
+    [switch]$SkipHost = $true,
     [switch]$SkipBootstrap,
     [switch]$SkipCpp26,
     [int]$RuntimeWarmups = 1,
@@ -29,6 +29,10 @@ if ($OutDir.Length -eq 0) { $OutDir = Join-Path $benchRoot "out" }
 elseif (-not [System.IO.Path]::IsPathRooted($OutDir)) {
     $OutDir = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutDir))
 }
+if (-not $SkipHost) {
+    throw 'The frozen host standard library was retired; use the SDK compiler benchmark.'
+}
+$env:VYX_STD_PACKAGES = Join-Path $repoRoot "bootstrap_compiler/std_packages"
 $workRoot = Join-Path $OutDir "work"
 $logRoot = Join-Path $OutDir "logs"
 $csvPath = Join-Path $OutDir "results.csv"
@@ -232,18 +236,6 @@ function Invoke-Cpp26Build([string]$Workspace, [string]$LogPath) {
     return Invoke-Captured "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $script) $Workspace $LogPath
 }
 
-function Sync-VyxStd([string]$Workspace, [string]$Tool) {
-    $stdSource = if ($Tool -eq "bootstrap") {
-        Join-Path $repoRoot "bootstrap_compiler/std"
-    } else {
-        Join-Path $repoRoot "std"
-    }
-    $stdDest = Join-Path $Workspace "std"
-    if ((Test-Path $stdSource) -and -not (Test-Path $stdDest)) {
-        Copy-Item -Path $stdSource -Destination $stdDest -Recurse -Force
-    }
-}
-
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function Write-Utf8Text([string]$Path, [string]$Text) {
@@ -265,7 +257,6 @@ function Add-Utf8Line([string]$Path, [string]$Text) {
 }
 
 function Invoke-VyxBuild([string]$Compiler, [string]$Workspace, [string]$LogPath, [string]$Tool) {
-    Sync-VyxStd $Workspace $Tool
     $args = [System.Collections.Generic.List[string]]::new()
     [void]$args.Add("build")
     if ($OptFlag.Length -gt 0) { [void]$args.Add($OptFlag) }
@@ -589,8 +580,7 @@ if (-not $SkipCpp26) {
     $cppLtoMode = if ($SkipCppLto) { "disabled" } else { "enabled (-flto, lld)" }
     Write-ProgressLine "cpp26 whole-program LTO: $cppLtoMode"
 }
-if (-not $SkipHost) { Write-ProgressLine "host std: $(Join-Path $repoRoot 'std')" }
-if (-not $SkipBootstrap) { Write-ProgressLine "bootstrap std: $(Join-Path $repoRoot 'bootstrap_compiler/std')" }
+if (-not $SkipBootstrap) { Write-ProgressLine "bootstrap std: $(Join-Path $repoRoot 'bootstrap_compiler/std_packages')" }
 if (-not $SkipRuntime) {
     Write-ProgressLine ("runtime runs: warmups={0} measured={1} timeout={2}s" -f $RuntimeWarmups,$RuntimeRuns,$RunTimeoutSec)
     if ($VyxRuntimePath.Length -gt 0) { Write-ProgressLine "vyx runtime path: $VyxRuntimePath" }

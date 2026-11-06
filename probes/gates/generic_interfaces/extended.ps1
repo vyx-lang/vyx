@@ -100,7 +100,7 @@ Capture-Case 'same-short-name' {
 
 Capture-Case 'std-dict-string-i64' {
     $stdUnitSources = Join-Path $run 'std.unit_sources'
-    (Resolve-Path (Join-Path $repo 'bootstrap_compiler/std/dict.vyx')).Path | Set-Content $stdUnitSources
+    (Resolve-Path (Join-Path $repo 'bootstrap_compiler/std_packages/collections/src/dict.vyx')).Path | Set-Content $stdUnitSources
     Run-InterfaceCase 'std-dict-string-i64' (Join-Path $fixture 'DictProducer.vyx') (Join-Path $fixture 'DictConsumer.vyx') 'DictProducer' $stdUnitSources
 }
 

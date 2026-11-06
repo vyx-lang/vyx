@@ -31,12 +31,14 @@ def main():
                          ' + std.editor_provider.helper(); }\n')
             main_file.write_text(main_text, encoding='utf-8')
             def provider(root, value):
-                src = root / 'editor' / 'src'
+                # std_packages/std is a valid package, unlike the retired
+                # workspace/std and workspace/bootstrap_compiler/std roots.
+                src = root / 'std' / 'src'
                 src.mkdir(parents=True)
                 selected, helper = src / 'primary.vyx', src / 'extension.vyx'
                 selected.write_text(f'module std.editor_provider;\npublic fn selected() -> i32 {{ return {value}; }}\n', encoding='utf-8')
                 helper.write_text('module std.editor_provider;\npublic fn helper() -> i32 { return 7; }\n', encoding='utf-8')
-                (root / 'registry').write_text('editor/src/primary.vyx\neditor/src/extension.vyx\n', encoding='utf-8')
+                (root / 'registry').write_text('std/src/primary.vyx\nstd/src/extension.vyx\n', encoding='utf-8')
                 return selected, helper
             local = provider(workspace / 'std_packages', 11)
             override_root = base / 'override_packages'
@@ -44,6 +46,9 @@ def main():
             legacy = workspace / 'std'
             legacy.mkdir()
             (legacy / 'editor.vyx').write_text('module std.editor_provider;\npublic fn selected() -> i32 { return 99; }\n', encoding='utf-8')
+            old_bootstrap = workspace / 'bootstrap_compiler/std'
+            old_bootstrap.mkdir(parents=True)
+            (old_bootstrap / 'editor.vyx').write_text('module std.editor_provider;\npublic fn selected() -> i32 { return 100; }\n', encoding='utf-8')
             for explicit, expected in ((False, local), (True, override)):
                 if explicit:
                     os.environ['VYX_STD_PACKAGES'] = str(override_root)

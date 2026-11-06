@@ -7,7 +7,7 @@
 
 > `bootstrap_compiler/std_packages/` 是 std 源码的唯一权威。`--src=file` 经该目录
 > 根上的 `registry` 转发到各 package 的 `.vyx`。标准库修改只落在 `std_packages/`；
-> 展平的 `bootstrap_compiler/std/` 和根目录 `std/` 都是旧源码，不作为实现入口。
+> SDK 中安装为 `std_packages/`。两份展平旧库及其隐式搜索路径已移除。
 >
 > 权威门：`probes/gates/h/std_single_truth.sh` 要求非 FFI 模块 basename 不得
 > 出现在两个 package，并探测 SDK 编译器能导入真实 std 模块。
@@ -247,8 +247,8 @@ cacao = { path = "std:cacao", target = "std_cacao" }
 `samples/projects/cacao` 相同）。SQLite、OpenSSL 等已声明公开链接依赖的包会
 传播库名和相应搜索路径；消费方仍须安装匹配目标的原生库并部署动态运行库。
 
-`std.cjson` 平铺 binding 已移除。显式 source package 会关闭该 target 的隐式
-flat-std 搜索；漏写依赖会在 import 阶段直接报错，而不是静默拾取兼容镜像。
+`std.cjson` 平铺 binding 已移除。项目 target 通过声明的包依赖解析标准库模块；
+漏写依赖会在 import 阶段直接报错。
 
 ---
 

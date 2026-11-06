@@ -232,10 +232,20 @@ def package(args):
         raise ValueError('Termux prefix must be an absolute normalized path')
     installed_sdk = prefix / 'lib/vyx-sdk'
     sdk = stage / str(installed_sdk).lstrip('/')
+    # Older base packages contain a retired flat standard-library snapshot.
+    # Do not carry it into an otherwise updated SDK.
+    if not sdk.resolve().is_relative_to(stage.resolve()):
+        raise ValueError(f'SDK destination escapes staging: {sdk}')
+    legacy_std = sdk / 'std'
+    if legacy_std.is_symlink():
+        legacy_std.unlink()
+    elif legacy_std.exists():
+        if not legacy_std.resolve().is_relative_to(stage.resolve()):
+            raise ValueError(f'Legacy standard library escapes staging: {legacy_std}')
+        shutil.rmtree(legacy_std)
     source_root = args.source_root.resolve() if args.source_root else None
     if source_root:
         assets = {
-            'std': source_root / 'bootstrap_compiler/std',
             'std_packages': source_root / 'bootstrap_compiler/std_packages',
             'tools': source_root / 'bootstrap_compiler/tools',
         }
@@ -307,7 +317,7 @@ exec "$VYX_HOME/bin/vyxc.bin" "$@"
     if source_root:
         manifest['source_asset_sha256'] = {
             path.relative_to(sdk).as_posix(): sha256(path)
-            for relative in ('std', 'std_packages', 'tools')
+            for relative in ('std_packages', 'tools')
             for path in sorted((sdk / relative).rglob('*')) if path.is_file()
         }
     manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')

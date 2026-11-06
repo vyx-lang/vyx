@@ -366,8 +366,8 @@ mir-verify hir-facts`。LLVM 是验收后端；`cpp` 是实验。
 对齐和压力测试留待后续，AOT 验证结果不代表相同操作已经支持 JIT。
 
 活动树：`bootstrap_compiler/`（lexer → parse → Sema → HIR → MIR → LLVM）。
-已归档 C++ Host：仓库根 `src/`。冻结 host std：仓库根 `std/`。权威 std：
-`bootstrap_compiler/std_packages/`。
+已归档 C++ Host：仓库根 `src/`。标准库源码：
+`bootstrap_compiler/std_packages/`；展平旧库已移除。
 
 构建与门： [TESTING_GUIDE_ZH.md](TESTING_GUIDE_ZH.md)。课表对照：
 [语言表面](语言表面_ZH.md)。

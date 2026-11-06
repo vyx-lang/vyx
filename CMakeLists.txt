@@ -115,7 +115,7 @@ target_link_libraries(vyx PRIVATE vyxc_core)
 # Optional AddressSanitizer support: cmake -DENABLE_ASAN=ON ..
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
-# Self-host LLVM backend DLL (loaded by Vyx-min via std/dll.vyx).
+# Self-host LLVM backend DLL (loaded through the std:dll package).
 # Toggle with -DBUILD_BOOTSTRAP=OFF to skip if you only want vyxc/vyx.
 option(BUILD_BOOTSTRAP "Build the private Vyx compiler backend" ON)
 if(BUILD_BOOTSTRAP)

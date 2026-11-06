@@ -188,7 +188,7 @@ try {
         Copy-CleanTree -Source $debugAdapter -DestinationPath (Join-Path $bin.FullName "debugger")
     }
 
-    foreach ($directory in @("std", "std_packages", "tools")) {
+    foreach ($directory in @("std_packages", "tools")) {
         $source = Join-Path $bootstrap $directory
         if (Test-Path -LiteralPath $source -PathType Container) {
             Copy-CleanTree -Source $source -DestinationPath (Join-Path $stage $directory)

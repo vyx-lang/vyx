@@ -60,7 +60,7 @@ def main():
             f"public fn unused() -> i32 {{ return {index}; }}\n", encoding="utf-8")
     for name in ("hello", "consumer", "missing"):
         shutil.copyfile(FIXTURES / f"{name}.vyx", generated / f"{name}.vyx")
-    # This makes input_std look valid to the implicit compatibility-root check.
+    # A retired flat std layout must not become an implicit import root.
     std = generated / "std"
     std.mkdir()
     (std / "clone.vyx").write_text(
@@ -80,6 +80,7 @@ def main():
     lexical_function_sources.write_text(str(lexical_functions / "left.vyx") + "\n"
                                         + str(lexical_functions / "right.vyx") + "\n", encoding="utf-8")
     env = dict(os.environ)
+    env.setdefault("VYX_STD_PACKAGES", str(ROOT / "bootstrap_compiler/std_packages"))
     for name in ("VYX_DCI_EXPORT_OUT", "VYX_EFFECT_MANIFEST_OUT", "VYX_PACKAGE_PROJECT"):
         env.pop(name, None)
     env["VYX_DEBUG_IMPORT"] = "1"
@@ -105,7 +106,7 @@ def main():
         if args.case and label not in args.case:
             return
         executable = work / (label + (".exe" if os.name == "nt" else ""))
-        command = [str(compiler), "--src=file", str(source), "--no-implicit-std"]
+        command = [str(compiler), "--src=file", str(source)]
         if expected is None:
             command.append("--stop-after-sema")
             timeout = args.budget

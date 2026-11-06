@@ -192,7 +192,7 @@ foreach ($entry in @(
 # Limit provenance to compiler inputs. Do not inspect unrelated project state,
 # editor/session settings, environment files, or repository-root dirty paths.
 $sourcePaths = @(
-    'bootstrap_compiler/src', 'bootstrap_compiler/std',
+    'bootstrap_compiler/src', 'bootstrap_compiler/std_packages',
     'bootstrap_compiler/Vyx.toml', 'bootstrap_compiler/CMakeLists.txt',
     'vyx_codegen/src', 'vyx_codegen/include', 'vyx_codegen/CMakeLists.txt',
     'tools/dci'

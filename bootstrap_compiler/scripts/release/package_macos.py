@@ -168,7 +168,7 @@ def package(build, llvm, output, arch, environment, work):
     (root / "lib/libtbb.dylib").symlink_to("libtbb.12.dylib")
     shutil.copy2(out / "libvyx_runtime.a", root / "lib/libvyx_runtime.a")
     ignore = shutil.ignore_patterns(".git", ".cache", "__pycache__", "*.pyc", "target", "out", "node_modules")
-    for directory in ("std", "std_packages"):
+    for directory in ("std_packages",):
         shutil.copytree(build / directory, root / directory, ignore=ignore)
     for directory in ("dci", "packages"):
         shutil.copytree(build.parent / "tools" / directory, root / "tools" / directory, ignore=ignore)

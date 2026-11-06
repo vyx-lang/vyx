@@ -413,8 +413,8 @@ exists, but JIT parity and pressure testing remain later work; AOT results do
 not establish JIT support for the same operation.
 
 Active tree: `bootstrap_compiler/` (lexer → parse → Sema → HIR → MIR →
-LLVM). Archived C++ host: repo-root `src/`. Frozen host std: repo-root
-`std/`. Canonical std: `bootstrap_compiler/std_packages/`.
+LLVM). Archived C++ host: repo-root `src/`. Standard-library sources:
+`bootstrap_compiler/std_packages/`; flat legacy copies have been removed.
 
 Build and gates: [TESTING_GUIDE.md](TESTING_GUIDE.md). Lesson map:
 [LANGUAGE_SURFACE.md](LANGUAGE_SURFACE.md).

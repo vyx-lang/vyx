@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# std_packages is the single authority for std sources. The flat seed std/
-# tree is a frozen legacy snapshot pending deletion -- no mirror/sync gate.
+# std_packages is the single authority for std sources.
 # Also: boot can import a real std module (std.time).
 set -euo pipefail
 

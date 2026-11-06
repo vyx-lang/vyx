@@ -119,7 +119,6 @@ function New-ProjectSnapshot {
 
     $snapshotBootstrap = Join-Path $DestinationRoot "bootstrap_compiler"
     Copy-FilteredTree -Source (Join-Path $bootstrapRoot "src") -Destination (Join-Path $snapshotBootstrap "src")
-    Copy-FilteredTree -Source (Join-Path $bootstrapRoot "std") -Destination (Join-Path $snapshotBootstrap "std")
     # std_packages is part of the canonical bootstrap project.  Omitting it
     # silently turns a cold stage into a different project and breaks targets
     # that consume the json/vendor or package-local source closure.

@@ -32,8 +32,8 @@ forwards implicit `std.*` lookup to the `.vyx` files declared by each package
 manifest. `vyxc build` still consumes packages through `std:` dependencies and
 `--module-sources-file`; it does not double-load this registry.
 
-`../std/` is a leftover seed snapshot, not a consumer import contract. The root
-repository `std/` is the frozen host mirror and is intentionally untouched.
+The flat standard-library snapshots have been removed. Source changes,
+package discovery and SDK distribution all use this directory.
 
 Regular expressions use a [vendored PCRE2 package](regex/README.md). TOML
 has a [typed, immutable document API](serde/TOML.md). [`std.uuid.Uuid`](std/UUID.md) uses OS

@@ -5,11 +5,11 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$repo_root"
 fail=0
 
-if git grep -n 'return "(response)"' -- bootstrap_compiler/std/curl.vyx; then
+if git grep -n 'return "(response)"' -- bootstrap_compiler/std_packages/network/src/curl.vyx; then
     echo "FAIL: boot curl still returns the fake (response) literal"
     fail=1
 fi
-if ! grep -q 'http_perform_capture' bootstrap_compiler/std/curl.vyx; then
+if ! grep -q 'http_perform_capture' bootstrap_compiler/std_packages/network/src/curl.vyx; then
     echo "FAIL: boot curl does not call http_perform_capture"
     fail=1
 fi

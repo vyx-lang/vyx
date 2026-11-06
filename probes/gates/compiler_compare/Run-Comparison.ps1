@@ -48,7 +48,7 @@ $identity = @($toolPaths.Keys | ForEach-Object {
 $repo = (& git -C ([IO.Path]::GetDirectoryName($compilerPath)) rev-parse --show-toplevel 2>$null | Out-String).Trim()
 $sourceIdentity = $null
 if ($LASTEXITCODE -eq 0 -and $repo) {
-    $scope = @('bootstrap_compiler/src','bootstrap_compiler/std','bootstrap_compiler/Vyx.toml','vyx_codegen/src','vyx_codegen/include','vyx_codegen/CMakeLists.txt','tools/dci')
+    $scope = @('bootstrap_compiler/src','bootstrap_compiler/std_packages','bootstrap_compiler/Vyx.toml','vyx_codegen/src','vyx_codegen/include','vyx_codegen/CMakeLists.txt','tools/dci')
     $diffPath = Join-Path $matrix 'compiler-source.diff'
     & git -C $repo diff --binary --no-ext-diff --no-textconv "--output=$diffPath" HEAD -- @scope
     if ($LASTEXITCODE -ne 0) { throw 'Cannot record compiler-source diff.' }

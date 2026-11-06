@@ -150,16 +150,13 @@ object VyxPackageCompletion {
             dirs += File(out, "std_packages")
             out.parentFile?.let { boot ->
                 dirs += File(boot, "std_packages")
-                dirs += File(boot, "std")
             }
         }
         var root = project?.basePath?.let(::File)?.absoluteFile
         var depth = 0
         while (root != null && depth < 6) {
             dirs += File(root, "std_packages")
-            dirs += File(root, "std")
             dirs += File(root, "bootstrap_compiler/std_packages")
-            dirs += File(root, "bootstrap_compiler/std")
             root = root.parentFile
             depth++
         }

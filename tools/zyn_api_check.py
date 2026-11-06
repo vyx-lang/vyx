@@ -504,7 +504,7 @@ def check_file(path, members, bases, returns, alias_map, module_fns, module_alia
 
 def main():
     argv = sys.argv[1:]
-    roots = ["Zyn/src", "std"]
+    roots = ["Zyn/src", "bootstrap_compiler/std_packages"]
     only = []
     if "--root" in argv:
         roots = argv[argv.index("--root") + 1].split(",")

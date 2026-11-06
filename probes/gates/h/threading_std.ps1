@@ -16,19 +16,6 @@ if (-not (Test-Path -LiteralPath $Boot)) {
 }
 
 $fail = 0
-$SrcPkg = Join-Path $Root "bootstrap_compiler\std_packages\sync\src"
-$Seed = Join-Path $Root "bootstrap_compiler\std"
-foreach ($name in @("threading.vyx", "sync.vyx", "thread_pool.vyx")) {
-    $a = Join-Path $SrcPkg $name
-    $b = Join-Path $Seed $name
-    $ha = (Get-FileHash -LiteralPath $a -Algorithm SHA256).Hash
-    $hb = (Get-FileHash -LiteralPath $b -Algorithm SHA256).Hash
-    if ($ha -ne $hb) {
-        Write-Host "FAIL: seed drift $name"
-        $fail++
-    }
-}
-
 $src = Join-Path $PSScriptRoot "_threading_probe.vyx"
 $exe = Join-Path $OutDir "_threading_probe.exe"
 

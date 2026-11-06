@@ -39,8 +39,8 @@ Closed files first supply declaration indexes. References and rename analyze
 candidate files individually and retain only source positions and binding facts.
 Dependencies supply signatures; inferred return types still require function
 bodies. Standard imports select one complete provider: `VYX_STD_PACKAGES`, then
-the workspace's canonical packages, then the SDK. Legacy `std/` is a fallback
-only when no canonical registry exists. Other copies remain indexed for
+the workspace's canonical packages, then the SDK. Each provider requires a
+`std_packages/registry`; flat `std/` fallbacks have been removed. Other canonical providers remain indexed for
 navigation but are not merged into semantic analysis; SDK sources stay read-only.
 Relative and absolute paths share one file identity.
 Open buffers also receive full diagnostics. Analysis allocations are released after each request and each

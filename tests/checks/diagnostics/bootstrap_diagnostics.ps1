@@ -275,108 +275,12 @@ function Runtime-Args {
 }
 
 function Test-StdTree {
-    $packageRoot = Join-Path $repoRoot "bootstrap_compiler\std_packages"
-    $seedStd = Join-Path $repoRoot "bootstrap_compiler\std"
-    if (-not (Test-Path -LiteralPath $packageRoot -PathType Container) -or
-        -not (Test-Path -LiteralPath $seedStd -PathType Container)) {
-        Add-Result "std" "std_tree" "canonical_seed" "FAIL" 1 $false $false 0 "canonical package root or seed mirror missing" ""
-        return
-    }
-
-    $layout = New-Object System.Collections.Generic.List[string]
-    $sourceIndex = @{}
-    $packageCount = 0
-    $canonicalCount = 0
-    foreach ($packageDir in @(Get-ChildItem -LiteralPath $packageRoot -Directory | Sort-Object Name)) {
-        $manifest = Join-Path $packageDir.FullName "Vyx.toml"
-        if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
-            [void]$layout.Add("$($packageDir.Name):missing_manifest")
-            continue
-        }
-        $packageCount++
-        $raw = Get-Content -Raw -LiteralPath $manifest
-        $isSourcePackage = $raw -match '(?m)^\s*type\s*=\s*"source"\s*(?:#.*)?$'
-        $declared = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($match in [regex]::Matches($raw, '"(src[/\\][^"\r\n]+\.vyx)"')) {
-            [void]$declared.Add($match.Groups[1].Value.Replace('/', [System.IO.Path]::DirectorySeparatorChar))
-        }
-        if ($declared.Count -eq 0) {
-            [void]$layout.Add("$($packageDir.Name):no_declared_source")
-            continue
-        }
-        foreach ($relative in @($declared)) {
-            $absolute = Join-Path $packageDir.FullName $relative
-            if (-not (Test-Path -LiteralPath $absolute -PathType Leaf)) {
-                [void]$layout.Add("$($packageDir.Name):missing:$relative")
-                continue
-            }
-            $canonicalCount++
-            if ($isSourcePackage) {
-                $name = [System.IO.Path]::GetFileName($relative)
-                if ($sourceIndex.ContainsKey($name)) {
-                    [void]$layout.Add("duplicate:$name")
-                } else {
-                    $sourceIndex[$name] = $absolute
-                }
-            }
-        }
-        $srcRoot = Join-Path $packageDir.FullName "src"
-        if (-not (Test-Path -LiteralPath $srcRoot -PathType Container)) {
-            [void]$layout.Add("$($packageDir.Name):missing_src_dir")
-            continue
-        }
-        foreach ($file in @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File -Filter "*.vyx")) {
-            $relative = $file.FullName.Substring($packageDir.FullName.Length + 1)
-            if (-not $declared.Contains($relative)) {
-                [void]$layout.Add("$($packageDir.Name):undeclared:$relative")
-            }
-        }
-    }
-
-    function Get-StdMirrorText {
-        param([string]$Path)
-        $rawText = ([System.IO.File]::ReadAllText($Path) -replace "`r`n", "`n") -replace "`r", "`n"
-        [string[]]$lines = @($rawText -split "`n" | ForEach-Object { $_ -replace '[ \t]+$', '' })
-        $last = $lines.Count - 1
-        while ($last -ge 0 -and $lines[$last].Length -eq 0) { $last-- }
-        if ($last -lt 0) { return "" }
-        return (($lines[0..$last]) -join "`n")
-    }
-
-    $missing = New-Object System.Collections.Generic.List[string]
-    $diff = New-Object System.Collections.Generic.List[string]
-    foreach ($name in @($sourceIndex.Keys | Sort-Object)) {
-        $mirror = Join-Path $seedStd $name
-        if (-not (Test-Path -LiteralPath $mirror -PathType Leaf)) {
-            [void]$missing.Add($name)
-        } elseif ((Get-StdMirrorText $sourceIndex[$name]) -cne (Get-StdMirrorText $mirror)) {
-            [void]$diff.Add($name)
-        }
-    }
-
-    $seedOnly = @(
-        "cacao.vyx", "curl.vyx", "dll.vyx", "grpc.vyx", "httpclient.vyx",
-        "llvm.vyx", "openssl.vyx", "sqlite.vyx", "stb_image.vyx",
-        "websocket.vyx", "win32.vyx"
-    )
-    $unclassified = New-Object System.Collections.Generic.List[string]
-    foreach ($file in @(Get-ChildItem -LiteralPath $seedStd -File -Filter "*.vyx")) {
-        if (-not $sourceIndex.ContainsKey($file.Name) -and $file.Name -notin $seedOnly) {
-            [void]$unclassified.Add($file.Name)
-        }
-    }
-
-    $status = "PASS"
-    $exit = 0
-    if ($layout.Count -gt 0 -or $missing.Count -gt 0 -or
-        $diff.Count -gt 0 -or $unclassified.Count -gt 0) {
-        $status = "FAIL"
-        $exit = 1
-    }
-    $detail = "packages={0} canonical={1} seed_required={2} layout={3} missing={4} diff={5} unclassified={6}" -f `
-        $packageCount, $canonicalCount, $sourceIndex.Count, $layout.Count, `
-        $missing.Count, $diff.Count, $unclassified.Count
-    Add-Result "std" "std_tree" "canonical_seed" $status $exit $false $false 0 $detail ""
+    $checker = Join-Path $repoRoot "scripts/check_std_drift.ps1"
+    $shell = (Get-Process -Id $PID).Path
+    $detail = (& $shell -NoProfile -File $checker 2>&1 | Out-String).Trim()
+    $exit = $LASTEXITCODE
+    $status = if ($exit -eq 0) { "PASS" } else { "FAIL" }
+    Add-Result "std" "std_tree" "canonical_packages" $status $exit $false $false 0 $detail ""
 }
 
 function Invoke-CliMatrix {
